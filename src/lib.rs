@@ -80,7 +80,10 @@ pub use observer::{NoOpObserver, SagaObserver, TracingObserver};
 pub use stats::{ParticipantStats, ParticipantStatsSnapshot};
 
 // Helpers
-pub use helpers::{compensate_wrapper, execute_step_wrapper, handle_saga_event, recover_sagas};
+pub use helpers::{
+    compensate_wrapper, execute_step_wrapper, handle_saga_event, handle_saga_event_with_emit,
+    recover_sagas,
+};
 pub use testkit::{
     compensation_requested, drive_scenario, saga_started, step_completed, step_failed,
     DeterministicContextBuilder,

@@ -28,6 +28,19 @@ pub fn handle_saga_event<P>(participant: &mut P, event: SagaChoreographyEvent)
 where
     P: SagaParticipant + SagaStateExt,
 {
+    handle_saga_event_with_emit(participant, event, |_| {});
+}
+
+/// Saga event handler with an explicit emit sink for produced choreography events.
+pub fn handle_saga_event_with_emit<P, F>(
+    participant: &mut P,
+    event: SagaChoreographyEvent,
+    mut emit: F,
+)
+where
+    P: SagaParticipant + SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
+{
     let context = event.context().clone();
     let now = participant.now_millis();
 
@@ -50,7 +63,7 @@ where
         SagaChoreographyEvent::SagaStarted { payload, .. }
             if participant.depends_on().is_on_saga_start() =>
         {
-            execute_step_wrapper(participant, context.clone(), payload, now);
+            execute_step_wrapper_with_emit(participant, context.clone(), payload, now, &mut emit);
         }
 
         SagaChoreographyEvent::StepCompleted {
@@ -63,7 +76,7 @@ where
                 .is_satisfied_by(&step_ctx.step_name)
             {
                 let next_context = context.next_step(participant.step_name().into());
-                execute_step_wrapper(participant, next_context, output, now);
+                execute_step_wrapper_with_emit(participant, next_context, output, now, &mut emit);
             }
         }
 
@@ -72,7 +85,7 @@ where
             ..
         } => {
             if steps_to_compensate.contains(&participant.step_name().into()) {
-                compensate_wrapper(participant, &context, now);
+                compensate_wrapper_with_emit(participant, &context, now, &mut emit);
             }
         }
 
@@ -94,6 +107,20 @@ where
 pub fn execute_step_wrapper<P>(participant: &mut P, context: SagaContext, input: Vec<u8>, now: u64)
 where
     P: SagaParticipant + SagaStateExt,
+{
+    let mut ignore_emit = |_| {};
+    execute_step_wrapper_with_emit(participant, context, input, now, &mut ignore_emit);
+}
+
+fn execute_step_wrapper_with_emit<P, F>(
+    participant: &mut P,
+    context: SagaContext,
+    input: Vec<u8>,
+    now: u64,
+    emit: &mut F,
+) where
+    P: SagaParticipant + SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
 {
     let saga_id = context.saga_id;
 
@@ -127,30 +154,43 @@ where
     // Execute
     match participant.execute_step(&context, &input) {
         Ok(output) => {
-            complete_step(participant, &context, output, now);
+            complete_step(participant, &context, output, now, emit);
         }
         Err(error) => {
-            fail_step(participant, &context, error, now);
+            fail_step(participant, &context, error, now, emit);
         }
     }
 }
 
 /// Complete a step with state transition
-fn complete_step<P>(participant: &mut P, context: &SagaContext, output: StepOutput, now: u64)
+fn complete_step<P, F>(
+    participant: &mut P,
+    context: &SagaContext,
+    output: StepOutput,
+    now: u64,
+    emit: &mut F,
+)
 where
     P: SagaParticipant + SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
 {
     let saga_id = context.saga_id;
-    let (out_data, comp_data) = match output {
+    let (out_data, comp_data, compensation_available) = match output {
         StepOutput::Completed {
             output,
             compensation_data,
-        } => (output, compensation_data),
+        } => {
+            let compensation_available = !compensation_data.is_empty();
+            (output, compensation_data, compensation_available)
+        }
         StepOutput::CompletedWithEffect {
             output,
             compensation_data,
             ..
-        } => (output, compensation_data),
+        } => {
+            let compensation_available = !compensation_data.is_empty();
+            (output, compensation_data, compensation_available)
+        }
     };
 
     // State: Executing -> Completed
@@ -162,6 +202,7 @@ where
     }
 
     // Persist
+    let emitted_output = out_data.clone();
     participant.record_event(
         saga_id,
         ParticipantEvent::StepExecutionCompleted {
@@ -170,12 +211,25 @@ where
             completed_at_millis: now,
         },
     );
+
+    emit(SagaChoreographyEvent::StepCompleted {
+        context: context.next_step(participant.step_name().into()),
+        output: emitted_output,
+        compensation_available,
+    });
 }
 
 /// Fail a step with state transition
-fn fail_step<P>(participant: &mut P, context: &SagaContext, error: StepError, now: u64)
+fn fail_step<P, F>(
+    participant: &mut P,
+    context: &SagaContext,
+    error: StepError,
+    now: u64,
+    emit: &mut F,
+)
 where
     P: SagaParticipant + SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
 {
     let saga_id = context.saga_id;
     let (reason, requires_comp) = match error {
@@ -200,17 +254,37 @@ where
     participant.record_event(
         saga_id,
         ParticipantEvent::StepExecutionFailed {
-            error: reason,
+            error: reason.clone(),
             requires_compensation: requires_comp,
             failed_at_millis: now,
         },
     );
+
+    emit(SagaChoreographyEvent::StepFailed {
+        context: context.next_step(participant.step_name().into()),
+        error: reason,
+        will_retry: false,
+        requires_compensation: requires_comp,
+    });
 }
 
 /// Execute compensation with state management
 pub fn compensate_wrapper<P>(participant: &mut P, context: &SagaContext, now: u64)
 where
     P: SagaParticipant + SagaStateExt,
+{
+    let mut ignore_emit = |_| {};
+    compensate_wrapper_with_emit(participant, context, now, &mut ignore_emit);
+}
+
+fn compensate_wrapper_with_emit<P, F>(
+    participant: &mut P,
+    context: &SagaContext,
+    now: u64,
+    emit: &mut F,
+) where
+    P: SagaParticipant + SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
 {
     let saga_id = context.saga_id;
 
@@ -236,19 +310,25 @@ where
         // Execute compensation
         match participant.compensate_step(context, &comp_data) {
             Ok(()) => {
-                complete_compensation(participant, context, now);
+                complete_compensation(participant, context, now, emit);
             }
             Err(error) => {
-                fail_compensation(participant, context, error, now);
+                fail_compensation(participant, context, error, now, emit);
             }
         }
     }
 }
 
 /// Complete compensation
-fn complete_compensation<P>(participant: &mut P, context: &SagaContext, now: u64)
+fn complete_compensation<P, F>(
+    participant: &mut P,
+    context: &SagaContext,
+    now: u64,
+    emit: &mut F,
+)
 where
     P: SagaParticipant + SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
 {
     let saga_id = context.saga_id;
 
@@ -269,24 +349,30 @@ where
         },
     );
 
+    emit(SagaChoreographyEvent::CompensationCompleted {
+        context: context.next_step(participant.step_name().into()),
+    });
+
     // Notify
     participant.on_compensation_completed(context);
 }
 
 /// Fail compensation (quarantine)
-fn fail_compensation<P>(
+fn fail_compensation<P, F>(
     participant: &mut P,
     context: &SagaContext,
     error: CompensationError,
     now: u64,
+    emit: &mut F,
 ) where
     P: SagaParticipant + SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
 {
     let saga_id = context.saga_id;
-    let reason = match error {
-        CompensationError::SafeToRetry { reason } => reason,
-        CompensationError::Ambiguous { reason } => reason,
-        CompensationError::Terminal { reason } => reason,
+    let (reason, is_ambiguous) = match error {
+        CompensationError::SafeToRetry { reason } => (reason, false),
+        CompensationError::Ambiguous { reason } => (reason, true),
+        CompensationError::Terminal { reason } => (reason, false),
     };
 
     // State: Compensating -> Quarantined
@@ -306,6 +392,18 @@ fn fail_compensation<P>(
             quarantined_at_millis: now,
         },
     );
+
+    let event_context = context.next_step(participant.step_name().into());
+    emit(SagaChoreographyEvent::CompensationFailed {
+        context: event_context.clone(),
+        error: reason.clone(),
+        is_ambiguous,
+    });
+    emit(SagaChoreographyEvent::SagaQuarantined {
+        context: event_context,
+        reason: reason.clone(),
+        step: participant.step_name().into(),
+    });
 
     // Notify
     participant.on_quarantined(context, &reason);
@@ -387,5 +485,215 @@ impl RebuiltState {
                 | RebuiltState::Compensated
                 | RebuiltState::Quarantined
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use crate::{
+        DeterministicContextBuilder, InMemoryDedupe, InMemoryJournal, ParticipantDedupeStore,
+        ParticipantJournal, SagaContext, SagaId, SagaStateEntry,
+    };
+
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    enum ExecuteMode {
+        Completed,
+        TerminalFail,
+    }
+
+    struct TestParticipant {
+        states: HashMap<SagaId, SagaStateEntry>,
+        journal: InMemoryJournal,
+        dedupe: InMemoryDedupe,
+        execute_mode: ExecuteMode,
+        compensation_error: Option<CompensationError>,
+        executed: usize,
+    }
+
+    impl Default for TestParticipant {
+        fn default() -> Self {
+            Self {
+                states: HashMap::new(),
+                journal: InMemoryJournal::new(),
+                dedupe: InMemoryDedupe::new(),
+                execute_mode: ExecuteMode::Completed,
+                compensation_error: None,
+                executed: 0,
+            }
+        }
+    }
+
+    impl SagaStateExt for TestParticipant {
+        type Journal = InMemoryJournal;
+        type Dedupe = InMemoryDedupe;
+
+        fn saga_states(&mut self) -> &mut HashMap<SagaId, SagaStateEntry> {
+            &mut self.states
+        }
+
+        fn saga_states_ref(&self) -> &HashMap<SagaId, SagaStateEntry> {
+            &self.states
+        }
+
+        fn saga_journal(&self) -> &Self::Journal {
+            &self.journal
+        }
+
+        fn saga_dedupe(&self) -> &Self::Dedupe {
+            &self.dedupe
+        }
+
+        fn now_millis(&self) -> u64 {
+            1_700_000_000_000
+        }
+    }
+
+    impl SagaParticipant for TestParticipant {
+        type Error = String;
+
+        fn step_name(&self) -> &str {
+            "risk_check"
+        }
+
+        fn saga_types(&self) -> &[&'static str] {
+            &["order_lifecycle"]
+        }
+
+        fn depends_on(&self) -> DependencySpec {
+            DependencySpec::OnSagaStart
+        }
+
+        fn execute_step(
+            &mut self,
+            _context: &SagaContext,
+            _input: &[u8],
+        ) -> Result<StepOutput, StepError> {
+            self.executed = self.executed.saturating_add(1);
+            match self.execute_mode {
+                ExecuteMode::Completed => Ok(StepOutput::Completed {
+                    output: vec![1, 2, 3],
+                    compensation_data: vec![9],
+                }),
+                ExecuteMode::TerminalFail => Err(StepError::Terminal {
+                    reason: "terminal failure".into(),
+                }),
+            }
+        }
+
+        fn compensate_step(
+            &mut self,
+            _context: &SagaContext,
+            _compensation_data: &[u8],
+        ) -> Result<(), CompensationError> {
+            if let Some(err) = self.compensation_error.clone() {
+                return Err(err);
+            }
+            Ok(())
+        }
+    }
+
+    fn started_event() -> SagaChoreographyEvent {
+        SagaChoreographyEvent::SagaStarted {
+            context: DeterministicContextBuilder::default().build(),
+            payload: vec![7],
+        }
+    }
+
+    #[test]
+    fn handle_saga_event_with_emit_emits_step_completed() {
+        let mut participant = TestParticipant::default();
+        let mut emitted = Vec::new();
+
+        handle_saga_event_with_emit(&mut participant, started_event(), |event| emitted.push(event));
+
+        assert_eq!(participant.executed, 1);
+        assert_eq!(emitted.len(), 1);
+        assert!(matches!(
+            emitted.first(),
+            Some(SagaChoreographyEvent::StepCompleted {
+                compensation_available: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn handle_saga_event_with_emit_emits_step_failed_on_terminal_failure() {
+        let mut participant = TestParticipant {
+            execute_mode: ExecuteMode::TerminalFail,
+            ..TestParticipant::default()
+        };
+        let mut emitted = Vec::new();
+
+        handle_saga_event_with_emit(&mut participant, started_event(), |event| emitted.push(event));
+
+        assert_eq!(participant.executed, 1);
+        assert_eq!(emitted.len(), 1);
+        assert!(matches!(
+            emitted.first(),
+            Some(SagaChoreographyEvent::StepFailed {
+                requires_compensation: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn handle_saga_event_with_emit_dedupes_replayed_input() {
+        let mut participant = TestParticipant::default();
+        let input = started_event();
+        let mut emitted = Vec::new();
+
+        handle_saga_event_with_emit(&mut participant, input.clone(), |event| emitted.push(event));
+        handle_saga_event_with_emit(&mut participant, input, |event| emitted.push(event));
+
+        assert_eq!(participant.executed, 1);
+        assert_eq!(emitted.len(), 1);
+    }
+
+    #[test]
+    fn handle_saga_event_compat_wrapper_still_executes() {
+        let mut participant = TestParticipant::default();
+        handle_saga_event(&mut participant, started_event());
+        assert_eq!(participant.executed, 1);
+    }
+
+    #[test]
+    fn handle_saga_event_with_emit_emits_compensation_terminal_signals() {
+        let mut participant = TestParticipant {
+            compensation_error: Some(CompensationError::Terminal {
+                reason: "cannot compensate".into(),
+            }),
+            ..TestParticipant::default()
+        };
+        let started = started_event();
+        let context = started.context().clone();
+        let mut emitted = Vec::new();
+
+        handle_saga_event_with_emit(&mut participant, started, |_| {});
+        handle_saga_event_with_emit(
+            &mut participant,
+            SagaChoreographyEvent::CompensationRequested {
+                context,
+                failed_step: "risk_check".into(),
+                reason: "failed downstream".into(),
+                steps_to_compensate: vec!["risk_check".into()],
+            },
+            |event| emitted.push(event),
+        );
+
+        assert_eq!(emitted.len(), 2);
+        assert!(matches!(
+            emitted.first(),
+            Some(SagaChoreographyEvent::CompensationFailed { .. })
+        ));
+        assert!(matches!(
+            emitted.get(1),
+            Some(SagaChoreographyEvent::SagaQuarantined { .. })
+        ));
     }
 }
