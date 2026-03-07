@@ -1,4 +1,4 @@
-# icanact-saga-choreography
+# I.Can.Act: Choreography
 
 Robust workflow coordination for `icanact-core`.
 
