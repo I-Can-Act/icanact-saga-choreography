@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use icanact_core::local_sync::DirectPubSub;
+use icanact_core::local_direct::PubSub;
 
 use crate::{
     ParticipantDedupeStore, ParticipantJournal, ParticipantStats, SagaChoreographyEvent, SagaId,
@@ -24,7 +24,7 @@ where
     pub dedupe: D,
     pub stats: ParticipantStats,
     pub startup_recovery_events: Vec<SagaChoreographyEvent>,
-    pub bus: Option<DirectPubSub<SagaChoreographyEvent>>,
+    pub bus: Option<PubSub<SagaChoreographyEvent>>,
 }
 
 impl<J, D> SagaParticipantSupport<J, D>
@@ -52,7 +52,7 @@ where
         std::mem::take(&mut self.startup_recovery_events)
     }
 
-    pub fn attach_bus(&mut self, bus: DirectPubSub<SagaChoreographyEvent>) {
+    pub fn attach_bus(&mut self, bus: PubSub<SagaChoreographyEvent>) {
         self.bus = Some(bus);
     }
 
@@ -93,7 +93,7 @@ pub trait HasSagaParticipantSupport: Send + 'static {
 
 /// Convenience methods for participants that embed [`SagaParticipantSupport`].
 pub trait SagaParticipantSupportExt: HasSagaParticipantSupport {
-    fn attach_saga_bus(&mut self, bus: DirectPubSub<SagaChoreographyEvent>) {
+    fn attach_saga_bus(&mut self, bus: PubSub<SagaChoreographyEvent>) {
         self.saga_support_mut().attach_bus(bus);
     }
 
@@ -146,7 +146,7 @@ mod tests {
 
     #[test]
     fn support_publishes_to_attached_bus() {
-        let bus = DirectPubSub::<SagaChoreographyEvent>::new();
+        let bus = PubSub::<SagaChoreographyEvent>::new();
         let delivered = Arc::new(Mutex::new(Vec::new()));
         let delivered_clone = Arc::clone(&delivered);
         let _sub = bus.subscribe_fn("saga:order_lifecycle", move |event| {
