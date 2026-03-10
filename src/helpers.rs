@@ -98,7 +98,8 @@ pub fn handle_saga_event_with_emit<P, F>(
             ..
         } => {
             let dependency_spec = participant.depends_on();
-            if dependency_spec.is_satisfied_by(&step_ctx.step_name) {
+            if dependency_should_fire(participant, context.saga_id, &dependency_spec, &step_ctx.step_name)
+            {
                 let next_context = context.next_step(participant.step_name().into());
                 let input = if dependency_spec.prefers_original_saga_input() {
                     saga_input
@@ -129,6 +130,45 @@ pub fn handle_saga_event_with_emit<P, F>(
         }
 
         _ => {}
+    }
+}
+
+fn dependency_should_fire<P>(
+    participant: &mut P,
+    saga_id: SagaId,
+    dependency_spec: &DependencySpec,
+    completed_step: &str,
+) -> bool
+where
+    P: SagaParticipant + SagaStateExt,
+{
+    match dependency_spec {
+        DependencySpec::OnSagaStart => false,
+        DependencySpec::After(step) => {
+            if completed_step != *step {
+                return false;
+            }
+            participant.dependency_fired().insert(saga_id)
+        }
+        DependencySpec::AnyOf(steps) => {
+            if !steps.contains(&completed_step) {
+                return false;
+            }
+            participant.dependency_fired().insert(saga_id)
+        }
+        DependencySpec::AllOf(steps) => {
+            {
+                let seen = participant
+                    .dependency_completions()
+                    .entry(saga_id)
+                    .or_default();
+                seen.insert(completed_step.into());
+                if !steps.iter().all(|step| seen.contains(*step)) {
+                    return false;
+                }
+            }
+            participant.dependency_fired().insert(saga_id)
+        }
     }
 }
 
@@ -329,6 +369,8 @@ fn fail_step<P, F>(
 
     emit(SagaChoreographyEvent::StepFailed {
         context: context.next_step(participant.step_name().into()),
+        participant_id: participant.participant_id_owned(),
+        error_code: None,
         error: reason,
         will_retry: false,
         requires_compensation: requires_comp,
@@ -458,6 +500,7 @@ fn fail_compensation<P, F>(
     let event_context = context.next_step(participant.step_name().into());
     emit(SagaChoreographyEvent::CompensationFailed {
         context: event_context.clone(),
+        participant_id: participant.participant_id_owned(),
         error: reason.clone(),
         is_ambiguous,
     });
@@ -465,6 +508,7 @@ fn fail_compensation<P, F>(
         context: event_context,
         reason: reason.clone(),
         step: participant.step_name().into(),
+        participant_id: participant.participant_id_owned(),
     });
 
     // Notify
@@ -716,7 +760,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_saga_event_with_emit_processes_distinct_step_completed_events() {
+    fn handle_saga_event_with_emit_allof_triggers_once_after_full_dependency_set() {
         let mut participant = TestParticipant {
             dependency_spec: DependencySpec::AllOf(&["risk_check", "positions_check"]),
             ..TestParticipant::default()
@@ -745,7 +789,7 @@ mod tests {
             |event| emitted.push(event),
         );
 
-        assert_eq!(participant.executed, 2);
+        assert_eq!(participant.executed, 1);
     }
 
     #[test]
@@ -761,6 +805,16 @@ mod tests {
             SagaChoreographyEvent::StepCompleted {
                 context: context.next_step("risk_check".into()),
                 output: vec![9],
+                saga_input: vec![7, 7, 7],
+                compensation_available: false,
+            },
+            |_| {},
+        );
+        handle_saga_event_with_emit(
+            &mut participant,
+            SagaChoreographyEvent::StepCompleted {
+                context: context.next_step("positions_check".into()),
+                output: vec![8],
                 saga_input: vec![7, 7, 7],
                 compensation_available: false,
             },

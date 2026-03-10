@@ -18,7 +18,6 @@
 //! - An attempt number (for step execution) to distinguish retries
 
 use crate::SagaId;
-use serde::{Deserialize, Serialize};
 
 /// A unique key for deduplicating side effects in saga execution.
 ///
@@ -42,7 +41,7 @@ use serde::{Deserialize, Serialize};
 /// let key = IdempotencyKey::for_step(saga_id, "reserve_inventory", 1);
 /// assert!(key.as_str().contains("reserve_inventory"));
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct IdempotencyKey(pub Box<str>);
 
 impl IdempotencyKey {

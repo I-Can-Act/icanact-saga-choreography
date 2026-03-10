@@ -1,6 +1,6 @@
 //! First-class embedded saga support for participants.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     ParticipantDedupeStore, ParticipantJournal, ParticipantStats, SagaChoreographyBus,
@@ -18,6 +18,8 @@ where
     D: ParticipantDedupeStore,
 {
     pub saga_states: HashMap<SagaId, SagaStateEntry>,
+    pub dependency_completions: HashMap<SagaId, HashSet<Box<str>>>,
+    pub dependency_fired: HashSet<SagaId>,
     pub journal: J,
     pub dedupe: D,
     pub stats: ParticipantStats,
@@ -33,6 +35,8 @@ where
     pub fn new(journal: J, dedupe: D) -> Self {
         Self {
             saga_states: HashMap::new(),
+            dependency_completions: HashMap::new(),
+            dependency_fired: HashSet::new(),
             journal,
             dedupe,
             stats: ParticipantStats::new(),
@@ -69,6 +73,11 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SagaParticipantSupport")
             .field("saga_states_len", &self.saga_states.len())
+            .field(
+                "dependency_completions_len",
+                &self.dependency_completions.len(),
+            )
+            .field("dependency_fired_len", &self.dependency_fired.len())
             .field(
                 "startup_recovery_events_len",
                 &self.startup_recovery_events.len(),
@@ -131,6 +140,7 @@ mod tests {
                 event_timestamp_millis: 100,
             },
             reason: "startup quarantine".into(),
+            failure: None,
         };
 
         let mut support =
@@ -138,6 +148,8 @@ mod tests {
                 .with_startup_recovery_events(vec![event.clone()]);
 
         assert!(support.saga_states.is_empty());
+        assert!(support.dependency_completions.is_empty());
+        assert!(support.dependency_fired.is_empty());
         assert_eq!(support.take_startup_recovery_events().len(), 1);
         assert!(support.take_startup_recovery_events().is_empty());
     }

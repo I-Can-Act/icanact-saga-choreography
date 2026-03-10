@@ -12,7 +12,6 @@
 //! journal of events, allowing for independent recovery and replay.
 
 use super::{ParticipantEvent, SagaId};
-use serde::{Deserialize, Serialize};
 
 /// A trait for participant journal storage implementations.
 ///
@@ -108,7 +107,13 @@ pub trait ParticipantJournal: Send + Sync + 'static {
 /// - Ordering events during replay
 /// - Debugging and auditing
 /// - Time-based analysis of SAGA execution
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct JournalEntry {
     /// The monotonically increasing sequence number assigned to this entry.
     ///

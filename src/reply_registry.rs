@@ -3,7 +3,7 @@ use std::sync::{Mutex, OnceLock};
 
 use icanact_core::local_sync::ReplyTo;
 
-use crate::{SagaChoreographyEvent, SagaDelegatedReply, SagaId};
+use crate::{SagaChoreographyEvent, SagaDelegatedReply, SagaId, TERMINAL_RESOLVER_STEP};
 
 pub type SagaDelegatedReplyResult = Result<SagaDelegatedReply, String>;
 pub type SagaDelegatedReplyHandle = ReplyTo<SagaDelegatedReplyResult>;
@@ -46,6 +46,17 @@ pub fn complete_terminal_reply_from_event(
     event: &SagaChoreographyEvent,
     responder: impl Into<Box<str>>,
 ) -> bool {
+    let is_resolver_terminal = match event {
+        SagaChoreographyEvent::SagaCompleted { context }
+        | SagaChoreographyEvent::SagaFailed { context, .. }
+        | SagaChoreographyEvent::SagaQuarantined { context, .. } => {
+            context.step_name.as_ref() == TERMINAL_RESOLVER_STEP
+        }
+        _ => false,
+    };
+    if !is_resolver_terminal {
+        return false;
+    }
     let Some(outcome) = event.terminal_outcome() else {
         return false;
     };

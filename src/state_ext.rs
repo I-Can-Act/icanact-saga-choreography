@@ -11,7 +11,7 @@ use crate::{
     HasSagaParticipantSupport, ParticipantDedupeStore, ParticipantEvent, ParticipantJournal,
     SagaId, SagaStateEntry,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Extension trait providing common saga state management operations.
 ///
@@ -64,6 +64,16 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
     /// without modifying it.
     fn saga_states_ref(&self) -> &HashMap<SagaId, SagaStateEntry> {
         &self.saga_support().saga_states
+    }
+
+    /// Returns mutable access to per-saga dependency completion tracking.
+    fn dependency_completions(&mut self) -> &mut HashMap<SagaId, HashSet<Box<str>>> {
+        &mut self.saga_support_mut().dependency_completions
+    }
+
+    /// Returns mutable access to per-saga dependency fire tracking.
+    fn dependency_fired(&mut self) -> &mut HashSet<SagaId> {
+        &mut self.saga_support_mut().dependency_fired
     }
 
     /// Returns the participant journal for event persistence.
@@ -140,6 +150,8 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
     /// * `saga_id` - The unique identifier of the saga to prune
     fn prune_saga(&mut self, saga_id: SagaId) {
         self.saga_states().remove(&saga_id);
+        self.dependency_completions().remove(&saga_id);
+        self.dependency_fired().remove(&saga_id);
         let _ = self.saga_dedupe().prune(saga_id);
     }
 

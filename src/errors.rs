@@ -1,9 +1,7 @@
 //! Error types for saga execution and compensation
 
-use serde::{Deserialize, Serialize};
-
 /// Output from step execution
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub enum StepOutput {
     /// Step completed successfully
     Completed {
@@ -24,7 +22,7 @@ pub enum StepOutput {
 }
 
 /// Error from step execution
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub enum StepError {
     /// Temporary error - can retry with exponential backoff
     Retriable {
@@ -56,7 +54,7 @@ impl StepError {
 }
 
 /// Error from compensation execution
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub enum CompensationError {
     /// Safe to retry - no side effects were applied
     SafeToRetry {
