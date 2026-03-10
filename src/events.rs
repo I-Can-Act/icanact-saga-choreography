@@ -1,10 +1,20 @@
 //! Saga events
 
 use super::{SagaContext, SagaId};
-use serde::{Deserialize, Serialize};
+use icanact_core::ActorId;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SagaFailureDetails {
+    pub step_name: Box<str>,
+    pub participant_id: Box<str>,
+    pub error_code: Option<Box<str>>,
+    pub error_message: Box<str>,
+    pub will_retry: bool,
+    pub at_millis: u64,
+}
 
 /// Events published via DistributedPubSub
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub enum SagaChoreographyEvent {
     /// Emitted when a new SAGA orchestration begins.
     SagaStarted {
@@ -24,6 +34,8 @@ pub enum SagaChoreographyEvent {
         context: SagaContext,
         /// The reason for the saga failure.
         reason: Box<str>,
+        /// Optional structured failure metadata preserved from the failing step.
+        failure: Option<SagaFailureDetails>,
     },
 
     /// Emitted when a step within the saga begins execution.
@@ -46,6 +58,10 @@ pub enum SagaChoreographyEvent {
     StepFailed {
         /// The saga context containing identifiers and metadata.
         context: SagaContext,
+        /// The participant that emitted the failure.
+        participant_id: Box<str>,
+        /// Optional machine-readable failure code.
+        error_code: Option<Box<str>>,
         /// The error message describing why the step failed.
         error: Box<str>,
         /// Whether the step will be retried.
@@ -79,6 +95,8 @@ pub enum SagaChoreographyEvent {
     CompensationFailed {
         /// The saga context containing identifiers and metadata.
         context: SagaContext,
+        /// The participant that failed compensation.
+        participant_id: Box<str>,
         /// The error message describing why compensation failed.
         error: Box<str>,
         /// Whether the system state is ambiguous (partial compensation may have occurred).
@@ -92,6 +110,8 @@ pub enum SagaChoreographyEvent {
         reason: Box<str>,
         /// The step during which the quarantine occurred.
         step: Box<str>,
+        /// The participant that caused quarantine.
+        participant_id: Box<str>,
     },
 
     /// Emitted as an acknowledgment from a participant for a step.
@@ -105,35 +125,90 @@ pub enum SagaChoreographyEvent {
     },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub enum SagaTerminalOutcome {
     Completed { context: SagaContext },
-    Failed { context: SagaContext, reason: Box<str> },
-    StepFailed {
+    Failed {
         context: SagaContext,
-        error: Box<str>,
-        will_retry: bool,
-        requires_compensation: bool,
-    },
-    CompensationFailed {
-        context: SagaContext,
-        error: Box<str>,
-        is_ambiguous: bool,
+        reason: Box<str>,
+        failure: Option<SagaFailureDetails>,
     },
     Quarantined {
         context: SagaContext,
         reason: Box<str>,
         step: Box<str>,
+        participant_id: Box<str>,
     },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct SagaDelegatedReply {
     pub responder: Box<str>,
     pub outcome: SagaTerminalOutcome,
 }
 
 impl SagaChoreographyEvent {
+    pub fn saga_failed_default(context: SagaContext, reason: Box<str>) -> Self {
+        Self::SagaFailed {
+            context,
+            reason,
+            failure: None,
+        }
+    }
+
+    pub fn step_failed_default(
+        context: SagaContext,
+        error: Box<str>,
+        will_retry: bool,
+        requires_compensation: bool,
+    ) -> Self {
+        let participant_id = context.step_name.clone();
+        Self::step_failed_for_participant(
+            context,
+            participant_id,
+            None,
+            error,
+            will_retry,
+            requires_compensation,
+        )
+    }
+
+    pub fn step_failed_for_participant(
+        context: SagaContext,
+        participant_id: Box<str>,
+        error_code: Option<Box<str>>,
+        error: Box<str>,
+        will_retry: bool,
+        requires_compensation: bool,
+    ) -> Self {
+        Self::StepFailed {
+            context,
+            participant_id,
+            error_code,
+            error,
+            will_retry,
+            requires_compensation,
+        }
+    }
+
+    pub fn step_failed_for_actor_id(
+        context: SagaContext,
+        participant_id: ActorId,
+        error_code: Option<Box<str>>,
+        error: Box<str>,
+        will_retry: bool,
+        requires_compensation: bool,
+    ) -> Self {
+        Self::step_failed_for_participant(
+            context,
+            participant_id.as_str().to_string().into_boxed_str(),
+            error_code,
+            error,
+            will_retry,
+            requires_compensation,
+        )
+    }
+
     /// Returns a reference to the saga context associated with this event.
     ///
     /// @return A reference to the `SagaContext` containing saga identifiers and metadata.
@@ -187,38 +262,25 @@ impl SagaChoreographyEvent {
             Self::SagaCompleted { context } => Some(SagaTerminalOutcome::Completed {
                 context: context.clone(),
             }),
-            Self::SagaFailed { context, reason } => Some(SagaTerminalOutcome::Failed {
+            Self::SagaFailed {
+                context,
+                reason,
+                failure,
+            } => Some(SagaTerminalOutcome::Failed {
                 context: context.clone(),
                 reason: reason.clone(),
-            }),
-            Self::StepFailed {
-                context,
-                error,
-                will_retry,
-                requires_compensation,
-            } => Some(SagaTerminalOutcome::StepFailed {
-                context: context.clone(),
-                error: error.clone(),
-                will_retry: *will_retry,
-                requires_compensation: *requires_compensation,
-            }),
-            Self::CompensationFailed {
-                context,
-                error,
-                is_ambiguous,
-            } => Some(SagaTerminalOutcome::CompensationFailed {
-                context: context.clone(),
-                error: error.clone(),
-                is_ambiguous: *is_ambiguous,
+                failure: failure.clone(),
             }),
             Self::SagaQuarantined {
                 context,
                 reason,
                 step,
+                participant_id,
             } => Some(SagaTerminalOutcome::Quarantined {
                 context: context.clone(),
                 reason: reason.clone(),
                 step: step.clone(),
+                participant_id: participant_id.clone(),
             }),
             _ => None,
         }
@@ -226,7 +288,7 @@ impl SagaChoreographyEvent {
 }
 
 /// Acknowledgment status for step processing responses.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub enum AckStatus {
     /// The step has been accepted and queued for processing.
     Accepted,
@@ -241,7 +303,13 @@ pub enum AckStatus {
 }
 
 /// Events stored in participant's local journal for durability and recovery.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub enum ParticipantEvent {
     /// Emitted when a participant registers to handle a step in a saga type.
     SagaRegistered {

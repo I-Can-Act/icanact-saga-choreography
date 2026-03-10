@@ -1,9 +1,7 @@
 //! Saga context and identity types
 
-use serde::{Deserialize, Serialize};
-
 /// Unique identifier for a saga execution
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SagaId(pub u64);
 
 impl SagaId {
@@ -31,7 +29,7 @@ impl std::fmt::Display for SagaId {
 }
 
 /// Unique identifier for a step within a saga
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StepId {
     /// The saga this step belongs to
     pub saga_id: SagaId,
@@ -43,7 +41,7 @@ pub struct StepId {
 pub type PeerId = [u8; 32];
 
 /// Correlation context passed with every saga event
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct SagaContext {
     /// Unique saga execution identifier
     pub saga_id: SagaId,

@@ -61,6 +61,7 @@ mod stats;
 // === Helpers ===
 mod helpers;
 mod reply_registry;
+mod resolver;
 mod testkit;
 
 // === Re-exports ===
@@ -79,7 +80,8 @@ pub use support::{HasSagaParticipantSupport, SagaParticipantSupport, SagaPartici
 
 // Events
 pub use events::{
-    AckStatus, ParticipantEvent, SagaChoreographyEvent, SagaDelegatedReply, SagaTerminalOutcome,
+    AckStatus, ParticipantEvent, SagaChoreographyEvent, SagaDelegatedReply, SagaFailureDetails,
+    SagaTerminalOutcome,
 };
 
 // Errors
@@ -105,6 +107,9 @@ pub use helpers::{
 pub use reply_registry::{
     SagaDelegatedReplyHandle, SagaDelegatedReplyResult, complete_terminal_reply,
     complete_terminal_reply_from_event, register_terminal_reply, reject_terminal_reply,
+};
+pub use resolver::{
+    FailureAuthority, SuccessCriteria, TerminalPolicy, TerminalResolver, TERMINAL_RESOLVER_STEP,
 };
 pub use testkit::{
     compensation_requested, drive_scenario, saga_started, step_completed, step_failed,

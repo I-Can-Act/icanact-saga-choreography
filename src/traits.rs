@@ -2,6 +2,8 @@
 
 use crate::{CompensationError, SagaContext, StepError, StepOutput};
 
+use icanact_core::{ActorId, ActorIdError};
+
 /// Trait for actors that participate in choreography-based sagas.
 ///
 /// Actors implementing this trait handle saga events alongside their
@@ -36,6 +38,29 @@ pub trait SagaParticipant: Send + 'static {
 
     /// The step name this participant handles
     fn step_name(&self) -> &str;
+
+    /// Stable participant identity used for terminal failure fidelity.
+    ///
+    /// Defaults to the step name so existing participants remain compatible.
+    fn participant_id(&self) -> &str {
+        self.step_name()
+    }
+
+    /// Parsed `ActorId` view of participant identity when valid.
+    fn participant_actor_id(&self) -> Result<ActorId, ActorIdError> {
+        ActorId::new(self.participant_id())
+    }
+
+    /// Owned participant identity for event payloads.
+    ///
+    /// Framework internals should prefer this when constructing events that
+    /// carry participant identity to avoid repeating ad-hoc conversion logic.
+    fn participant_id_owned(&self) -> Box<str> {
+        match self.participant_actor_id() {
+            Ok(actor_id) => actor_id.as_str().to_string().into_boxed_str(),
+            Err(_) => self.participant_id().to_string().into_boxed_str(),
+        }
+    }
 
     /// Which saga types this participant joins
     fn saga_types(&self) -> &[&'static str];

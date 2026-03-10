@@ -96,6 +96,8 @@ pub fn step_failed(
 ) -> SagaChoreographyEvent {
     SagaChoreographyEvent::StepFailed {
         context,
+        participant_id: "testkit".into(),
+        error_code: None,
         error: error.into().into_boxed_str(),
         will_retry,
         requires_compensation,
