@@ -107,7 +107,8 @@ impl<T> SagaParticipantSupportExt for T where T: HasSagaParticipantSupport {}
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::{InMemoryDedupe, InMemoryJournal, PeerId, SagaContext, SagaId};
 
@@ -144,10 +145,10 @@ mod tests {
     #[test]
     fn support_publishes_to_attached_bus() {
         let bus = SagaChoreographyBus::new();
-        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let delivered = Arc::new(AtomicUsize::new(0));
         let delivered_clone = Arc::clone(&delivered);
-        let _sub = bus.subscribe_saga_type_fn("order_lifecycle", move |event| {
-            delivered_clone.lock().expect("lock").push(event);
+        let _sub = bus.subscribe_saga_type_fn("order_lifecycle", move |_event| {
+            delivered_clone.fetch_add(1, Ordering::Relaxed);
             true
         });
 
@@ -170,6 +171,6 @@ mod tests {
             },
         });
 
-        assert_eq!(delivered.lock().expect("lock").len(), 1);
+        assert_eq!(delivered.load(Ordering::Relaxed), 1);
     }
 }
