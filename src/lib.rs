@@ -44,6 +44,7 @@ mod events;
 mod idempotency;
 mod state;
 mod support;
+mod bus;
 
 // === Traits ===
 mod state_ext;
@@ -67,6 +68,7 @@ mod testkit;
 // Types
 pub use context::{PeerId, SagaContext, SagaId, StepId};
 pub use idempotency::IdempotencyKey;
+pub use bus::SagaChoreographyBus;
 
 // State (typestate)
 pub use state::{

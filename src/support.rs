@@ -2,11 +2,9 @@
 
 use std::collections::HashMap;
 
-use icanact_core::local_direct::PubSub;
-
 use crate::{
-    ParticipantDedupeStore, ParticipantJournal, ParticipantStats, SagaChoreographyEvent, SagaId,
-    SagaStateEntry,
+    ParticipantDedupeStore, ParticipantJournal, ParticipantStats, SagaChoreographyBus,
+    SagaChoreographyEvent, SagaId, SagaStateEntry,
 };
 
 /// Embedded choreography capability owned by a saga-enabled participant.
@@ -24,7 +22,7 @@ where
     pub dedupe: D,
     pub stats: ParticipantStats,
     pub startup_recovery_events: Vec<SagaChoreographyEvent>,
-    pub bus: Option<PubSub<SagaChoreographyEvent>>,
+    pub bus: Option<SagaChoreographyBus>,
 }
 
 impl<J, D> SagaParticipantSupport<J, D>
@@ -52,14 +50,13 @@ where
         std::mem::take(&mut self.startup_recovery_events)
     }
 
-    pub fn attach_bus(&mut self, bus: PubSub<SagaChoreographyEvent>) {
+    pub fn attach_bus(&mut self, bus: SagaChoreographyBus) {
         self.bus = Some(bus);
     }
 
     pub fn publish(&self, event: SagaChoreographyEvent) {
         if let Some(bus) = &self.bus {
-            let topic = SagaChoreographyEvent::topic(event.context().saga_type.as_ref());
-            let _ = bus.publish(topic.as_str(), event);
+            let _ = bus.publish(event);
         }
     }
 }
@@ -93,7 +90,7 @@ pub trait HasSagaParticipantSupport: Send + 'static {
 
 /// Convenience methods for participants that embed [`SagaParticipantSupport`].
 pub trait SagaParticipantSupportExt: HasSagaParticipantSupport {
-    fn attach_saga_bus(&mut self, bus: PubSub<SagaChoreographyEvent>) {
+    fn attach_saga_bus(&mut self, bus: SagaChoreographyBus) {
         self.saga_support_mut().attach_bus(bus);
     }
 
@@ -110,7 +107,8 @@ impl<T> SagaParticipantSupportExt for T where T: HasSagaParticipantSupport {}
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::{InMemoryDedupe, InMemoryJournal, PeerId, SagaContext, SagaId};
 
@@ -146,11 +144,11 @@ mod tests {
 
     #[test]
     fn support_publishes_to_attached_bus() {
-        let bus = PubSub::<SagaChoreographyEvent>::new();
-        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let bus = SagaChoreographyBus::new();
+        let delivered = Arc::new(AtomicUsize::new(0));
         let delivered_clone = Arc::clone(&delivered);
-        let _sub = bus.subscribe_fn("saga:order_lifecycle", move |event| {
-            delivered_clone.lock().expect("lock").push(event);
+        let _sub = bus.subscribe_saga_type_fn("order_lifecycle", move |_event| {
+            delivered_clone.fetch_add(1, Ordering::Relaxed);
             true
         });
 
@@ -173,6 +171,6 @@ mod tests {
             },
         });
 
-        assert_eq!(delivered.lock().expect("lock").len(), 1);
+        assert_eq!(delivered.load(Ordering::Relaxed), 1);
     }
 }

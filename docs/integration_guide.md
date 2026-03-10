@@ -1,60 +1,61 @@
 # LLM Integration Guide
 
-Use this when adding a new saga participant actor to an `icanact-core` app with `icanact-saga-choreography`.
+Use this guide when you want to add a saga workflow to an `icanact-core` application with `icanact-saga-choreography`.
 
-## Required Actor Layout
+This crate does not require any specific actor folder layout or project structure. It only provides:
 
-Follow this structure from `spec/PLAN.md`:
+- the saga event model
+- participant traits
+- embedded saga support state
+- helper functions for execution, compensation, and recovery
 
-```text
-src/actors/<actor-name>/
-├── mod.rs
-├── actor.rs
-├── messaging.rs
-├── business.rs
-├── saga/
-│   ├── mod.rs
-│   ├── participant.rs
-│   └── types.rs            # optional
-├── tests/
-│   ├── unit.rs
-│   ├── integration.rs      # optional
-│   └── saga.rs
-└── architecture.md         # short role/flow notes
-```
+Your application decides how actors, modules, and messages are organized.
 
-## Required Actor Fields
+## Minimal Model
 
-The canonical integration is one embedded saga support field:
+To make an actor saga-capable:
+
+1. embed `SagaParticipantSupport<Journal, Dedupe>` in the actor
+2. implement `HasSagaParticipantSupport`
+3. implement `SagaParticipant`
+4. route incoming `SagaChoreographyEvent` messages to `handle_saga_event(...)`
+
+## Generic Example Workflow
+
+Imagine a workflow with three generic steps:
+
+- `step_a`
+- `step_b`
+- `step_c`
+
+`step_a` runs when the saga starts.  
+`step_b` runs after `step_a` completes.  
+`step_c` runs after `step_b` completes.  
+If `step_c` fails, earlier steps may compensate.
+
+## Example Participant
 
 ```rust
-pub struct MyActor {
-    // business state + dependencies...
-    saga: SagaParticipantSupport<MyJournal, MyDedupe>,
+use icanact_saga_choreography::{
+    CompensationError, DependencySpec, HasSagaParticipantSupport, InMemoryDedupe,
+    InMemoryJournal, SagaContext, SagaParticipant, SagaParticipantSupport, StepError, StepOutput,
+};
+
+pub struct StepAActor {
+    pub saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
 }
-```
 
-`SagaParticipantSupport` owns:
+impl Default for StepAActor {
+    fn default() -> Self {
+        Self {
+            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+        }
+    }
+}
 
-- saga state storage
-- journal
-- dedupe store
-- participant stats
-- startup recovery events
-- optional local pubsub bus
-
-## Required Traits
-
-Implement exactly these two traits for each saga participant.
-
-### 1) `HasSagaParticipantSupport` (canonical infrastructure access)
-
-Preferred integration:
-
-```rust
-impl HasSagaParticipantSupport for MyActor {
-    type Journal = MyJournal;
-    type Dedupe = MyDedupe;
+impl HasSagaParticipantSupport for StepAActor {
+    type Journal = InMemoryJournal;
+    type Dedupe = InMemoryDedupe;
 
     fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
         &self.saga
@@ -64,69 +65,81 @@ impl HasSagaParticipantSupport for MyActor {
         &mut self.saga
     }
 }
+
+impl SagaParticipant for StepAActor {
+    type Error = String;
+
+    fn step_name(&self) -> &str {
+        "step_a"
+    }
+
+    fn saga_types(&self) -> &[&'static str] {
+        &["example_workflow"]
+    }
+
+    fn depends_on(&self) -> DependencySpec {
+        DependencySpec::OnSagaStart
+    }
+
+    fn execute_step(
+        &mut self,
+        _context: &SagaContext,
+        input: &[u8],
+    ) -> Result<StepOutput, StepError> {
+        let output = input.to_vec();
+        Ok(StepOutput::Completed {
+            output,
+            compensation_data: b"undo_step_a".to_vec(),
+        })
+    }
+
+    fn compensate_step(
+        &mut self,
+        _context: &SagaContext,
+        _compensation_data: &[u8],
+    ) -> Result<(), CompensationError> {
+        Ok(())
+    }
+}
 ```
 
-After that, `SagaStateExt` is provided automatically by the crate.
+`step_b` and `step_c` look the same, except:
 
-### 2) `SagaParticipant` (business behavior)
+- they use different `step_name()` values
+- they return `DependencySpec::After("step_a")` or `DependencySpec::After("step_b")`
+- they implement their own forward and compensation behavior
 
-Implement required methods:
+## Event Flow
 
-- `step_name()`
-- `saga_types()`
-- `execute_step(&SagaContext, &[u8]) -> Result<StepOutput, StepError>`
-- `compensate_step(&SagaContext, &[u8]) -> Result<(), CompensationError>`
+Typical flow:
 
-Use `depends_on()` for choreography ordering (`OnSagaStart`, `After`, `AnyOf`, `AllOf`).
+1. publish `SagaStarted` for saga type `example_workflow`
+2. `step_a` receives it and emits `StepCompleted`
+3. `step_b` reacts to `StepCompleted` from `step_a` and emits its own `StepCompleted`
+4. `step_c` reacts to `StepCompleted` from `step_b`
+5. if a step fails with compensation required, `CompensationRequested` is published and earlier participants compensate
 
-Keep core business logic in `business.rs` as pure functions; `participant.rs` should mostly deserialize, call business logic, and map errors to `StepError`/`CompensationError`.
+## Routing Saga Events
 
-## Messaging + PubSub Wiring
-
-In `messaging.rs`, add:
+When your actor receives a saga event, pass it to the crate helper:
 
 ```rust
-SagaEvent { event: SagaChoreographyEvent },
-RecoverSagas { reply_to: ReplyTo<Vec<SagaId>> },
-GetSagaStats { reply_to: ReplyTo<ParticipantStatsSnapshot> },
+use icanact_saga_choreography::{SagaChoreographyEvent, handle_saga_event};
+
+fn on_saga_event(
+    actor: &mut impl SagaParticipant + icanact_saga_choreography::SagaStateExt,
+    event: SagaChoreographyEvent,
+) {
+    handle_saga_event(actor, event);
+}
 ```
 
-In `actor.rs` handler:
+## Recovery
 
-```rust
-SagaEvent { event } => handle_saga_event(self, event),
-RecoverSagas { reply_to } => { let _ = reply_tell(reply_to, recover_sagas(self)); }
-GetSagaStats { reply_to } => { let _ = reply_tell(reply_to, self.saga.stats.snapshot()); }
-```
+On startup or restart, use `recover_sagas(...)` to enumerate non-terminal sagas from the journal and decide how your app should resume or reconcile them.
 
-PubSub conventions:
+## Notes
 
-- Topic name: `SagaChoreographyEvent::topic(saga_type)` (`saga:<type>`).
-- Subscribe each participant mailbox to every saga type it returns from `saga_types()`.
-- Start a saga by publishing `SagaChoreographyEvent::SagaStarted { context, payload }`.
-- Publish follow-up choreography events (`StepCompleted`, `StepFailed`, `CompensationRequested`, etc.) through pubsub.
-
-## Observability Pattern
-
-Use both stats and tracing.
-
-- Keep participant stats in `self.saga.stats` and expose `GetSagaStats`.
-- Emit structured `tracing` logs in participant hooks (`on_saga_completed`, `on_saga_failed`, `on_quarantined`) and/or around pubsub boundaries.
-- Include at least: `saga_id`, `saga_type`, `step_name`, `trace_id`, and failure reason.
-- If you need a pluggable telemetry sink, wire a `SagaObserver` implementation (e.g. `TracingObserver`) in your actor runtime path.
-
-## Recovery + Idempotency Rules
-
-- Call `recover_sagas(self)` during startup/recovery commands to find non-terminal sagas.
-- Do not bypass dedupe/journal paths; `handle_saga_event` already enforces dedupe via `trace_id:event_type`.
-- Prune saga state/dedupe keys on terminal events where appropriate (`SagaCompleted`, `SagaFailed`).
-
-## Minimal Implementation Checklist
-
-1. Create actor folder layout (including `saga/participant.rs`).
-2. Add `saga: SagaParticipantSupport<Journal, Dedupe>`.
-3. Implement `HasSagaParticipantSupport` and `SagaParticipant`.
-4. Add `SagaEvent`/`RecoverSagas`/`GetSagaStats` commands.
-5. Route `SagaEvent` to `handle_saga_event(self, event)`.
-6. Subscribe mailbox to `saga:<type>` topic(s), publish `SagaStarted`, and emit choreography events.
-7. Add tracing + stats exposure for ops/observability.
+- `SagaParticipantSupport` is the canonical integration path.
+- The crate stays storage-generic; your app can choose in-memory, LMDB, or another backend.
+- Keep your actor business logic generic to your domain; this crate does not impose any actor module structure.

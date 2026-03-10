@@ -124,15 +124,3 @@ sequenceDiagram
   events received/relevant/duplicate, steps started/completed/failed, compensations started/completed, and quarantined sagas.
 - `SagaObserver` allows external hooks for lifecycle and failure telemetry.
 - `TracingObserver` provides structured tracing integration out of the box.
-
-## Deribit Example Mapping
-
-The Deribit example was moved to a separate crate and remains the reference implementation of this pattern with clear roles:
-
-- `RiskManagerActor` starts `deribit_order` sagas after risk checks.
-- `OrderPlacerActor` performs `prepare_order` after `SagaStarted`.
-- `OrderCoordinatorActor` performs `place_order` after `prepare_order`, calls Deribit WS, and handles compensation.
-- `OrderMonitorActor` watches order outcomes and drives completion/failure signaling.
-- `DeribitWSActor` is external I/O infrastructure (not a saga participant itself).
-
-This example mirrors the intended production usage: local actor autonomy, event-driven progression, and compensation-first failure handling.

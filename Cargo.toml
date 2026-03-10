@@ -26,3 +26,6 @@ tracing-subscriber = { version = "0.3", optional = true }
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros", "sync", "test-util"] }
+
+[patch."ssh://git@github.com/moofone/actor-framework-core.git"]
+icanact-core = { path = "../icanact-core" }

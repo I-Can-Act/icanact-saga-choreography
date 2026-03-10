@@ -42,6 +42,13 @@ pub fn handle_saga_event_with_emit<P, F>(
 {
     let context = event.context().clone();
     let now = participant.now_millis();
+    eprintln!(
+        "[saga-helper] participant_step={} received type={} saga_id={} step={}",
+        participant.step_name(),
+        event.event_type(),
+        context.saga_id.get(),
+        context.step_name.as_ref()
+    );
 
     // Check saga type
     if !participant
@@ -49,14 +56,33 @@ pub fn handle_saga_event_with_emit<P, F>(
         .iter()
         .any(|t| *t == context.saga_type.as_ref())
     {
+        eprintln!(
+            "[saga-helper] participant_step={} ignored saga_type={}",
+            participant.step_name(),
+            context.saga_type.as_ref()
+        );
         return;
     }
 
     // Idempotency check
     let dedupe_key = dedupe_key_for_event(&event);
     if !participant.check_dedupe(context.saga_id, &dedupe_key) {
+        eprintln!(
+            "[saga-helper] participant_step={} deduped type={} saga_id={} key={}",
+            participant.step_name(),
+            event.event_type(),
+            context.saga_id.get(),
+            dedupe_key
+        );
         return; // Already processed
     }
+    eprintln!(
+        "[saga-helper] participant_step={} accepted type={} saga_id={} key={}",
+        participant.step_name(),
+        event.event_type(),
+        context.saga_id.get(),
+        dedupe_key
+    );
 
     match event {
         SagaChoreographyEvent::SagaStarted { payload, .. }
