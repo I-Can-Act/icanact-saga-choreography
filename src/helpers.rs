@@ -62,7 +62,16 @@ pub fn handle_saga_event_with_emit<P, F>(
         SagaChoreographyEvent::SagaStarted { payload, .. }
             if participant.depends_on().is_on_saga_start() =>
         {
+            participant.saga_states().remove(&context.saga_id);
+            participant.dependency_completions().remove(&context.saga_id);
+            participant.dependency_fired().remove(&context.saga_id);
             execute_step_wrapper_with_emit(participant, context.clone(), payload, now, &mut emit);
+        }
+
+        SagaChoreographyEvent::SagaStarted { .. } => {
+            participant.saga_states().remove(&context.saga_id);
+            participant.dependency_completions().remove(&context.saga_id);
+            participant.dependency_fired().remove(&context.saga_id);
         }
 
         SagaChoreographyEvent::StepCompleted {
@@ -111,8 +120,9 @@ fn dedupe_key_for_event(event: &SagaChoreographyEvent) -> String {
     match event {
         SagaChoreographyEvent::SagaStarted { .. } => {
             format!(
-                "{}:{}:{}",
+                "{}:{}:{}:{}",
                 context.trace_id,
+                context.saga_started_at_millis,
                 event.event_type(),
                 context.step_name
             )
@@ -128,15 +138,17 @@ fn dedupe_key_for_event(event: &SagaChoreographyEvent) -> String {
         | SagaChoreographyEvent::StepStarted { .. }
         | SagaChoreographyEvent::StepAck { .. } => {
             format!(
-                "{}:{}:{}",
+                "{}:{}:{}:{}",
                 context.trace_id,
+                context.saga_started_at_millis,
                 event.event_type(),
                 context.step_name
             )
         }
         SagaChoreographyEvent::CompensationRequested { failed_step, .. } => format!(
-            "{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}",
             context.trace_id,
+            context.saga_started_at_millis,
             event.event_type(),
             context.step_name,
             failed_step
@@ -680,6 +692,28 @@ mod tests {
 
         assert_eq!(participant.executed, 1);
         assert_eq!(emitted.len(), 1);
+    }
+
+    #[test]
+    fn handle_saga_event_with_emit_accepts_reused_saga_id_for_new_run() {
+        let mut participant = TestParticipant::default();
+        let mut emitted = Vec::new();
+        let first = started_event();
+        let mut second_context = first.context().clone();
+        second_context.saga_started_at_millis =
+            second_context.saga_started_at_millis.saturating_add(1);
+        second_context.event_timestamp_millis =
+            second_context.event_timestamp_millis.saturating_add(1);
+        let second = SagaChoreographyEvent::SagaStarted {
+            context: second_context,
+            payload: vec![8],
+        };
+
+        handle_saga_event_with_emit(&mut participant, first, |event| emitted.push(event));
+        handle_saga_event_with_emit(&mut participant, second, |event| emitted.push(event));
+
+        assert_eq!(participant.executed, 2);
+        assert_eq!(emitted.len(), 2);
     }
 
     #[test]

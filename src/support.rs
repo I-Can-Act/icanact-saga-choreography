@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use icanact_core::local_direct::PubSub;
+use icanact_core::local_sync::PubSub;
 
 use crate::{
     ParticipantDedupeStore, ParticipantJournal, ParticipantStats, SagaChoreographyEvent, SagaId,
@@ -149,7 +149,7 @@ mod tests {
         let bus = PubSub::<SagaChoreographyEvent>::new();
         let delivered = Arc::new(Mutex::new(Vec::new()));
         let delivered_clone = Arc::clone(&delivered);
-        let _sub = bus.subscribe_fn("saga:order_lifecycle", move |event| {
+        let _sub = bus.subscribe_direct_fn("saga:order_lifecycle", move |event| {
             delivered_clone.lock().expect("lock").push(event);
             true
         });
