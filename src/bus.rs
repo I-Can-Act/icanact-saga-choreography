@@ -1,4 +1,4 @@
-use icanact_core::local_direct::{PubSub, PublishStats};
+use icanact_core::local_sync::{PubSub, PublishStats, Subscription};
 
 use crate::SagaChoreographyEvent;
 
@@ -18,14 +18,14 @@ impl SagaChoreographyBus {
         &self,
         topic: &str,
         f: F,
-    ) -> icanact_core::local_sync::DirectSubscription
+    ) -> Subscription
     where
         F: Fn(SagaChoreographyEvent) -> bool + Send + Sync + 'static,
     {
-        self.inner.subscribe_fn(topic, f)
+        self.inner.subscribe_direct_fn(topic, f)
     }
 
-    pub fn unsubscribe(&self, sub: icanact_core::local_sync::DirectSubscription) -> bool {
+    pub fn unsubscribe(&self, sub: Subscription) -> bool {
         self.inner.unsubscribe(sub)
     }
 
@@ -47,7 +47,7 @@ impl SagaChoreographyBus {
         &self,
         saga_type: &str,
         f: F,
-    ) -> icanact_core::local_sync::DirectSubscription
+    ) -> Subscription
     where
         F: Fn(SagaChoreographyEvent) -> bool + Send + Sync + 'static,
     {

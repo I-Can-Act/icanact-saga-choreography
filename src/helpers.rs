@@ -88,7 +88,22 @@ pub fn handle_saga_event_with_emit<P, F>(
         SagaChoreographyEvent::SagaStarted { payload, .. }
             if participant.depends_on().is_on_saga_start() =>
         {
+            // A new saga run may legitimately reuse a saga_id after process restart.
+            // Reset per-saga in-memory dependency/state tracking so old runs cannot
+            // satisfy dependencies for the new run.
+            participant.saga_states().remove(&context.saga_id);
+            participant.dependency_completions().remove(&context.saga_id);
+            participant.dependency_fired().remove(&context.saga_id);
             execute_step_wrapper_with_emit(participant, context.clone(), payload, now, &mut emit);
+        }
+
+        SagaChoreographyEvent::SagaStarted { .. } => {
+            // Even when this participant does not execute on saga start, clear stale
+            // dependency/state entries for this saga id so downstream dependency checks
+            // are scoped to the current run.
+            participant.saga_states().remove(&context.saga_id);
+            participant.dependency_completions().remove(&context.saga_id);
+            participant.dependency_fired().remove(&context.saga_id);
         }
 
         SagaChoreographyEvent::StepCompleted {
@@ -98,8 +113,20 @@ pub fn handle_saga_event_with_emit<P, F>(
             ..
         } => {
             let dependency_spec = participant.depends_on();
-            if dependency_should_fire(participant, context.saga_id, &dependency_spec, &step_ctx.step_name)
-            {
+            let should_fire = dependency_should_fire(
+                participant,
+                context.saga_id,
+                &dependency_spec,
+                &step_ctx.step_name,
+            );
+            eprintln!(
+                "[saga-helper] participant_step={} dependency_check saga_id={} completed_step={} should_fire={}",
+                participant.step_name(),
+                context.saga_id.get(),
+                step_ctx.step_name.as_ref(),
+                should_fire
+            );
+            if should_fire {
                 let next_context = context.next_step(participant.step_name().into());
                 let input = if dependency_spec.prefers_original_saga_input() {
                     saga_input
@@ -157,6 +184,9 @@ where
             participant.dependency_fired().insert(saga_id)
         }
         DependencySpec::AllOf(steps) => {
+            if !steps.contains(&completed_step) {
+                return false;
+            }
             {
                 let seen = participant
                     .dependency_completions()
@@ -167,7 +197,7 @@ where
                     return false;
                 }
             }
-            participant.dependency_fired().insert(saga_id)
+            true
         }
     }
 }
@@ -177,8 +207,9 @@ fn dedupe_key_for_event(event: &SagaChoreographyEvent) -> String {
     match event {
         SagaChoreographyEvent::SagaStarted { .. } => {
             format!(
-                "{}:{}:{}",
+                "{}:{}:{}:{}",
                 context.trace_id,
+                context.saga_started_at_millis,
                 event.event_type(),
                 context.step_name
             )
@@ -194,15 +225,17 @@ fn dedupe_key_for_event(event: &SagaChoreographyEvent) -> String {
         | SagaChoreographyEvent::StepStarted { .. }
         | SagaChoreographyEvent::StepAck { .. } => {
             format!(
-                "{}:{}:{}",
+                "{}:{}:{}:{}",
                 context.trace_id,
+                context.saga_started_at_millis,
                 event.event_type(),
                 context.step_name
             )
         }
         SagaChoreographyEvent::CompensationRequested { failed_step, .. } => format!(
-            "{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}",
             context.trace_id,
+            context.saga_started_at_millis,
             event.event_type(),
             context.step_name,
             failed_step
@@ -750,6 +783,75 @@ mod tests {
 
         assert_eq!(participant.executed, 1);
         assert_eq!(emitted.len(), 1);
+    }
+
+    #[test]
+    fn handle_saga_event_with_emit_accepts_reused_saga_id_for_new_run() {
+        let mut participant = TestParticipant::default();
+        let mut emitted = Vec::new();
+        let first = started_event();
+        let mut second_context = first.context().clone();
+        second_context.saga_started_at_millis =
+            second_context.saga_started_at_millis.saturating_add(1);
+        second_context.event_timestamp_millis =
+            second_context.event_timestamp_millis.saturating_add(1);
+        let second = SagaChoreographyEvent::SagaStarted {
+            context: second_context,
+            payload: vec![8],
+        };
+
+        handle_saga_event_with_emit(&mut participant, first, |event| emitted.push(event));
+        handle_saga_event_with_emit(&mut participant, second, |event| emitted.push(event));
+
+        assert_eq!(participant.executed, 2);
+        assert_eq!(emitted.len(), 2);
+    }
+
+    #[test]
+    fn handle_saga_event_with_emit_resets_allof_dependencies_on_new_saga_started() {
+        let mut participant = TestParticipant {
+            dependency_spec: DependencySpec::AllOf(&["risk_check", "positions_check"]),
+            ..TestParticipant::default()
+        };
+        let first_context = DeterministicContextBuilder::default().build();
+        let mut second_context = first_context.clone();
+        second_context.saga_started_at_millis =
+            second_context.saga_started_at_millis.saturating_add(1);
+        second_context.event_timestamp_millis =
+            second_context.event_timestamp_millis.saturating_add(1);
+        let mut emitted = Vec::new();
+
+        handle_saga_event_with_emit(
+            &mut participant,
+            SagaChoreographyEvent::StepCompleted {
+                context: first_context.next_step("risk_check".into()),
+                output: vec![9],
+                saga_input: vec![7],
+                compensation_available: false,
+            },
+            |_| {},
+        );
+        handle_saga_event_with_emit(
+            &mut participant,
+            SagaChoreographyEvent::SagaStarted {
+                context: second_context.clone(),
+                payload: vec![7],
+            },
+            |_| {},
+        );
+        handle_saga_event_with_emit(
+            &mut participant,
+            SagaChoreographyEvent::StepCompleted {
+                context: second_context.next_step("positions_check".into()),
+                output: vec![8],
+                saga_input: vec![7],
+                compensation_available: false,
+            },
+            |event| emitted.push(event),
+        );
+
+        assert_eq!(participant.executed, 0);
+        assert!(emitted.is_empty());
     }
 
     #[test]
