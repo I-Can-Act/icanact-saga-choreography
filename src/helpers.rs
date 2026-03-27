@@ -1,8 +1,8 @@
 //! Helper functions for saga handling
 
 use crate::{
-    Compensating, CompensationError, Completed, DependencySpec, Executing, ParticipantEvent,
-    ParticipantJournal, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant,
+    AsyncSagaParticipant, Compensating, CompensationError, Completed, DependencySpec, Executing,
+    ParticipantEvent, ParticipantJournal, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant,
     SagaParticipantState, SagaStateEntry, SagaStateExt, StepError, StepOutput,
 };
 use std::sync::atomic::Ordering;
@@ -92,7 +92,9 @@ pub fn handle_saga_event_with_emit<P, F>(
             // Reset per-saga in-memory dependency/state tracking so old runs cannot
             // satisfy dependencies for the new run.
             participant.saga_states().remove(&context.saga_id);
-            participant.dependency_completions().remove(&context.saga_id);
+            participant
+                .dependency_completions()
+                .remove(&context.saga_id);
             participant.dependency_fired().remove(&context.saga_id);
             execute_step_wrapper_with_emit(participant, context.clone(), payload, now, &mut emit);
         }
@@ -102,7 +104,9 @@ pub fn handle_saga_event_with_emit<P, F>(
             // dependency/state entries for this saga id so downstream dependency checks
             // are scoped to the current run.
             participant.saga_states().remove(&context.saga_id);
-            participant.dependency_completions().remove(&context.saga_id);
+            participant
+                .dependency_completions()
+                .remove(&context.saga_id);
             participant.dependency_fired().remove(&context.saga_id);
         }
 
@@ -160,6 +164,139 @@ pub fn handle_saga_event_with_emit<P, F>(
     }
 }
 
+pub async fn handle_async_saga_event<P>(participant: &mut P, event: SagaChoreographyEvent)
+where
+    P: AsyncSagaParticipant + SagaStateExt,
+{
+    handle_async_saga_event_with_emit(participant, event, |_| {}).await;
+}
+
+pub async fn handle_async_saga_event_with_emit<P, F>(
+    participant: &mut P,
+    event: SagaChoreographyEvent,
+    mut emit: F,
+) where
+    P: AsyncSagaParticipant + SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let context = event.context().clone();
+    let now = participant.now_millis();
+    eprintln!(
+        "[saga-helper] participant_step={} received type={} saga_id={} step={}",
+        participant.step_name(),
+        event.event_type(),
+        context.saga_id.get(),
+        context.step_name.as_ref()
+    );
+
+    if !participant
+        .saga_types()
+        .iter()
+        .any(|t| *t == context.saga_type.as_ref())
+    {
+        eprintln!(
+            "[saga-helper] participant_step={} ignored saga_type={}",
+            participant.step_name(),
+            context.saga_type.as_ref()
+        );
+        return;
+    }
+
+    let dedupe_key = dedupe_key_for_event(&event);
+    if !participant.check_dedupe(context.saga_id, &dedupe_key) {
+        eprintln!(
+            "[saga-helper] participant_step={} deduped type={} saga_id={} key={}",
+            participant.step_name(),
+            event.event_type(),
+            context.saga_id.get(),
+            dedupe_key
+        );
+        return;
+    }
+    eprintln!(
+        "[saga-helper] participant_step={} accepted type={} saga_id={} key={}",
+        participant.step_name(),
+        event.event_type(),
+        context.saga_id.get(),
+        dedupe_key
+    );
+
+    match event {
+        SagaChoreographyEvent::SagaStarted { payload, .. }
+            if participant.depends_on().is_on_saga_start() =>
+        {
+            participant.saga_states().remove(&context.saga_id);
+            participant
+                .dependency_completions()
+                .remove(&context.saga_id);
+            participant.dependency_fired().remove(&context.saga_id);
+            execute_step_wrapper_with_emit_async(participant, context.clone(), payload, now, &mut emit)
+                .await;
+        }
+        SagaChoreographyEvent::SagaStarted { .. } => {
+            participant.saga_states().remove(&context.saga_id);
+            participant
+                .dependency_completions()
+                .remove(&context.saga_id);
+            participant.dependency_fired().remove(&context.saga_id);
+        }
+        SagaChoreographyEvent::StepCompleted {
+            context: step_ctx,
+            output,
+            saga_input,
+            ..
+        } => {
+            let dependency_spec = participant.depends_on();
+            let should_fire = dependency_should_fire_async(
+                participant,
+                context.saga_id,
+                &dependency_spec,
+                &step_ctx.step_name,
+            );
+            eprintln!(
+                "[saga-helper] participant_step={} dependency_check saga_id={} completed_step={} should_fire={}",
+                participant.step_name(),
+                context.saga_id.get(),
+                step_ctx.step_name.as_ref(),
+                should_fire
+            );
+            if should_fire {
+                let next_context = context.next_step(participant.step_name().into());
+                let input = if dependency_spec.prefers_original_saga_input() {
+                    saga_input
+                } else {
+                    output
+                };
+                execute_step_wrapper_with_emit_async(
+                    participant,
+                    next_context,
+                    input,
+                    now,
+                    &mut emit,
+                )
+                .await;
+            }
+        }
+        SagaChoreographyEvent::CompensationRequested {
+            steps_to_compensate,
+            ..
+        } => {
+            if steps_to_compensate.contains(&participant.step_name().into()) {
+                compensate_wrapper_with_emit_async(participant, &context, now, &mut emit).await;
+            }
+        }
+        SagaChoreographyEvent::SagaCompleted { .. } => {
+            participant.on_saga_completed(&context);
+            participant.prune_saga(context.saga_id);
+        }
+        SagaChoreographyEvent::SagaFailed { reason, .. } => {
+            participant.on_saga_failed(&context, &reason);
+            participant.prune_saga(context.saga_id);
+        }
+        _ => {}
+    }
+}
+
 fn dependency_should_fire<P>(
     participant: &mut P,
     saga_id: SagaId,
@@ -168,6 +305,48 @@ fn dependency_should_fire<P>(
 ) -> bool
 where
     P: SagaParticipant + SagaStateExt,
+{
+    match dependency_spec {
+        DependencySpec::OnSagaStart => false,
+        DependencySpec::After(step) => {
+            if completed_step != *step {
+                return false;
+            }
+            participant.dependency_fired().insert(saga_id)
+        }
+        DependencySpec::AnyOf(steps) => {
+            if !steps.contains(&completed_step) {
+                return false;
+            }
+            participant.dependency_fired().insert(saga_id)
+        }
+        DependencySpec::AllOf(steps) => {
+            if !steps.contains(&completed_step) {
+                return false;
+            }
+            {
+                let seen = participant
+                    .dependency_completions()
+                    .entry(saga_id)
+                    .or_default();
+                seen.insert(completed_step.into());
+                if !steps.iter().all(|step| seen.contains(*step)) {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+}
+
+fn dependency_should_fire_async<P>(
+    participant: &mut P,
+    saga_id: SagaId,
+    dependency_spec: &DependencySpec,
+    completed_step: &str,
+) -> bool
+where
+    P: AsyncSagaParticipant + SagaStateExt,
 {
     match dependency_spec {
         DependencySpec::OnSagaStart => false,
@@ -252,6 +431,18 @@ where
     execute_step_wrapper_with_emit(participant, context, input, now, &mut ignore_emit);
 }
 
+pub async fn execute_step_wrapper_async<P>(
+    participant: &mut P,
+    context: SagaContext,
+    input: Vec<u8>,
+    now: u64,
+) where
+    P: AsyncSagaParticipant + SagaStateExt,
+{
+    let mut ignore_emit = |_| {};
+    execute_step_wrapper_with_emit_async(participant, context, input, now, &mut ignore_emit).await;
+}
+
 fn execute_step_wrapper_with_emit<P, F>(
     participant: &mut P,
     context: SagaContext,
@@ -302,6 +493,48 @@ fn execute_step_wrapper_with_emit<P, F>(
     }
 }
 
+async fn execute_step_wrapper_with_emit_async<P, F>(
+    participant: &mut P,
+    context: SagaContext,
+    input: Vec<u8>,
+    now: u64,
+    emit: &mut F,
+) where
+    P: AsyncSagaParticipant + SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let saga_id = context.saga_id;
+
+    let state = SagaParticipantState::new(
+        saga_id,
+        context.saga_type.clone(),
+        participant.step_name().into(),
+        context.correlation_id,
+        context.trace_id,
+        context.initiator_peer_id,
+        context.saga_started_at_millis,
+    )
+    .trigger("dependency_satisfied", now)
+    .start_execution(now);
+
+    participant.record_event(
+        saga_id,
+        ParticipantEvent::StepExecutionStarted {
+            attempt: 1,
+            started_at_millis: now,
+        },
+    );
+
+    participant
+        .saga_states()
+        .insert(saga_id, SagaStateEntry::Executing(state));
+
+    match participant.execute_step(&context, &input).await {
+        Ok(output) => complete_step_async(participant, &context, input, output, now, emit),
+        Err(error) => fail_step_async(participant, &context, error, now, emit),
+    }
+}
+
 /// Complete a step with state transition
 fn complete_step<P, F>(
     participant: &mut P,
@@ -342,6 +575,61 @@ fn complete_step<P, F>(
     }
 
     // Persist
+    let emitted_output = out_data.clone();
+    participant.record_event(
+        saga_id,
+        ParticipantEvent::StepExecutionCompleted {
+            output: out_data,
+            compensation_data: vec![],
+            completed_at_millis: now,
+        },
+    );
+
+    emit(SagaChoreographyEvent::StepCompleted {
+        context: context.next_step(participant.step_name().into()),
+        output: emitted_output,
+        saga_input,
+        compensation_available,
+    });
+}
+
+fn complete_step_async<P, F>(
+    participant: &mut P,
+    context: &SagaContext,
+    saga_input: Vec<u8>,
+    output: StepOutput,
+    now: u64,
+    emit: &mut F,
+) where
+    P: AsyncSagaParticipant + SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let saga_id = context.saga_id;
+    let (out_data, comp_data, compensation_available) = match output {
+        StepOutput::Completed {
+            output,
+            compensation_data,
+        } => {
+            let compensation_available = !compensation_data.is_empty();
+            (output, compensation_data, compensation_available)
+        }
+        StepOutput::CompletedWithEffect {
+            output,
+            compensation_data,
+            ..
+        } => {
+            let compensation_available = !compensation_data.is_empty();
+            (output, compensation_data, compensation_available)
+        }
+    };
+
+    if let Some(SagaStateEntry::Executing(state)) = participant.saga_states().remove(&saga_id) {
+        let new_state = state.complete(out_data.clone(), comp_data, now);
+        participant
+            .saga_states()
+            .insert(saga_id, SagaStateEntry::Completed(new_state));
+    }
+
     let emitted_output = out_data.clone();
     participant.record_event(
         saga_id,
@@ -410,6 +698,49 @@ fn fail_step<P, F>(
     });
 }
 
+fn fail_step_async<P, F>(
+    participant: &mut P,
+    context: &SagaContext,
+    error: StepError,
+    now: u64,
+    emit: &mut F,
+) where
+    P: AsyncSagaParticipant + SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let saga_id = context.saga_id;
+    let (reason, requires_comp) = match error {
+        StepError::Retriable { reason } => return,
+        StepError::Terminal { reason } => (reason, false),
+        StepError::RequireCompensation { reason } => (reason, true),
+    };
+
+    if let Some(SagaStateEntry::Executing(state)) = participant.saga_states().remove(&saga_id) {
+        let new_state = state.fail(reason.clone(), requires_comp, now);
+        participant
+            .saga_states()
+            .insert(saga_id, SagaStateEntry::Failed(new_state));
+    }
+
+    participant.record_event(
+        saga_id,
+        ParticipantEvent::StepExecutionFailed {
+            error: reason.clone(),
+            requires_compensation: requires_comp,
+            failed_at_millis: now,
+        },
+    );
+
+    emit(SagaChoreographyEvent::StepFailed {
+        context: context.next_step(participant.step_name().into()),
+        participant_id: participant.participant_id_owned(),
+        error_code: None,
+        error: reason,
+        will_retry: false,
+        requires_compensation: requires_comp,
+    });
+}
+
 /// Execute compensation with state management
 pub fn compensate_wrapper<P>(participant: &mut P, context: &SagaContext, now: u64)
 where
@@ -417,6 +748,14 @@ where
 {
     let mut ignore_emit = |_| {};
     compensate_wrapper_with_emit(participant, context, now, &mut ignore_emit);
+}
+
+pub async fn compensate_wrapper_async<P>(participant: &mut P, context: &SagaContext, now: u64)
+where
+    P: AsyncSagaParticipant + SagaStateExt,
+{
+    let mut ignore_emit = |_| {};
+    compensate_wrapper_with_emit_async(participant, context, now, &mut ignore_emit).await;
 }
 
 fn compensate_wrapper_with_emit<P, F>(
@@ -461,6 +800,40 @@ fn compensate_wrapper_with_emit<P, F>(
     }
 }
 
+async fn compensate_wrapper_with_emit_async<P, F>(
+    participant: &mut P,
+    context: &SagaContext,
+    now: u64,
+    emit: &mut F,
+) where
+    P: AsyncSagaParticipant + SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let saga_id = context.saga_id;
+
+    if let Some(SagaStateEntry::Completed(state)) = participant.saga_states().remove(&saga_id) {
+        let comp_data = state.state.compensation_data.clone();
+
+        let new_state = state.start_compensation(now);
+        participant
+            .saga_states()
+            .insert(saga_id, SagaStateEntry::Compensating(new_state));
+
+        participant.record_event(
+            saga_id,
+            ParticipantEvent::CompensationStarted {
+                attempt: 1,
+                started_at_millis: now,
+            },
+        );
+
+        match participant.compensate_step(context, &comp_data).await {
+            Ok(()) => complete_compensation_async(participant, context, now, emit),
+            Err(error) => fail_compensation_async(participant, context, error, now, emit),
+        }
+    }
+}
+
 /// Complete compensation
 fn complete_compensation<P, F>(participant: &mut P, context: &SagaContext, now: u64, emit: &mut F)
 where
@@ -491,6 +864,38 @@ where
     });
 
     // Notify
+    participant.on_compensation_completed(context);
+}
+
+fn complete_compensation_async<P, F>(
+    participant: &mut P,
+    context: &SagaContext,
+    now: u64,
+    emit: &mut F,
+) where
+    P: AsyncSagaParticipant + SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let saga_id = context.saga_id;
+
+    if let Some(SagaStateEntry::Compensating(state)) = participant.saga_states().remove(&saga_id) {
+        let new_state = state.complete_compensation(now);
+        participant
+            .saga_states()
+            .insert(saga_id, SagaStateEntry::Compensated(new_state));
+    }
+
+    participant.record_event(
+        saga_id,
+        ParticipantEvent::CompensationCompleted {
+            completed_at_millis: now,
+        },
+    );
+
+    emit(SagaChoreographyEvent::CompensationCompleted {
+        context: context.next_step(participant.step_name().into()),
+    });
+
     participant.on_compensation_completed(context);
 }
 
@@ -545,6 +950,55 @@ fn fail_compensation<P, F>(
     });
 
     // Notify
+    participant.on_quarantined(context, &reason);
+}
+
+fn fail_compensation_async<P, F>(
+    participant: &mut P,
+    context: &SagaContext,
+    error: CompensationError,
+    now: u64,
+    emit: &mut F,
+) where
+    P: AsyncSagaParticipant + SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let saga_id = context.saga_id;
+    let (reason, is_ambiguous) = match error {
+        CompensationError::SafeToRetry { reason } => (reason, false),
+        CompensationError::Ambiguous { reason } => (reason, true),
+        CompensationError::Terminal { reason } => (reason, false),
+    };
+
+    if let Some(SagaStateEntry::Compensating(state)) = participant.saga_states().remove(&saga_id) {
+        let new_state = state.quarantine(reason.clone(), now);
+        participant
+            .saga_states()
+            .insert(saga_id, SagaStateEntry::Quarantined(new_state));
+    }
+
+    participant.record_event(
+        saga_id,
+        ParticipantEvent::Quarantined {
+            reason: reason.clone(),
+            quarantined_at_millis: now,
+        },
+    );
+
+    let event_context = context.next_step(participant.step_name().into());
+    emit(SagaChoreographyEvent::CompensationFailed {
+        context: event_context.clone(),
+        participant_id: participant.participant_id_owned(),
+        error: reason.clone(),
+        is_ambiguous,
+    });
+    emit(SagaChoreographyEvent::SagaQuarantined {
+        context: event_context,
+        reason: reason.clone(),
+        step: participant.step_name().into(),
+        participant_id: participant.participant_id_owned(),
+    });
+
     participant.on_quarantined(context, &reason);
 }
 

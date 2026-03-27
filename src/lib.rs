@@ -38,13 +38,14 @@
 #![allow(missing_docs, unused_imports, unused_variables, dead_code)]
 
 // === Core Types ===
+mod bus;
 mod context;
+pub mod durability;
 mod errors;
 mod events;
 mod idempotency;
 mod state;
 mod support;
-mod bus;
 
 // === Traits ===
 mod state_ext;
@@ -67,9 +68,10 @@ mod testkit;
 // === Re-exports ===
 
 // Types
-pub use context::{PeerId, SagaContext, SagaId, StepId};
-pub use idempotency::IdempotencyKey;
 pub use bus::SagaChoreographyBus;
+pub use context::{PeerId, SagaContext, SagaId, StepId};
+pub use durability::*;
+pub use idempotency::IdempotencyKey;
 
 // State (typestate)
 pub use state::{
@@ -89,7 +91,7 @@ pub use errors::{CompensationError, StepError, StepOutput};
 
 // Traits
 pub use state_ext::SagaStateExt;
-pub use traits::{DependencySpec, RetryPolicy, SagaParticipant};
+pub use traits::{AsyncSagaParticipant, DependencySpec, RetryPolicy, SagaBoxFuture, SagaParticipant};
 
 // Storage
 pub use dedupe::{DedupeError, InMemoryDedupe, ParticipantDedupeStore};
@@ -101,13 +103,11 @@ pub use stats::{ParticipantStats, ParticipantStatsSnapshot};
 
 // Helpers
 pub use helpers::{
-    compensate_wrapper, execute_step_wrapper, handle_saga_event, handle_saga_event_with_emit,
+    compensate_wrapper, execute_step_wrapper, handle_async_saga_event,
+    handle_async_saga_event_with_emit, handle_saga_event, handle_saga_event_with_emit,
     recover_sagas,
 };
-pub use reply_registry::{
-    SagaDelegatedReplyHandle, SagaDelegatedReplyResult, complete_terminal_reply,
-    complete_terminal_reply_from_event, register_terminal_reply, reject_terminal_reply,
-};
+pub use reply_registry::{SagaDelegatedReplyHandle, SagaDelegatedReplyResult};
 pub use resolver::{
     FailureAuthority, SuccessCriteria, TerminalPolicy, TerminalResolver, TERMINAL_RESOLVER_STEP,
 };

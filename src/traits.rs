@@ -1,5 +1,8 @@
 //! Core traits for saga participants
 
+use std::future::Future;
+use std::pin::Pin;
+
 use crate::{CompensationError, SagaContext, StepError, StepOutput};
 
 use icanact_core::{ActorId, ActorIdError};
@@ -110,6 +113,67 @@ pub trait SagaParticipant: Send + 'static {
     }
 
     /// Timeout for step execution
+    fn step_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(30)
+    }
+}
+
+pub type SagaBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Async variant of [`SagaParticipant`].
+///
+/// Use this when a participant step needs to await actor asks or other async IO.
+/// This keeps sync and async choreography execution models distinct at the type level.
+pub trait AsyncSagaParticipant: Send + 'static {
+    type Error: std::fmt::Debug + Send;
+
+    fn step_name(&self) -> &str;
+
+    fn participant_id(&self) -> &str {
+        self.step_name()
+    }
+
+    fn participant_actor_id(&self) -> Result<ActorId, ActorIdError> {
+        ActorId::new(self.participant_id())
+    }
+
+    fn participant_id_owned(&self) -> Box<str> {
+        match self.participant_actor_id() {
+            Ok(actor_id) => actor_id.as_str().to_string().into_boxed_str(),
+            Err(_) => self.participant_id().to_string().into_boxed_str(),
+        }
+    }
+
+    fn saga_types(&self) -> &[&'static str];
+
+    fn execute_step<'a>(
+        &'a mut self,
+        context: &'a SagaContext,
+        input: &'a [u8],
+    ) -> SagaBoxFuture<'a, Result<StepOutput, StepError>>;
+
+    fn compensate_step<'a>(
+        &'a mut self,
+        context: &'a SagaContext,
+        compensation_data: &'a [u8],
+    ) -> SagaBoxFuture<'a, Result<(), CompensationError>>;
+
+    fn on_saga_completed(&mut self, _context: &SagaContext) {}
+
+    fn on_saga_failed(&mut self, _context: &SagaContext, _reason: &str) {}
+
+    fn on_compensation_completed(&mut self, _context: &SagaContext) {}
+
+    fn on_quarantined(&mut self, _context: &SagaContext, _reason: &str) {}
+
+    fn depends_on(&self) -> DependencySpec {
+        DependencySpec::OnSagaStart
+    }
+
+    fn retry_policy(&self) -> RetryPolicy {
+        RetryPolicy::default()
+    }
+
     fn step_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(30)
     }

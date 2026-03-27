@@ -179,11 +179,18 @@ impl TerminalResolver {
                 let step_name = context.step_name.clone();
                 state.completed_steps.insert(step_name.clone());
                 if *compensation_available
-                    && !state.compensable_steps.iter().any(|step| step == &step_name)
+                    && !state
+                        .compensable_steps
+                        .iter()
+                        .any(|step| step == &step_name)
                 {
                     state.compensable_steps.push(step_name);
                 }
-                if self.policy.success_criteria.is_satisfied(&state.completed_steps) {
+                if self
+                    .policy
+                    .success_criteria
+                    .is_satisfied(&state.completed_steps)
+                {
                     out.push(SagaChoreographyEvent::SagaCompleted {
                         context: terminal_context(context),
                     });
@@ -254,7 +261,9 @@ impl TerminalResolver {
             }
             SagaChoreographyEvent::CompensationCompleted { context } => {
                 if state.compensation_requested {
-                    state.pending_compensation_steps.remove(context.step_name.as_ref());
+                    state
+                        .pending_compensation_steps
+                        .remove(context.step_name.as_ref());
                     if state.pending_compensation_steps.is_empty() {
                         let failure = state.pending_failure.clone();
                         let reason: Box<str> = failure
@@ -448,4 +457,3 @@ mod tests {
         assert!(out.is_empty());
     }
 }
-

@@ -10,6 +10,7 @@ authors = ["Greg"]
 default = []
 diagnostics = []
 test-harness = []
+lmdb = ["dep:heed"]
 
 [dependencies]
 # Core dependencies
@@ -18,6 +19,7 @@ rkyv = { version = "0.8", features = ["std", "bytecheck"] }
 thiserror = "1.0"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros", "sync"] }
 tracing = "0.1"
+heed = { version = "0.20", optional = true }
 
 # Optional observability
 tracing-subscriber = { version = "0.3", optional = true }

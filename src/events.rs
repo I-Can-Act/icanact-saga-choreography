@@ -127,7 +127,9 @@ pub enum SagaChoreographyEvent {
 
 #[derive(Clone, Debug)]
 pub enum SagaTerminalOutcome {
-    Completed { context: SagaContext },
+    Completed {
+        context: SagaContext,
+    },
     Failed {
         context: SagaContext,
         reason: Box<str>,
@@ -303,13 +305,7 @@ pub enum AckStatus {
 }
 
 /// Events stored in participant's local journal for durability and recovery.
-#[derive(
-    Clone,
-    Debug,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum ParticipantEvent {
     /// Emitted when a participant registers to handle a step in a saga type.
     SagaRegistered {
