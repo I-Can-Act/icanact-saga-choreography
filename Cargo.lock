@@ -618,7 +618,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 [[package]]
 name = "icanact-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/moofone/actor-framework-core.git?branch=main#172cbe6201af2c6087921b5cbcdc264560180810"
+source = "git+ssh://git@github.com/moofone/actor-framework-core.git?branch=main#36b6927ff054fc72be7b871380ee1ed8e54b60d7"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -626,6 +626,7 @@ dependencies = [
  "heed",
  "icanact-core-derive",
  "icanact-remote",
+ "kanal",
  "rkyv",
  "rustc-hash",
  "tokio",
@@ -635,7 +636,7 @@ dependencies = [
 [[package]]
 name = "icanact-core-derive"
 version = "0.1.0"
-source = "git+ssh://git@github.com/moofone/actor-framework-core.git?branch=main#172cbe6201af2c6087921b5cbcdc264560180810"
+source = "git+ssh://git@github.com/moofone/actor-framework-core.git?branch=main#36b6927ff054fc72be7b871380ee1ed8e54b60d7"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -645,7 +646,7 @@ dependencies = [
 [[package]]
 name = "icanact-remote"
 version = "0.1.0"
-source = "git+https://github.com/moofone/icanact-remote?branch=main#111f0e4513b0bc237d663b7579310d3fab46869c"
+source = "git+ssh://git@github.com/moofone/icanact-remote.git?rev=2d4a00c33477b8129cec67107b46658970a21e14#2d4a00c33477b8129cec67107b46658970a21e14"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -677,6 +678,7 @@ dependencies = [
 name = "icanact-saga-choreography"
 version = "0.1.0"
 dependencies = [
+ "heed",
  "icanact-core",
  "rkyv",
  "tempfile",
@@ -830,6 +832,16 @@ checksum = "b49715b7073f385ba4bc528e5747d02e66cb39c6146efb66b781f131f0fb399c"
 dependencies = [
  "once_cell",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "kanal"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e3953adf0cd667798b396c2fa13552d6d9b3269d7dd1154c4c416442d1ff574"
+dependencies = [
+ "futures-core",
+ "lock_api",
 ]
 
 [[package]]
