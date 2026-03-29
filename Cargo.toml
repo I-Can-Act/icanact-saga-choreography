@@ -14,7 +14,7 @@ lmdb = ["dep:heed"]
 
 [dependencies]
 # Core dependencies
-icanact-core = { git = "ssh://git@github.com/moofone/actor-framework-core.git", branch = "main", features = ["perf-counters", "loom-tests", "async-actors", "lmdb-durability", "remote", "relay", "ws"] }
+icanact-core = { git = "ssh://git@github.com/moofone/actor-framework-core.git", rev = "54c1fda38b0aae853562e9bff7fe0673f15cfb44", features = ["perf-counters", "loom-tests", "async-actors", "lmdb-durability", "remote", "relay", "ws"] }
 rkyv = { version = "0.8", features = ["std", "bytecheck"] }
 thiserror = "1.0"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros", "sync"] }

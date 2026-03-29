@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use icanact_core::local_sync::{self, PubSub, PublishStats, Subscription};
 use icanact_core::{ActorMessage, Ask, Tell};
 
-use crate::reply_registry::{SagaDelegatedReplyHandle, SagaDelegatedReplyResult};
+use crate::reply_registry::{SagaReplyToHandle, SagaReplyToResult};
 use crate::{
-    SagaChoreographyEvent, SagaDelegatedReply, SagaId, TERMINAL_RESOLVER_STEP, TerminalPolicy,
+    SagaChoreographyEvent, SagaId, SagaReplyTo, TERMINAL_RESOLVER_STEP, TerminalPolicy,
     TerminalResolver,
 };
 
@@ -70,7 +70,7 @@ impl SagaChoreographyBus {
     pub fn register_terminal_reply(
         &self,
         saga_id: SagaId,
-        reply: SagaDelegatedReplyHandle,
+        reply: SagaReplyToHandle,
     ) -> Result<(), Box<str>> {
         match self
             .control_ref
@@ -82,7 +82,7 @@ impl SagaChoreographyBus {
         }
     }
 
-    pub fn complete_terminal_reply(&self, saga_id: SagaId, reply: SagaDelegatedReply) -> bool {
+    pub fn complete_terminal_reply(&self, saga_id: SagaId, reply: SagaReplyTo) -> bool {
         match self
             .control_ref
             .ask(SagaBusControlAsk::CompleteTerminalReply { saga_id, reply })
@@ -116,10 +116,9 @@ impl SagaChoreographyBus {
             responder.into(),
         ));
         resolver_handle.wait_for_startup();
-        let mailbox = resolver_ref
-            .snapshot()
-            .expect("resolver actor mailbox should be available after startup");
-        let subscription = self.pubsub.subscribe(topic.as_str(), mailbox);
+        let subscription = self.pubsub.subscribe_direct_fn(topic.as_str(), move |event| {
+            resolver_ref.tell(event)
+        });
         let _ = self.control_ref.ask(SagaBusControlAsk::RegisterResolver {
             subscription_id: subscription.id().as_u64(),
             handle: resolver_handle,
@@ -155,7 +154,7 @@ impl SagaChoreographyBus {
         };
         self.complete_terminal_reply(
             event.context().saga_id,
-            SagaDelegatedReply {
+            SagaReplyTo {
                 responder: responder.into(),
                 outcome,
             },
@@ -189,7 +188,7 @@ impl Default for SagaChoreographyBus {
 
 #[derive(Default)]
 struct SagaBusControlActor {
-    pending_replies: HashMap<u64, SagaDelegatedReplyHandle>,
+    pending_replies: HashMap<u64, SagaReplyToHandle>,
     resolver_handles: HashMap<u64, local_sync::ActorHandle>,
 }
 
@@ -203,11 +202,11 @@ enum SagaBusControlMsg {
 enum SagaBusControlAsk {
     RegisterTerminalReply {
         saga_id: SagaId,
-        reply: SagaDelegatedReplyHandle,
+        reply: SagaReplyToHandle,
     },
     CompleteTerminalReply {
         saga_id: SagaId,
-        reply: SagaDelegatedReply,
+        reply: SagaReplyTo,
     },
     RejectTerminalReply {
         saga_id: SagaId,
@@ -248,13 +247,27 @@ impl Ask for SagaBusControlActor {
     }
 }
 
+impl icanact_core::local_sync::Actor for SagaBusControlActor {
+    type ActorMailboxContract = icanact_core::local_sync::contract::TellAsk;
+    type Tell = SagaBusControlMsg;
+    type Ask = SagaBusControlAsk;
+    type Reply = SagaBusControlAskReply;
+}
+
 impl icanact_core::local_sync::SyncEndpoint for SagaBusControlActor {
-    type RuntimeMsg = SagaBusControlMsg;
+    type RuntimeMsg = icanact_core::local_sync::SyncTellAskMessage<
+        SagaBusControlMsg,
+        SagaBusControlAsk,
+        SagaBusControlAskReply,
+    >;
 
     fn handle_runtime(&mut self, msg: ActorMessage<Self::RuntimeMsg>) {
         match msg.payload {
-            SagaBusControlMsg::Ask { msg, reply } => {
-                let out = handle_control_ask(self, msg);
+            icanact_core::local_sync::SyncTellAskMessage::Tell(inner) => {
+                icanact_core::Tell::handle_tell(self, ActorMessage::tell(inner));
+            }
+            icanact_core::local_sync::SyncTellAskMessage::Ask { msg, reply } => {
+                let out = icanact_core::Ask::handle_ask(self, ActorMessage::ask(msg));
                 let _ = reply.reply(out);
             }
         }
@@ -263,20 +276,23 @@ impl icanact_core::local_sync::SyncEndpoint for SagaBusControlActor {
 
 impl icanact_core::local_sync::SyncTellEndpoint for SagaBusControlActor {
     fn runtime_tell(msg: SagaBusControlMsg) -> Self::RuntimeMsg {
-        msg
+        icanact_core::local_sync::SyncTellAskMessage::Tell(msg)
     }
 
     fn recover_tell(msg: Self::RuntimeMsg) -> Option<SagaBusControlMsg> {
-        Some(msg)
+        match msg {
+            icanact_core::local_sync::SyncTellAskMessage::Tell(inner) => Some(inner),
+            _ => None,
+        }
     }
 }
 
 impl icanact_core::local_sync::SyncAskEndpoint for SagaBusControlActor {
     fn runtime_ask(
         msg: SagaBusControlAsk,
-        reply: local_sync::ReplyTo<SagaBusControlAskReply>,
+        reply: icanact_core::local_sync::ReplyTo<SagaBusControlAskReply>,
     ) -> Self::RuntimeMsg {
-        SagaBusControlMsg::Ask { msg, reply }
+        icanact_core::local_sync::SyncTellAskMessage::Ask { msg, reply }
     }
 }
 
@@ -399,21 +415,34 @@ impl Tell for TerminalResolverActor {
     }
 }
 
+impl icanact_core::local_sync::Actor for TerminalResolverActor {
+    type ActorMailboxContract = icanact_core::local_sync::contract::TellOnly;
+    type Tell = SagaChoreographyEvent;
+    type Ask = icanact_core::local_sync::contract::NoAsk;
+    type Reply = icanact_core::local_sync::contract::NoReply;
+}
+
 impl icanact_core::local_sync::SyncEndpoint for TerminalResolverActor {
-    type RuntimeMsg = SagaChoreographyEvent;
+    type RuntimeMsg = icanact_core::local_sync::SyncTellMessage<SagaChoreographyEvent>;
 
     fn handle_runtime(&mut self, msg: ActorMessage<Self::RuntimeMsg>) {
-        Tell::handle_tell(self, ActorMessage::tell(msg.payload));
+        match msg.payload {
+            icanact_core::local_sync::SyncTellMessage::Tell(inner) => {
+                icanact_core::Tell::handle_tell(self, ActorMessage::tell(inner));
+            }
+        }
     }
 }
 
 impl icanact_core::local_sync::SyncTellEndpoint for TerminalResolverActor {
     fn runtime_tell(msg: SagaChoreographyEvent) -> Self::RuntimeMsg {
-        msg
+        icanact_core::local_sync::SyncTellMessage::Tell(msg)
     }
 
     fn recover_tell(msg: Self::RuntimeMsg) -> Option<SagaChoreographyEvent> {
-        Some(msg)
+        match msg {
+            icanact_core::local_sync::SyncTellMessage::Tell(inner) => Some(inner),
+        }
     }
 }
 
@@ -428,7 +457,7 @@ mod tests {
     use icanact_core::local_sync;
 
     use crate::{
-        SagaChoreographyEvent, SagaContext, SagaDelegatedReplyResult, SagaId,
+        SagaChoreographyEvent, SagaContext, SagaId, SagaReplyToResult,
         TERMINAL_RESOLVER_STEP,
     };
 
@@ -466,7 +495,7 @@ mod tests {
         Register {
             bus: SagaChoreographyBus,
             saga_id: SagaId,
-            reply: super::SagaDelegatedReplyHandle,
+            reply: super::SagaReplyToHandle,
         },
     }
 
@@ -474,7 +503,7 @@ mod tests {
         bus: SagaChoreographyBus,
         saga_id: SagaId,
     ) -> (
-        local_sync::PendingAsk<SagaDelegatedReplyResult>,
+        local_sync::PendingAsk<SagaReplyToResult>,
         local_sync::mpsc::ActorHandle,
     ) {
         let (probe_addr, probe_handle) = local_sync::mpsc::spawn(8, |msg: ProbeMsg| match msg {

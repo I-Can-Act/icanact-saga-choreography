@@ -144,7 +144,7 @@ pub enum SagaTerminalOutcome {
 }
 
 #[derive(Clone, Debug)]
-pub struct SagaDelegatedReply {
+pub struct SagaReplyTo {
     pub responder: Box<str>,
     pub outcome: SagaTerminalOutcome,
 }
