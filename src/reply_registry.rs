@@ -1,6 +1,6 @@
 use icanact_core::local_sync;
 
-use crate::SagaDelegatedReply;
+use crate::SagaReplyTo;
 
-pub type SagaDelegatedReplyResult = Result<SagaDelegatedReply, String>;
-pub type SagaDelegatedReplyHandle = local_sync::ReplyTo<SagaDelegatedReplyResult>;
+pub type SagaReplyToResult = Result<SagaReplyTo, String>;
+pub type SagaReplyToHandle = local_sync::ReplyTo<SagaReplyToResult>;

@@ -82,7 +82,7 @@ pub use support::{HasSagaParticipantSupport, SagaParticipantSupport, SagaPartici
 
 // Events
 pub use events::{
-    AckStatus, ParticipantEvent, SagaChoreographyEvent, SagaDelegatedReply, SagaFailureDetails,
+    AckStatus, ParticipantEvent, SagaChoreographyEvent, SagaFailureDetails, SagaReplyTo,
     SagaTerminalOutcome,
 };
 
@@ -107,7 +107,7 @@ pub use helpers::{
     handle_async_saga_event_with_emit, handle_saga_event, handle_saga_event_with_emit,
     recover_sagas,
 };
-pub use reply_registry::{SagaDelegatedReplyHandle, SagaDelegatedReplyResult};
+pub use reply_registry::{SagaReplyToHandle, SagaReplyToResult};
 pub use resolver::{
     FailureAuthority, SuccessCriteria, TerminalPolicy, TerminalResolver, TERMINAL_RESOLVER_STEP,
 };
