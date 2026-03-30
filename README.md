@@ -51,7 +51,7 @@ If you do want backend injection, the same support object can also be embedded g
 - `SagaParticipantSupport<J, D>`: embedded saga state, journal, dedupe, stats, recovery events, bus
 - `HasSagaParticipantSupport`: actor access trait for the embedded support object
 - `SagaParticipant`: step execution and compensation behavior
-- `SagaChoreographyEvent`: pubsub event model for saga progression
+- `SagaChoreographyEvent`: event-bus model for saga progression
 - `ParticipantJournal` / `ParticipantDedupeStore`: storage contracts
 
 ## Verification

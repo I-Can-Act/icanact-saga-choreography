@@ -1,8 +1,8 @@
 use icanact_saga_choreography::durability::apply_async_participant_saga_ingress_with_hooks;
 use icanact_saga_choreography::{
     AsyncSagaParticipant, CompensationError, DependencySpec, DeterministicContextBuilder,
-    HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal, SagaChoreographyEvent,
-    SagaContext, SagaParticipantSupport, SagaStateEntry, SagaStateExt, StepError, StepOutput,
+    HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal, SagaChoreographyEvent, SagaContext,
+    SagaParticipantSupport, SagaStateEntry, SagaStateExt, StepError, StepOutput,
 };
 
 struct AsyncTestParticipant {
@@ -190,10 +190,9 @@ async fn async_ingress_compensation_failure_quarantines_saga() {
     .await;
 
     assert_eq!(participant.compensation_calls, 1);
-    assert!(emitted.iter().any(|event| matches!(
-        event,
-        SagaChoreographyEvent::SagaQuarantined { .. }
-    )));
+    assert!(emitted
+        .iter()
+        .any(|event| matches!(event, SagaChoreographyEvent::SagaQuarantined { .. })));
     assert!(matches!(
         participant.saga_states_ref().values().next(),
         Some(SagaStateEntry::Quarantined(_))

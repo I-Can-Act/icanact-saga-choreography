@@ -9,7 +9,7 @@ The key idea is simple: actors already represent service boundaries, so saga par
 ## Core Model
 
 - Each saga participant is a normal actor that handles business messages plus saga events.
-- Participants communicate through pubsub saga events (`SagaChoreographyEvent`).
+- Participants communicate through saga event bus events (`SagaChoreographyEvent`).
 - Each participant should embed one `SagaParticipantSupport<J, D>` field that owns local choreography state keyed by `SagaId`.
 - Each participant persists participant-local events to a journal and deduplicates incoming events.
 - Failure handling is compensation-driven, with quarantine for ambiguous compensation outcomes.
@@ -18,7 +18,7 @@ The key idea is simple: actors already represent service boundaries, so saga par
 
 ```mermaid
 flowchart LR
-    Initiator["Initiator Actor"] -->|"SagaStarted"| Topic[("PubSub Topic: saga:{type}")]
+    Initiator["Initiator Actor"] -->|"SagaStarted"| Topic[("EventBus Key: saga_type")]
     Topic --> P1["Participant A"]
     Topic --> P2["Participant B"]
     Topic --> P3["Participant C"]
@@ -70,7 +70,7 @@ stateDiagram-v2
 ```mermaid
 sequenceDiagram
     participant I as Initiator
-    participant T as PubSub Topic
+    participant T as EventBus Key
     participant A as Upstream Step
     participant B as Dependent Step
 

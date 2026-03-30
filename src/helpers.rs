@@ -2,8 +2,8 @@
 
 use crate::{
     AsyncSagaParticipant, Compensating, CompensationError, Completed, DependencySpec, Executing,
-    ParticipantEvent, ParticipantJournal, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant,
-    SagaParticipantState, SagaStateEntry, SagaStateExt, StepError, StepOutput,
+    ParticipantEvent, ParticipantJournal, SagaChoreographyEvent, SagaContext, SagaId,
+    SagaParticipant, SagaParticipantState, SagaStateEntry, SagaStateExt, StepError, StepOutput,
 };
 use std::sync::atomic::Ordering;
 
@@ -230,8 +230,14 @@ pub async fn handle_async_saga_event_with_emit<P, F>(
                 .dependency_completions()
                 .remove(&context.saga_id);
             participant.dependency_fired().remove(&context.saga_id);
-            execute_step_wrapper_with_emit_async(participant, context.clone(), payload, now, &mut emit)
-                .await;
+            execute_step_wrapper_with_emit_async(
+                participant,
+                context.clone(),
+                payload,
+                now,
+                &mut emit,
+            )
+            .await;
         }
         SagaChoreographyEvent::SagaStarted { .. } => {
             participant.saga_states().remove(&context.saga_id);

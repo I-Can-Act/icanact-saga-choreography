@@ -91,7 +91,9 @@ pub use errors::{CompensationError, StepError, StepOutput};
 
 // Traits
 pub use state_ext::SagaStateExt;
-pub use traits::{AsyncSagaParticipant, DependencySpec, RetryPolicy, SagaBoxFuture, SagaParticipant};
+pub use traits::{
+    AsyncSagaParticipant, DependencySpec, RetryPolicy, SagaBoxFuture, SagaParticipant,
+};
 
 // Storage
 pub use dedupe::{DedupeError, InMemoryDedupe, ParticipantDedupeStore};
