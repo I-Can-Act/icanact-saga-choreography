@@ -3,15 +3,15 @@ use std::sync::{Arc, Mutex};
 use icanact_core::local::{EventBus, EventSubscription, PublishStats};
 use icanact_core::CorrelationRegistry;
 
-use crate::reply_registry::{SagaDelegatedReplyHandle, SagaDelegatedReplyResult};
+use crate::reply_registry::{SagaReplyToHandle, SagaReplyToResult};
 use crate::{
-    SagaChoreographyEvent, SagaDelegatedReply, SagaId, TerminalPolicy, TerminalResolver,
-    TERMINAL_RESOLVER_STEP,
+    SagaChoreographyEvent, SagaId, SagaReplyTo, TERMINAL_RESOLVER_STEP, TerminalPolicy,
+    TerminalResolver,
 };
 
 pub struct SagaChoreographyBus {
     bus: EventBus<SagaChoreographyEvent>,
-    pending_replies: CorrelationRegistry<SagaId, SagaDelegatedReplyResult>,
+    pending_replies: CorrelationRegistry<SagaId, SagaReplyToResult>,
     owned: bool,
 }
 
@@ -57,7 +57,7 @@ impl SagaChoreographyBus {
     pub fn register_terminal_reply(
         &self,
         saga_id: SagaId,
-        reply: SagaDelegatedReplyHandle,
+        reply: SagaReplyToHandle,
     ) -> Result<(), Box<str>> {
         match self.pending_replies.register(saga_id, reply) {
             Ok(()) => Ok(()),
@@ -69,7 +69,7 @@ impl SagaChoreographyBus {
         }
     }
 
-    pub fn complete_terminal_reply(&self, saga_id: SagaId, reply: SagaDelegatedReply) -> bool {
+    pub fn complete_terminal_reply(&self, saga_id: SagaId, reply: SagaReplyTo) -> bool {
         self.pending_replies.resolve(&saga_id, Ok(reply)).is_ok()
     }
 
@@ -87,24 +87,22 @@ impl SagaChoreographyBus {
         let resolver = Arc::new(Mutex::new(TerminalResolver::new(policy.clone())));
         let bus = self.clone();
         let responder: Arc<str> = Arc::from(responder);
-        self.bus
-            .subscribe_fn(policy.saga_type.as_ref(), move |event| {
-                let terminal_events = {
-                    let mut resolver = match resolver.lock() {
-                        Ok(guard) => guard,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    resolver.ingest(event)
+        self.bus.subscribe_fn(policy.saga_type.as_ref(), move |event| {
+            let terminal_events = {
+                let mut resolver = match resolver.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
                 };
+                resolver.ingest(event)
+            };
 
-                for terminal_event in terminal_events {
-                    let _ =
-                        bus.complete_terminal_reply_from_event(&terminal_event, responder.as_ref());
-                    let _ = bus.publish(terminal_event);
-                }
+            for terminal_event in terminal_events {
+                let _ = bus.complete_terminal_reply_from_event(&terminal_event, responder.as_ref());
+                let _ = bus.publish(terminal_event);
+            }
 
-                true
-            })
+            true
+        })
     }
 
     pub fn attach_order_lifecycle_terminal_resolver(
@@ -135,7 +133,7 @@ impl SagaChoreographyBus {
         };
         self.complete_terminal_reply(
             event.context().saga_id,
-            SagaDelegatedReply {
+            SagaReplyTo {
                 responder: responder.into(),
                 outcome,
             },
@@ -173,17 +171,14 @@ impl Default for SagaChoreographyBus {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
 
     use icanact_core::local_sync;
 
-    use crate::{
-        SagaChoreographyEvent, SagaContext, SagaDelegatedReplyResult, SagaId,
-        TERMINAL_RESOLVER_STEP,
-    };
+    use crate::{SagaChoreographyEvent, SagaContext, SagaId, SagaReplyToResult, TERMINAL_RESOLVER_STEP};
 
     use super::SagaChoreographyBus;
 
@@ -219,7 +214,7 @@ mod tests {
         Register {
             bus: SagaChoreographyBus,
             saga_id: SagaId,
-            reply: super::SagaDelegatedReplyHandle,
+            reply: super::SagaReplyToHandle,
         },
     }
 
@@ -227,7 +222,7 @@ mod tests {
         bus: SagaChoreographyBus,
         saga_id: SagaId,
     ) -> (
-        local_sync::PendingAsk<SagaDelegatedReplyResult>,
+        local_sync::PendingAsk<SagaReplyToResult>,
         local_sync::mpsc::ActorHandle,
     ) {
         let (probe_addr, probe_handle) = local_sync::mpsc::spawn(8, |msg: ProbeMsg| match msg {
