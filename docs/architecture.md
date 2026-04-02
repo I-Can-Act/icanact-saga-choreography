@@ -46,8 +46,9 @@ flowchart LR
 | Execution contract | `SagaParticipant` trait | Implement `execute_step`, `compensate_step`, dependencies, retry policy |
 | State access contract | `HasSagaParticipantSupport` + blanket `SagaStateExt` | Expose the embedded `saga` field |
 | Persistence contract | `ParticipantJournal` and `ParticipantDedupeStore` traits | Provide concrete backend (in-memory, LMDB/Heed, etc.) |
-| Runtime helpers | `handle_saga_event`, `execute_step_wrapper`, `compensate_wrapper`, `recover_sagas` | Wire helpers into actor message handling |
+| Runtime helpers | `apply_sync_participant_saga_ingress`, `apply_async_participant_saga_ingress`, `execute_step_wrapper`, `compensate_wrapper`, `recover_sagas` | Wire ingress helpers into actor message handling |
 | Observability | `ParticipantStats`, `SagaObserver` | Export metrics and connect observer implementation |
+| E2E test harness | `SagaTestWorld`, transcript capture, terminal waits | Spawn real actors and assert through actor refs, transcript, and shared stores |
 
 ## Participant State Machine
 
@@ -98,10 +99,19 @@ sequenceDiagram
 3. Implement `HasSagaParticipantSupport` for the actor. `SagaStateExt` is then derived automatically.
 4. Implement `SagaParticipant` for business behavior:
    step identity, forward execution, compensation, dependencies, retry policy.
-5. Add a saga event variant to the actor command enum and route it to `handle_saga_event`.
+5. Add a saga event variant to the actor command enum and route it through `apply_sync_participant_saga_ingress(...)` or `apply_async_participant_saga_ingress(...)`.
 6. Subscribe each actor mailbox to the saga topic (`saga:{saga_type}`).
 7. Start sagas by publishing `SagaStarted` with payload and context.
 8. Run recovery on startup (`recover_sagas`) and expose stats/admin commands.
+
+## Testing Model
+
+- The deterministic replay helpers remain useful for narrow unit tests.
+- The intended end-to-end path is `SagaTestWorld` with real actor refs and a real `SagaChoreographyBus`.
+- `SagaTestWorld` owns the bus wiring, transcript capture, and terminal waiting so tests can execute the same workflow code production actors use.
+- Assertions should prefer:
+  terminal outcomes, transcript inspection, actor `ask` snapshots, and shared journal/dedupe stores when the test injects them.
+- The harness should not require a test-only alternate workflow implementation.
 
 ## Storage and Idempotency
 

@@ -197,3 +197,24 @@ impl Default for InMemoryDedupe {
         Self::new()
     }
 }
+
+impl<T> ParticipantDedupeStore for std::sync::Arc<T>
+where
+    T: ParticipantDedupeStore + ?Sized,
+{
+    fn check_and_mark(&self, saga_id: SagaId, key: &str) -> Result<bool, DedupeError> {
+        (**self).check_and_mark(saga_id, key)
+    }
+
+    fn contains(&self, saga_id: SagaId, key: &str) -> bool {
+        (**self).contains(saga_id, key)
+    }
+
+    fn mark_processed(&self, saga_id: SagaId, key: &str) -> Result<(), DedupeError> {
+        (**self).mark_processed(saga_id, key)
+    }
+
+    fn prune(&self, saga_id: SagaId) -> Result<(), DedupeError> {
+        (**self).prune(saga_id)
+    }
+}

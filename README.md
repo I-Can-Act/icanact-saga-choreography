@@ -42,7 +42,7 @@ impl HasSagaParticipantSupport for MyActor {
 }
 ```
 
-Then implement `SagaParticipant` for the actor’s business behavior and route incoming saga events to `handle_saga_event(...)`.
+Then implement `SagaParticipant` for the actor’s business behavior and route incoming saga events through `apply_sync_participant_saga_ingress(...)` or `apply_async_participant_saga_ingress(...)` so emitted choreography events go back onto the attached bus.
 
 If you do want backend injection, the same support object can also be embedded generically.
 
@@ -53,6 +53,70 @@ If you do want backend injection, the same support object can also be embedded g
 - `SagaParticipant`: step execution and compensation behavior
 - `SagaChoreographyEvent`: event-bus model for saga progression
 - `ParticipantJournal` / `ParticipantDedupeStore`: storage contracts
+- `SagaTestWorld`: actor-ref-centric e2e saga harness behind the `test-harness` feature
+
+## E2E Testing
+
+For end-to-end saga tests, prefer the built-in testkit over replaying events by hand.
+
+Enable the feature:
+
+```toml
+[dev-dependencies]
+icanact-saga-choreography = { version = "...", features = ["test-harness"] }
+```
+
+Then spawn real actors, wire their normal saga message path, and drive the workflow through the shared saga bus:
+
+```rust,ignore
+use std::time::Duration;
+
+use icanact_core::local_sync::{self, SyncActor};
+use icanact_saga_choreography::{
+    durability::apply_sync_participant_saga_ingress, DependencySpec,
+    DeterministicContextBuilder, SagaChoreographyEvent, SagaParticipant, SagaTestWorld,
+};
+
+enum MyCmd {
+    SagaEvent(SagaChoreographyEvent),
+    // other business messages
+}
+
+impl SyncActor for MyActor {
+    type Contract = local_sync::contract::TellOnly;
+    type Tell = MyCmd;
+    type Ask = ();
+    type Reply = ();
+
+    fn handle_tell(&mut self, msg: Self::Tell) {
+        match msg {
+            MyCmd::SagaEvent(event) => {
+                apply_sync_participant_saga_ingress(self, event, |_actor, _incoming| {}, |_invalid| {});
+            }
+        }
+    }
+}
+
+let world = SagaTestWorld::new();
+let actor = world.spawn_sync_participant(MyActor::default(), MyCmd::SagaEvent);
+
+let ctx = DeterministicContextBuilder::default()
+    .with_saga_id(42)
+    .with_saga_type("order_lifecycle")
+    .with_step_name("start")
+    .build();
+
+world.start_saga(ctx.clone(), b"payload".to_vec());
+let terminal = world.wait_for_terminal(ctx.saga_id, Duration::from_secs(1));
+
+// assert on:
+// - terminal outcome
+// - world.transcript_for_saga(ctx.saga_id)
+// - normal actor ask/snapshot APIs
+// - shared journal/dedupe stores if your test provides them
+
+actor.shutdown();
+```
 
 ## Verification
 
@@ -60,6 +124,8 @@ If you do want backend injection, the same support object can also be embedded g
 cargo fmt --check
 cargo check --all-targets
 cargo test --all-targets
+cargo check --all-targets --features test-harness
+cargo test --all-targets --features test-harness
 RUSTFLAGS='-D warnings' cargo test --all-targets --all-features
 ```
 
