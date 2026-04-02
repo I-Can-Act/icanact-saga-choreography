@@ -218,3 +218,20 @@ impl Default for InMemoryJournal {
         Self::new()
     }
 }
+
+impl<T> ParticipantJournal for std::sync::Arc<T>
+where
+    T: ParticipantJournal + ?Sized,
+{
+    fn append(&self, saga_id: SagaId, event: ParticipantEvent) -> Result<u64, JournalError> {
+        (**self).append(saga_id, event)
+    }
+
+    fn read(&self, saga_id: SagaId) -> Result<Vec<JournalEntry>, JournalError> {
+        (**self).read(saga_id)
+    }
+
+    fn list_sagas(&self) -> Result<Vec<SagaId>, JournalError> {
+        (**self).list_sagas()
+    }
+}

@@ -5,8 +5,8 @@ use icanact_core::CorrelationRegistry;
 
 use crate::reply_registry::{SagaReplyToHandle, SagaReplyToResult};
 use crate::{
-    SagaChoreographyEvent, SagaId, SagaReplyTo, TERMINAL_RESOLVER_STEP, TerminalPolicy,
-    TerminalResolver,
+    SagaChoreographyEvent, SagaId, SagaReplyTo, TerminalPolicy, TerminalResolver,
+    TERMINAL_RESOLVER_STEP,
 };
 
 pub struct SagaChoreographyBus {
@@ -87,22 +87,24 @@ impl SagaChoreographyBus {
         let resolver = Arc::new(Mutex::new(TerminalResolver::new(policy.clone())));
         let bus = self.clone();
         let responder: Arc<str> = Arc::from(responder);
-        self.bus.subscribe_fn(policy.saga_type.as_ref(), move |event| {
-            let terminal_events = {
-                let mut resolver = match resolver.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
+        self.bus
+            .subscribe_fn(policy.saga_type.as_ref(), move |event| {
+                let terminal_events = {
+                    let mut resolver = match resolver.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    resolver.ingest(event)
                 };
-                resolver.ingest(event)
-            };
 
-            for terminal_event in terminal_events {
-                let _ = bus.complete_terminal_reply_from_event(&terminal_event, responder.as_ref());
-                let _ = bus.publish(terminal_event);
-            }
+                for terminal_event in terminal_events {
+                    let _ =
+                        bus.complete_terminal_reply_from_event(&terminal_event, responder.as_ref());
+                    let _ = bus.publish(terminal_event);
+                }
 
-            true
-        })
+                true
+            })
     }
 
     pub fn attach_order_lifecycle_terminal_resolver(
@@ -171,14 +173,16 @@ impl Default for SagaChoreographyBus {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant};
 
     use icanact_core::local_sync;
 
-    use crate::{SagaChoreographyEvent, SagaContext, SagaId, SagaReplyToResult, TERMINAL_RESOLVER_STEP};
+    use crate::{
+        SagaChoreographyEvent, SagaContext, SagaId, SagaReplyToResult, TERMINAL_RESOLVER_STEP,
+    };
 
     use super::SagaChoreographyBus;
 

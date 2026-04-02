@@ -113,7 +113,11 @@ pub use reply_registry::{SagaReplyToHandle, SagaReplyToResult};
 pub use resolver::{
     FailureAuthority, SuccessCriteria, TerminalPolicy, TerminalResolver, TERMINAL_RESOLVER_STEP,
 };
+#[cfg(any(test, feature = "test-harness"))]
+pub use testkit::AsyncSagaParticipantHandle;
 pub use testkit::{
     compensation_requested, drive_scenario, saga_started, step_completed, step_failed,
     DeterministicContextBuilder,
 };
+#[cfg(any(test, feature = "test-harness"))]
+pub use testkit::{SagaTestWorld, SyncSagaParticipantHandle};

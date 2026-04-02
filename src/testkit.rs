@@ -1,7 +1,8 @@
-//! Deterministic helpers for participant choreography tests.
+//! Test helpers for participant choreography tests.
 
 use crate::{
-    handle_saga_event, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant, SagaStateExt,
+    handle_saga_event, SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId,
+    SagaParticipant, SagaStateExt, SagaTerminalOutcome, TerminalPolicy,
 };
 
 /// Small deterministic builder for saga test contexts.
@@ -130,6 +131,369 @@ pub fn drive_scenario<P>(
 {
     for event in events {
         handle_saga_event(participant, event);
+    }
+}
+
+#[cfg(any(test, feature = "test-harness"))]
+use std::collections::HashSet;
+#[cfg(any(test, feature = "test-harness"))]
+use std::sync::{Arc, Condvar, Mutex, Once};
+#[cfg(any(test, feature = "test-harness"))]
+use std::time::{Duration, Instant};
+
+#[cfg(any(test, feature = "test-harness"))]
+use crate::{AsyncSagaParticipant, HasSagaParticipantSupport, SagaParticipantSupportExt};
+#[cfg(any(test, feature = "test-harness"))]
+use icanact_core::local::{EventSubscription, PublishStats};
+
+#[cfg(any(test, feature = "test-harness"))]
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(err) => err.into_inner(),
+    }
+}
+
+#[cfg(any(test, feature = "test-harness"))]
+#[derive(Debug, Default)]
+struct TranscriptState {
+    events: Mutex<Vec<SagaChoreographyEvent>>,
+    cv: Condvar,
+}
+
+#[cfg(any(test, feature = "test-harness"))]
+impl TranscriptState {
+    fn push(&self, event: SagaChoreographyEvent) {
+        let mut events = lock_unpoisoned(&self.events);
+        events.push(event);
+        self.cv.notify_all();
+    }
+
+    fn snapshot(&self) -> Vec<SagaChoreographyEvent> {
+        lock_unpoisoned(&self.events).clone()
+    }
+
+    fn wait_for<P>(&self, predicate: P, timeout: Duration) -> SagaChoreographyEvent
+    where
+        P: Fn(&SagaChoreographyEvent) -> bool,
+    {
+        let deadline = Instant::now() + timeout;
+        let mut events = lock_unpoisoned(&self.events);
+        loop {
+            if let Some(found) = events.iter().find(|event| predicate(event)).cloned() {
+                return found;
+            }
+            let now = Instant::now();
+            assert!(now < deadline, "timed out waiting for saga testkit event");
+            let remaining = deadline.saturating_duration_since(now);
+            let result = self.cv.wait_timeout(events, remaining);
+            let (next_events, _) = match result {
+                Ok(pair) => pair,
+                Err(err) => err.into_inner(),
+            };
+            events = next_events;
+        }
+    }
+}
+
+/// Actor-ref-centric harness for exercising real saga participants over the real runtime path.
+#[cfg(any(test, feature = "test-harness"))]
+#[derive(Default, Clone)]
+pub struct SagaTestWorld {
+    world: icanact_core::testkit::TestWorld,
+    bus: SagaChoreographyBus,
+    transcript: Arc<TranscriptState>,
+    captured_saga_types: Arc<Mutex<HashSet<Box<str>>>>,
+    subscriptions: Arc<Mutex<Vec<EventSubscription>>>,
+}
+
+#[cfg(any(test, feature = "test-harness"))]
+impl SagaTestWorld {
+    pub fn new() -> Self {
+        Self {
+            world: icanact_core::testkit::TestWorld::new(),
+            bus: SagaChoreographyBus::new(),
+            transcript: Arc::new(TranscriptState::default()),
+            captured_saga_types: Arc::new(Mutex::new(HashSet::new())),
+            subscriptions: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub fn init_test_logging() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let _ = tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_max_level(tracing::Level::DEBUG)
+                .try_init();
+        });
+    }
+
+    pub fn bus(&self) -> SagaChoreographyBus {
+        self.bus.clone()
+    }
+
+    pub fn publish(&self, event: SagaChoreographyEvent) -> PublishStats {
+        self.ensure_capture_saga_type(event.context().saga_type.as_ref());
+        self.bus.publish(event)
+    }
+
+    pub fn start_saga(&self, context: SagaContext, payload: Vec<u8>) -> PublishStats {
+        self.publish(saga_started(context, payload))
+    }
+
+    pub fn attach_terminal_resolver(
+        &self,
+        policy: TerminalPolicy,
+        responder: &'static str,
+    ) -> EventSubscription {
+        self.ensure_capture_saga_type(policy.saga_type.as_ref());
+        let sub = self.bus.attach_terminal_resolver(policy, responder);
+        self.remember_subscription(sub.clone());
+        sub
+    }
+
+    pub fn attach_order_lifecycle_terminal_resolver(
+        &self,
+        responder: &'static str,
+    ) -> EventSubscription {
+        self.ensure_capture_saga_type("order_lifecycle");
+        let sub = self.bus.attach_order_lifecycle_terminal_resolver(responder);
+        self.remember_subscription(sub.clone());
+        sub
+    }
+
+    pub fn transcript(&self) -> Vec<SagaChoreographyEvent> {
+        self.transcript.snapshot()
+    }
+
+    pub fn transcript_for_saga(&self, saga_id: SagaId) -> Vec<SagaChoreographyEvent> {
+        self.transcript()
+            .into_iter()
+            .filter(|event| event.context().saga_id == saga_id)
+            .collect()
+    }
+
+    pub fn wait_for_event<P>(&self, predicate: P, timeout: Duration) -> SagaChoreographyEvent
+    where
+        P: Fn(&SagaChoreographyEvent) -> bool,
+    {
+        self.transcript.wait_for(predicate, timeout)
+    }
+
+    pub fn wait_for_terminal(&self, saga_id: SagaId, timeout: Duration) -> SagaTerminalOutcome {
+        self.wait_for_event(
+            |event| event.context().saga_id == saga_id && event.terminal_outcome().is_some(),
+            timeout,
+        )
+        .terminal_outcome()
+        .expect("terminal wait predicate must only match terminal events")
+    }
+
+    pub async fn wait_for_event_async<P>(
+        &self,
+        predicate: P,
+        timeout: Duration,
+    ) -> SagaChoreographyEvent
+    where
+        P: Fn(&SagaChoreographyEvent) -> bool + Send + 'static,
+    {
+        let state = Arc::clone(&self.transcript);
+        tokio::task::spawn_blocking(move || state.wait_for(predicate, timeout))
+            .await
+            .expect("wait_for_event_async task panicked")
+    }
+
+    pub async fn wait_for_terminal_async(
+        &self,
+        saga_id: SagaId,
+        timeout: Duration,
+    ) -> SagaTerminalOutcome {
+        self.wait_for_event_async(
+            move |event| event.context().saga_id == saga_id && event.terminal_outcome().is_some(),
+            timeout,
+        )
+        .await
+        .terminal_outcome()
+        .expect("terminal wait predicate must only match terminal events")
+    }
+
+    pub fn spawn_sync_participant<A, F>(
+        &self,
+        actor: A,
+        map_event: F,
+    ) -> SyncSagaParticipantHandle<A>
+    where
+        A: icanact_core::local_sync::SyncActor + SagaParticipant + HasSagaParticipantSupport,
+        A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
+        F: Fn(SagaChoreographyEvent) -> A::Tell + Send + Sync + 'static,
+    {
+        self.spawn_sync_participant_with_opts(
+            actor,
+            icanact_core::local_sync::SpawnOpts::default(),
+            map_event,
+        )
+    }
+
+    pub fn spawn_sync_participant_with_opts<A, F>(
+        &self,
+        mut actor: A,
+        opts: icanact_core::local_sync::SpawnOpts,
+        map_event: F,
+    ) -> SyncSagaParticipantHandle<A>
+    where
+        A: icanact_core::local_sync::SyncActor + SagaParticipant + HasSagaParticipantSupport,
+        A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
+        F: Fn(SagaChoreographyEvent) -> A::Tell + Send + Sync + 'static,
+    {
+        actor.attach_saga_bus(self.bus.clone());
+        let saga_types: Vec<&'static str> = actor.saga_types().to_vec();
+        let (actor_ref, handle) = self.world.spawn_sync_with_opts(actor, opts);
+        self.register_sync_subscriptions(actor_ref.clone(), &saga_types, map_event);
+        SyncSagaParticipantHandle { actor_ref, handle }
+    }
+
+    pub async fn spawn_async_participant<A, F>(
+        &self,
+        actor: A,
+        map_event: F,
+    ) -> AsyncSagaParticipantHandle<A>
+    where
+        A: icanact_core::local_async::AsyncActor + AsyncSagaParticipant + HasSagaParticipantSupport,
+        A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
+        F: Fn(SagaChoreographyEvent) -> A::Tell + Send + Sync + 'static,
+    {
+        self.spawn_async_participant_with_opts(
+            actor,
+            icanact_core::local_async::SpawnOpts::default(),
+            map_event,
+        )
+        .await
+    }
+
+    pub async fn spawn_async_participant_with_opts<A, F>(
+        &self,
+        mut actor: A,
+        opts: icanact_core::local_async::SpawnOpts,
+        map_event: F,
+    ) -> AsyncSagaParticipantHandle<A>
+    where
+        A: icanact_core::local_async::AsyncActor + AsyncSagaParticipant + HasSagaParticipantSupport,
+        A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
+        F: Fn(SagaChoreographyEvent) -> A::Tell + Send + Sync + 'static,
+    {
+        actor.attach_saga_bus(self.bus.clone());
+        let saga_types: Vec<&'static str> = actor.saga_types().to_vec();
+        let (actor_ref, handle) = self.world.spawn_async_with_opts(actor, opts).await;
+        self.register_async_subscriptions(actor_ref.clone(), &saga_types, map_event);
+        AsyncSagaParticipantHandle { actor_ref, handle }
+    }
+
+    fn ensure_capture_saga_type(&self, saga_type: &str) {
+        let mut captured = lock_unpoisoned(&self.captured_saga_types);
+        if !captured.insert(saga_type.to_string().into_boxed_str()) {
+            return;
+        }
+        let transcript = Arc::clone(&self.transcript);
+        let sub = self.bus.subscribe_saga_type_fn(saga_type, move |event| {
+            transcript.push(event.clone());
+            true
+        });
+        self.remember_subscription(sub);
+    }
+
+    fn remember_subscription(&self, sub: EventSubscription) {
+        lock_unpoisoned(&self.subscriptions).push(sub);
+    }
+
+    fn register_sync_subscriptions<A, F>(
+        &self,
+        actor_ref: icanact_core::local_sync::SyncActorRef<A>,
+        saga_types: &[&'static str],
+        map_event: F,
+    ) where
+        A: icanact_core::local_sync::SyncActor,
+        A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
+        F: Fn(SagaChoreographyEvent) -> A::Tell + Send + Sync + 'static,
+    {
+        let map_event = Arc::new(map_event);
+        for saga_type in saga_types {
+            self.ensure_capture_saga_type(saga_type);
+            let actor_ref = actor_ref.clone();
+            let map_event = Arc::clone(&map_event);
+            let sub = self.bus.subscribe_saga_type_fn(saga_type, move |event| {
+                actor_ref.tell(map_event(event.clone()))
+            });
+            self.remember_subscription(sub);
+        }
+    }
+
+    fn register_async_subscriptions<A, F>(
+        &self,
+        actor_ref: icanact_core::local_async::AsyncActorRef<A>,
+        saga_types: &[&'static str],
+        map_event: F,
+    ) where
+        A: icanact_core::local_async::AsyncActor,
+        A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
+        F: Fn(SagaChoreographyEvent) -> A::Tell + Send + Sync + 'static,
+    {
+        let map_event = Arc::new(map_event);
+        for saga_type in saga_types {
+            self.ensure_capture_saga_type(saga_type);
+            let actor_ref = actor_ref.clone();
+            let map_event = Arc::clone(&map_event);
+            let sub = self.bus.subscribe_saga_type_fn(saga_type, move |event| {
+                actor_ref.tell(map_event(event.clone()))
+            });
+            self.remember_subscription(sub);
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-harness"))]
+pub struct SyncSagaParticipantHandle<A>
+where
+    A: icanact_core::local_sync::SyncActor,
+{
+    actor_ref: icanact_core::local_sync::SyncActorRef<A>,
+    handle: icanact_core::local_sync::ActorHandle,
+}
+
+#[cfg(any(test, feature = "test-harness"))]
+impl<A> SyncSagaParticipantHandle<A>
+where
+    A: icanact_core::local_sync::SyncActor,
+{
+    pub fn actor_ref(&self) -> icanact_core::local_sync::SyncActorRef<A> {
+        self.actor_ref.clone()
+    }
+
+    pub fn shutdown(self) {
+        self.handle.shutdown();
+    }
+}
+
+#[cfg(any(test, feature = "test-harness"))]
+pub struct AsyncSagaParticipantHandle<A>
+where
+    A: icanact_core::local_async::AsyncActor,
+{
+    actor_ref: icanact_core::local_async::AsyncActorRef<A>,
+    handle: icanact_core::local_async::ActorHandle,
+}
+
+#[cfg(any(test, feature = "test-harness"))]
+impl<A> AsyncSagaParticipantHandle<A>
+where
+    A: icanact_core::local_async::AsyncActor,
+{
+    pub fn actor_ref(&self) -> icanact_core::local_async::AsyncActorRef<A> {
+        self.actor_ref.clone()
+    }
+
+    pub async fn shutdown(self) {
+        self.handle.shutdown().await;
     }
 }
 

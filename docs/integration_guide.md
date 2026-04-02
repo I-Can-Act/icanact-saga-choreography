@@ -18,7 +18,7 @@ To make an actor saga-capable:
 1. embed `SagaParticipantSupport<Journal, Dedupe>` in the actor
 2. implement `HasSagaParticipantSupport`
 3. implement `SagaParticipant`
-4. route incoming `SagaChoreographyEvent` messages to `handle_saga_event(...)`
+4. route incoming `SagaChoreographyEvent` messages through `apply_sync_participant_saga_ingress(...)` or `apply_async_participant_saga_ingress(...)`
 
 ## Generic Example Workflow
 
@@ -121,17 +121,82 @@ Typical flow:
 
 ## Routing Saga Events
 
-When your actor receives a saga event, pass it to the crate helper:
+When your actor receives a saga event inside its normal actor command handling, pass it through the ingress helper rather than calling `handle_saga_event(...)` directly. The ingress helper is the runtime-facing path because it validates emitted transitions and republishes emitted choreography events through the attached bus.
 
 ```rust
-use icanact_saga_choreography::{SagaChoreographyEvent, handle_saga_event};
+use icanact_saga_choreography::{
+    durability::apply_sync_participant_saga_ingress, SagaChoreographyEvent,
+};
 
 fn on_saga_event(
     actor: &mut impl SagaParticipant + icanact_saga_choreography::SagaStateExt,
     event: SagaChoreographyEvent,
 ) {
-    handle_saga_event(actor, event);
+    apply_sync_participant_saga_ingress(actor, event, |_actor, _incoming| {}, |_invalid| {});
 }
+```
+
+For async participants, use `apply_async_participant_saga_ingress(...)` with the same hook shape.
+
+## E2E Test Example
+
+When you want to test the real saga workflow code without rewriting the actor for tests, use `SagaTestWorld` behind the `test-harness` feature.
+
+```rust,ignore
+use std::time::Duration;
+
+use icanact_core::local_sync::{self, SyncActor};
+use icanact_saga_choreography::{
+    durability::apply_sync_participant_saga_ingress, DeterministicContextBuilder,
+    SagaChoreographyEvent, SagaTestWorld,
+};
+
+enum MyCmd {
+    SagaEvent(SagaChoreographyEvent),
+    Snapshot,
+}
+
+impl SyncActor for MyActor {
+    type Contract = local_sync::contract::TellAsk;
+    type Tell = MyCmd;
+    type Ask = ();
+    type Reply = MySnapshot;
+
+    fn handle_tell(&mut self, msg: Self::Tell) {
+        match msg {
+            MyCmd::SagaEvent(event) => {
+                apply_sync_participant_saga_ingress(self, event, |_actor, _incoming| {}, |_invalid| {});
+            }
+            MyCmd::Snapshot => {}
+        }
+    }
+
+    fn handle_ask(&mut self, _msg: Self::Ask) -> Self::Reply {
+        self.snapshot()
+    }
+}
+
+let world = SagaTestWorld::new();
+let _resolver = world.attach_order_lifecycle_terminal_resolver("testkit");
+let actor = world.spawn_sync_participant(MyActor::default(), MyCmd::SagaEvent);
+
+let ctx = DeterministicContextBuilder::default()
+    .with_saga_id(7)
+    .with_saga_type("order_lifecycle")
+    .with_step_name("start")
+    .build();
+
+world.start_saga(ctx.clone(), b"payload".to_vec());
+let terminal = world.wait_for_terminal(ctx.saga_id, Duration::from_secs(1));
+let transcript = world.transcript_for_saga(ctx.saga_id);
+
+// Assert on:
+// - terminal outcome
+// - transcript sequence
+// - normal actor ask/snapshot replies
+// - shared journal/dedupe stores if provided to the actor
+
+actor.shutdown();
 ```
 
 ## Recovery
@@ -143,3 +208,4 @@ On startup or restart, use `recover_sagas(...)` to enumerate non-terminal sagas 
 - `SagaParticipantSupport` is the canonical integration path.
 - The crate stays storage-generic; your app can choose in-memory, LMDB, or another backend.
 - Keep your actor business logic generic to your domain; this crate does not impose any actor module structure.
+- For e2e tests, prefer `SagaTestWorld` over calling `handle_saga_event(...)` directly in unit-style loops.

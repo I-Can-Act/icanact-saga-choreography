@@ -9,7 +9,8 @@ authors = ["Greg"]
 [features]
 default = []
 diagnostics = []
-test-harness = []
+test-harness = ["icanact-core/test-support", "dep:tracing-subscriber"]
+test-support = ["test-harness"]
 lmdb = ["dep:heed"]
 
 [dependencies]
@@ -25,5 +26,8 @@ heed = { version = "0.20", optional = true }
 tracing-subscriber = { version = "0.3", optional = true }
 
 [dev-dependencies]
+icanact-core = { git = "ssh://git@github.com/moofone/actor-framework-core.git", branch = "main", features = ["async-actors", "test-support"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros", "sync", "test-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
