@@ -348,7 +348,7 @@ impl SagaTestWorld {
     {
         actor.attach_saga_bus(self.bus.clone());
         let saga_types: Vec<&'static str> = actor.saga_types().to_vec();
-        let (actor_ref, handle) = self.world.spawn_sync_with_opts(actor, opts);
+        let (actor_ref, handle) = icanact_core::local_sync::spawn_with_opts(actor, opts);
         self.register_sync_subscriptions(actor_ref.clone(), &saga_types, map_event);
         SyncSagaParticipantHandle { actor_ref, handle }
     }
@@ -384,7 +384,7 @@ impl SagaTestWorld {
     {
         actor.attach_saga_bus(self.bus.clone());
         let saga_types: Vec<&'static str> = actor.saga_types().to_vec();
-        let (actor_ref, handle) = self.world.spawn_async_with_opts(actor, opts).await;
+        let (actor_ref, handle) = icanact_core::local_async::spawn_with_opts(actor, opts).await;
         self.register_async_subscriptions(actor_ref.clone(), &saga_types, map_event);
         AsyncSagaParticipantHandle { actor_ref, handle }
     }
