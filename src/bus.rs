@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use icanact_core::local::{EventBus, EventSubscription, PublishStats};
 use icanact_core::CorrelationRegistry;
@@ -141,6 +141,11 @@ impl SagaChoreographyBus {
             },
         )
     }
+}
+
+pub fn global_saga_choreography_bus() -> SagaChoreographyBus {
+    static BUS: OnceLock<SagaChoreographyBus> = OnceLock::new();
+    BUS.get_or_init(SagaChoreographyBus::new).clone()
 }
 
 impl Clone for SagaChoreographyBus {

@@ -76,6 +76,17 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
         &mut self.saga_support_mut().dependency_fired
     }
 
+    /// Returns mutable access to terminal saga latches.
+    fn terminal_sagas(&mut self) -> &mut HashSet<SagaId> {
+        &mut self.saga_support_mut().terminal_sagas
+    }
+
+    /// Returns true when this participant has already observed terminal saga state
+    /// for the given saga id and should ignore late replays until a new SagaStarted resets it.
+    fn is_terminal_saga_latched(&self, saga_id: SagaId) -> bool {
+        self.saga_support().terminal_sagas.contains(&saga_id)
+    }
+
     /// Returns the participant journal for event persistence.
     ///
     /// The journal is used to durably record saga events for recovery

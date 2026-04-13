@@ -64,6 +64,17 @@ pub fn handle_saga_event_with_emit<P, F>(
         return;
     }
 
+    let is_saga_started = matches!(event, SagaChoreographyEvent::SagaStarted { .. });
+    if !is_saga_started && participant.is_terminal_saga_latched(context.saga_id) {
+        eprintln!(
+            "[saga-helper] participant_step={} ignored post-terminal replay type={} saga_id={}",
+            participant.step_name(),
+            event.event_type(),
+            context.saga_id.get()
+        );
+        return;
+    }
+
     // Idempotency check
     let dedupe_key = dedupe_key_for_event(&event);
     if !participant.check_dedupe(context.saga_id, &dedupe_key) {
@@ -91,6 +102,7 @@ pub fn handle_saga_event_with_emit<P, F>(
             // A new saga run may legitimately reuse a saga_id after process restart.
             // Reset per-saga in-memory dependency/state tracking so old runs cannot
             // satisfy dependencies for the new run.
+            participant.terminal_sagas().remove(&context.saga_id);
             participant.saga_states().remove(&context.saga_id);
             participant
                 .dependency_completions()
@@ -103,6 +115,7 @@ pub fn handle_saga_event_with_emit<P, F>(
             // Even when this participant does not execute on saga start, clear stale
             // dependency/state entries for this saga id so downstream dependency checks
             // are scoped to the current run.
+            participant.terminal_sagas().remove(&context.saga_id);
             participant.saga_states().remove(&context.saga_id);
             participant
                 .dependency_completions()
@@ -151,11 +164,13 @@ pub fn handle_saga_event_with_emit<P, F>(
         }
 
         SagaChoreographyEvent::SagaCompleted { .. } => {
+            participant.terminal_sagas().insert(context.saga_id);
             participant.on_saga_completed(&context);
             participant.prune_saga(context.saga_id);
         }
 
         SagaChoreographyEvent::SagaFailed { reason, .. } => {
+            participant.terminal_sagas().insert(context.saga_id);
             participant.on_saga_failed(&context, &reason);
             participant.prune_saga(context.saga_id);
         }
@@ -202,6 +217,17 @@ pub async fn handle_async_saga_event_with_emit<P, F>(
         return;
     }
 
+    let is_saga_started = matches!(event, SagaChoreographyEvent::SagaStarted { .. });
+    if !is_saga_started && participant.is_terminal_saga_latched(context.saga_id) {
+        eprintln!(
+            "[saga-helper] participant_step={} ignored post-terminal replay type={} saga_id={}",
+            participant.step_name(),
+            event.event_type(),
+            context.saga_id.get()
+        );
+        return;
+    }
+
     let dedupe_key = dedupe_key_for_event(&event);
     if !participant.check_dedupe(context.saga_id, &dedupe_key) {
         eprintln!(
@@ -225,6 +251,7 @@ pub async fn handle_async_saga_event_with_emit<P, F>(
         SagaChoreographyEvent::SagaStarted { payload, .. }
             if participant.depends_on().is_on_saga_start() =>
         {
+            participant.terminal_sagas().remove(&context.saga_id);
             participant.saga_states().remove(&context.saga_id);
             participant
                 .dependency_completions()
@@ -240,6 +267,7 @@ pub async fn handle_async_saga_event_with_emit<P, F>(
             .await;
         }
         SagaChoreographyEvent::SagaStarted { .. } => {
+            participant.terminal_sagas().remove(&context.saga_id);
             participant.saga_states().remove(&context.saga_id);
             participant
                 .dependency_completions()
@@ -292,10 +320,12 @@ pub async fn handle_async_saga_event_with_emit<P, F>(
             }
         }
         SagaChoreographyEvent::SagaCompleted { .. } => {
+            participant.terminal_sagas().insert(context.saga_id);
             participant.on_saga_completed(&context);
             participant.prune_saga(context.saga_id);
         }
         SagaChoreographyEvent::SagaFailed { reason, .. } => {
+            participant.terminal_sagas().insert(context.saga_id);
             participant.on_saga_failed(&context, &reason);
             participant.prune_saga(context.saga_id);
         }
@@ -340,7 +370,7 @@ where
                     return false;
                 }
             }
-            true
+            participant.dependency_fired().insert(saga_id)
         }
     }
 }
@@ -382,7 +412,7 @@ where
                     return false;
                 }
             }
-            true
+            participant.dependency_fired().insert(saga_id)
         }
     }
 }

@@ -20,6 +20,7 @@ where
     pub saga_states: HashMap<SagaId, SagaStateEntry>,
     pub dependency_completions: HashMap<SagaId, HashSet<Box<str>>>,
     pub dependency_fired: HashSet<SagaId>,
+    pub terminal_sagas: HashSet<SagaId>,
     pub journal: J,
     pub dedupe: D,
     pub stats: ParticipantStats,
@@ -37,6 +38,7 @@ where
             saga_states: HashMap::new(),
             dependency_completions: HashMap::new(),
             dependency_fired: HashSet::new(),
+            terminal_sagas: HashSet::new(),
             journal,
             dedupe,
             stats: ParticipantStats::new(),
@@ -78,6 +80,7 @@ where
                 &self.dependency_completions.len(),
             )
             .field("dependency_fired_len", &self.dependency_fired.len())
+            .field("terminal_sagas_len", &self.terminal_sagas.len())
             .field(
                 "startup_recovery_events_len",
                 &self.startup_recovery_events.len(),

@@ -68,7 +68,7 @@ mod testkit;
 // === Re-exports ===
 
 // Types
-pub use bus::SagaChoreographyBus;
+pub use bus::{global_saga_choreography_bus, SagaChoreographyBus};
 pub use context::{PeerId, SagaContext, SagaId, StepId};
 pub use durability::*;
 pub use idempotency::IdempotencyKey;
