@@ -144,14 +144,13 @@ impl SagaChoreographyBus {
         &self,
         saga_id: SagaId,
     ) -> Option<crate::SagaTerminalOutcome> {
-        self.take_terminal_reply(saga_id)
-            .map(|reply| reply.outcome)
-            .or_else(|| {
-                self.terminal_outcomes
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(&saga_id)
-            })
+        let reply = self.take_terminal_reply(saga_id).map(|reply| reply.outcome);
+        let direct = self
+            .terminal_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&saga_id);
+        reply.or(direct)
     }
 
     fn complete_terminal_reply_from_event(
