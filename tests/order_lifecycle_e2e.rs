@@ -9,6 +9,7 @@
 //! panics, idempotency, dependency gating, and terminal latch.
 
 use std::collections::HashSet;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use icanact_core::local_sync;
@@ -79,6 +80,60 @@ impl TerminalProbe {
         Self {
             counts: TerminalCounts::default(),
         }
+    }
+}
+
+struct SpawnedParticipant {
+    bus: SagaChoreographyBus,
+    subscriptions: Vec<icanact_core::local::EventSubscription>,
+    handle: Option<local_sync::ActorHandle>,
+}
+
+impl SpawnedParticipant {
+    fn shutdown(mut self) {
+        self.teardown();
+    }
+
+    fn teardown(&mut self) {
+        for sub in self.subscriptions.drain(..) {
+            let _ = self.bus.unsubscribe(sub);
+        }
+        if let Some(handle) = self.handle.take() {
+            handle.shutdown();
+        }
+    }
+}
+
+impl Drop for SpawnedParticipant {
+    fn drop(&mut self) {
+        self.teardown();
+    }
+}
+
+struct SpawnedTerminalProbe {
+    bus: SagaChoreographyBus,
+    subscription: Option<icanact_core::local::EventSubscription>,
+    handle: Option<local_sync::ActorHandle>,
+}
+
+impl SpawnedTerminalProbe {
+    fn shutdown(mut self) {
+        self.teardown();
+    }
+
+    fn teardown(&mut self) {
+        if let Some(sub) = self.subscription.take() {
+            let _ = self.bus.unsubscribe(sub);
+        }
+        if let Some(handle) = self.handle.take() {
+            handle.shutdown();
+        }
+    }
+}
+
+impl Drop for SpawnedTerminalProbe {
+    fn drop(&mut self) {
+        self.teardown();
     }
 }
 
@@ -315,6 +370,14 @@ fn test_policy() -> TerminalPolicy {
 /// With N subscribers, a single publish can generate O(N^2) messages per actor.
 const MAILBOX_CAPACITY: usize = 512;
 
+fn suite_guard() -> MutexGuard<'static, ()> {
+    static SUITE_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    match SUITE_MUTEX.get_or_init(|| Mutex::new(())).lock() {
+        Ok(guard) => guard,
+        Err(err) => err.into_inner(),
+    }
+}
+
 /// Spawn a participant as a real SyncActor, subscribe it to the bus, return the actor ref.
 fn spawn_and_subscribe(
     world: &TestWorld,
@@ -322,7 +385,7 @@ fn spawn_and_subscribe(
     mut participant: ConfigurableParticipant,
 ) -> (
     local_sync::SyncActorRef<ConfigurableParticipant>,
-    local_sync::ActorHandle,
+    SpawnedParticipant,
 ) {
     participant.attach_bus(bus.clone());
     let opts = local_sync::SpawnOpts {
@@ -339,8 +402,14 @@ fn spawn_and_subscribe(
         MAILBOX_CAPACITY,
     )
     .expect("participant saga channel should bind");
-    let _ = Box::leak(Box::new(subscriptions));
-    (actor_ref, handle)
+    (
+        actor_ref,
+        SpawnedParticipant {
+            bus: bus.clone(),
+            subscriptions,
+            handle: Some(handle),
+        },
+    )
 }
 
 fn spawn_terminal_probe(
@@ -348,7 +417,7 @@ fn spawn_terminal_probe(
     bus: &SagaChoreographyBus,
 ) -> (
     local_sync::SyncActorRef<TerminalProbe>,
-    local_sync::ActorHandle,
+    SpawnedTerminalProbe,
 ) {
     let opts = local_sync::SpawnOpts {
         mailbox_capacity: MAILBOX_CAPACITY,
@@ -357,11 +426,18 @@ fn spawn_terminal_probe(
     let (probe_ref, handle) = world.spawn_sync_with_opts(TerminalProbe::new(), opts);
     handle.wait_for_startup();
     let ref_clone = probe_ref.clone();
-    let _probe = bus.subscribe_saga_type_fn(SAGA_TYPE, move |event: &SagaChoreographyEvent| {
+    let probe = bus.subscribe_saga_type_fn(SAGA_TYPE, move |event: &SagaChoreographyEvent| {
         let _ = ref_clone.try_tell(TerminalProbeMsg(event.clone()));
         true
     });
-    (probe_ref, handle)
+    (
+        probe_ref,
+        SpawnedTerminalProbe {
+            bus: bus.clone(),
+            subscription: Some(probe),
+            handle: Some(handle),
+        },
+    )
 }
 
 /// Query a participant's state via ask.
@@ -389,16 +465,13 @@ fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) {
     panic!("wait_until timed out after {timeout:?}");
 }
 
-fn shutdown(handle: local_sync::ActorHandle) {
-    handle.shutdown();
-}
-
 // ===========================================================================
 // Test 1: Happy Path
 // ===========================================================================
 
 #[test]
 fn all_succeed_saga_completed() {
+    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = SagaChoreographyBus::new();
 
@@ -463,10 +536,10 @@ fn all_succeed_saga_completed() {
             compensated_count: 0
         }
     );
-    shutdown(p_h);
-    shutdown(b_h);
-    shutdown(o_h);
-    shutdown(terminal_h);
+    p_h.shutdown();
+    b_h.shutdown();
+    o_h.shutdown();
+    terminal_h.shutdown();
 }
 
 // ===========================================================================
@@ -475,6 +548,7 @@ fn all_succeed_saga_completed() {
 
 #[test]
 fn position_fails_terminal_no_compensation() {
+    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = SagaChoreographyBus::new();
     let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
@@ -537,10 +611,10 @@ fn position_fails_terminal_no_compensation() {
             compensated_count: 0
         }
     ); // Never fires
-    shutdown(p_h);
-    shutdown(b_h);
-    shutdown(o_h);
-    shutdown(terminal_h);
+    p_h.shutdown();
+    b_h.shutdown();
+    o_h.shutdown();
+    terminal_h.shutdown();
 }
 
 // ===========================================================================
@@ -549,6 +623,7 @@ fn position_fails_terminal_no_compensation() {
 
 #[test]
 fn balance_fails_terminal_after_position_succeeds() {
+    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = SagaChoreographyBus::new();
     let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
@@ -603,10 +678,10 @@ fn balance_fails_terminal_after_position_succeeds() {
             compensated_count: 0
         }
     );
-    shutdown(p_h);
-    shutdown(b_h);
-    shutdown(o_h);
-    shutdown(terminal_h);
+    p_h.shutdown();
+    b_h.shutdown();
+    o_h.shutdown();
+    terminal_h.shutdown();
 }
 
 // ===========================================================================
@@ -615,6 +690,7 @@ fn balance_fails_terminal_after_position_succeeds() {
 
 #[test]
 fn order_fails_terminal_after_both_succeed() {
+    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = SagaChoreographyBus::new();
     let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
@@ -669,10 +745,10 @@ fn order_fails_terminal_after_both_succeed() {
             compensated_count: 0
         }
     );
-    shutdown(p_h);
-    shutdown(b_h);
-    shutdown(o_h);
-    shutdown(terminal_h);
+    p_h.shutdown();
+    b_h.shutdown();
+    o_h.shutdown();
+    terminal_h.shutdown();
 }
 
 // ===========================================================================
@@ -681,6 +757,7 @@ fn order_fails_terminal_after_both_succeed() {
 
 #[test]
 fn order_fails_require_compensation_triggers_full_compensation() {
+    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = SagaChoreographyBus::new();
     let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
@@ -727,10 +804,10 @@ fn order_fails_require_compensation_triggers_full_compensation() {
     assert_eq!(p.compensated_count, 1, "position should be compensated");
     assert_eq!(b.compensated_count, 1, "balance should be compensated");
     assert_eq!(o.compensated_count, 0, "order is Failed, not Completed");
-    shutdown(p_h);
-    shutdown(b_h);
-    shutdown(o_h);
-    shutdown(terminal_h);
+    p_h.shutdown();
+    b_h.shutdown();
+    o_h.shutdown();
+    terminal_h.shutdown();
 }
 
 // ===========================================================================
@@ -739,6 +816,7 @@ fn order_fails_require_compensation_triggers_full_compensation() {
 
 #[test]
 fn position_compensation_fails_terminal_causes_saga_failed() {
+    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = SagaChoreographyBus::new();
     let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
@@ -752,43 +830,41 @@ fn position_compensation_fails_terminal_causes_saga_failed() {
                 reason: "cannot undo position".into(),
             })),
     );
-    let (_b_ref, b_h) = spawn_and_subscribe(
-        &world,
-        &bus,
-        ConfigurableParticipant::new(STEP_BALANCE, DependencySpec::OnSagaStart)
-            .with_execute_result(Err(require_compensation_error("balance check fatal"))),
-    );
-    let (_o_ref, o_h) = spawn_and_subscribe(
-        &world,
-        &bus,
-        ConfigurableParticipant::new(
-            STEP_ORDER,
-            DependencySpec::AllOf(&[STEP_POSITION, STEP_BALANCE]),
-        ),
-    );
-
     let ctx = context_for(6);
     let _ = bus.publish(SagaChoreographyEvent::SagaStarted {
-        context: ctx,
+        context: ctx.clone(),
         payload: vec![42],
     });
 
-    wait_until(TIMEOUT, || {
-        let counts = query_terminal_counts(&terminal_ref);
-        counts.failed >= 1 || counts.quarantined >= 1
+    wait_until(TIMEOUT, || query_state(&p_ref).executed_count >= 1);
+
+    let _ = bus.publish(SagaChoreographyEvent::StepFailed {
+        context: ctx.next_step(STEP_BALANCE.into()),
+        participant_id: STEP_BALANCE.into(),
+        error_code: None,
+        error: "balance check fatal".into(),
+        requires_compensation: true,
     });
+
+    wait_until(TIMEOUT, || query_terminal_counts(&terminal_ref).failed >= 1);
 
     wait_until(TIMEOUT, || query_state(&p_ref).compensated_count >= 1);
 
+    assert_eq!(
+        query_terminal_counts(&terminal_ref),
+        TerminalCounts {
+            completed: 0,
+            failed: 1,
+            quarantined: 0,
+        }
+    );
     assert_eq!(
         query_state(&p_ref).compensated_count,
         1,
         "compensation attempted"
     );
-    shutdown(p_h);
-    shutdown(b_h);
-    shutdown(o_h);
-    shutdown(terminal_h);
+    p_h.shutdown();
+    terminal_h.shutdown();
 }
 
 // ===========================================================================
@@ -797,6 +873,7 @@ fn position_compensation_fails_terminal_causes_saga_failed() {
 
 #[test]
 fn balance_compensation_fails_ambiguous_causes_quarantine() {
+    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = SagaChoreographyBus::new();
     let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
@@ -834,10 +911,10 @@ fn balance_compensation_fails_ambiguous_causes_quarantine() {
     wait_until(TIMEOUT, || {
         query_terminal_counts(&terminal_ref).quarantined >= 1
     });
-    shutdown(p_h);
-    shutdown(b_h);
-    shutdown(o_h);
-    shutdown(terminal_h);
+    p_h.shutdown();
+    b_h.shutdown();
+    o_h.shutdown();
+    terminal_h.shutdown();
 }
 
 // ===========================================================================
@@ -846,6 +923,7 @@ fn balance_compensation_fails_ambiguous_causes_quarantine() {
 
 #[test]
 fn balance_compensation_fails_safe_to_retry_causes_failed() {
+    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = SagaChoreographyBus::new();
     let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
@@ -881,10 +959,18 @@ fn balance_compensation_fails_safe_to_retry_causes_failed() {
     });
 
     wait_until(TIMEOUT, || query_terminal_counts(&terminal_ref).failed >= 1);
-    shutdown(p_h);
-    shutdown(b_h);
-    shutdown(o_h);
-    shutdown(terminal_h);
+    assert_eq!(
+        query_terminal_counts(&terminal_ref),
+        TerminalCounts {
+            completed: 0,
+            failed: 1,
+            quarantined: 0,
+        }
+    );
+    p_h.shutdown();
+    b_h.shutdown();
+    o_h.shutdown();
+    terminal_h.shutdown();
 }
 
 // ===========================================================================
@@ -893,6 +979,7 @@ fn balance_compensation_fails_safe_to_retry_causes_failed() {
 
 #[test]
 fn position_panics_emits_quarantined() {
+    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = SagaChoreographyBus::new();
     let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
@@ -934,9 +1021,9 @@ fn position_panics_emits_quarantined() {
         query_terminal_counts(&terminal_ref).quarantined >= 1
     });
     assert!(query_terminal_counts(&terminal_ref).quarantined >= 1);
-    shutdown(b_h);
-    shutdown(o_h);
-    shutdown(terminal_h);
+    b_h.shutdown();
+    o_h.shutdown();
+    terminal_h.shutdown();
 }
 
 // ===========================================================================
@@ -945,6 +1032,7 @@ fn position_panics_emits_quarantined() {
 
 #[test]
 fn balance_panics_after_position_succeeds() {
+    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = SagaChoreographyBus::new();
     let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
@@ -993,9 +1081,9 @@ fn balance_panics_after_position_succeeds() {
         query_terminal_counts(&terminal_ref).quarantined >= 1
     });
     assert_eq!(query_state(&p_ref).executed_count, 1);
-    shutdown(p_h);
-    shutdown(o_h);
-    shutdown(terminal_h);
+    p_h.shutdown();
+    o_h.shutdown();
+    terminal_h.shutdown();
 }
 
 // ===========================================================================
@@ -1004,6 +1092,7 @@ fn balance_panics_after_position_succeeds() {
 
 #[test]
 fn order_panics_after_both_succeed() {
+    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = SagaChoreographyBus::new();
     let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
@@ -1065,9 +1154,9 @@ fn order_panics_after_both_succeed() {
         0,
         "no compensation from panic"
     );
-    shutdown(p_h);
-    shutdown(b_h);
-    shutdown(terminal_h);
+    p_h.shutdown();
+    b_h.shutdown();
+    terminal_h.shutdown();
 }
 
 // ===========================================================================
@@ -1076,6 +1165,7 @@ fn order_panics_after_both_succeed() {
 
 #[test]
 fn duplicate_saga_started_is_deduped() {
+    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = SagaChoreographyBus::new();
     let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
@@ -1115,10 +1205,10 @@ fn duplicate_saga_started_is_deduped() {
     assert_eq!(query_state(&p_ref).executed_count, 1);
     assert_eq!(query_state(&b_ref).executed_count, 1);
     assert_eq!(query_state(&o_ref).executed_count, 1);
-    shutdown(p_h);
-    shutdown(b_h);
-    shutdown(o_h);
-    shutdown(terminal_h);
+    p_h.shutdown();
+    b_h.shutdown();
+    o_h.shutdown();
+    terminal_h.shutdown();
 }
 
 // ===========================================================================
@@ -1127,6 +1217,7 @@ fn duplicate_saga_started_is_deduped() {
 
 #[test]
 fn order_does_not_fire_on_partial_dependency() {
+    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = SagaChoreographyBus::new();
 
@@ -1170,7 +1261,7 @@ fn order_does_not_fire_on_partial_dependency() {
         1,
         "should fire once both dependencies met"
     );
-    shutdown(o_h);
+    o_h.shutdown();
 }
 
 // ===========================================================================
@@ -1179,6 +1270,7 @@ fn order_does_not_fire_on_partial_dependency() {
 
 #[test]
 fn terminal_latch_prevents_duplicate_events() {
+    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = SagaChoreographyBus::new();
     let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
@@ -1228,10 +1320,10 @@ fn terminal_latch_prevents_duplicate_events() {
         1,
         "terminal latch should prevent duplicates"
     );
-    shutdown(p_h);
-    shutdown(b_h);
-    shutdown(o_h);
-    shutdown(terminal_h);
+    p_h.shutdown();
+    b_h.shutdown();
+    o_h.shutdown();
+    terminal_h.shutdown();
 }
 
 // ===========================================================================
@@ -1240,6 +1332,7 @@ fn terminal_latch_prevents_duplicate_events() {
 
 #[test]
 fn duplicate_dependency_completion_after_order_executes_is_deduped() {
+    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = SagaChoreographyBus::new();
     let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
@@ -1289,10 +1382,10 @@ fn duplicate_dependency_completion_after_order_executes_is_deduped() {
         "duplicate dependency replay must not re-execute the dependent actor"
     );
     assert_eq!(query_terminal_counts(&terminal_ref).completed, 1);
-    shutdown(p_h);
-    shutdown(b_h);
-    shutdown(o_h);
-    shutdown(terminal_h);
+    p_h.shutdown();
+    b_h.shutdown();
+    o_h.shutdown();
+    terminal_h.shutdown();
 }
 
 // ===========================================================================
@@ -1301,6 +1394,7 @@ fn duplicate_dependency_completion_after_order_executes_is_deduped() {
 
 #[test]
 fn duplicate_compensation_request_is_deduped() {
+    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = SagaChoreographyBus::new();
 
@@ -1334,7 +1428,7 @@ fn duplicate_compensation_request_is_deduped() {
         1,
         "duplicate compensation requests must not re-run compensation"
     );
-    shutdown(p_h);
+    p_h.shutdown();
 }
 
 // ===========================================================================
@@ -1343,6 +1437,7 @@ fn duplicate_compensation_request_is_deduped() {
 
 #[test]
 fn duplicate_position_approval_before_balance_keeps_order_exactly_once() {
+    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = SagaChoreographyBus::new();
 
@@ -1403,9 +1498,9 @@ fn duplicate_position_approval_before_balance_keeps_order_exactly_once() {
 
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(query_state(&o_ref).executed_count, 1);
-    shutdown(p_h);
-    shutdown(b_h);
-    shutdown(o_h);
+    p_h.shutdown();
+    b_h.shutdown();
+    o_h.shutdown();
 }
 
 // ===========================================================================
@@ -1414,6 +1509,7 @@ fn duplicate_position_approval_before_balance_keeps_order_exactly_once() {
 
 #[test]
 fn duplicate_balance_approval_before_position_keeps_order_exactly_once() {
+    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = SagaChoreographyBus::new();
 
@@ -1474,9 +1570,9 @@ fn duplicate_balance_approval_before_position_keeps_order_exactly_once() {
 
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(query_state(&o_ref).executed_count, 1);
-    shutdown(p_h);
-    shutdown(b_h);
-    shutdown(o_h);
+    p_h.shutdown();
+    b_h.shutdown();
+    o_h.shutdown();
 }
 
 // ===========================================================================
@@ -1485,6 +1581,7 @@ fn duplicate_balance_approval_before_position_keeps_order_exactly_once() {
 
 #[test]
 fn duplicate_both_approvals_still_produce_single_order_execution() {
+    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = SagaChoreographyBus::new();
     let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
@@ -1544,8 +1641,8 @@ fn duplicate_both_approvals_still_produce_single_order_execution() {
     assert_eq!(query_state(&b_ref).executed_count, 1);
     assert_eq!(query_state(&o_ref).executed_count, 1);
     assert_eq!(query_terminal_counts(&terminal_ref).completed, 1);
-    shutdown(p_h);
-    shutdown(b_h);
-    shutdown(o_h);
-    shutdown(terminal_h);
+    p_h.shutdown();
+    b_h.shutdown();
+    o_h.shutdown();
+    terminal_h.shutdown();
 }

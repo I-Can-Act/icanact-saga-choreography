@@ -1,9 +1,11 @@
 //! Test helpers for participant choreography tests.
 
 use crate::{
+    apply_sync_workflow_participant_saga_ingress, bind_async_participant_channel,
+    bind_sync_participant_channel, bind_sync_workflow_participant_channel,
+    checked_workflow_saga_types, handle_saga_event, HasSagaWorkflowParticipants,
     SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant,
     SagaParticipantChannel, SagaStateExt, SagaTerminalOutcome, TerminalPolicy,
-    bind_async_participant_channel, bind_sync_participant_channel, handle_saga_event,
 };
 
 /// Small deterministic builder for saga test contexts.
@@ -93,7 +95,6 @@ pub fn step_completed(
 pub fn step_failed(
     context: SagaContext,
     error: impl Into<String>,
-    will_retry: bool,
     requires_compensation: bool,
 ) -> SagaChoreographyEvent {
     SagaChoreographyEvent::StepFailed {
@@ -101,7 +102,6 @@ pub fn step_failed(
         participant_id: "testkit".into(),
         error_code: None,
         error: error.into().into_boxed_str(),
-        will_retry,
         requires_compensation,
     }
 }
@@ -132,6 +132,18 @@ pub fn drive_scenario<P>(
 {
     for event in events {
         handle_saga_event(participant, event);
+    }
+}
+
+/// Replay a deterministic event sequence against a workflow-scoped participant actor.
+pub fn drive_workflow_scenario<A>(
+    actor: &mut A,
+    events: impl IntoIterator<Item = SagaChoreographyEvent>,
+) where
+    A: crate::HasSagaParticipantSupport + HasSagaWorkflowParticipants + Send + 'static,
+{
+    for event in events {
+        apply_sync_workflow_participant_saga_ingress(actor, event, |_actor, _event| {}, |_| {});
     }
 }
 
@@ -375,6 +387,41 @@ impl SagaTestWorld {
             channel_capacity,
         )
         .expect("sync participant saga channel binding should succeed");
+        for sub in subs {
+            self.remember_subscription(sub);
+        }
+        SyncSagaParticipantHandle { actor_ref, handle }
+    }
+
+    pub fn spawn_sync_workflow_channel_participant<A, C>(
+        &self,
+        mut actor: A,
+        channel_name: &str,
+        channel_capacity: usize,
+    ) -> SyncSagaParticipantHandle<A>
+    where
+        A: icanact_core::local_sync::SyncActor
+            + HasSagaParticipantSupport
+            + HasSagaWorkflowParticipants,
+        A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
+        <A as icanact_core::local_sync::SyncActor>::Channel: From<SagaParticipantChannel<C>>,
+        C: Send + 'static,
+    {
+        actor.attach_saga_bus(self.bus.clone());
+        let saga_types = checked_workflow_saga_types::<A>()
+            .expect("workflow participant saga type registration should be valid");
+        for saga_type in &saga_types {
+            self.ensure_capture_saga_type(saga_type);
+        }
+
+        let (actor_ref, handle) = icanact_core::local_sync::spawn(actor);
+        let subs = bind_sync_workflow_participant_channel::<A, C>(
+            &self.bus,
+            &actor_ref,
+            channel_name,
+            channel_capacity,
+        )
+        .expect("sync workflow participant saga channel binding should succeed");
         for sub in subs {
             self.remember_subscription(sub);
         }

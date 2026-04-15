@@ -1,11 +1,10 @@
 //! Helper functions for saga handling
 
 use crate::{
-    AsyncSagaParticipant, Compensating, CompensationError, Completed, DependencySpec, Executing,
-    ParticipantEvent, ParticipantJournal, SagaChoreographyEvent, SagaContext, SagaId,
-    SagaParticipant, SagaParticipantState, SagaStateEntry, SagaStateExt, StepError, StepOutput,
+    AsyncSagaParticipant, CompensationError, DependencySpec, ParticipantEvent, ParticipantJournal,
+    SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant, SagaParticipantState,
+    SagaStateEntry, SagaStateExt, StepError, StepOutput,
 };
-use std::sync::atomic::Ordering;
 
 /// Default saga event handler.
 ///
@@ -478,18 +477,6 @@ where
     execute_step_wrapper_with_emit(participant, context, input, now, &mut ignore_emit);
 }
 
-pub async fn execute_step_wrapper_async<P>(
-    participant: &mut P,
-    context: SagaContext,
-    input: Vec<u8>,
-    now: u64,
-) where
-    P: AsyncSagaParticipant + SagaStateExt,
-{
-    let mut ignore_emit = |_| {};
-    execute_step_wrapper_with_emit_async(participant, context, input, now, &mut ignore_emit).await;
-}
-
 fn execute_step_wrapper_with_emit<P, F>(
     participant: &mut P,
     context: SagaContext,
@@ -708,17 +695,12 @@ fn fail_step<P, F>(
 {
     let saga_id = context.saga_id;
     let (reason, requires_comp) = match error {
-        StepError::Retriable { reason } => {
-            // TODO: Handle retry with backoff
-            return;
-        }
         StepError::Terminal { reason } => (reason, false),
         StepError::RequireCompensation { reason } => (reason, true),
     };
 
     // State: Executing -> Failed
     if let Some(SagaStateEntry::Executing(state)) = participant.saga_states().remove(&saga_id) {
-        use crate::state::Failed;
         let new_state = state.fail(reason.clone(), requires_comp, now);
         participant
             .saga_states()
@@ -740,7 +722,6 @@ fn fail_step<P, F>(
         participant_id: participant.participant_id_owned(),
         error_code: None,
         error: reason,
-        will_retry: false,
         requires_compensation: requires_comp,
     });
 }
@@ -757,7 +738,6 @@ fn fail_step_async<P, F>(
 {
     let saga_id = context.saga_id;
     let (reason, requires_comp) = match error {
-        StepError::Retriable { reason } => return,
         StepError::Terminal { reason } => (reason, false),
         StepError::RequireCompensation { reason } => (reason, true),
     };
@@ -783,7 +763,6 @@ fn fail_step_async<P, F>(
         participant_id: participant.participant_id_owned(),
         error_code: None,
         error: reason,
-        will_retry: false,
         requires_compensation: requires_comp,
     });
 }
@@ -795,14 +774,6 @@ where
 {
     let mut ignore_emit = |_| {};
     compensate_wrapper_with_emit(participant, context, now, &mut ignore_emit);
-}
-
-pub async fn compensate_wrapper_async<P>(participant: &mut P, context: &SagaContext, now: u64)
-where
-    P: AsyncSagaParticipant + SagaStateExt,
-{
-    let mut ignore_emit = |_| {};
-    compensate_wrapper_with_emit_async(participant, context, now, &mut ignore_emit).await;
 }
 
 fn compensate_wrapper_with_emit<P, F>(
@@ -891,7 +862,6 @@ where
 
     // State: Compensating -> Compensated
     if let Some(SagaStateEntry::Compensating(state)) = participant.saga_states().remove(&saga_id) {
-        use crate::state::Compensated;
         let new_state = state.complete_compensation(now);
         participant
             .saga_states()
@@ -966,7 +936,6 @@ fn fail_compensation<P, F>(
 
     // State: Compensating -> Quarantined
     if let Some(SagaStateEntry::Compensating(state)) = participant.saga_states().remove(&saga_id) {
-        use crate::state::Quarantined;
         let new_state = state.quarantine(reason.clone(), now);
         participant
             .saga_states()
@@ -989,12 +958,14 @@ fn fail_compensation<P, F>(
         error: reason.clone(),
         is_ambiguous,
     });
-    emit(SagaChoreographyEvent::SagaQuarantined {
-        context: event_context,
-        reason: reason.clone(),
-        step: participant.step_name().into(),
-        participant_id: participant.participant_id_owned(),
-    });
+    if is_ambiguous {
+        emit(SagaChoreographyEvent::SagaQuarantined {
+            context: event_context,
+            reason: reason.clone(),
+            step: participant.step_name().into(),
+            participant_id: participant.participant_id_owned(),
+        });
+    }
 
     // Notify
     participant.on_quarantined(context, &reason);
@@ -1039,12 +1010,14 @@ fn fail_compensation_async<P, F>(
         error: reason.clone(),
         is_ambiguous,
     });
-    emit(SagaChoreographyEvent::SagaQuarantined {
-        context: event_context,
-        reason: reason.clone(),
-        step: participant.step_name().into(),
-        participant_id: participant.participant_id_owned(),
-    });
+    if is_ambiguous {
+        emit(SagaChoreographyEvent::SagaQuarantined {
+            context: event_context,
+            reason: reason.clone(),
+            step: participant.step_name().into(),
+            participant_id: participant.participant_id_owned(),
+        });
+    }
 
     participant.on_quarantined(context, &reason);
 }
@@ -1132,7 +1105,7 @@ impl RebuiltState {
 mod tests {
     use crate::{
         DeterministicContextBuilder, HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal,
-        SagaContext, SagaId, SagaParticipantSupport,
+        SagaContext, SagaParticipantSupport,
     };
 
     use super::*;
@@ -1428,7 +1401,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_saga_event_with_emit_emits_compensation_terminal_signals() {
+    fn handle_saga_event_with_emit_emits_non_ambiguous_compensation_failure_only() {
         let mut participant = TestParticipant {
             compensation_error: Some(CompensationError::Terminal {
                 reason: "cannot compensate".into(),
@@ -1451,10 +1424,44 @@ mod tests {
             |event| emitted.push(event),
         );
 
-        assert_eq!(emitted.len(), 2);
+        assert_eq!(emitted.len(), 1);
         assert!(matches!(
             emitted.first(),
             Some(SagaChoreographyEvent::CompensationFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn handle_saga_event_with_emit_emits_quarantine_for_ambiguous_compensation_failure() {
+        let mut participant = TestParticipant {
+            compensation_error: Some(CompensationError::Ambiguous {
+                reason: "cannot confirm rollback".into(),
+            }),
+            ..TestParticipant::default()
+        };
+        let started = started_event();
+        let context = started.context().clone();
+        let mut emitted = Vec::new();
+
+        handle_saga_event_with_emit(&mut participant, started, |_| {});
+        handle_saga_event_with_emit(
+            &mut participant,
+            SagaChoreographyEvent::CompensationRequested {
+                context,
+                failed_step: "risk_check".into(),
+                reason: "failed downstream".into(),
+                steps_to_compensate: vec!["risk_check".into()],
+            },
+            |event| emitted.push(event),
+        );
+
+        assert_eq!(emitted.len(), 2);
+        assert!(matches!(
+            emitted.first(),
+            Some(SagaChoreographyEvent::CompensationFailed {
+                is_ambiguous: true,
+                ..
+            })
         ));
         assert!(matches!(
             emitted.get(1),
@@ -1475,7 +1482,9 @@ mod tests {
         handle_saga_event_with_emit(
             &mut participant,
             SagaChoreographyEvent::SagaQuarantined {
-                context: DeterministicContextBuilder::default().with_saga_id(saga_id.get()).build(),
+                context: DeterministicContextBuilder::default()
+                    .with_saga_id(saga_id.get())
+                    .build(),
                 reason: "panic".into(),
                 step: "risk_check".into(),
                 participant_id: "risk_check".into(),

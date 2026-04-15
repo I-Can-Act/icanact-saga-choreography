@@ -1,6 +1,9 @@
 use icanact_core::local::EventSubscription;
 
-use crate::{SagaChoreographyBus, SagaChoreographyEvent};
+use crate::{
+    HasSagaWorkflowParticipants, SagaChoreographyBus, SagaChoreographyEvent,
+    SagaWorkflowParticipant,
+};
 
 #[derive(Clone, Debug)]
 pub enum SagaParticipantChannel<C> {
@@ -12,6 +15,40 @@ impl<C> From<C> for SagaParticipantChannel<C> {
     fn from(value: C) -> Self {
         Self::Business(value)
     }
+}
+
+pub fn workflow_saga_types<A>(
+    workflows: &[&'static dyn SagaWorkflowParticipant<A>],
+) -> Vec<&'static str> {
+    let mut saga_types = Vec::new();
+    for workflow in workflows {
+        for saga_type in workflow.saga_types() {
+            if !saga_types.contains(saga_type) {
+                saga_types.push(*saga_type);
+            }
+        }
+    }
+    saga_types
+}
+
+pub fn checked_workflow_saga_types<A>() -> Result<Vec<&'static str>, String>
+where
+    A: HasSagaWorkflowParticipants,
+{
+    let workflows = A::saga_workflows();
+    let mut saga_types = Vec::new();
+    for workflow in workflows {
+        for saga_type in workflow.saga_types() {
+            if saga_types.contains(saga_type) {
+                return Err(format!(
+                    "duplicate workflow registration for saga_type `{saga_type}` on actor type `{}`",
+                    std::any::type_name::<A>()
+                ));
+            }
+            saga_types.push(*saga_type);
+        }
+    }
+    Ok(saga_types)
 }
 
 pub fn bind_sync_participant_channel<A, C>(
@@ -53,6 +90,23 @@ where
             })
         })
         .collect())
+}
+
+pub fn bind_sync_workflow_participant_channel<A, C>(
+    bus: &SagaChoreographyBus,
+    actor_ref: &icanact_core::local_sync::SyncActorRef<A>,
+    channel_name: &str,
+    capacity: usize,
+) -> Result<Vec<EventSubscription>, String>
+where
+    A: icanact_core::local_sync::SyncActor + HasSagaWorkflowParticipants + Send + 'static,
+    <A as icanact_core::local_sync::SyncActor>::Channel: Send + 'static,
+    <A as icanact_core::local_sync::SyncActor>::Channel: From<SagaParticipantChannel<C>>,
+    A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
+    C: Send + 'static,
+{
+    let saga_types = checked_workflow_saga_types::<A>()?;
+    bind_sync_participant_channel::<A, C>(bus, actor_ref, &saga_types, channel_name, capacity)
 }
 
 pub fn bind_async_participant_channel<A, C>(

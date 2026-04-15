@@ -2,9 +2,9 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     handle_async_saga_event_with_emit, handle_saga_event_with_emit, AsyncSagaParticipant,
-    DedupeError, HasSagaParticipantSupport, JournalEntry, JournalError, ParticipantDedupeStore,
+    HasSagaParticipantSupport, HasSagaWorkflowParticipants, JournalEntry, ParticipantDedupeStore,
     ParticipantEvent, ParticipantJournal, SagaChoreographyEvent, SagaContext, SagaId,
-    SagaParticipant, SagaParticipantSupport, SagaStateEntry, SagaStateExt,
+    SagaParticipant, SagaParticipantSupport, SagaStateEntry, SagaStateExt, SagaWorkflowParticipant,
 };
 
 pub const PANIC_QUARANTINE_REASON_PREFIX: &str = "panic_during_active_";
@@ -148,6 +148,521 @@ pub fn apply_sync_participant_saga_ingress_with_hooks<P, FApplyTerminal, FOnInva
     }
 }
 
+fn workflow_for_event<A>(
+    event: &SagaChoreographyEvent,
+) -> Option<&'static dyn SagaWorkflowParticipant<A>>
+where
+    A: HasSagaWorkflowParticipants,
+{
+    let saga_type = event.context().saga_type.as_ref();
+    let mut matches = A::saga_workflows()
+        .iter()
+        .copied()
+        .filter(|workflow| workflow.saga_types().contains(&saga_type));
+    let selected = matches.next();
+    if matches.next().is_some() {
+        panic!(
+            "ambiguous workflow registration for saga_type={} on actor type={}",
+            saga_type,
+            std::any::type_name::<A>()
+        );
+    }
+    selected
+}
+
+pub fn apply_sync_workflow_participant_saga_ingress<A, FApplyTerminal, FOnInvalid>(
+    actor: &mut A,
+    event: SagaChoreographyEvent,
+    apply_terminal_side_effects: FApplyTerminal,
+    on_invalid_transition: FOnInvalid,
+) where
+    A: HasSagaParticipantSupport + HasSagaWorkflowParticipants + Send + 'static,
+    FApplyTerminal: FnMut(&mut A, &SagaChoreographyEvent),
+    FOnInvalid: FnMut(&SagaChoreographyEvent),
+{
+    apply_sync_workflow_participant_saga_ingress_with_hooks(
+        actor,
+        event,
+        apply_terminal_side_effects,
+        on_invalid_transition,
+        |_actor, _event| {},
+    );
+}
+
+pub fn apply_sync_workflow_participant_saga_ingress_with_hooks<
+    A,
+    FApplyTerminal,
+    FOnInvalid,
+    FOnEmitted,
+>(
+    actor: &mut A,
+    event: SagaChoreographyEvent,
+    mut apply_terminal_side_effects: FApplyTerminal,
+    mut on_invalid_transition: FOnInvalid,
+    mut on_emitted_transition: FOnEmitted,
+) where
+    A: HasSagaParticipantSupport + HasSagaWorkflowParticipants + Send + 'static,
+    FApplyTerminal: FnMut(&mut A, &SagaChoreographyEvent),
+    FOnInvalid: FnMut(&SagaChoreographyEvent),
+    FOnEmitted: FnMut(&mut A, &SagaChoreographyEvent),
+{
+    let Some(workflow) = workflow_for_event::<A>(&event) else {
+        return;
+    };
+
+    apply_terminal_side_effects(actor, &event);
+
+    let mut emitted = Vec::new();
+    handle_workflow_saga_event_with_emit(actor, workflow, event, |next_event| {
+        emitted.push(next_event)
+    });
+
+    let saga_bus = actor.saga_support().bus.clone();
+    for next_event in emitted {
+        if !is_valid_emitted_transition(
+            actor.saga_states_ref().get(&next_event.context().saga_id),
+            &next_event,
+        ) {
+            on_invalid_transition(&next_event);
+            continue;
+        }
+
+        on_emitted_transition(actor, &next_event);
+
+        if let Some(bus) = &saga_bus {
+            let _ = bus.publish(next_event);
+        }
+    }
+}
+
+fn handle_workflow_saga_event_with_emit<A, F>(
+    actor: &mut A,
+    workflow: &'static dyn SagaWorkflowParticipant<A>,
+    event: SagaChoreographyEvent,
+    mut emit: F,
+) where
+    A: HasSagaParticipantSupport,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let context = event.context().clone();
+    let now = actor.now_millis();
+
+    if !workflow
+        .saga_types()
+        .iter()
+        .any(|t| *t == context.saga_type.as_ref())
+    {
+        return;
+    }
+
+    let is_saga_started = matches!(event, SagaChoreographyEvent::SagaStarted { .. });
+    if !is_saga_started && actor.is_terminal_saga_latched(context.saga_id) {
+        return;
+    }
+
+    let dedupe_key = workflow_dedupe_key_for_event(&event);
+    if !actor.check_dedupe(context.saga_id, &dedupe_key) {
+        return;
+    }
+
+    match event {
+        SagaChoreographyEvent::SagaStarted { payload, .. }
+            if workflow.depends_on().is_on_saga_start() =>
+        {
+            actor.terminal_sagas().remove(&context.saga_id);
+            actor.saga_states().remove(&context.saga_id);
+            actor.dependency_completions().remove(&context.saga_id);
+            actor.dependency_fired().remove(&context.saga_id);
+            execute_workflow_step_with_emit(
+                actor,
+                workflow,
+                context.clone(),
+                payload,
+                now,
+                &mut emit,
+            );
+        }
+        SagaChoreographyEvent::SagaStarted { .. } => {
+            actor.terminal_sagas().remove(&context.saga_id);
+            actor.saga_states().remove(&context.saga_id);
+            actor.dependency_completions().remove(&context.saga_id);
+            actor.dependency_fired().remove(&context.saga_id);
+        }
+        SagaChoreographyEvent::StepCompleted {
+            context: step_ctx,
+            output,
+            saga_input,
+            ..
+        } => {
+            let dependency_spec = workflow.depends_on();
+            let should_fire = workflow_dependency_should_fire(
+                actor,
+                context.saga_id,
+                &dependency_spec,
+                &step_ctx.step_name,
+            );
+            if should_fire {
+                let next_context = context.next_step(workflow.step_name().into());
+                let input = if dependency_spec.prefers_original_saga_input() {
+                    saga_input
+                } else {
+                    output
+                };
+                execute_workflow_step_with_emit(
+                    actor,
+                    workflow,
+                    next_context,
+                    input,
+                    now,
+                    &mut emit,
+                );
+            }
+        }
+        SagaChoreographyEvent::CompensationRequested {
+            steps_to_compensate,
+            ..
+        } => {
+            if steps_to_compensate.contains(&workflow.step_name().into()) {
+                compensate_workflow_with_emit(actor, workflow, &context, now, &mut emit);
+            }
+        }
+        SagaChoreographyEvent::SagaCompleted { .. } => {
+            actor.terminal_sagas().insert(context.saga_id);
+            workflow.on_saga_completed(actor, &context);
+            actor.prune_saga(context.saga_id);
+        }
+        SagaChoreographyEvent::SagaFailed { reason, .. } => {
+            actor.terminal_sagas().insert(context.saga_id);
+            workflow.on_saga_failed(actor, &context, &reason);
+            actor.prune_saga(context.saga_id);
+        }
+        SagaChoreographyEvent::SagaQuarantined { reason, .. } => {
+            actor.terminal_sagas().insert(context.saga_id);
+            workflow.on_quarantined(actor, &context, &reason);
+            actor.prune_saga(context.saga_id);
+        }
+        _ => {}
+    }
+}
+
+fn workflow_dependency_should_fire<A>(
+    actor: &mut A,
+    saga_id: SagaId,
+    dependency_spec: &crate::DependencySpec,
+    completed_step: &str,
+) -> bool
+where
+    A: HasSagaParticipantSupport,
+{
+    match dependency_spec {
+        crate::DependencySpec::OnSagaStart => false,
+        crate::DependencySpec::After(step) => {
+            if completed_step != *step {
+                return false;
+            }
+            actor.dependency_fired().insert(saga_id)
+        }
+        crate::DependencySpec::AnyOf(steps) => {
+            if !steps.contains(&completed_step) {
+                return false;
+            }
+            actor.dependency_fired().insert(saga_id)
+        }
+        crate::DependencySpec::AllOf(steps) => {
+            if !steps.contains(&completed_step) {
+                return false;
+            }
+            {
+                let seen = actor.dependency_completions().entry(saga_id).or_default();
+                seen.insert(completed_step.into());
+                if !steps.iter().all(|step| seen.contains(*step)) {
+                    return false;
+                }
+            }
+            actor.dependency_fired().insert(saga_id)
+        }
+    }
+}
+
+fn workflow_dedupe_key_for_event(event: &SagaChoreographyEvent) -> String {
+    let context = event.context();
+    match event {
+        SagaChoreographyEvent::CompensationRequested { failed_step, .. } => format!(
+            "{}:{}:{}:{}:{}",
+            context.trace_id,
+            context.saga_started_at_millis,
+            event.event_type(),
+            context.step_name,
+            failed_step
+        ),
+        _ => format!(
+            "{}:{}:{}:{}",
+            context.trace_id,
+            context.saga_started_at_millis,
+            event.event_type(),
+            context.step_name
+        ),
+    }
+}
+
+fn execute_workflow_step_with_emit<A, F>(
+    actor: &mut A,
+    workflow: &'static dyn SagaWorkflowParticipant<A>,
+    context: SagaContext,
+    input: Vec<u8>,
+    now: u64,
+    emit: &mut F,
+) where
+    A: HasSagaParticipantSupport,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let saga_id = context.saga_id;
+    let state = crate::SagaParticipantState::new(
+        saga_id,
+        context.saga_type.clone(),
+        workflow.step_name().into(),
+        context.correlation_id,
+        context.trace_id,
+        context.initiator_peer_id,
+        context.saga_started_at_millis,
+    )
+    .trigger("dependency_satisfied", now)
+    .start_execution(now);
+
+    actor.record_event(
+        saga_id,
+        ParticipantEvent::StepExecutionStarted {
+            attempt: 1,
+            started_at_millis: now,
+        },
+    );
+    actor
+        .saga_states()
+        .insert(saga_id, SagaStateEntry::Executing(state));
+
+    match workflow.execute_step(actor, &context, &input) {
+        Ok(output) => complete_workflow_step(actor, workflow, &context, input, output, now, emit),
+        Err(error) => fail_workflow_step(actor, workflow, &context, error, now, emit),
+    }
+}
+
+fn complete_workflow_step<A, F>(
+    actor: &mut A,
+    workflow: &'static dyn SagaWorkflowParticipant<A>,
+    context: &SagaContext,
+    saga_input: Vec<u8>,
+    output: crate::StepOutput,
+    now: u64,
+    emit: &mut F,
+) where
+    A: HasSagaParticipantSupport,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let saga_id = context.saga_id;
+    let (out_data, comp_data, compensation_available) = match output {
+        crate::StepOutput::Completed {
+            output,
+            compensation_data,
+        } => {
+            let compensation_available = !compensation_data.is_empty();
+            (output, compensation_data, compensation_available)
+        }
+        crate::StepOutput::CompletedWithEffect {
+            output,
+            compensation_data,
+            ..
+        } => {
+            let compensation_available = !compensation_data.is_empty();
+            (output, compensation_data, compensation_available)
+        }
+    };
+
+    if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&saga_id) {
+        let new_state = state.complete(out_data.clone(), comp_data, now);
+        actor
+            .saga_states()
+            .insert(saga_id, SagaStateEntry::Completed(new_state));
+    }
+
+    let emitted_output = out_data.clone();
+    actor.record_event(
+        saga_id,
+        ParticipantEvent::StepExecutionCompleted {
+            output: out_data,
+            compensation_data: vec![],
+            completed_at_millis: now,
+        },
+    );
+
+    emit(SagaChoreographyEvent::StepCompleted {
+        context: context.next_step(workflow.step_name().into()),
+        output: emitted_output,
+        saga_input,
+        compensation_available,
+    });
+}
+
+fn fail_workflow_step<A, F>(
+    actor: &mut A,
+    workflow: &'static dyn SagaWorkflowParticipant<A>,
+    context: &SagaContext,
+    error: crate::StepError,
+    now: u64,
+    emit: &mut F,
+) where
+    A: HasSagaParticipantSupport,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let saga_id = context.saga_id;
+    let (reason, requires_comp) = match error {
+        crate::StepError::Terminal { reason } => (reason, false),
+        crate::StepError::RequireCompensation { reason } => (reason, true),
+    };
+
+    if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&saga_id) {
+        let new_state = state.fail(reason.clone(), requires_comp, now);
+        actor
+            .saga_states()
+            .insert(saga_id, SagaStateEntry::Failed(new_state));
+    }
+
+    actor.record_event(
+        saga_id,
+        ParticipantEvent::StepExecutionFailed {
+            error: reason.clone(),
+            requires_compensation: requires_comp,
+            failed_at_millis: now,
+        },
+    );
+
+    emit(SagaChoreographyEvent::StepFailed {
+        context: context.next_step(workflow.step_name().into()),
+        participant_id: workflow.participant_id_owned(),
+        error_code: None,
+        error: reason,
+        requires_compensation: requires_comp,
+    });
+}
+
+fn compensate_workflow_with_emit<A, F>(
+    actor: &mut A,
+    workflow: &'static dyn SagaWorkflowParticipant<A>,
+    context: &SagaContext,
+    now: u64,
+    emit: &mut F,
+) where
+    A: HasSagaParticipantSupport,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let saga_id = context.saga_id;
+
+    if let Some(SagaStateEntry::Completed(state)) = actor.saga_states().remove(&saga_id) {
+        let comp_data = state.state.compensation_data.clone();
+        let new_state = state.start_compensation(now);
+        actor
+            .saga_states()
+            .insert(saga_id, SagaStateEntry::Compensating(new_state));
+
+        actor.record_event(
+            saga_id,
+            ParticipantEvent::CompensationStarted {
+                attempt: 1,
+                started_at_millis: now,
+            },
+        );
+
+        match workflow.compensate_step(actor, context, &comp_data) {
+            Ok(()) => complete_workflow_compensation(actor, workflow, context, now, emit),
+            Err(error) => fail_workflow_compensation(actor, workflow, context, error, now, emit),
+        }
+    }
+}
+
+fn complete_workflow_compensation<A, F>(
+    actor: &mut A,
+    workflow: &'static dyn SagaWorkflowParticipant<A>,
+    context: &SagaContext,
+    now: u64,
+    emit: &mut F,
+) where
+    A: HasSagaParticipantSupport,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let saga_id = context.saga_id;
+
+    if let Some(SagaStateEntry::Compensating(state)) = actor.saga_states().remove(&saga_id) {
+        let new_state = state.complete_compensation(now);
+        actor
+            .saga_states()
+            .insert(saga_id, SagaStateEntry::Compensated(new_state));
+    }
+
+    actor.record_event(
+        saga_id,
+        ParticipantEvent::CompensationCompleted {
+            completed_at_millis: now,
+        },
+    );
+
+    emit(SagaChoreographyEvent::CompensationCompleted {
+        context: context.next_step(workflow.step_name().into()),
+    });
+
+    workflow.on_compensation_completed(actor, context);
+}
+
+fn fail_workflow_compensation<A, F>(
+    actor: &mut A,
+    workflow: &'static dyn SagaWorkflowParticipant<A>,
+    context: &SagaContext,
+    error: crate::CompensationError,
+    now: u64,
+    emit: &mut F,
+) where
+    A: HasSagaParticipantSupport,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let saga_id = context.saga_id;
+    let (reason, is_ambiguous) = match error {
+        crate::CompensationError::SafeToRetry { reason } => (reason, false),
+        crate::CompensationError::Ambiguous { reason } => (reason, true),
+        crate::CompensationError::Terminal { reason } => (reason, false),
+    };
+
+    if let Some(SagaStateEntry::Compensating(state)) = actor.saga_states().remove(&saga_id) {
+        let new_state = state.quarantine(reason.clone(), now);
+        actor
+            .saga_states()
+            .insert(saga_id, SagaStateEntry::Quarantined(new_state));
+    }
+
+    actor.record_event(
+        saga_id,
+        ParticipantEvent::Quarantined {
+            reason: reason.clone(),
+            quarantined_at_millis: now,
+        },
+    );
+
+    let event_context = context.next_step(workflow.step_name().into());
+    emit(SagaChoreographyEvent::CompensationFailed {
+        context: event_context.clone(),
+        participant_id: workflow.participant_id_owned(),
+        error: reason.clone(),
+        is_ambiguous,
+    });
+    if is_ambiguous {
+        emit(SagaChoreographyEvent::SagaQuarantined {
+            context: event_context,
+            reason: reason.clone(),
+            step: workflow.step_name().into(),
+            participant_id: workflow.participant_id_owned(),
+        });
+    }
+
+    workflow.on_quarantined(actor, context, &reason);
+}
+
 pub async fn apply_async_participant_saga_ingress<P, FApplyTerminal, FOnInvalid>(
     participant: &mut P,
     event: SagaChoreographyEvent,
@@ -242,6 +757,43 @@ where
                 panic_payload.as_ref(),
                 step_name.as_str(),
                 participant_id,
+            );
+            std::panic::resume_unwind(panic_payload);
+        }
+    }
+}
+
+pub fn run_workflow_participant_phase_with_panic_quarantine<A, W, R, F>(
+    actor: &mut A,
+    workflow: &'static W,
+    context: &SagaContext,
+    phase: ActiveSagaExecutionPhase,
+    run: F,
+) -> R
+where
+    A: HasSagaParticipantSupport + HasActiveSagaExecution,
+    W: SagaWorkflowParticipant<A>,
+    F: FnOnce(&mut A) -> R,
+{
+    *actor.active_saga_execution_slot() = Some(ActiveSagaExecution {
+        context: context.clone(),
+        phase,
+    });
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(actor)));
+
+    *actor.active_saga_execution_slot() = None;
+
+    match result {
+        Ok(out) => out,
+        Err(panic_payload) => {
+            publish_active_saga_panic_quarantine(
+                actor.saga_support_mut(),
+                context,
+                phase,
+                panic_payload.as_ref(),
+                workflow.step_name(),
+                workflow.participant_id_owned(),
             );
             std::panic::resume_unwind(panic_payload);
         }
@@ -784,7 +1336,212 @@ pub mod lmdb {
 
 #[cfg(test)]
 mod tests {
-    use super::default_runtime_dir;
+    use super::{
+        apply_sync_workflow_participant_saga_ingress, default_runtime_dir, workflow_for_event,
+        ActiveSagaExecution, HasActiveSagaExecution,
+    };
+    use crate::{
+        DependencySpec, DeterministicContextBuilder, HasSagaParticipantSupport,
+        HasSagaWorkflowParticipants, InMemoryDedupe, InMemoryJournal, SagaParticipantSupport,
+        SagaWorkflowParticipant, StepOutput,
+    };
+
+    struct WorkflowTestActor {
+        saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
+        active: Option<ActiveSagaExecution>,
+        alpha_calls: usize,
+        beta_calls: usize,
+    }
+
+    impl Default for WorkflowTestActor {
+        fn default() -> Self {
+            Self {
+                saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+                active: None,
+                alpha_calls: 0,
+                beta_calls: 0,
+            }
+        }
+    }
+
+    impl HasSagaParticipantSupport for WorkflowTestActor {
+        type Journal = InMemoryJournal;
+        type Dedupe = InMemoryDedupe;
+
+        fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+            &self.saga
+        }
+
+        fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+            &mut self.saga
+        }
+    }
+
+    impl HasActiveSagaExecution for WorkflowTestActor {
+        fn active_saga_execution_slot(&mut self) -> &mut Option<ActiveSagaExecution> {
+            &mut self.active
+        }
+    }
+
+    struct AlphaWorkflow;
+    struct BetaWorkflow;
+
+    static ALPHA_WORKFLOW: AlphaWorkflow = AlphaWorkflow;
+    static BETA_WORKFLOW: BetaWorkflow = BetaWorkflow;
+    static WORKFLOWS: [&'static dyn SagaWorkflowParticipant<WorkflowTestActor>; 2] =
+        [&ALPHA_WORKFLOW, &BETA_WORKFLOW];
+
+    impl SagaWorkflowParticipant<WorkflowTestActor> for AlphaWorkflow {
+        fn step_name(&self) -> &'static str {
+            "alpha_step"
+        }
+
+        fn saga_types(&self) -> &[&'static str] {
+            &["alpha_workflow"]
+        }
+
+        fn execute_step(
+            &self,
+            actor: &mut WorkflowTestActor,
+            _context: &crate::SagaContext,
+            _input: &[u8],
+        ) -> Result<crate::StepOutput, crate::StepError> {
+            actor.alpha_calls += 1;
+            Ok(StepOutput::Completed {
+                output: Vec::new(),
+                compensation_data: Vec::new(),
+            })
+        }
+
+        fn compensate_step(
+            &self,
+            _actor: &mut WorkflowTestActor,
+            _context: &crate::SagaContext,
+            _compensation_data: &[u8],
+        ) -> Result<(), crate::CompensationError> {
+            Ok(())
+        }
+    }
+
+    impl SagaWorkflowParticipant<WorkflowTestActor> for BetaWorkflow {
+        fn step_name(&self) -> &'static str {
+            "beta_step"
+        }
+
+        fn saga_types(&self) -> &[&'static str] {
+            &["beta_workflow"]
+        }
+
+        fn depends_on(&self) -> DependencySpec {
+            DependencySpec::OnSagaStart
+        }
+
+        fn execute_step(
+            &self,
+            actor: &mut WorkflowTestActor,
+            _context: &crate::SagaContext,
+            _input: &[u8],
+        ) -> Result<crate::StepOutput, crate::StepError> {
+            actor.beta_calls += 1;
+            Ok(StepOutput::Completed {
+                output: Vec::new(),
+                compensation_data: Vec::new(),
+            })
+        }
+
+        fn compensate_step(
+            &self,
+            _actor: &mut WorkflowTestActor,
+            _context: &crate::SagaContext,
+            _compensation_data: &[u8],
+        ) -> Result<(), crate::CompensationError> {
+            Ok(())
+        }
+    }
+
+    impl HasSagaWorkflowParticipants for WorkflowTestActor {
+        fn saga_workflows() -> &'static [&'static dyn SagaWorkflowParticipant<Self>] {
+            &WORKFLOWS
+        }
+    }
+
+    struct DuplicateWorkflowTestActor;
+
+    struct DuplicateWorkflowAlpha;
+    struct DuplicateWorkflowBeta;
+
+    static DUPLICATE_ALPHA_WORKFLOW: DuplicateWorkflowAlpha = DuplicateWorkflowAlpha;
+    static DUPLICATE_BETA_WORKFLOW: DuplicateWorkflowBeta = DuplicateWorkflowBeta;
+    static DUPLICATE_WORKFLOWS: [&'static dyn SagaWorkflowParticipant<DuplicateWorkflowTestActor>;
+        2] = [&DUPLICATE_ALPHA_WORKFLOW, &DUPLICATE_BETA_WORKFLOW];
+
+    impl SagaWorkflowParticipant<DuplicateWorkflowTestActor> for DuplicateWorkflowAlpha {
+        fn step_name(&self) -> &'static str {
+            "alpha"
+        }
+
+        fn saga_types(&self) -> &[&'static str] {
+            &["shared_workflow"]
+        }
+
+        fn execute_step(
+            &self,
+            _actor: &mut DuplicateWorkflowTestActor,
+            _context: &crate::SagaContext,
+            _input: &[u8],
+        ) -> Result<crate::StepOutput, crate::StepError> {
+            Ok(StepOutput::Completed {
+                output: Vec::new(),
+                compensation_data: Vec::new(),
+            })
+        }
+
+        fn compensate_step(
+            &self,
+            _actor: &mut DuplicateWorkflowTestActor,
+            _context: &crate::SagaContext,
+            _compensation_data: &[u8],
+        ) -> Result<(), crate::CompensationError> {
+            Ok(())
+        }
+    }
+
+    impl SagaWorkflowParticipant<DuplicateWorkflowTestActor> for DuplicateWorkflowBeta {
+        fn step_name(&self) -> &'static str {
+            "beta"
+        }
+
+        fn saga_types(&self) -> &[&'static str] {
+            &["shared_workflow"]
+        }
+
+        fn execute_step(
+            &self,
+            _actor: &mut DuplicateWorkflowTestActor,
+            _context: &crate::SagaContext,
+            _input: &[u8],
+        ) -> Result<crate::StepOutput, crate::StepError> {
+            Ok(StepOutput::Completed {
+                output: Vec::new(),
+                compensation_data: Vec::new(),
+            })
+        }
+
+        fn compensate_step(
+            &self,
+            _actor: &mut DuplicateWorkflowTestActor,
+            _context: &crate::SagaContext,
+            _compensation_data: &[u8],
+        ) -> Result<(), crate::CompensationError> {
+            Ok(())
+        }
+    }
+
+    impl HasSagaWorkflowParticipants for DuplicateWorkflowTestActor {
+        fn saga_workflows() -> &'static [&'static dyn SagaWorkflowParticipant<Self>] {
+            &DUPLICATE_WORKFLOWS
+        }
+    }
 
     #[test]
     fn default_runtime_dir_uses_test_tmp_path_when_env_is_missing() {
@@ -796,5 +1553,41 @@ mod tests {
             "expected test runtime dir under target/test-tmp, got {:?}",
             runtime_dir
         );
+    }
+
+    #[test]
+    fn workflow_ingress_routes_to_matching_workflow_spec() {
+        let mut actor = WorkflowTestActor::default();
+        let event = crate::SagaChoreographyEvent::SagaStarted {
+            context: DeterministicContextBuilder::default()
+                .with_saga_id(77)
+                .with_saga_type("beta_workflow")
+                .with_step_name("beta_step")
+                .build(),
+            payload: Vec::new(),
+        };
+
+        apply_sync_workflow_participant_saga_ingress(
+            &mut actor,
+            event,
+            |_actor, _event| {},
+            |_| {},
+        );
+
+        assert_eq!(actor.alpha_calls, 0);
+        assert_eq!(actor.beta_calls, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "ambiguous workflow registration")]
+    fn workflow_lookup_panics_on_duplicate_saga_type_registration() {
+        let event = crate::SagaChoreographyEvent::SagaStarted {
+            context: DeterministicContextBuilder::default()
+                .with_saga_type("shared_workflow")
+                .build(),
+            payload: Vec::new(),
+        };
+
+        let _ = workflow_for_event::<DuplicateWorkflowTestActor>(&event);
     }
 }

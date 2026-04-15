@@ -6,8 +6,8 @@ use icanact_core::CorrelationRegistry;
 
 use crate::reply_registry::{SagaReplyToHandle, SagaReplyToResult};
 use crate::{
-    SagaChoreographyEvent, SagaId, SagaReplyTo, SagaTerminalOutcome, TerminalPolicy, TerminalResolver,
-    TERMINAL_RESOLVER_STEP,
+    SagaChoreographyEvent, SagaId, SagaReplyTo, SagaTerminalOutcome, TerminalPolicy,
+    TerminalResolver, TERMINAL_RESOLVER_STEP,
 };
 
 pub struct SagaChoreographyBus {
@@ -142,10 +142,7 @@ impl SagaChoreographyBus {
         reply
     }
 
-    pub fn take_terminal_outcome(
-        &self,
-        saga_id: SagaId,
-    ) -> Option<crate::SagaTerminalOutcome> {
+    pub fn take_terminal_outcome(&self, saga_id: SagaId) -> Option<crate::SagaTerminalOutcome> {
         let reply = self.take_terminal_reply(saga_id).map(|reply| reply.outcome);
         let direct = self
             .terminal_outcomes
@@ -297,7 +294,7 @@ mod tests {
         TERMINAL_RESOLVER_STEP,
     };
 
-    use super::{DEFAULT_TERMINAL_RETENTION_LIMIT, SagaChoreographyBus};
+    use super::{SagaChoreographyBus, DEFAULT_TERMINAL_RETENTION_LIMIT};
 
     fn context(step_name: &str, saga_id: u64) -> SagaContext {
         let now = SagaContext::now_millis();
@@ -441,7 +438,10 @@ mod tests {
             .wait()
             .expect("terminal reply should resolve")
             .expect("terminal reply should be successful");
-        assert!(matches!(reply.outcome, SagaTerminalOutcome::Completed { .. }));
+        assert!(matches!(
+            reply.outcome,
+            SagaTerminalOutcome::Completed { .. }
+        ));
         assert!(matches!(
             bus.take_terminal_outcome(saga_id),
             Some(SagaTerminalOutcome::Completed { .. })

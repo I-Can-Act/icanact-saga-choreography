@@ -1,6 +1,6 @@
 //! Saga events
 
-use super::{SagaContext, SagaId};
+use super::SagaContext;
 use icanact_core::ActorId;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -9,7 +9,6 @@ pub struct SagaFailureDetails {
     pub participant_id: Box<str>,
     pub error_code: Option<Box<str>>,
     pub error_message: Box<str>,
-    pub will_retry: bool,
     pub at_millis: u64,
 }
 
@@ -64,8 +63,6 @@ pub enum SagaChoreographyEvent {
         error_code: Option<Box<str>>,
         /// The error message describing why the step failed.
         error: Box<str>,
-        /// Whether the step will be retried.
-        will_retry: bool,
         /// Whether compensation is required due to this failure.
         requires_compensation: bool,
     },
@@ -161,7 +158,6 @@ impl SagaChoreographyEvent {
     pub fn step_failed_default(
         context: SagaContext,
         error: Box<str>,
-        will_retry: bool,
         requires_compensation: bool,
     ) -> Self {
         let participant_id = context.step_name.clone();
@@ -170,7 +166,6 @@ impl SagaChoreographyEvent {
             participant_id,
             None,
             error,
-            will_retry,
             requires_compensation,
         )
     }
@@ -180,7 +175,6 @@ impl SagaChoreographyEvent {
         participant_id: Box<str>,
         error_code: Option<Box<str>>,
         error: Box<str>,
-        will_retry: bool,
         requires_compensation: bool,
     ) -> Self {
         Self::StepFailed {
@@ -188,7 +182,6 @@ impl SagaChoreographyEvent {
             participant_id,
             error_code,
             error,
-            will_retry,
             requires_compensation,
         }
     }
@@ -198,7 +191,6 @@ impl SagaChoreographyEvent {
         participant_id: ActorId,
         error_code: Option<Box<str>>,
         error: Box<str>,
-        will_retry: bool,
         requires_compensation: bool,
     ) -> Self {
         Self::step_failed_for_participant(
@@ -206,7 +198,6 @@ impl SagaChoreographyEvent {
             participant_id.as_str().to_string().into_boxed_str(),
             error_code,
             error,
-            will_retry,
             requires_compensation,
         )
     }

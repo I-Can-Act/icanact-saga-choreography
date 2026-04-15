@@ -35,11 +35,11 @@
 //! MyActorCommand::SagaEvent { event } => handle_saga_event(self, event),
 //! ```
 
-#![allow(missing_docs, unused_imports, unused_variables, dead_code)]
+#![allow(missing_docs)]
 
 // === Core Types ===
-mod bus;
 mod binding;
+mod bus;
 mod context;
 pub mod durability;
 mod errors;
@@ -69,10 +69,12 @@ mod testkit;
 // === Re-exports ===
 
 // Types
-pub use bus::{global_saga_choreography_bus, SagaChoreographyBus};
 pub use binding::{
-    SagaParticipantChannel, bind_async_participant_channel, bind_sync_participant_channel,
+    bind_async_participant_channel, bind_sync_participant_channel,
+    bind_sync_workflow_participant_channel, checked_workflow_saga_types, workflow_saga_types,
+    SagaParticipantChannel,
 };
+pub use bus::{global_saga_choreography_bus, SagaChoreographyBus};
 pub use context::{PeerId, SagaContext, SagaId, StepId};
 pub use durability::*;
 pub use idempotency::IdempotencyKey;
@@ -96,7 +98,8 @@ pub use errors::{CompensationError, StepError, StepOutput};
 // Traits
 pub use state_ext::SagaStateExt;
 pub use traits::{
-    AsyncSagaParticipant, DependencySpec, RetryPolicy, SagaBoxFuture, SagaParticipant,
+    AsyncSagaParticipant, DependencySpec, HasSagaWorkflowParticipants, SagaBoxFuture,
+    SagaParticipant, SagaWorkflowParticipant,
 };
 
 // Storage
@@ -120,8 +123,8 @@ pub use resolver::{
 #[cfg(any(test, feature = "test-harness"))]
 pub use testkit::AsyncSagaParticipantHandle;
 pub use testkit::{
-    compensation_requested, drive_scenario, saga_started, step_completed, step_failed,
-    DeterministicContextBuilder,
+    compensation_requested, drive_scenario, drive_workflow_scenario, saga_started, step_completed,
+    step_failed, DeterministicContextBuilder,
 };
 #[cfg(any(test, feature = "test-harness"))]
 pub use testkit::{SagaTestWorld, SyncSagaParticipantHandle};

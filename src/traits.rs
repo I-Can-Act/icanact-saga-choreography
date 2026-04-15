@@ -35,7 +35,7 @@ use icanact_core::{ActorId, ActorIdError};
 ///     }
 /// }
 /// ```
-pub trait SagaParticipant: Send + 'static {
+pub trait SagaParticipant {
     /// Error type for this participant
     type Error: std::fmt::Debug + Send;
 
@@ -106,16 +106,75 @@ pub trait SagaParticipant: Send + 'static {
     fn depends_on(&self) -> DependencySpec {
         DependencySpec::OnSagaStart
     }
+}
 
-    /// Retry policy for this step
-    fn retry_policy(&self) -> RetryPolicy {
-        RetryPolicy::default()
+/// Workflow-scoped participant contract for actors that join multiple saga workflows.
+///
+/// This allows one actor instance to expose several distinct participant
+/// contracts without collapsing them into one monolithic `SagaParticipant`
+/// implementation with ad-hoc branching on `saga_type`.
+pub trait SagaWorkflowParticipant<A>: Send + Sync + 'static {
+    /// The step name this workflow participant handles.
+    fn step_name(&self) -> &'static str;
+
+    /// Stable participant identity used for terminal failure fidelity.
+    fn participant_id(&self) -> &'static str {
+        self.step_name()
     }
 
-    /// Timeout for step execution
-    fn step_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(30)
+    /// Parsed `ActorId` view of participant identity when valid.
+    fn participant_actor_id(&self) -> Result<ActorId, ActorIdError> {
+        ActorId::new(self.participant_id())
     }
+
+    /// Owned participant identity for event payloads.
+    fn participant_id_owned(&self) -> Box<str> {
+        match self.participant_actor_id() {
+            Ok(actor_id) => actor_id.as_str().to_string().into_boxed_str(),
+            Err(_) => self.participant_id().to_string().into_boxed_str(),
+        }
+    }
+
+    /// Which saga types this workflow participant joins.
+    fn saga_types(&self) -> &[&'static str];
+
+    /// Execute the forward step for this workflow.
+    fn execute_step(
+        &self,
+        actor: &mut A,
+        context: &SagaContext,
+        input: &[u8],
+    ) -> Result<StepOutput, StepError>;
+
+    /// Execute compensation for this workflow.
+    fn compensate_step(
+        &self,
+        actor: &mut A,
+        context: &SagaContext,
+        compensation_data: &[u8],
+    ) -> Result<(), CompensationError>;
+
+    /// Called after saga completes successfully.
+    fn on_saga_completed(&self, _actor: &mut A, _context: &SagaContext) {}
+
+    /// Called after saga fails.
+    fn on_saga_failed(&self, _actor: &mut A, _context: &SagaContext, _reason: &str) {}
+
+    /// Called after compensation completes.
+    fn on_compensation_completed(&self, _actor: &mut A, _context: &SagaContext) {}
+
+    /// Called when saga is quarantined.
+    fn on_quarantined(&self, _actor: &mut A, _context: &SagaContext, _reason: &str) {}
+
+    /// When does this participant execute?
+    fn depends_on(&self) -> DependencySpec {
+        DependencySpec::OnSagaStart
+    }
+}
+
+/// Access trait for actors that register distinct workflow-scoped participant contracts.
+pub trait HasSagaWorkflowParticipants: Sized + Send + 'static {
+    fn saga_workflows() -> &'static [&'static dyn SagaWorkflowParticipant<Self>];
 }
 
 pub type SagaBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -124,7 +183,7 @@ pub type SagaBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 ///
 /// Use this when a participant step needs to await actor asks or other async IO.
 /// This keeps sync and async choreography execution models distinct at the type level.
-pub trait AsyncSagaParticipant: Send + 'static {
+pub trait AsyncSagaParticipant {
     type Error: std::fmt::Debug + Send;
 
     fn step_name(&self) -> &str;
@@ -169,14 +228,6 @@ pub trait AsyncSagaParticipant: Send + 'static {
     fn depends_on(&self) -> DependencySpec {
         DependencySpec::OnSagaStart
     }
-
-    fn retry_policy(&self) -> RetryPolicy {
-        RetryPolicy::default()
-    }
-
-    fn step_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(30)
-    }
 }
 
 /// Dependency specification - when does this step execute?
@@ -215,73 +266,9 @@ impl DependencySpec {
     }
 }
 
-/// Retry policy for step execution
-#[derive(Clone, Debug)]
-pub struct RetryPolicy {
-    /// Maximum number of retry attempts
-    pub max_attempts: u32,
-    /// Initial delay before first retry (milliseconds)
-    pub initial_delay_millis: u64,
-    /// Maximum delay cap (milliseconds)
-    pub max_delay_millis: u64,
-    /// Backoff multiplier
-    pub backoff_multiplier: f64,
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            max_attempts: 3,
-            initial_delay_millis: 1000,
-            max_delay_millis: 30000,
-            backoff_multiplier: 2.0,
-        }
-    }
-}
-
-impl RetryPolicy {
-    /// Calculate delay for a given attempt (1-indexed)
-    pub fn delay_for_attempt(&self, attempt: u32) -> std::time::Duration {
-        if attempt == 0 {
-            return std::time::Duration::from_millis(0);
-        }
-
-        let delay = self.initial_delay_millis as f64
-            * self
-                .backoff_multiplier
-                .powi(attempt.saturating_sub(1) as i32);
-        let capped = delay.min(self.max_delay_millis as f64);
-        std::time::Duration::from_millis(capped as u64)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_retry_delay() {
-        let policy = RetryPolicy::default();
-
-        assert_eq!(
-            policy.delay_for_attempt(0),
-            std::time::Duration::from_millis(0)
-        );
-        assert_eq!(
-            policy.delay_for_attempt(1),
-            std::time::Duration::from_millis(1000)
-        );
-        assert_eq!(
-            policy.delay_for_attempt(2),
-            std::time::Duration::from_millis(2000)
-        );
-        assert_eq!(
-            policy.delay_for_attempt(3),
-            std::time::Duration::from_millis(4000)
-        );
-        // Would be 8000 but capped at max
-        assert!(policy.delay_for_attempt(10) <= std::time::Duration::from_millis(30000));
-    }
 
     #[test]
     fn test_dependency_spec() {

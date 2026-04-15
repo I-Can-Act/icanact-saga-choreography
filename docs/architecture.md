@@ -43,7 +43,7 @@ flowchart LR
 | Identity and context | `SagaId`, `SagaContext`, `IdempotencyKey` | Populate context at saga start and across steps |
 | State model | Typestate containers and transitions (`Idle`, `Executing`, `Completed`, etc.) plus `SagaParticipantSupport<J, D>` | Embed one `saga` field on the actor |
 | Events | `SagaChoreographyEvent`, `ParticipantEvent` | Publish/consume events for the saga type |
-| Execution contract | `SagaParticipant` trait | Implement `execute_step`, `compensate_step`, dependencies, retry policy |
+| Execution contract | `SagaParticipant` trait | Implement `execute_step`, `compensate_step`, and dependencies |
 | State access contract | `HasSagaParticipantSupport` + blanket `SagaStateExt` | Expose the embedded `saga` field |
 | Persistence contract | `ParticipantJournal` and `ParticipantDedupeStore` traits | Provide concrete backend (in-memory, LMDB/Heed, etc.) |
 | Runtime helpers | `apply_sync_participant_saga_ingress`, `apply_async_participant_saga_ingress`, `execute_step_wrapper`, `compensate_wrapper`, `recover_sagas` | Wire ingress helpers into actor message handling |
@@ -98,7 +98,7 @@ sequenceDiagram
 2. Add `saga: SagaParticipantSupport<Journal, Dedupe>` to each participant actor.
 3. Implement `HasSagaParticipantSupport` for the actor. `SagaStateExt` is then derived automatically.
 4. Implement `SagaParticipant` for business behavior:
-   step identity, forward execution, compensation, dependencies, retry policy.
+   step identity, forward execution, compensation, and dependencies.
 5. Add a saga event variant to the actor command enum and route it through `apply_sync_participant_saga_ingress(...)` or `apply_async_participant_saga_ingress(...)`.
 6. Subscribe each actor mailbox to the saga topic (`saga:{saga_type}`).
 7. Start sagas by publishing `SagaStarted` with payload and context.
