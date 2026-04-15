@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use icanact_core::local::{EventBus, EventSubscription, PublishStats};
@@ -12,6 +13,7 @@ use crate::{
 pub struct SagaChoreographyBus {
     bus: EventBus<SagaChoreographyEvent>,
     pending_replies: CorrelationRegistry<SagaId, SagaReplyToResult>,
+    terminal_replies: Arc<Mutex<HashMap<SagaId, SagaReplyTo>>>,
     owned: bool,
 }
 
@@ -20,6 +22,7 @@ impl SagaChoreographyBus {
         Self {
             bus: EventBus::new(),
             pending_replies: CorrelationRegistry::new(),
+            terminal_replies: Arc::new(Mutex::new(HashMap::new())),
             owned: true,
         }
     }
@@ -70,6 +73,10 @@ impl SagaChoreographyBus {
     }
 
     pub fn complete_terminal_reply(&self, saga_id: SagaId, reply: SagaReplyTo) -> bool {
+        self.terminal_replies
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(saga_id, reply.clone());
         self.pending_replies.resolve(&saga_id, Ok(reply)).is_ok()
     }
 
@@ -114,6 +121,20 @@ impl SagaChoreographyBus {
         self.attach_terminal_resolver(TerminalPolicy::order_lifecycle_default(), responder)
     }
 
+    pub fn take_terminal_reply(&self, saga_id: SagaId) -> Option<SagaReplyTo> {
+        self.terminal_replies
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&saga_id)
+    }
+
+    pub fn take_terminal_outcome(
+        &self,
+        saga_id: SagaId,
+    ) -> Option<crate::SagaTerminalOutcome> {
+        self.take_terminal_reply(saga_id).map(|reply| reply.outcome)
+    }
+
     fn complete_terminal_reply_from_event(
         &self,
         event: &SagaChoreographyEvent,
@@ -153,6 +174,7 @@ impl Clone for SagaChoreographyBus {
         Self {
             bus: self.bus.clone(),
             pending_replies: self.pending_replies.clone(),
+            terminal_replies: Arc::clone(&self.terminal_replies),
             owned: false,
         }
     }
@@ -186,7 +208,8 @@ mod tests {
     use icanact_core::local_sync;
 
     use crate::{
-        SagaChoreographyEvent, SagaContext, SagaId, SagaReplyToResult, TERMINAL_RESOLVER_STEP,
+        SagaChoreographyEvent, SagaContext, SagaId, SagaReplyToResult, SagaTerminalOutcome,
+        TERMINAL_RESOLVER_STEP,
     };
 
     use super::SagaChoreographyBus;
@@ -244,7 +267,7 @@ mod tests {
             }
         });
         let pending = probe_addr
-            .ask_deferred(|reply| ProbeMsg::Register {
+            .ask_delegated(|reply| ProbeMsg::Register {
                 bus,
                 saga_id,
                 reply,
@@ -312,6 +335,37 @@ mod tests {
         assert!(got_b.is_ok());
         probe_a.shutdown();
         probe_b.shutdown();
+    }
+
+    #[test]
+    fn take_terminal_outcome_returns_and_consumes_resolved_reply() {
+        let bus = SagaChoreographyBus::new();
+        let saga_id = SagaId::new(77);
+        let (pending, probe) = register_pending_reply(bus.clone(), saga_id);
+        thread::sleep(Duration::from_millis(20));
+
+        let completed = SagaChoreographyEvent::SagaCompleted {
+            context: SagaContext {
+                step_name: TERMINAL_RESOLVER_STEP.into(),
+                ..context("create_order", saga_id.get())
+            },
+        };
+        assert!(bus.complete_terminal_reply_from_event(&completed, "resolver"));
+
+        let reply = pending
+            .wait()
+            .expect("terminal reply should resolve")
+            .expect("terminal reply should be successful");
+        assert!(matches!(reply.outcome, SagaTerminalOutcome::Completed { .. }));
+        assert!(matches!(
+            bus.take_terminal_outcome(saga_id),
+            Some(SagaTerminalOutcome::Completed { .. })
+        ));
+        assert!(
+            bus.take_terminal_outcome(saga_id).is_none(),
+            "terminal outcome should be consumed after the first read"
+        );
+        probe.shutdown();
     }
 
     #[test]

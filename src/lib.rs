@@ -39,6 +39,7 @@
 
 // === Core Types ===
 mod bus;
+mod binding;
 mod context;
 pub mod durability;
 mod errors;
@@ -69,6 +70,9 @@ mod testkit;
 
 // Types
 pub use bus::{global_saga_choreography_bus, SagaChoreographyBus};
+pub use binding::{
+    SagaParticipantChannel, bind_async_participant_channel, bind_sync_participant_channel,
+};
 pub use context::{PeerId, SagaContext, SagaId, StepId};
 pub use durability::*;
 pub use idempotency::IdempotencyKey;

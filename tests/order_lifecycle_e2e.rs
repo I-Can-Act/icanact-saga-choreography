@@ -20,10 +20,11 @@ use icanact_saga_choreography::durability::{
     HasActiveSagaExecution,
 };
 use icanact_saga_choreography::{
-    handle_saga_event_with_emit, CompensationError, DependencySpec, FailureAuthority,
-    HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal, SagaChoreographyBus,
-    SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant, SagaParticipantSupport, StepError,
-    StepOutput, SuccessCriteria, TerminalPolicy,
+    bind_sync_participant_channel, handle_saga_event_with_emit, CompensationError, DependencySpec,
+    FailureAuthority, HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal,
+    SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant,
+    SagaParticipantChannel, SagaParticipantSupport, StepError, StepOutput, SuccessCriteria,
+    TerminalPolicy,
 };
 
 const SAGA_TYPE: &str = "order_lifecycle";
@@ -39,6 +40,14 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 /// Query message to inspect participant state from tests.
 #[derive(Debug)]
 struct QueryState;
+
+#[allow(dead_code)]
+#[derive(Debug)]
+enum ParticipantCtl {
+    Noop,
+}
+
+impl icanact_core::TellAskTell for ParticipantCtl {}
 
 /// Reply with current execution and compensation counts.
 #[derive(Debug, PartialEq, Eq)]
@@ -56,6 +65,10 @@ struct TerminalCounts {
 
 #[derive(Debug)]
 struct QueryTerminalCounts;
+
+struct TerminalProbeMsg(SagaChoreographyEvent);
+
+impl icanact_core::TellAskTell for TerminalProbeMsg {}
 
 struct TerminalProbe {
     counts: TerminalCounts,
@@ -128,18 +141,12 @@ impl ConfigurableParticipant {
 
 impl local_sync::SyncActor for ConfigurableParticipant {
     type Contract = TellAsk;
-    type Tell = SagaChoreographyEvent;
+    type Tell = ParticipantCtl;
     type Ask = QueryState;
     type Reply = ParticipantState;
-
-    fn handle_tell(&mut self, msg: Self::Tell) {
-        let bus = self.bus.clone();
-        if let Some(bus) = bus {
-            handle_saga_event_with_emit(self, msg, |emitted| {
-                let _ = bus.publish(emitted);
-            });
-        }
-    }
+    type Channel = SagaParticipantChannel<()>;
+    type PubSub = ();
+    type Broadcast = ();
 
     fn handle_ask(&mut self, _msg: Self::Ask) -> Self::Reply {
         ParticipantState {
@@ -147,16 +154,35 @@ impl local_sync::SyncActor for ConfigurableParticipant {
             compensated_count: self.compensated_count,
         }
     }
+
+    fn handle_tell(&mut self, _msg: Self::Tell) {}
+
+    fn handle_channel(&mut self, _channel_id: local_sync::ChannelId, msg: Self::Channel) {
+        match msg {
+            SagaParticipantChannel::Saga(event) => {
+                let bus = self.bus.clone();
+                if let Some(bus) = bus {
+                    handle_saga_event_with_emit(self, event, |emitted| {
+                        let _ = bus.publish(emitted);
+                    });
+                }
+            }
+            SagaParticipantChannel::Business(()) => {}
+        }
+    }
 }
 
 impl local_sync::SyncActor for TerminalProbe {
     type Contract = TellAsk;
-    type Tell = SagaChoreographyEvent;
+    type Tell = TerminalProbeMsg;
     type Ask = QueryTerminalCounts;
     type Reply = TerminalCounts;
+    type Channel = ();
+    type PubSub = ();
+    type Broadcast = ();
 
     fn handle_tell(&mut self, msg: Self::Tell) {
-        match &msg {
+        match &msg.0 {
             SagaChoreographyEvent::SagaCompleted { .. } => {
                 self.counts.completed += 1;
             }
@@ -305,10 +331,15 @@ fn spawn_and_subscribe(
     };
     let (actor_ref, handle) = world.spawn_sync_with_opts(participant, opts);
     handle.wait_for_startup();
-    let ref_clone = actor_ref.clone();
-    let _sub = bus.subscribe_saga_type_fn(SAGA_TYPE, move |event: &SagaChoreographyEvent| {
-        ref_clone.try_tell(event.clone()).is_ok()
-    });
+    let subscriptions = bind_sync_participant_channel::<ConfigurableParticipant, ()>(
+        bus,
+        &actor_ref,
+        &[SAGA_TYPE],
+        "saga",
+        MAILBOX_CAPACITY,
+    )
+    .expect("participant saga channel should bind");
+    let _ = Box::leak(Box::new(subscriptions));
     (actor_ref, handle)
 }
 
@@ -327,7 +358,7 @@ fn spawn_terminal_probe(
     handle.wait_for_startup();
     let ref_clone = probe_ref.clone();
     let _probe = bus.subscribe_saga_type_fn(SAGA_TYPE, move |event: &SagaChoreographyEvent| {
-        let _ = ref_clone.try_tell(event.clone());
+        let _ = ref_clone.try_tell(TerminalProbeMsg(event.clone()));
         true
     });
     (probe_ref, handle)

@@ -10,15 +10,16 @@ use icanact_saga_choreography::{
     AsyncSagaParticipant, CompensationError, DependencySpec, DeterministicContextBuilder,
     FailureAuthority, HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal, JournalEntry,
     ParticipantDedupeStore, ParticipantJournal, SagaChoreographyEvent, SagaParticipant,
-    SagaParticipantSupport, SagaStateExt, SagaTerminalOutcome, SagaTestWorld, StepError,
-    StepOutput, SuccessCriteria, TerminalPolicy,
+    SagaParticipantChannel, SagaParticipantSupport, SagaStateExt, SagaTerminalOutcome,
+    SagaTestWorld, StepError, StepOutput, SuccessCriteria, TerminalPolicy,
 };
 
 #[derive(Clone, Debug)]
 enum SyncCmd {
-    SagaEvent(SagaChoreographyEvent),
     AddBusinessFlag(&'static str),
 }
+
+impl icanact_core::TellAskTell for SyncCmd {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SyncSnapshot {
@@ -126,17 +127,12 @@ impl SyncActor for SyncParticipant {
     type Tell = SyncCmd;
     type Ask = ();
     type Reply = SyncSnapshot;
+    type Channel = SagaParticipantChannel<()>;
+    type PubSub = ();
+    type Broadcast = ();
 
     fn handle_tell(&mut self, msg: Self::Tell) {
         match msg {
-            SyncCmd::SagaEvent(event) => {
-                icanact_saga_choreography::durability::apply_sync_participant_saga_ingress(
-                    self,
-                    event,
-                    |_actor, _incoming| {},
-                    |_invalid| {},
-                );
-            }
             SyncCmd::AddBusinessFlag(flag) => self.business_flags.push(flag),
         }
     }
@@ -144,17 +140,34 @@ impl SyncActor for SyncParticipant {
     fn handle_ask(&mut self, _msg: Self::Ask) -> Self::Reply {
         self.snapshot()
     }
-}
 
-#[derive(Clone, Debug)]
-enum AsyncCmd {
-    SagaEvent(SagaChoreographyEvent),
+    fn handle_channel(&mut self, _channel_id: local_sync::ChannelId, msg: Self::Channel) {
+        match msg {
+            SagaParticipantChannel::Saga(event) => {
+                icanact_saga_choreography::durability::apply_sync_participant_saga_ingress(
+                    self,
+                    event,
+                    |_actor, _incoming| {},
+                    |_invalid| {},
+                );
+            }
+            SagaParticipantChannel::Business(()) => {}
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AsyncSnapshot {
     executed_inputs: Vec<Vec<u8>>,
 }
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+enum AsyncCtl {
+    Noop,
+}
+
+impl icanact_core::TellAskTell for AsyncCtl {}
 
 struct AsyncParticipant {
     saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
@@ -223,21 +236,23 @@ impl AsyncSagaParticipant for AsyncParticipant {
 
 impl AsyncActor for AsyncParticipant {
     type Contract = local_async::contract::TellAsk;
-    type Tell = AsyncCmd;
+    type Tell = AsyncCtl;
     type Ask = ();
     type Reply = AsyncSnapshot;
+    type Channel = SagaParticipantChannel<()>;
+    type PubSub = ();
+    type Broadcast = ();
 
-    fn handle_tell(&mut self, msg: Self::Tell) -> impl std::future::Future<Output = ()> + Send {
-        match msg {
-            AsyncCmd::SagaEvent(event) => Box::pin(
-                icanact_saga_choreography::durability::apply_async_participant_saga_ingress(
-                    self,
-                    event,
-                    |_actor, _incoming| {},
-                    |_invalid| {},
-                ),
-            ),
-        }
+    fn supports_channels() -> bool {
+        true
+    }
+
+    fn handle_tell(
+        &mut self,
+        _msg: Self::Tell,
+        _ctx: &mut icanact_core::local_async::AsyncContext,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        async {}
     }
 
     fn handle_ask(
@@ -248,6 +263,25 @@ impl AsyncActor for AsyncParticipant {
             executed_inputs: self.executed_inputs.clone(),
         };
         async move { snapshot }
+    }
+
+    async fn handle_channel(
+        &mut self,
+        _channel_id: icanact_core::local_async::ChannelId,
+        msg: Self::Channel,
+    ) {
+        match msg {
+            SagaParticipantChannel::Saga(event) => {
+                icanact_saga_choreography::durability::apply_async_participant_saga_ingress(
+                    self,
+                    event,
+                    |_actor, _incoming| {},
+                    |_invalid| {},
+                )
+                .await;
+            }
+            SagaParticipantChannel::Business(()) => {}
+        }
     }
 }
 
@@ -324,23 +358,25 @@ fn sync_world_runs_real_saga_workflow_and_exposes_actor_state() {
     let step_a_journal = Arc::new(InMemoryJournal::new());
     let step_a_dedupe = Arc::new(InMemoryDedupe::new());
 
-    let step_a = world.spawn_sync_participant(
+    let step_a = world.spawn_sync_channel_participant(
         SyncParticipant::new(
             "step_a",
             DependencySpec::OnSagaStart,
             Arc::clone(&step_a_journal),
             Arc::clone(&step_a_dedupe),
         ),
-        SyncCmd::SagaEvent,
+        "saga",
+        1024,
     );
-    let step_b = world.spawn_sync_participant(
+    let step_b = world.spawn_sync_channel_participant(
         SyncParticipant::new(
             "step_b",
             DependencySpec::After("step_a"),
             Arc::new(InMemoryJournal::new()),
             Arc::new(InMemoryDedupe::new()),
         ),
-        SyncCmd::SagaEvent,
+        "saga",
+        1024,
     );
 
     let ctx = DeterministicContextBuilder::default()
@@ -389,18 +425,59 @@ fn sync_world_runs_real_saga_workflow_and_exposes_actor_state() {
 }
 
 #[test]
-fn sync_world_drives_compensation_flow_without_changing_actor_contracts() {
+fn sync_world_spawn_args_runs_real_saga_workflow() {
     let world = SagaTestWorld::new();
     let _resolver = world.attach_terminal_resolver(test_terminal_policy(), "testkit");
 
-    let step_a = world.spawn_sync_participant(
+    let step_a = world.spawn_sync_channel_participant(
         SyncParticipant::new(
             "step_a",
             DependencySpec::OnSagaStart,
             Arc::new(InMemoryJournal::new()),
             Arc::new(InMemoryDedupe::new()),
         ),
-        SyncCmd::SagaEvent,
+        "saga",
+        1024,
+    );
+    let step_b = world.spawn_sync_channel_participant(
+        SyncParticipant::new(
+            "step_b",
+            DependencySpec::After("step_a"),
+            Arc::new(InMemoryJournal::new()),
+            Arc::new(InMemoryDedupe::new()),
+        ),
+        "saga",
+        1024,
+    );
+
+    let ctx = DeterministicContextBuilder::default()
+        .with_saga_id(142)
+        .with_saga_type("order_lifecycle")
+        .with_step_name("start")
+        .build();
+    world.start_saga(ctx.clone(), b"payload".to_vec());
+
+    let terminal = world.wait_for_terminal(ctx.saga_id, Duration::from_secs(2));
+    assert!(matches!(terminal, SagaTerminalOutcome::Completed { .. }));
+
+    step_a.shutdown();
+    step_b.shutdown();
+}
+
+#[test]
+fn sync_world_drives_compensation_flow_without_changing_actor_contracts() {
+    let world = SagaTestWorld::new();
+    let _resolver = world.attach_terminal_resolver(test_terminal_policy(), "testkit");
+
+    let step_a = world.spawn_sync_channel_participant(
+        SyncParticipant::new(
+            "step_a",
+            DependencySpec::OnSagaStart,
+            Arc::new(InMemoryJournal::new()),
+            Arc::new(InMemoryDedupe::new()),
+        ),
+        "saga",
+        1024,
     );
     let mut failing_step_b = SyncParticipant::new(
         "step_b",
@@ -409,7 +486,7 @@ fn sync_world_drives_compensation_flow_without_changing_actor_contracts() {
         Arc::new(InMemoryDedupe::new()),
     );
     failing_step_b.fail_on_execute = true;
-    let step_b = world.spawn_sync_participant(failing_step_b, SyncCmd::SagaEvent);
+    let step_b = world.spawn_sync_channel_participant(failing_step_b, "saga", 1024);
 
     let ctx = DeterministicContextBuilder::default()
         .with_saga_id(77)
@@ -441,7 +518,7 @@ fn sync_world_drives_compensation_flow_without_changing_actor_contracts() {
 async fn async_world_runs_real_async_participant_path() {
     let world = SagaTestWorld::new();
     let actor = world
-        .spawn_async_participant(AsyncParticipant::default(), AsyncCmd::SagaEvent)
+        .spawn_async_channel_participant(AsyncParticipant::default(), "saga", 1024)
         .await;
 
     let ctx = DeterministicContextBuilder::default()
@@ -476,6 +553,41 @@ async fn async_world_runs_real_async_participant_path() {
     )
     .await;
     assert_eq!(snapshot.executed_inputs, vec![b"async-input".to_vec()]);
+
+    actor.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_world_spawn_args_runs_real_async_participant_path() {
+    let world = SagaTestWorld::new();
+    let actor = world
+        .spawn_async_channel_participant(AsyncParticipant::default(), "saga", 1024)
+        .await;
+
+    let ctx = DeterministicContextBuilder::default()
+        .with_saga_id(199)
+        .with_saga_type("order_lifecycle")
+        .with_step_name("start")
+        .build();
+
+    world.start_saga(ctx.clone(), b"async-input".to_vec());
+
+    let observed = world
+        .wait_for_event_async(
+            move |event| {
+                matches!(
+                    event,
+                    SagaChoreographyEvent::StepCompleted { context, .. }
+                        if context.saga_id == ctx.saga_id && context.step_name.as_ref() == "async_step"
+                )
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+    assert!(matches!(
+        observed,
+        SagaChoreographyEvent::StepCompleted { .. }
+    ));
 
     actor.shutdown().await;
 }
