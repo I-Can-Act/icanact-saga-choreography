@@ -6,7 +6,7 @@ use icanact_core::CorrelationRegistry;
 
 use crate::reply_registry::{SagaReplyToHandle, SagaReplyToResult};
 use crate::{
-    SagaChoreographyEvent, SagaId, SagaReplyTo, TerminalPolicy, TerminalResolver,
+    SagaChoreographyEvent, SagaId, SagaReplyTo, SagaTerminalOutcome, TerminalPolicy, TerminalResolver,
     TERMINAL_RESOLVER_STEP,
 };
 
@@ -14,6 +14,7 @@ pub struct SagaChoreographyBus {
     bus: EventBus<SagaChoreographyEvent>,
     pending_replies: CorrelationRegistry<SagaId, SagaReplyToResult>,
     terminal_replies: Arc<Mutex<HashMap<SagaId, SagaReplyTo>>>,
+    terminal_outcomes: Arc<Mutex<HashMap<SagaId, SagaTerminalOutcome>>>,
     owned: bool,
 }
 
@@ -23,6 +24,7 @@ impl SagaChoreographyBus {
             bus: EventBus::new(),
             pending_replies: CorrelationRegistry::new(),
             terminal_replies: Arc::new(Mutex::new(HashMap::new())),
+            terminal_outcomes: Arc::new(Mutex::new(HashMap::new())),
             owned: true,
         }
     }
@@ -39,6 +41,12 @@ impl SagaChoreographyBus {
     }
 
     pub fn publish(&self, event: SagaChoreographyEvent) -> PublishStats {
+        if let Some(outcome) = event.terminal_outcome() {
+            self.terminal_outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(event.context().saga_id, outcome);
+        }
         self.bus.publish(event)
     }
 
@@ -77,6 +85,10 @@ impl SagaChoreographyBus {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(saga_id, reply.clone());
+        self.terminal_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(saga_id, reply.outcome.clone());
         self.pending_replies.resolve(&saga_id, Ok(reply)).is_ok()
     }
 
@@ -132,7 +144,14 @@ impl SagaChoreographyBus {
         &self,
         saga_id: SagaId,
     ) -> Option<crate::SagaTerminalOutcome> {
-        self.take_terminal_reply(saga_id).map(|reply| reply.outcome)
+        self.take_terminal_reply(saga_id)
+            .map(|reply| reply.outcome)
+            .or_else(|| {
+                self.terminal_outcomes
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&saga_id)
+            })
     }
 
     fn complete_terminal_reply_from_event(
@@ -175,6 +194,7 @@ impl Clone for SagaChoreographyBus {
             bus: self.bus.clone(),
             pending_replies: self.pending_replies.clone(),
             terminal_replies: Arc::clone(&self.terminal_replies),
+            terminal_outcomes: Arc::clone(&self.terminal_outcomes),
             owned: false,
         }
     }
