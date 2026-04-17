@@ -2,7 +2,6 @@
 
 pub mod markers {
     pub trait StepState: Send + 'static {}
-    pub trait TerminalState: StepState {}
 }
 
 // State types
@@ -45,9 +44,6 @@ impl markers::StepState for Failed {}
 impl markers::StepState for Compensating {}
 impl markers::StepState for Compensated {}
 impl markers::StepState for Quarantined {}
-
-impl markers::TerminalState for Compensated {}
-impl markers::TerminalState for Quarantined {}
 
 use super::ParticipantEvent;
 

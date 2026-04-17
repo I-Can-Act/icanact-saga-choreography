@@ -24,11 +24,6 @@ pub enum StepOutput {
 /// Error from step execution
 #[derive(Clone, Debug)]
 pub enum StepError {
-    /// Temporary error - can retry with exponential backoff
-    Retriable {
-        /// Error description
-        reason: Box<str>,
-    },
     /// Permanent error - fail saga without compensation
     Terminal {
         /// Error description
@@ -42,11 +37,6 @@ pub enum StepError {
 }
 
 impl StepError {
-    /// Check if this error is retriable
-    pub fn is_retriable(&self) -> bool {
-        matches!(self, Self::Retriable { .. })
-    }
-
     /// Check if this error requires compensation
     pub fn requires_compensation(&self) -> bool {
         matches!(self, Self::RequireCompensation { .. })

@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use icanact_core::local::{EventBus, EventSubscription, PublishStats};
@@ -5,21 +6,29 @@ use icanact_core::CorrelationRegistry;
 
 use crate::reply_registry::{SagaReplyToHandle, SagaReplyToResult};
 use crate::{
-    SagaChoreographyEvent, SagaId, SagaReplyTo, TerminalPolicy, TerminalResolver,
-    TERMINAL_RESOLVER_STEP,
+    SagaChoreographyEvent, SagaId, SagaReplyTo, SagaTerminalOutcome, TerminalPolicy,
+    TerminalResolver, TERMINAL_RESOLVER_STEP,
 };
 
 pub struct SagaChoreographyBus {
     bus: EventBus<SagaChoreographyEvent>,
     pending_replies: CorrelationRegistry<SagaId, SagaReplyToResult>,
+    terminal_replies: Arc<Mutex<HashMap<SagaId, SagaReplyTo>>>,
+    terminal_outcomes: Arc<Mutex<HashMap<SagaId, SagaTerminalOutcome>>>,
+    terminal_order: Arc<Mutex<VecDeque<SagaId>>>,
     owned: bool,
 }
+
+const DEFAULT_TERMINAL_RETENTION_LIMIT: usize = 1024;
 
 impl SagaChoreographyBus {
     pub fn new() -> Self {
         Self {
             bus: EventBus::new(),
             pending_replies: CorrelationRegistry::new(),
+            terminal_replies: Arc::new(Mutex::new(HashMap::new())),
+            terminal_outcomes: Arc::new(Mutex::new(HashMap::new())),
+            terminal_order: Arc::new(Mutex::new(VecDeque::new())),
             owned: true,
         }
     }
@@ -36,6 +45,9 @@ impl SagaChoreographyBus {
     }
 
     pub fn publish(&self, event: SagaChoreographyEvent) -> PublishStats {
+        if let Some(outcome) = event.terminal_outcome() {
+            self.store_terminal_outcome(event.context().saga_id, outcome);
+        }
         self.bus.publish(event)
     }
 
@@ -70,6 +82,7 @@ impl SagaChoreographyBus {
     }
 
     pub fn complete_terminal_reply(&self, saga_id: SagaId, reply: SagaReplyTo) -> bool {
+        self.store_terminal_reply(saga_id, reply.clone());
         self.pending_replies.resolve(&saga_id, Ok(reply)).is_ok()
     }
 
@@ -114,6 +127,31 @@ impl SagaChoreographyBus {
         self.attach_terminal_resolver(TerminalPolicy::order_lifecycle_default(), responder)
     }
 
+    pub fn take_terminal_reply(&self, saga_id: SagaId) -> Option<SagaReplyTo> {
+        let reply = self
+            .terminal_replies
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&saga_id);
+        if reply.is_some() {
+            self.terminal_outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&saga_id);
+        }
+        reply
+    }
+
+    pub fn take_terminal_outcome(&self, saga_id: SagaId) -> Option<crate::SagaTerminalOutcome> {
+        let reply = self.take_terminal_reply(saga_id).map(|reply| reply.outcome);
+        let direct = self
+            .terminal_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&saga_id);
+        reply.or(direct)
+    }
+
     fn complete_terminal_reply_from_event(
         &self,
         event: &SagaChoreographyEvent,
@@ -141,6 +179,69 @@ impl SagaChoreographyBus {
             },
         )
     }
+
+    fn terminal_retention_limit(&self) -> usize {
+        std::env::var("SAGA_TERMINAL_RETENTION_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_TERMINAL_RETENTION_LIMIT)
+    }
+
+    fn store_terminal_reply(&self, saga_id: SagaId, reply: SagaReplyTo) {
+        let outcome = reply.outcome.clone();
+        self.terminal_replies
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(saga_id, reply);
+        self.store_terminal_outcome(saga_id, outcome);
+    }
+
+    fn store_terminal_outcome(&self, saga_id: SagaId, outcome: SagaTerminalOutcome) {
+        let inserted_new = {
+            let mut terminal_outcomes = self
+                .terminal_outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            terminal_outcomes.insert(saga_id, outcome).is_none()
+        };
+
+        if inserted_new {
+            let limit = self.terminal_retention_limit();
+            let evicted_id = {
+                let mut order = self
+                    .terminal_order
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut evicted_id = None;
+                order.push_back(saga_id);
+                while order.len() > limit {
+                    let Some(candidate) = order.pop_front() else {
+                        break;
+                    };
+                    if candidate != saga_id {
+                        evicted_id = Some(candidate);
+                        break;
+                    }
+                }
+                evicted_id
+            };
+            if let Some(evicted_id) = evicted_id {
+                self.remove_terminal_state(evicted_id);
+            }
+        }
+    }
+
+    fn remove_terminal_state(&self, saga_id: SagaId) -> Option<SagaTerminalOutcome> {
+        self.terminal_replies
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&saga_id);
+        self.terminal_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&saga_id)
+    }
 }
 
 pub fn global_saga_choreography_bus() -> SagaChoreographyBus {
@@ -153,6 +254,9 @@ impl Clone for SagaChoreographyBus {
         Self {
             bus: self.bus.clone(),
             pending_replies: self.pending_replies.clone(),
+            terminal_replies: Arc::clone(&self.terminal_replies),
+            terminal_outcomes: Arc::clone(&self.terminal_outcomes),
+            terminal_order: Arc::clone(&self.terminal_order),
             owned: false,
         }
     }
@@ -186,10 +290,11 @@ mod tests {
     use icanact_core::local_sync;
 
     use crate::{
-        SagaChoreographyEvent, SagaContext, SagaId, SagaReplyToResult, TERMINAL_RESOLVER_STEP,
+        SagaChoreographyEvent, SagaContext, SagaId, SagaReplyToResult, SagaTerminalOutcome,
+        TERMINAL_RESOLVER_STEP,
     };
 
-    use super::SagaChoreographyBus;
+    use super::{SagaChoreographyBus, DEFAULT_TERMINAL_RETENTION_LIMIT};
 
     fn context(step_name: &str, saga_id: u64) -> SagaContext {
         let now = SagaContext::now_millis();
@@ -244,7 +349,7 @@ mod tests {
             }
         });
         let pending = probe_addr
-            .ask_deferred(|reply| ProbeMsg::Register {
+            .ask_delegated(|reply| ProbeMsg::Register {
                 bus,
                 saga_id,
                 reply,
@@ -312,6 +417,64 @@ mod tests {
         assert!(got_b.is_ok());
         probe_a.shutdown();
         probe_b.shutdown();
+    }
+
+    #[test]
+    fn take_terminal_outcome_returns_and_consumes_resolved_reply() {
+        let bus = SagaChoreographyBus::new();
+        let saga_id = SagaId::new(77);
+        let (pending, probe) = register_pending_reply(bus.clone(), saga_id);
+        thread::sleep(Duration::from_millis(20));
+
+        let completed = SagaChoreographyEvent::SagaCompleted {
+            context: SagaContext {
+                step_name: TERMINAL_RESOLVER_STEP.into(),
+                ..context("create_order", saga_id.get())
+            },
+        };
+        assert!(bus.complete_terminal_reply_from_event(&completed, "resolver"));
+
+        let reply = pending
+            .wait()
+            .expect("terminal reply should resolve")
+            .expect("terminal reply should be successful");
+        assert!(matches!(
+            reply.outcome,
+            SagaTerminalOutcome::Completed { .. }
+        ));
+        assert!(matches!(
+            bus.take_terminal_outcome(saga_id),
+            Some(SagaTerminalOutcome::Completed { .. })
+        ));
+        assert!(
+            bus.take_terminal_outcome(saga_id).is_none(),
+            "terminal outcome should be consumed after the first read"
+        );
+        probe.shutdown();
+    }
+
+    #[test]
+    fn terminal_outcome_retention_is_bounded() {
+        let bus = SagaChoreographyBus::new();
+        let total = DEFAULT_TERMINAL_RETENTION_LIMIT + 8;
+
+        for raw_id in 1..=total as u64 {
+            let _ = bus.publish(SagaChoreographyEvent::SagaCompleted {
+                context: SagaContext {
+                    step_name: TERMINAL_RESOLVER_STEP.into(),
+                    ..context("create_order", raw_id)
+                },
+            });
+        }
+
+        assert!(
+            bus.take_terminal_outcome(SagaId::new(1)).is_none(),
+            "oldest terminal outcome should be evicted once retention limit is exceeded"
+        );
+        assert!(matches!(
+            bus.take_terminal_outcome(SagaId::new(total as u64)),
+            Some(SagaTerminalOutcome::Completed { .. })
+        ));
     }
 
     #[test]

@@ -443,7 +443,7 @@ fn default_runtime_dir_and_open_actor_helpers_work() {
     let runtime_dir = default_runtime_dir("THIS_ENV_SHOULD_NOT_EXIST_123", "runtime-data");
     assert!(
         runtime_dir.to_string_lossy().contains("target/test-tmp")
-            || runtime_dir == PathBuf::from("runtime-data")
+            || runtime_dir.as_path() == Path::new("runtime-data")
     );
 
     let opened = open_saga_lmdb_actor::<MockLmdbBackedActor>("mock-id", Path::new("/tmp/saga"))
@@ -628,7 +628,6 @@ fn helper_and_wrapper_apis_cover_default_branches() {
             participant_id: "pid".into(),
             error_code: None,
             error: "err".into(),
-            will_retry: false,
             requires_compensation: true,
         }
     ));

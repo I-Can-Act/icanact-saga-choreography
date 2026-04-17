@@ -1,8 +1,11 @@
 //! Test helpers for participant choreography tests.
 
 use crate::{
-    handle_saga_event, SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId,
-    SagaParticipant, SagaStateExt, SagaTerminalOutcome, TerminalPolicy,
+    apply_sync_workflow_participant_saga_ingress, bind_async_participant_channel,
+    bind_sync_participant_channel, bind_sync_workflow_participant_channel,
+    checked_workflow_saga_types, handle_saga_event, HasSagaWorkflowParticipants,
+    SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant,
+    SagaParticipantChannel, SagaStateExt, SagaTerminalOutcome, TerminalPolicy,
 };
 
 /// Small deterministic builder for saga test contexts.
@@ -92,7 +95,6 @@ pub fn step_completed(
 pub fn step_failed(
     context: SagaContext,
     error: impl Into<String>,
-    will_retry: bool,
     requires_compensation: bool,
 ) -> SagaChoreographyEvent {
     SagaChoreographyEvent::StepFailed {
@@ -100,7 +102,6 @@ pub fn step_failed(
         participant_id: "testkit".into(),
         error_code: None,
         error: error.into().into_boxed_str(),
-        will_retry,
         requires_compensation,
     }
 }
@@ -131,6 +132,18 @@ pub fn drive_scenario<P>(
 {
     for event in events {
         handle_saga_event(participant, event);
+    }
+}
+
+/// Replay a deterministic event sequence against a workflow-scoped participant actor.
+pub fn drive_workflow_scenario<A>(
+    actor: &mut A,
+    events: impl IntoIterator<Item = SagaChoreographyEvent>,
+) where
+    A: crate::HasSagaParticipantSupport + HasSagaWorkflowParticipants + Send + 'static,
+{
+    for event in events {
+        apply_sync_workflow_participant_saga_ingress(actor, event, |_actor, _event| {}, |_| {});
     }
 }
 
@@ -200,7 +213,6 @@ impl TranscriptState {
 #[cfg(any(test, feature = "test-harness"))]
 #[derive(Default, Clone)]
 pub struct SagaTestWorld {
-    world: icanact_core::testkit::TestWorld,
     bus: SagaChoreographyBus,
     transcript: Arc<TranscriptState>,
     captured_saga_types: Arc<Mutex<HashSet<Box<str>>>>,
@@ -211,7 +223,6 @@ pub struct SagaTestWorld {
 impl SagaTestWorld {
     pub fn new() -> Self {
         Self {
-            world: icanact_core::testkit::TestWorld::new(),
             bus: SagaChoreographyBus::new(),
             transcript: Arc::new(TranscriptState::default()),
             captured_saga_types: Arc::new(Mutex::new(HashSet::new())),
@@ -353,6 +364,103 @@ impl SagaTestWorld {
         SyncSagaParticipantHandle { actor_ref, handle }
     }
 
+    pub fn spawn_sync_channel_participant<A, C>(
+        &self,
+        mut actor: A,
+        channel_name: &str,
+        channel_capacity: usize,
+    ) -> SyncSagaParticipantHandle<A>
+    where
+        A: icanact_core::local_sync::SyncActor + SagaParticipant + HasSagaParticipantSupport,
+        A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
+        <A as icanact_core::local_sync::SyncActor>::Channel: From<SagaParticipantChannel<C>>,
+        C: Send + 'static,
+    {
+        actor.attach_saga_bus(self.bus.clone());
+        let saga_types: Vec<&'static str> = actor.saga_types().to_vec();
+        let (actor_ref, handle) = icanact_core::local_sync::spawn(actor);
+        let subs = bind_sync_participant_channel::<A, C>(
+            &self.bus,
+            &actor_ref,
+            &saga_types,
+            channel_name,
+            channel_capacity,
+        )
+        .expect("sync participant saga channel binding should succeed");
+        for sub in subs {
+            self.remember_subscription(sub);
+        }
+        SyncSagaParticipantHandle { actor_ref, handle }
+    }
+
+    pub fn spawn_sync_workflow_channel_participant<A, C>(
+        &self,
+        mut actor: A,
+        channel_name: &str,
+        channel_capacity: usize,
+    ) -> SyncSagaParticipantHandle<A>
+    where
+        A: icanact_core::local_sync::SyncActor
+            + HasSagaParticipantSupport
+            + HasSagaWorkflowParticipants,
+        A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
+        <A as icanact_core::local_sync::SyncActor>::Channel: From<SagaParticipantChannel<C>>,
+        C: Send + 'static,
+    {
+        actor.attach_saga_bus(self.bus.clone());
+        let saga_types = checked_workflow_saga_types::<A>()
+            .expect("workflow participant saga type registration should be valid");
+        for saga_type in &saga_types {
+            self.ensure_capture_saga_type(saga_type);
+        }
+
+        let (actor_ref, handle) = icanact_core::local_sync::spawn(actor);
+        let subs = bind_sync_workflow_participant_channel::<A, C>(
+            &self.bus,
+            &actor_ref,
+            channel_name,
+            channel_capacity,
+        )
+        .expect("sync workflow participant saga channel binding should succeed");
+        for sub in subs {
+            self.remember_subscription(sub);
+        }
+        SyncSagaParticipantHandle { actor_ref, handle }
+    }
+
+    pub fn spawn_sync_participant_args<A, Args, FMake, F>(
+        &self,
+        args: Args,
+        make: FMake,
+        map_event: F,
+    ) -> SyncSagaParticipantHandle<A>
+    where
+        A: icanact_core::local_sync::SyncActor + SagaParticipant + HasSagaParticipantSupport,
+        Args: Clone + Send + Sync + 'static,
+        FMake: Fn(Args) -> A + Send + Sync + 'static,
+        A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
+        F: Fn(SagaChoreographyEvent) -> A::Tell + Send + Sync + 'static,
+    {
+        self.spawn_sync_participant_with_opts(make(args), Default::default(), map_event)
+    }
+
+    pub fn spawn_sync_participant_args_with_opts<A, Args, FMake, F>(
+        &self,
+        args: Args,
+        make: FMake,
+        opts: icanact_core::local_sync::SpawnOpts,
+        map_event: F,
+    ) -> SyncSagaParticipantHandle<A>
+    where
+        A: icanact_core::local_sync::SyncActor + SagaParticipant + HasSagaParticipantSupport,
+        Args: Clone + Send + Sync + 'static,
+        FMake: Fn(Args) -> A + Send + Sync + 'static,
+        A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
+        F: Fn(SagaChoreographyEvent) -> A::Tell + Send + Sync + 'static,
+    {
+        self.spawn_sync_participant_with_opts(make(args), opts, map_event)
+    }
+
     pub async fn spawn_async_participant<A, F>(
         &self,
         actor: A,
@@ -387,6 +495,70 @@ impl SagaTestWorld {
         let (actor_ref, handle) = icanact_core::local_async::spawn_with_opts(actor, opts).await;
         self.register_async_subscriptions(actor_ref.clone(), &saga_types, map_event);
         AsyncSagaParticipantHandle { actor_ref, handle }
+    }
+
+    pub async fn spawn_async_channel_participant<A, C>(
+        &self,
+        mut actor: A,
+        channel_name: &str,
+        channel_capacity: usize,
+    ) -> AsyncSagaParticipantHandle<A>
+    where
+        A: icanact_core::local_async::AsyncActor + AsyncSagaParticipant + HasSagaParticipantSupport,
+        A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
+        <A as icanact_core::local_async::AsyncActor>::Channel: From<SagaParticipantChannel<C>>,
+        C: Send + 'static,
+    {
+        actor.attach_saga_bus(self.bus.clone());
+        let saga_types: Vec<&'static str> = actor.saga_types().to_vec();
+        let (actor_ref, handle) = icanact_core::local_async::spawn(actor).await;
+        let subs = bind_async_participant_channel::<A, C>(
+            &self.bus,
+            &actor_ref,
+            &saga_types,
+            channel_name,
+            channel_capacity,
+        )
+        .expect("async participant saga channel binding should succeed");
+        for sub in subs {
+            self.remember_subscription(sub);
+        }
+        AsyncSagaParticipantHandle { actor_ref, handle }
+    }
+
+    pub async fn spawn_async_participant_args<A, Args, FMake, F>(
+        &self,
+        args: Args,
+        make: FMake,
+        map_event: F,
+    ) -> AsyncSagaParticipantHandle<A>
+    where
+        A: icanact_core::local_async::AsyncActor + AsyncSagaParticipant + HasSagaParticipantSupport,
+        Args: Clone + Send + Sync + 'static,
+        FMake: Fn(Args) -> A + Send + Sync + 'static,
+        A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
+        F: Fn(SagaChoreographyEvent) -> A::Tell + Send + Sync + 'static,
+    {
+        self.spawn_async_participant_with_opts(make(args), Default::default(), map_event)
+            .await
+    }
+
+    pub async fn spawn_async_participant_args_with_opts<A, Args, FMake, F>(
+        &self,
+        args: Args,
+        make: FMake,
+        opts: icanact_core::local_async::SpawnOpts,
+        map_event: F,
+    ) -> AsyncSagaParticipantHandle<A>
+    where
+        A: icanact_core::local_async::AsyncActor + AsyncSagaParticipant + HasSagaParticipantSupport,
+        Args: Clone + Send + Sync + 'static,
+        FMake: Fn(Args) -> A + Send + Sync + 'static,
+        A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
+        F: Fn(SagaChoreographyEvent) -> A::Tell + Send + Sync + 'static,
+    {
+        self.spawn_async_participant_with_opts(make(args), opts, map_event)
+            .await
     }
 
     fn ensure_capture_saga_type(&self, saga_type: &str) {

@@ -156,7 +156,7 @@ async fn async_ingress_waits_for_all_dependencies_before_execution() {
 }
 
 #[tokio::test]
-async fn async_ingress_compensation_failure_quarantines_saga() {
+async fn async_ingress_non_ambiguous_compensation_failure_keeps_local_quarantine_only() {
     let mut participant = AsyncTestParticipant {
         compensation_result: Err(CompensationError::Terminal {
             reason: "undo failed".into(),
@@ -190,9 +190,14 @@ async fn async_ingress_compensation_failure_quarantines_saga() {
     .await;
 
     assert_eq!(participant.compensation_calls, 1);
-    assert!(emitted
-        .iter()
-        .any(|event| matches!(event, SagaChoreographyEvent::SagaQuarantined { .. })));
+    assert_eq!(emitted.len(), 1);
+    assert!(matches!(
+        emitted.first(),
+        Some(SagaChoreographyEvent::CompensationFailed {
+            is_ambiguous: false,
+            ..
+        })
+    ));
     assert!(matches!(
         participant.saga_states_ref().values().next(),
         Some(SagaStateEntry::Quarantined(_))

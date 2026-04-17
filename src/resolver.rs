@@ -202,12 +202,8 @@ impl TerminalResolver {
                 participant_id,
                 error_code,
                 error,
-                will_retry,
                 requires_compensation,
             } => {
-                if *will_retry {
-                    return out;
-                }
                 if !self
                     .policy
                     .failure_authority
@@ -221,7 +217,6 @@ impl TerminalResolver {
                     participant_id: participant_id.clone(),
                     error_code: error_code.clone(),
                     error_message: error.clone(),
-                    will_retry: *will_retry,
                     at_millis: context.event_timestamp_millis,
                 };
 
@@ -421,17 +416,19 @@ mod tests {
     }
 
     #[test]
-    fn step_failed_will_retry_is_non_terminal() {
+    fn step_failed_without_compensation_is_terminal() {
         let mut resolver = TerminalResolver::new(TerminalPolicy::order_lifecycle_default());
         let out = resolver.ingest(&SagaChoreographyEvent::StepFailed {
             context: ctx("a"),
             participant_id: "actor-a".into(),
             error_code: Some("TEMP".into()),
             error: "try again".into(),
-            will_retry: true,
             requires_compensation: false,
         });
-        assert!(out.is_empty());
+        assert!(matches!(
+            out.first(),
+            Some(SagaChoreographyEvent::SagaFailed { reason, .. }) if reason.as_ref() == "try again"
+        ));
     }
 
     #[test]
@@ -451,7 +448,6 @@ mod tests {
             participant_id: "actor-a".into(),
             error_code: None,
             error: "no".into(),
-            will_retry: false,
             requires_compensation: false,
         });
         assert!(out.is_empty());
