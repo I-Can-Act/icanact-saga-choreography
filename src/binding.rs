@@ -109,6 +109,44 @@ where
     bind_sync_participant_channel::<A, C>(bus, actor_ref, &saga_types, channel_name, capacity)
 }
 
+pub fn bind_sync_participant_tell<A, F>(
+    bus: &SagaChoreographyBus,
+    actor_ref: &icanact_core::local_sync::SyncActorRef<A>,
+    saga_types: &[&'static str],
+    map_event: F,
+) -> Result<Vec<EventSubscription>, String>
+where
+    A: icanact_core::local_sync::SyncActor + Send + 'static,
+    A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
+    F: Fn(SagaChoreographyEvent) -> A::Tell + Send + Sync + 'static,
+{
+    let map_event = std::sync::Arc::new(map_event);
+    Ok(saga_types
+        .iter()
+        .map(|saga_type| {
+            let actor_ref = actor_ref.clone();
+            let map_event = std::sync::Arc::clone(&map_event);
+            bus.subscribe_saga_type_fn(saga_type, move |event| {
+                actor_ref.try_tell(map_event(event.clone())).is_ok()
+            })
+        })
+        .collect())
+}
+
+pub fn bind_sync_workflow_participant_tell<A, F>(
+    bus: &SagaChoreographyBus,
+    actor_ref: &icanact_core::local_sync::SyncActorRef<A>,
+    map_event: F,
+) -> Result<Vec<EventSubscription>, String>
+where
+    A: icanact_core::local_sync::SyncActor + HasSagaWorkflowParticipants + Send + 'static,
+    A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
+    F: Fn(SagaChoreographyEvent) -> A::Tell + Send + Sync + 'static,
+{
+    let saga_types = checked_workflow_saga_types::<A>()?;
+    bind_sync_participant_tell(bus, actor_ref, &saga_types, map_event)
+}
+
 pub fn bind_async_participant_channel<A, C>(
     bus: &SagaChoreographyBus,
     actor_ref: &icanact_core::local_async::AsyncActorRef<A>,
@@ -145,6 +183,30 @@ where
                     .expect("saga async channel sender lock poisoned")
                     .try_send(SagaParticipantChannel::Saga(event.clone()).into())
                     .is_ok()
+            })
+        })
+        .collect())
+}
+
+pub fn bind_async_participant_tell<A, F>(
+    bus: &SagaChoreographyBus,
+    actor_ref: &icanact_core::local_async::AsyncActorRef<A>,
+    saga_types: &[&'static str],
+    map_event: F,
+) -> Result<Vec<EventSubscription>, String>
+where
+    A: icanact_core::local_async::AsyncActor + Send + 'static,
+    A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
+    F: Fn(SagaChoreographyEvent) -> A::Tell + Send + Sync + 'static,
+{
+    let map_event = std::sync::Arc::new(map_event);
+    Ok(saga_types
+        .iter()
+        .map(|saga_type| {
+            let actor_ref = actor_ref.clone();
+            let map_event = std::sync::Arc::clone(&map_event);
+            bus.subscribe_saga_type_fn(saga_type, move |event| {
+                actor_ref.try_tell(map_event(event.clone())).is_ok()
             })
         })
         .collect())

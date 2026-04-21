@@ -70,8 +70,9 @@ mod testkit;
 
 // Types
 pub use binding::{
-    bind_async_participant_channel, bind_sync_participant_channel,
-    bind_sync_workflow_participant_channel, checked_workflow_saga_types, workflow_saga_types,
+    bind_async_participant_channel, bind_async_participant_tell, bind_sync_participant_channel,
+    bind_sync_participant_tell, bind_sync_workflow_participant_channel,
+    bind_sync_workflow_participant_tell, checked_workflow_saga_types, workflow_saga_types,
     SagaParticipantChannel,
 };
 pub use bus::{global_saga_choreography_bus, SagaChoreographyBus};
