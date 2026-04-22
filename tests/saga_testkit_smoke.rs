@@ -294,6 +294,7 @@ fn test_terminal_policy() -> TerminalPolicy {
         failure_authority: FailureAuthority::AnyParticipant,
         success_criteria: SuccessCriteria::AllOf(required),
         timeout: None,
+        progress_timeout: None,
     }
 }
 
@@ -306,6 +307,7 @@ fn workflow_terminal_policy() -> TerminalPolicy {
         failure_authority: FailureAuthority::AnyParticipant,
         success_criteria: SuccessCriteria::AllOf(required),
         timeout: None,
+        progress_timeout: None,
     }
 }
 

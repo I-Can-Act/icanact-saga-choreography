@@ -1,5 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
+use std::time::Duration;
 
 use icanact_core::local::{EventBus, EventSubscription, PublishStats};
 use icanact_core::CorrelationRegistry;
@@ -21,6 +23,7 @@ pub struct SagaChoreographyBus {
 }
 
 const DEFAULT_TERMINAL_RETENTION_LIMIT: usize = 1024;
+const DEFAULT_TERMINAL_WATCHDOG_TICK_MS: u64 = 100;
 
 impl SagaChoreographyBus {
     pub fn new() -> Self {
@@ -136,6 +139,12 @@ impl SagaChoreographyBus {
         let resolver = Arc::new(Mutex::new(TerminalResolver::new(policy.clone())));
         let bus = self.clone();
         let responder: Arc<str> = Arc::from(responder);
+        spawn_terminal_watchdog_if_needed(
+            &policy,
+            Arc::clone(&resolver),
+            bus.clone(),
+            Arc::clone(&responder),
+        );
         self.bus
             .subscribe_fn(policy.saga_type.as_ref(), move |event| {
                 let terminal_events = {
@@ -295,6 +304,53 @@ impl SagaChoreographyBus {
     }
 }
 
+fn terminal_watchdog_tick_interval() -> Duration {
+    std::env::var("SAGA_TERMINAL_WATCHDOG_TICK_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(DEFAULT_TERMINAL_WATCHDOG_TICK_MS))
+}
+
+fn spawn_terminal_watchdog_if_needed(
+    policy: &TerminalPolicy,
+    resolver: Arc<Mutex<TerminalResolver>>,
+    bus: SagaChoreographyBus,
+    responder: Arc<str>,
+) {
+    if policy.timeout.is_none() && policy.progress_timeout.is_none() {
+        return;
+    }
+
+    let saga_type = policy.saga_type.clone();
+    let watchdog_name = format!("saga-terminal-watchdog:{saga_type}");
+    let spawn_result = thread::Builder::new()
+        .name(watchdog_name)
+        .spawn(move || loop {
+            thread::sleep(terminal_watchdog_tick_interval());
+            let terminal_events = {
+                let mut guard = match resolver.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.poll_timeouts()
+            };
+            for terminal_event in terminal_events {
+                let _ = bus.complete_terminal_reply_from_event(&terminal_event, responder.as_ref());
+                let _ = bus.publish(terminal_event);
+            }
+        });
+    if let Err(err) = spawn_result {
+        tracing::warn!(
+            target: "core::saga",
+            event = "terminal_watchdog_spawn_failed",
+            saga_type = policy.saga_type.as_ref(),
+            error = %err
+        );
+    }
+}
+
 pub fn global_saga_choreography_bus() -> SagaChoreographyBus {
     static BUS: OnceLock<SagaChoreographyBus> = OnceLock::new();
     BUS.get_or_init(SagaChoreographyBus::new).clone()
@@ -334,6 +390,7 @@ impl Default for SagaChoreographyBus {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::thread;
@@ -342,8 +399,9 @@ mod tests {
     use icanact_core::local_sync;
 
     use crate::{
-        SagaChoreographyEvent, SagaContext, SagaId, SagaReplyToResult, SagaTerminalOutcome,
-        SagaTerminalPolicyProvider, TerminalPolicy, TERMINAL_RESOLVER_STEP,
+        FailureAuthority, SagaChoreographyEvent, SagaContext, SagaId, SagaReplyToResult,
+        SagaTerminalOutcome, SagaTerminalPolicyProvider, SuccessCriteria, TerminalPolicy,
+        TERMINAL_RESOLVER_STEP,
     };
 
     use super::{SagaChoreographyBus, DEFAULT_TERMINAL_RETENTION_LIMIT};
@@ -641,6 +699,45 @@ mod tests {
         assert!(
             bus.take_terminal_outcome(saga_id).is_none(),
             "policy-registered saga start should not fail immediately"
+        );
+    }
+
+    #[test]
+    fn watchdog_times_out_stalled_saga_without_new_events() {
+        let bus = SagaChoreographyBus::new();
+        let mut required_steps = HashSet::new();
+        required_steps.insert("create_order".into());
+        let policy = TerminalPolicy {
+            saga_type: "order_lifecycle".into(),
+            policy_id: "watchdog/stall".into(),
+            failure_authority: FailureAuthority::AnyParticipant,
+            success_criteria: SuccessCriteria::AllOf(required_steps),
+            timeout: Some(Duration::from_secs(5)),
+            progress_timeout: Some(Duration::from_millis(120)),
+        };
+        let _resolver_sub = bus.attach_terminal_resolver(policy, "terminal-resolver");
+        let saga_id = SagaId::new(8_001);
+        let _ = bus.publish(SagaChoreographyEvent::SagaStarted {
+            context: context("risk_check", saga_id.get()),
+            payload: Vec::new(),
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut outcome = None;
+        while Instant::now() < deadline {
+            if let Some(found) = bus.take_terminal_outcome(saga_id) {
+                outcome = Some(found);
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let Some(SagaTerminalOutcome::Failed { reason, .. }) = outcome else {
+            panic!("expected stalled terminal failure, got: {outcome:?}");
+        };
+        assert!(
+            reason.as_ref().contains("stalled_timeout"),
+            "expected stalled_timeout reason, got: {reason}"
         );
     }
 }
