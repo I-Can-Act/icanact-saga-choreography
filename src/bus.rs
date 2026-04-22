@@ -6,8 +6,8 @@ use icanact_core::CorrelationRegistry;
 
 use crate::reply_registry::{SagaReplyToHandle, SagaReplyToResult};
 use crate::{
-    SagaChoreographyEvent, SagaId, SagaReplyTo, SagaTerminalOutcome, TerminalPolicy,
-    TerminalResolver, TERMINAL_RESOLVER_STEP,
+    SagaChoreographyEvent, SagaId, SagaReplyTo, SagaTerminalOutcome, SagaTerminalPolicyProvider,
+    TerminalPolicy, TerminalResolver, TERMINAL_RESOLVER_STEP,
 };
 
 pub struct SagaChoreographyBus {
@@ -16,6 +16,7 @@ pub struct SagaChoreographyBus {
     terminal_replies: Arc<Mutex<HashMap<SagaId, SagaReplyTo>>>,
     terminal_outcomes: Arc<Mutex<HashMap<SagaId, SagaTerminalOutcome>>>,
     terminal_order: Arc<Mutex<VecDeque<SagaId>>>,
+    terminal_policies_by_saga_type: Arc<Mutex<HashMap<Box<str>, Box<str>>>>,
     owned: bool,
 }
 
@@ -29,6 +30,7 @@ impl SagaChoreographyBus {
             terminal_replies: Arc::new(Mutex::new(HashMap::new())),
             terminal_outcomes: Arc::new(Mutex::new(HashMap::new())),
             terminal_order: Arc::new(Mutex::new(VecDeque::new())),
+            terminal_policies_by_saga_type: Arc::new(Mutex::new(HashMap::new())),
             owned: true,
         }
     }
@@ -45,10 +47,43 @@ impl SagaChoreographyBus {
     }
 
     pub fn publish(&self, event: SagaChoreographyEvent) -> PublishStats {
+        if let SagaChoreographyEvent::SagaStarted { context, .. } = &event {
+            if !self.has_terminal_policy_for_saga_type(context.saga_type.as_ref()) {
+                let terminal = SagaChoreographyEvent::SagaFailed {
+                    context: context.next_step(TERMINAL_RESOLVER_STEP.into()),
+                    reason: format!(
+                        "terminal policy is required before saga start; saga_type={} saga_id={}",
+                        context.saga_type,
+                        context.saga_id.get()
+                    )
+                    .into(),
+                    failure: None,
+                };
+                if let Some(outcome) = terminal.terminal_outcome() {
+                    self.store_terminal_outcome(terminal.context().saga_id, outcome);
+                }
+                return self.bus.publish(terminal);
+            }
+        }
         if let Some(outcome) = event.terminal_outcome() {
             self.store_terminal_outcome(event.context().saga_id, outcome);
         }
         self.bus.publish(event)
+    }
+
+    /// Registers a terminal policy for a saga type, enabling `SagaStarted`
+    /// acceptance for that workflow.
+    pub fn register_terminal_policy(&self, policy: &TerminalPolicy) {
+        self.terminal_policies_by_saga_type
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(policy.saga_type.clone(), policy.policy_id.clone());
+    }
+
+    /// Registers terminal policy via a static provider contract.
+    pub fn register_terminal_policy_provider<P: SagaTerminalPolicyProvider>(&self) {
+        let policy = P::terminal_policy();
+        self.register_terminal_policy(&policy);
     }
 
     pub fn publish_to_saga_type(
@@ -97,6 +132,7 @@ impl SagaChoreographyBus {
         policy: TerminalPolicy,
         responder: &'static str,
     ) -> EventSubscription {
+        self.register_terminal_policy(&policy);
         let resolver = Arc::new(Mutex::new(TerminalResolver::new(policy.clone())));
         let bus = self.clone();
         let responder: Arc<str> = Arc::from(responder);
@@ -125,6 +161,14 @@ impl SagaChoreographyBus {
         responder: &'static str,
     ) -> EventSubscription {
         self.attach_terminal_resolver(TerminalPolicy::order_lifecycle_default(), responder)
+    }
+
+    /// Attaches terminal resolver via a static policy provider contract.
+    pub fn attach_terminal_resolver_for<P: SagaTerminalPolicyProvider>(
+        &self,
+        responder: &'static str,
+    ) -> EventSubscription {
+        self.attach_terminal_resolver(P::terminal_policy(), responder)
     }
 
     pub fn take_terminal_reply(&self, saga_id: SagaId) -> Option<SagaReplyTo> {
@@ -186,6 +230,13 @@ impl SagaChoreographyBus {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(DEFAULT_TERMINAL_RETENTION_LIMIT)
+    }
+
+    fn has_terminal_policy_for_saga_type(&self, saga_type: &str) -> bool {
+        self.terminal_policies_by_saga_type
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(saga_type)
     }
 
     fn store_terminal_reply(&self, saga_id: SagaId, reply: SagaReplyTo) {
@@ -257,6 +308,7 @@ impl Clone for SagaChoreographyBus {
             terminal_replies: Arc::clone(&self.terminal_replies),
             terminal_outcomes: Arc::clone(&self.terminal_outcomes),
             terminal_order: Arc::clone(&self.terminal_order),
+            terminal_policies_by_saga_type: Arc::clone(&self.terminal_policies_by_saga_type),
             owned: false,
         }
     }
@@ -291,7 +343,7 @@ mod tests {
 
     use crate::{
         SagaChoreographyEvent, SagaContext, SagaId, SagaReplyToResult, SagaTerminalOutcome,
-        TERMINAL_RESOLVER_STEP,
+        SagaTerminalPolicyProvider, TerminalPolicy, TERMINAL_RESOLVER_STEP,
     };
 
     use super::{SagaChoreographyBus, DEFAULT_TERMINAL_RETENTION_LIMIT};
@@ -543,5 +595,52 @@ mod tests {
             .expect("pending terminal reply should resolve on bus drop");
         assert!(result.is_err());
         probe.shutdown();
+    }
+
+    #[test]
+    fn saga_started_without_terminal_policy_is_failed_immediately() {
+        let bus = SagaChoreographyBus::new();
+        let saga_id = SagaId::new(9001);
+        let started = SagaChoreographyEvent::SagaStarted {
+            context: context("create_order", saga_id.get()),
+            payload: Vec::new(),
+        };
+
+        let _ = bus.publish(started);
+
+        let Some(SagaTerminalOutcome::Failed { reason, .. }) = bus.take_terminal_outcome(saga_id)
+        else {
+            panic!("expected immediate terminal failure for unregistered terminal policy");
+        };
+        assert!(
+            reason.contains("terminal policy is required before saga start"),
+            "unexpected reason: {reason}"
+        );
+    }
+
+    struct OrderLifecycleProvider;
+
+    impl SagaTerminalPolicyProvider for OrderLifecycleProvider {
+        fn terminal_policy() -> TerminalPolicy {
+            TerminalPolicy::order_lifecycle_default()
+        }
+    }
+
+    #[test]
+    fn policy_provider_registration_allows_saga_started() {
+        let bus = SagaChoreographyBus::new();
+        bus.register_terminal_policy_provider::<OrderLifecycleProvider>();
+        let saga_id = SagaId::new(9002);
+        let started = SagaChoreographyEvent::SagaStarted {
+            context: context("create_order", saga_id.get()),
+            payload: Vec::new(),
+        };
+
+        let _ = bus.publish(started);
+
+        assert!(
+            bus.take_terminal_outcome(saga_id).is_none(),
+            "policy-registered saga start should not fail immediately"
+        );
     }
 }

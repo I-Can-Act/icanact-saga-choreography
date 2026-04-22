@@ -120,7 +120,8 @@ pub use helpers::{
 };
 pub use reply_registry::{SagaReplyToHandle, SagaReplyToResult};
 pub use resolver::{
-    FailureAuthority, SuccessCriteria, TerminalPolicy, TerminalResolver, TERMINAL_RESOLVER_STEP,
+    FailureAuthority, SagaTerminalPolicyProvider, SuccessCriteria, TerminalPolicy,
+    TerminalResolver, TERMINAL_RESOLVER_STEP,
 };
 #[cfg(any(test, feature = "test-harness"))]
 pub use testkit::AsyncSagaParticipantHandle;

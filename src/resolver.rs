@@ -95,6 +95,14 @@ pub struct TerminalPolicy {
     pub timeout: Option<Duration>,
 }
 
+/// Declarative workflow contract used to enforce terminal-policy registration.
+///
+/// Implementers provide the saga type and terminal policy that must be present
+/// before `SagaStarted` events are accepted by the bus.
+pub trait SagaTerminalPolicyProvider {
+    fn terminal_policy() -> TerminalPolicy;
+}
+
 impl TerminalPolicy {
     pub fn order_lifecycle_default() -> Self {
         let mut required_steps: HashSet<Box<str>> = HashSet::new();

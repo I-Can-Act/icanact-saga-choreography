@@ -1397,6 +1397,7 @@ fn duplicate_compensation_request_is_deduped() {
     let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = SagaChoreographyBus::new();
+    bus.register_terminal_policy(&test_policy());
 
     let (p_ref, p_h) = spawn_and_subscribe(
         &world,
