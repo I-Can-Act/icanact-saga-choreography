@@ -178,12 +178,21 @@ impl ParticipantJournal for InMemoryJournal {
         let seq = self
             .counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let recorded_at_millis =
+            match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                Ok(duration) => duration.as_millis() as u64,
+                Err(err) => {
+                    tracing::error!(
+                        target: "core::saga",
+                        event = "in_memory_journal_now_millis_failed",
+                        error = %err
+                    );
+                    0
+                }
+            };
         let entry = JournalEntry {
             sequence: seq,
-            recorded_at_millis: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0),
+            recorded_at_millis,
             event,
         };
 
@@ -201,7 +210,10 @@ impl ParticipantJournal for InMemoryJournal {
             .data
             .read()
             .map_err(|e| JournalError::Storage(e.to_string().into()))?;
-        Ok(data.get(&saga_id.0).cloned().unwrap_or_default())
+        match data.get(&saga_id.0) {
+            Some(entries) => Ok(entries.clone()),
+            None => Ok(Vec::new()),
+        }
     }
 
     fn list_sagas(&self) -> Result<Vec<SagaId>, JournalError> {

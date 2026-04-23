@@ -1,15 +1,29 @@
 use std::path::{Path, PathBuf};
 
 use crate::{
-    handle_async_saga_event_with_emit, handle_saga_event_with_emit, AsyncSagaParticipant,
-    HasSagaParticipantSupport, HasSagaWorkflowParticipants, JournalEntry, ParticipantDedupeStore,
-    ParticipantEvent, ParticipantJournal, SagaChoreographyEvent, SagaContext, SagaId,
-    SagaParticipant, SagaParticipantSupport, SagaStateEntry, SagaStateExt, SagaWorkflowParticipant,
+    AsyncSagaParticipant, DedupeError, HasSagaParticipantSupport, HasSagaWorkflowParticipants,
+    JournalEntry, JournalError, ParticipantDedupeStore, ParticipantEvent, ParticipantJournal,
+    SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant, SagaParticipantSupport,
+    SagaStateEntry, SagaStateExt, SagaWorkflowParticipant, handle_async_saga_event_with_emit,
+    handle_saga_event_with_emit,
 };
 
 pub const PANIC_QUARANTINE_REASON_PREFIX: &str = "panic_during_active_";
 pub const PANIC_QUARANTINE_PUBLISH_KEY: &str = "panic_quarantine_published";
-pub const DEFAULT_RECOVERY_SAGA_TYPE: &str = "order_lifecycle";
+pub const DEFAULT_RECOVERY_SAGA_TYPE: &str = "default_workflow";
+
+#[derive(Debug)]
+pub enum RecoveryCollectionError {
+    ListSagas(JournalError),
+    ReadSaga {
+        saga_id: SagaId,
+        source: JournalError,
+    },
+    MarkDedupe {
+        saga_id: SagaId,
+        source: DedupeError,
+    },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveSagaExecutionPhase {
@@ -143,14 +157,20 @@ pub fn apply_sync_participant_saga_ingress_with_hooks<P, FApplyTerminal, FOnInva
         on_emitted_transition(participant, &next_event);
 
         if let Some(bus) = &saga_bus {
-            let _ = bus.publish(next_event);
+            if let Err(err) = bus.publish_strict(next_event) {
+                tracing::error!(
+                    target: "core::saga",
+                    event = "participant_ingress_emit_publish_failed",
+                    error = ?err
+                );
+            }
         }
     }
 }
 
 fn workflow_for_event<A>(
     event: &SagaChoreographyEvent,
-) -> Option<&'static dyn SagaWorkflowParticipant<A>>
+) -> Result<Option<&'static dyn SagaWorkflowParticipant<A>>, String>
 where
     A: HasSagaWorkflowParticipants,
 {
@@ -161,13 +181,13 @@ where
         .filter(|workflow| workflow.saga_types().contains(&saga_type));
     let selected = matches.next();
     if matches.next().is_some() {
-        panic!(
+        return Err(format!(
             "ambiguous workflow registration for saga_type={} on actor type={}",
             saga_type,
             std::any::type_name::<A>()
-        );
+        ));
     }
-    selected
+    Ok(selected)
 }
 
 pub fn apply_sync_workflow_participant_saga_ingress<A, FApplyTerminal, FOnInvalid>(
@@ -206,8 +226,29 @@ pub fn apply_sync_workflow_participant_saga_ingress_with_hooks<
     FOnInvalid: FnMut(&SagaChoreographyEvent),
     FOnEmitted: FnMut(&mut A, &SagaChoreographyEvent),
 {
-    let Some(workflow) = workflow_for_event::<A>(&event) else {
-        return;
+    let workflow = match workflow_for_event::<A>(&event) {
+        Ok(Some(workflow)) => workflow,
+        Ok(None) => return,
+        Err(err) => {
+            let framework_failure = SagaChoreographyEvent::SagaFailed {
+                context: event
+                    .context()
+                    .next_step(crate::TERMINAL_RESOLVER_STEP.into()),
+                reason: format!("workflow_participant_resolution_failed: {err}").into(),
+                failure: None,
+            };
+            on_invalid_transition(&framework_failure);
+            if let Some(bus) = actor.saga_support().bus.as_ref() {
+                if let Err(publish_err) = bus.publish_strict(framework_failure) {
+                    tracing::error!(
+                        target: "core::saga",
+                        event = "workflow_resolution_failure_publish_failed",
+                        error = ?publish_err
+                    );
+                }
+            }
+            return;
+        }
     };
 
     apply_terminal_side_effects(actor, &event);
@@ -230,7 +271,13 @@ pub fn apply_sync_workflow_participant_saga_ingress_with_hooks<
         on_emitted_transition(actor, &next_event);
 
         if let Some(bus) = &saga_bus {
-            let _ = bus.publish(next_event);
+            if let Err(err) = bus.publish_strict(next_event) {
+                tracing::error!(
+                    target: "core::saga",
+                    event = "workflow_participant_ingress_emit_publish_failed",
+                    error = ?err
+                );
+            }
         }
     }
 }
@@ -269,7 +316,7 @@ fn handle_workflow_saga_event_with_emit<A, F>(
         SagaChoreographyEvent::SagaStarted { payload, .. }
             if workflow.depends_on().is_on_saga_start() =>
         {
-            actor.terminal_sagas().remove(&context.saga_id);
+            actor.unlatch_terminal_saga(context.saga_id);
             actor.saga_states().remove(&context.saga_id);
             actor.dependency_completions().remove(&context.saga_id);
             actor.dependency_fired().remove(&context.saga_id);
@@ -283,7 +330,7 @@ fn handle_workflow_saga_event_with_emit<A, F>(
             );
         }
         SagaChoreographyEvent::SagaStarted { .. } => {
-            actor.terminal_sagas().remove(&context.saga_id);
+            actor.unlatch_terminal_saga(context.saga_id);
             actor.saga_states().remove(&context.saga_id);
             actor.dependency_completions().remove(&context.saga_id);
             actor.dependency_fired().remove(&context.saga_id);
@@ -327,17 +374,17 @@ fn handle_workflow_saga_event_with_emit<A, F>(
             }
         }
         SagaChoreographyEvent::SagaCompleted { .. } => {
-            actor.terminal_sagas().insert(context.saga_id);
+            actor.latch_terminal_saga(context.saga_id);
             workflow.on_saga_completed(actor, &context);
             actor.prune_saga(context.saga_id);
         }
         SagaChoreographyEvent::SagaFailed { reason, .. } => {
-            actor.terminal_sagas().insert(context.saga_id);
+            actor.latch_terminal_saga(context.saga_id);
             workflow.on_saga_failed(actor, &context, &reason);
             actor.prune_saga(context.saga_id);
         }
         SagaChoreographyEvent::SagaQuarantined { reason, .. } => {
-            actor.terminal_sagas().insert(context.saga_id);
+            actor.latch_terminal_saga(context.saga_id);
             workflow.on_quarantined(actor, &context, &reason);
             actor.prune_saga(context.saga_id);
         }
@@ -721,7 +768,13 @@ pub async fn apply_async_participant_saga_ingress_with_hooks<
         on_emitted_transition(participant, &next_event);
 
         if let Some(bus) = &saga_bus {
-            let _ = bus.publish(next_event);
+            if let Err(err) = bus.publish_strict(next_event) {
+                tracing::error!(
+                    target: "core::saga",
+                    event = "async_participant_ingress_emit_publish_failed",
+                    error = ?err
+                );
+            }
         }
     }
 }
@@ -815,13 +868,20 @@ pub fn publish_active_saga_panic_quarantine<J, D>(
     let reason = panic_quarantine_reason(phase, message.as_ref());
     let now = SagaContext::now_millis();
 
-    let _ = saga.journal.append(
+    if let Err(err) = saga.journal.append(
         context.saga_id,
         ParticipantEvent::Quarantined {
             reason: reason.clone(),
             quarantined_at_millis: now,
         },
-    );
+    ) {
+        tracing::error!(
+            target: "core::saga",
+            event = "panic_quarantine_journal_append_failed",
+            saga_id = context.saga_id.get(),
+            error = %err
+        );
+    }
 
     let emitted = SagaChoreographyEvent::SagaQuarantined {
         context: context.next_step(step_name.into()),
@@ -831,11 +891,30 @@ pub fn publish_active_saga_panic_quarantine<J, D>(
     };
 
     if let Some(bus) = &saga.bus {
-        let stats = bus.publish(emitted);
-        if stats.delivered > 0 {
-            let _ = saga
-                .dedupe
-                .mark_processed(context.saga_id, PANIC_QUARANTINE_PUBLISH_KEY);
+        match bus.publish_strict(emitted) {
+            Ok(stats) => {
+                if stats.delivered > 0 {
+                    if let Err(err) = saga
+                        .dedupe
+                        .mark_processed(context.saga_id, PANIC_QUARANTINE_PUBLISH_KEY)
+                    {
+                        tracing::error!(
+                            target: "core::saga",
+                            event = "panic_quarantine_dedupe_mark_failed",
+                            saga_id = context.saga_id.get(),
+                            error = %err
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::error!(
+                    target: "core::saga",
+                    event = "panic_quarantine_publish_failed",
+                    saga_id = context.saga_id.get(),
+                    error = ?err
+                );
+            }
         }
     }
 }
@@ -855,10 +934,22 @@ pub struct RecoveryPolicy {
 
 impl Default for RecoveryPolicy {
     fn default() -> Self {
-        let stale_after_ms = std::env::var("SAGA_RECOVERY_MAX_AGE_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(5 * 60 * 1000);
+        let stale_after_ms = match std::env::var("SAGA_RECOVERY_MAX_AGE_MS") {
+            Ok(raw) => match raw.parse::<u64>() {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::error!(
+                        target: "core::saga",
+                        event = "saga_recovery_max_age_parse_failed",
+                        env = "SAGA_RECOVERY_MAX_AGE_MS",
+                        value = %raw,
+                        error = %err
+                    );
+                    5 * 60 * 1000
+                }
+            },
+            Err(_) => 5 * 60 * 1000,
+        };
         Self { stale_after_ms }
     }
 }
@@ -868,10 +959,9 @@ pub fn classify_recovery(
     now_ms: u64,
     policy: RecoveryPolicy,
 ) -> RecoveryDecision {
-    if entries.is_empty() {
+    let Some(last) = entries.last() else {
         return RecoveryDecision::TerminalNoAction;
-    }
-    let last = entries.last().expect("non-empty entries");
+    };
     if matches!(
         &last.event,
         ParticipantEvent::Quarantined { reason, .. } if is_panic_quarantine_reason(reason.as_ref())
@@ -902,7 +992,7 @@ pub fn collect_startup_recovery_events<J: ParticipantJournal, D: ParticipantDedu
     journal: &J,
     dedupe: &D,
     step_name: &'static str,
-) -> Vec<SagaChoreographyEvent> {
+) -> Result<Vec<SagaChoreographyEvent>, RecoveryCollectionError> {
     collect_startup_recovery_events_for_saga_type(
         journal,
         dedupe,
@@ -919,13 +1009,24 @@ pub fn collect_startup_recovery_events_for_saga_type<
     dedupe: &D,
     step_name: &'static str,
     saga_type: &'static str,
-) -> Vec<SagaChoreographyEvent> {
+) -> Result<Vec<SagaChoreographyEvent>, RecoveryCollectionError> {
     let mut out = Vec::new();
     let policy = RecoveryPolicy::default();
     let now = SagaContext::now_millis();
-    let saga_ids = journal.list_sagas().unwrap_or_default();
+    let saga_ids = match journal.list_sagas() {
+        Ok(ids) => ids,
+        Err(err) => return Err(RecoveryCollectionError::ListSagas(err)),
+    };
     for saga_id in saga_ids {
-        let entries = journal.read(saga_id).unwrap_or_default();
+        let entries = match journal.read(saga_id) {
+            Ok(entries) => entries,
+            Err(err) => {
+                return Err(RecoveryCollectionError::ReadSaga {
+                    saga_id,
+                    source: err,
+                });
+            }
+        };
         if entries.is_empty() {
             continue;
         }
@@ -937,9 +1038,16 @@ pub fn collect_startup_recovery_events_for_saga_type<
                 ));
             }
             RecoveryDecision::ReplayPanicQuarantine => {
-                let should_emit = dedupe
-                    .check_and_mark(saga_id, PANIC_QUARANTINE_PUBLISH_KEY)
-                    .unwrap_or(false);
+                let should_emit = match dedupe.check_and_mark(saga_id, PANIC_QUARANTINE_PUBLISH_KEY)
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return Err(RecoveryCollectionError::MarkDedupe {
+                            saga_id,
+                            source: err,
+                        });
+                    }
+                };
                 if should_emit {
                     let reason = panic_quarantine_reason_from_entries(&entries)
                         .unwrap_or_else(|| Box::<str>::from("panic quarantined during execution"));
@@ -954,7 +1062,7 @@ pub fn collect_startup_recovery_events_for_saga_type<
             RecoveryDecision::Continue | RecoveryDecision::TerminalNoAction => {}
         }
     }
-    out
+    Ok(out)
 }
 
 fn recovery_context_for_saga_type(
@@ -1020,10 +1128,7 @@ pub mod lmdb {
     use heed::types::{Bytes, Str};
     use heed::{Database, Env, EnvOpenOptions};
 
-    use super::{
-        collect_startup_recovery_events, collect_startup_recovery_events_for_saga_type,
-        DEFAULT_RECOVERY_SAGA_TYPE,
-    };
+    use super::{DEFAULT_RECOVERY_SAGA_TYPE, collect_startup_recovery_events_for_saga_type};
     use crate::{
         DedupeError, JournalEntry, JournalError, ParticipantDedupeStore, ParticipantEvent,
         ParticipantJournal, SagaId, SagaParticipantSupport,
@@ -1278,11 +1383,9 @@ pub mod lmdb {
     ) -> Result<SagaParticipantSupport<LmdbJournal, LmdbDedupe>, String> {
         let journal = LmdbJournal::open(&base.join("journal")).map_err(|err| err.to_string())?;
         let dedupe = LmdbDedupe::open(&base.join("dedupe")).map_err(|err| err.to_string())?;
-        let startup_recovery_events = if saga_type == DEFAULT_RECOVERY_SAGA_TYPE {
-            collect_startup_recovery_events(&journal, &dedupe, step_name)
-        } else {
+        let startup_recovery_events =
             collect_startup_recovery_events_for_saga_type(&journal, &dedupe, step_name, saga_type)
-        };
+                .map_err(|err| format!("startup recovery collection failed: {err:?}"))?;
         Ok(SagaParticipantSupport::new(journal, dedupe)
             .with_startup_recovery_events(startup_recovery_events))
     }
@@ -1337,8 +1440,8 @@ pub mod lmdb {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_sync_workflow_participant_saga_ingress, default_runtime_dir, workflow_for_event,
-        ActiveSagaExecution, HasActiveSagaExecution,
+        ActiveSagaExecution, HasActiveSagaExecution, apply_sync_workflow_participant_saga_ingress,
+        default_runtime_dir, workflow_for_event,
     };
     use crate::{
         DependencySpec, DeterministicContextBuilder, HasSagaParticipantSupport,
@@ -1579,8 +1682,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "ambiguous workflow registration")]
-    fn workflow_lookup_panics_on_duplicate_saga_type_registration() {
+    fn workflow_lookup_rejects_duplicate_saga_type_registration() {
         let event = crate::SagaChoreographyEvent::SagaStarted {
             context: DeterministicContextBuilder::default()
                 .with_saga_type("shared_workflow")
@@ -1588,6 +1690,13 @@ mod tests {
             payload: Vec::new(),
         };
 
-        let _ = workflow_for_event::<DuplicateWorkflowTestActor>(&event);
+        let err = match workflow_for_event::<DuplicateWorkflowTestActor>(&event) {
+            Ok(_) => panic!("duplicate workflow registration should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("ambiguous workflow registration"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -17,18 +17,19 @@ use icanact_core::local_sync::contract::TellAsk;
 use icanact_core::testkit::TestWorld;
 
 use icanact_saga_choreography::durability::{
-    run_participant_phase_with_panic_quarantine, ActiveSagaExecution, ActiveSagaExecutionPhase,
-    HasActiveSagaExecution,
+    ActiveSagaExecution, ActiveSagaExecutionPhase, HasActiveSagaExecution,
+    run_participant_phase_with_panic_quarantine,
 };
 use icanact_saga_choreography::{
-    bind_sync_participant_channel, handle_saga_event_with_emit, CompensationError, DependencySpec,
-    FailureAuthority, HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal,
-    SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant,
-    SagaParticipantChannel, SagaParticipantSupport, StepError, StepOutput, SuccessCriteria,
-    TerminalPolicy,
+    CompensationError, DependencySpec, FailureAuthority, HasSagaParticipantSupport, InMemoryDedupe,
+    InMemoryJournal, SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId,
+    SagaParticipant, SagaParticipantChannel, SagaParticipantSupport, SagaWorkflowContract,
+    SagaWorkflowStepContract, StepError, StepOutput, SuccessCriteria, TerminalPolicy,
+    WorkflowDependencySpec, bind_sync_participant_channel, handle_saga_event_with_emit,
 };
 
 const SAGA_TYPE: &str = "order_lifecycle";
+const STEP_START: &str = "start";
 const STEP_POSITION: &str = "check_position";
 const STEP_BALANCE: &str = "check_balance";
 const STEP_ORDER: &str = "create_order";
@@ -42,11 +43,8 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug)]
 struct QueryState;
 
-#[allow(dead_code)]
 #[derive(Debug)]
-enum ParticipantCtl {
-    Noop,
-}
+struct ParticipantCtl;
 
 impl icanact_core::TellAskTell for ParticipantCtl {}
 
@@ -327,7 +325,7 @@ fn context_for(saga_id: u64) -> SagaContext {
     SagaContext {
         saga_id: SagaId::new(saga_id),
         saga_type: SAGA_TYPE.into(),
-        step_name: "start".into(),
+        step_name: STEP_START.into(),
         correlation_id: saga_id,
         causation_id: saga_id,
         trace_id: saga_id,
@@ -361,8 +359,61 @@ fn test_policy() -> TerminalPolicy {
         policy_id: "order_lifecycle/e2e_test".into(),
         failure_authority: FailureAuthority::AnyParticipant,
         success_criteria: SuccessCriteria::AllOf(required),
-        timeout: None,
+        overall_timeout: Duration::from_secs(60),
+        stalled_timeout: Duration::from_secs(60),
     }
+}
+
+struct OrderLifecycleE2eContract;
+
+impl SagaWorkflowContract for OrderLifecycleE2eContract {
+    fn saga_type() -> &'static str {
+        SAGA_TYPE
+    }
+
+    fn first_step() -> &'static str {
+        STEP_START
+    }
+
+    fn steps() -> &'static [SagaWorkflowStepContract] {
+        &[
+            SagaWorkflowStepContract {
+                step_name: STEP_START,
+                participant_id: "saga-start",
+                depends_on: WorkflowDependencySpec::OnSagaStart,
+            },
+            SagaWorkflowStepContract {
+                step_name: STEP_POSITION,
+                participant_id: "position",
+                depends_on: WorkflowDependencySpec::After(STEP_START),
+            },
+            SagaWorkflowStepContract {
+                step_name: STEP_BALANCE,
+                participant_id: "balance",
+                depends_on: WorkflowDependencySpec::After(STEP_START),
+            },
+            SagaWorkflowStepContract {
+                step_name: STEP_ORDER,
+                participant_id: "order",
+                depends_on: WorkflowDependencySpec::AllOf(&[STEP_POSITION, STEP_BALANCE]),
+            },
+        ]
+    }
+
+    fn terminal_policy() -> TerminalPolicy {
+        test_policy()
+    }
+}
+
+fn new_e2e_bus() -> SagaChoreographyBus {
+    let bus = SagaChoreographyBus::new();
+    bus.register_workflow_contract_provider::<OrderLifecycleE2eContract>()
+        .expect("order lifecycle test workflow contract registration should succeed");
+    for step in [STEP_START, STEP_POSITION, STEP_BALANCE, STEP_ORDER] {
+        bus.register_bound_workflow_step(SAGA_TYPE, step)
+            .expect("order lifecycle test step binding should succeed");
+    }
+    bus
 }
 
 /// Mailbox capacity large enough for synchronous re-entrant bus dispatch cascades.
@@ -473,9 +524,11 @@ fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) {
 fn all_succeed_saga_completed() {
     let _suite = suite_guard();
     let world = TestWorld::new();
-    let bus = SagaChoreographyBus::new();
+    let bus = new_e2e_bus();
 
-    let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
+    let _resolver = bus
+        .attach_terminal_resolver(test_policy(), "e2e-resolver")
+        .expect("terminal resolver should attach");
     let (terminal_ref, terminal_h) = spawn_terminal_probe(&world, &bus);
 
     let (p_ref, p_h) = spawn_and_subscribe(
@@ -550,8 +603,10 @@ fn all_succeed_saga_completed() {
 fn position_fails_terminal_no_compensation() {
     let _suite = suite_guard();
     let world = TestWorld::new();
-    let bus = SagaChoreographyBus::new();
-    let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
+    let bus = new_e2e_bus();
+    let _resolver = bus
+        .attach_terminal_resolver(test_policy(), "e2e-resolver")
+        .expect("terminal resolver should attach");
     let (terminal_ref, terminal_h) = spawn_terminal_probe(&world, &bus);
 
     let (p_ref, p_h) = spawn_and_subscribe(
@@ -625,8 +680,10 @@ fn position_fails_terminal_no_compensation() {
 fn balance_fails_terminal_after_position_succeeds() {
     let _suite = suite_guard();
     let world = TestWorld::new();
-    let bus = SagaChoreographyBus::new();
-    let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
+    let bus = new_e2e_bus();
+    let _resolver = bus
+        .attach_terminal_resolver(test_policy(), "e2e-resolver")
+        .expect("terminal resolver should attach");
     let (terminal_ref, terminal_h) = spawn_terminal_probe(&world, &bus);
 
     let (p_ref, p_h) = spawn_and_subscribe(
@@ -692,8 +749,10 @@ fn balance_fails_terminal_after_position_succeeds() {
 fn order_fails_terminal_after_both_succeed() {
     let _suite = suite_guard();
     let world = TestWorld::new();
-    let bus = SagaChoreographyBus::new();
-    let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
+    let bus = new_e2e_bus();
+    let _resolver = bus
+        .attach_terminal_resolver(test_policy(), "e2e-resolver")
+        .expect("terminal resolver should attach");
     let (terminal_ref, terminal_h) = spawn_terminal_probe(&world, &bus);
 
     let (p_ref, p_h) = spawn_and_subscribe(
@@ -759,8 +818,10 @@ fn order_fails_terminal_after_both_succeed() {
 fn order_fails_require_compensation_triggers_full_compensation() {
     let _suite = suite_guard();
     let world = TestWorld::new();
-    let bus = SagaChoreographyBus::new();
-    let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
+    let bus = new_e2e_bus();
+    let _resolver = bus
+        .attach_terminal_resolver(test_policy(), "e2e-resolver")
+        .expect("terminal resolver should attach");
     let (terminal_ref, terminal_h) = spawn_terminal_probe(&world, &bus);
 
     let (p_ref, p_h) = spawn_and_subscribe(
@@ -818,9 +879,13 @@ fn order_fails_require_compensation_triggers_full_compensation() {
 fn position_compensation_fails_terminal_causes_saga_failed() {
     let _suite = suite_guard();
     let world = TestWorld::new();
-    let bus = SagaChoreographyBus::new();
-    let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
+    let bus = new_e2e_bus();
+    let _resolver = bus
+        .attach_terminal_resolver(test_policy(), "e2e-resolver")
+        .expect("terminal resolver should attach");
     let (terminal_ref, terminal_h) = spawn_terminal_probe(&world, &bus);
+    let _pad_sub_a = bus.subscribe_saga_type_fn(SAGA_TYPE, |_event| true);
+    let _pad_sub_b = bus.subscribe_saga_type_fn(SAGA_TYPE, |_event| true);
 
     let (p_ref, p_h) = spawn_and_subscribe(
         &world,
@@ -875,8 +940,10 @@ fn position_compensation_fails_terminal_causes_saga_failed() {
 fn balance_compensation_fails_ambiguous_causes_quarantine() {
     let _suite = suite_guard();
     let world = TestWorld::new();
-    let bus = SagaChoreographyBus::new();
-    let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
+    let bus = new_e2e_bus();
+    let _resolver = bus
+        .attach_terminal_resolver(test_policy(), "e2e-resolver")
+        .expect("terminal resolver should attach");
     let (terminal_ref, terminal_h) = spawn_terminal_probe(&world, &bus);
 
     let (_p_ref, p_h) = spawn_and_subscribe(
@@ -925,8 +992,10 @@ fn balance_compensation_fails_ambiguous_causes_quarantine() {
 fn balance_compensation_fails_safe_to_retry_causes_failed() {
     let _suite = suite_guard();
     let world = TestWorld::new();
-    let bus = SagaChoreographyBus::new();
-    let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
+    let bus = new_e2e_bus();
+    let _resolver = bus
+        .attach_terminal_resolver(test_policy(), "e2e-resolver")
+        .expect("terminal resolver should attach");
     let (terminal_ref, terminal_h) = spawn_terminal_probe(&world, &bus);
 
     let (_p_ref, p_h) = spawn_and_subscribe(
@@ -981,8 +1050,10 @@ fn balance_compensation_fails_safe_to_retry_causes_failed() {
 fn position_panics_emits_quarantined() {
     let _suite = suite_guard();
     let world = TestWorld::new();
-    let bus = SagaChoreographyBus::new();
-    let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
+    let bus = new_e2e_bus();
+    let _resolver = bus
+        .attach_terminal_resolver(test_policy(), "e2e-resolver")
+        .expect("terminal resolver should attach");
     let (terminal_ref, terminal_h) = spawn_terminal_probe(&world, &bus);
 
     // Subscribe balance and order as normal actors
@@ -1034,8 +1105,10 @@ fn position_panics_emits_quarantined() {
 fn balance_panics_after_position_succeeds() {
     let _suite = suite_guard();
     let world = TestWorld::new();
-    let bus = SagaChoreographyBus::new();
-    let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
+    let bus = new_e2e_bus();
+    let _resolver = bus
+        .attach_terminal_resolver(test_policy(), "e2e-resolver")
+        .expect("terminal resolver should attach");
     let (terminal_ref, terminal_h) = spawn_terminal_probe(&world, &bus);
 
     let (p_ref, p_h) = spawn_and_subscribe(
@@ -1094,8 +1167,10 @@ fn balance_panics_after_position_succeeds() {
 fn order_panics_after_both_succeed() {
     let _suite = suite_guard();
     let world = TestWorld::new();
-    let bus = SagaChoreographyBus::new();
-    let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
+    let bus = new_e2e_bus();
+    let _resolver = bus
+        .attach_terminal_resolver(test_policy(), "e2e-resolver")
+        .expect("terminal resolver should attach");
     let (terminal_ref, terminal_h) = spawn_terminal_probe(&world, &bus);
 
     let (p_ref, p_h) = spawn_and_subscribe(
@@ -1167,8 +1242,10 @@ fn order_panics_after_both_succeed() {
 fn duplicate_saga_started_is_deduped() {
     let _suite = suite_guard();
     let world = TestWorld::new();
-    let bus = SagaChoreographyBus::new();
-    let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
+    let bus = new_e2e_bus();
+    let _resolver = bus
+        .attach_terminal_resolver(test_policy(), "e2e-resolver")
+        .expect("terminal resolver should attach");
     let (terminal_ref, terminal_h) = spawn_terminal_probe(&world, &bus);
 
     let (p_ref, p_h) = spawn_and_subscribe(
@@ -1219,7 +1296,7 @@ fn duplicate_saga_started_is_deduped() {
 fn order_does_not_fire_on_partial_dependency() {
     let _suite = suite_guard();
     let world = TestWorld::new();
-    let bus = SagaChoreographyBus::new();
+    let bus = new_e2e_bus();
 
     let (o_ref, o_h) = spawn_and_subscribe(
         &world,
@@ -1272,8 +1349,10 @@ fn order_does_not_fire_on_partial_dependency() {
 fn terminal_latch_prevents_duplicate_events() {
     let _suite = suite_guard();
     let world = TestWorld::new();
-    let bus = SagaChoreographyBus::new();
-    let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
+    let bus = new_e2e_bus();
+    let _resolver = bus
+        .attach_terminal_resolver(test_policy(), "e2e-resolver")
+        .expect("terminal resolver should attach");
     let (terminal_ref, terminal_h) = spawn_terminal_probe(&world, &bus);
 
     let (_p_ref, p_h) = spawn_and_subscribe(
@@ -1334,8 +1413,10 @@ fn terminal_latch_prevents_duplicate_events() {
 fn duplicate_dependency_completion_after_order_executes_is_deduped() {
     let _suite = suite_guard();
     let world = TestWorld::new();
-    let bus = SagaChoreographyBus::new();
-    let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
+    let bus = new_e2e_bus();
+    let _resolver = bus
+        .attach_terminal_resolver(test_policy(), "e2e-resolver")
+        .expect("terminal resolver should attach");
     let (terminal_ref, terminal_h) = spawn_terminal_probe(&world, &bus);
 
     let (_p_ref, p_h) = spawn_and_subscribe(
@@ -1396,8 +1477,13 @@ fn duplicate_dependency_completion_after_order_executes_is_deduped() {
 fn duplicate_compensation_request_is_deduped() {
     let _suite = suite_guard();
     let world = TestWorld::new();
-    let bus = SagaChoreographyBus::new();
-    bus.register_terminal_policy(&test_policy());
+    let bus = new_e2e_bus();
+    let _resolver = bus
+        .attach_terminal_resolver(test_policy(), "e2e-resolver")
+        .expect("terminal resolver should attach");
+    let _pad_sub_a = bus.subscribe_saga_type_fn(SAGA_TYPE, |_event| true);
+    let _pad_sub_b = bus.subscribe_saga_type_fn(SAGA_TYPE, |_event| true);
+    let _pad_sub_c = bus.subscribe_saga_type_fn(SAGA_TYPE, |_event| true);
 
     let (p_ref, p_h) = spawn_and_subscribe(
         &world,
@@ -1440,7 +1526,7 @@ fn duplicate_compensation_request_is_deduped() {
 fn duplicate_position_approval_before_balance_keeps_order_exactly_once() {
     let _suite = suite_guard();
     let world = TestWorld::new();
-    let bus = SagaChoreographyBus::new();
+    let bus = new_e2e_bus();
 
     let (p_ref, p_h) = spawn_and_subscribe(
         &world,
@@ -1512,7 +1598,7 @@ fn duplicate_position_approval_before_balance_keeps_order_exactly_once() {
 fn duplicate_balance_approval_before_position_keeps_order_exactly_once() {
     let _suite = suite_guard();
     let world = TestWorld::new();
-    let bus = SagaChoreographyBus::new();
+    let bus = new_e2e_bus();
 
     let (p_ref, p_h) = spawn_and_subscribe(
         &world,
@@ -1584,8 +1670,10 @@ fn duplicate_balance_approval_before_position_keeps_order_exactly_once() {
 fn duplicate_both_approvals_still_produce_single_order_execution() {
     let _suite = suite_guard();
     let world = TestWorld::new();
-    let bus = SagaChoreographyBus::new();
-    let _resolver = bus.attach_terminal_resolver(test_policy(), "e2e-resolver");
+    let bus = new_e2e_bus();
+    let _resolver = bus
+        .attach_terminal_resolver(test_policy(), "e2e-resolver")
+        .expect("terminal resolver should attach");
     let (terminal_ref, terminal_h) = spawn_terminal_probe(&world, &bus);
 
     let (p_ref, p_h) = spawn_and_subscribe(

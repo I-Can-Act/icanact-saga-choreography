@@ -1,34 +1,10 @@
 //! Helper functions for saga handling
 
 use crate::{
-    AsyncSagaParticipant, CompensationError, DependencySpec, ParticipantEvent, ParticipantJournal,
+    AsyncSagaParticipant, CompensationError, DependencySpec, ParticipantEvent,
     SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant, SagaParticipantState,
     SagaStateEntry, SagaStateExt, StepError, StepOutput,
 };
-
-/// Default saga event handler.
-///
-/// Call this from your actor's `handle` method when a `SagaEvent` message arrives.
-///
-/// ```rust,ignore
-/// impl Actor for MyActor {
-///     type Msg = MyCommand;
-///     fn handle(&mut self, msg: Self::Msg) {
-///         match msg {
-///             MyCommand::SagaEvent { event } => {
-///                 handle_saga_event(self, event);
-///             }
-///             // ...
-///         }
-///     }
-/// }
-/// ```
-pub fn handle_saga_event<P>(participant: &mut P, event: SagaChoreographyEvent)
-where
-    P: SagaParticipant + SagaStateExt,
-{
-    handle_saga_event_with_emit(participant, event, |_| {});
-}
 
 /// Saga event handler with an explicit emit sink for produced choreography events.
 pub fn handle_saga_event_with_emit<P, F>(
@@ -41,13 +17,6 @@ pub fn handle_saga_event_with_emit<P, F>(
 {
     let context = event.context().clone();
     let now = participant.now_millis();
-    eprintln!(
-        "[saga-helper] participant_step={} received type={} saga_id={} step={}",
-        participant.step_name(),
-        event.event_type(),
-        context.saga_id.get(),
-        context.step_name.as_ref()
-    );
 
     // Check saga type
     if !participant
@@ -55,44 +24,19 @@ pub fn handle_saga_event_with_emit<P, F>(
         .iter()
         .any(|t| *t == context.saga_type.as_ref())
     {
-        eprintln!(
-            "[saga-helper] participant_step={} ignored saga_type={}",
-            participant.step_name(),
-            context.saga_type.as_ref()
-        );
         return;
     }
 
     let is_saga_started = matches!(event, SagaChoreographyEvent::SagaStarted { .. });
     if !is_saga_started && participant.is_terminal_saga_latched(context.saga_id) {
-        eprintln!(
-            "[saga-helper] participant_step={} ignored post-terminal replay type={} saga_id={}",
-            participant.step_name(),
-            event.event_type(),
-            context.saga_id.get()
-        );
         return;
     }
 
     // Idempotency check
     let dedupe_key = dedupe_key_for_event(&event);
     if !participant.check_dedupe(context.saga_id, &dedupe_key) {
-        eprintln!(
-            "[saga-helper] participant_step={} deduped type={} saga_id={} key={}",
-            participant.step_name(),
-            event.event_type(),
-            context.saga_id.get(),
-            dedupe_key
-        );
         return; // Already processed
     }
-    eprintln!(
-        "[saga-helper] participant_step={} accepted type={} saga_id={} key={}",
-        participant.step_name(),
-        event.event_type(),
-        context.saga_id.get(),
-        dedupe_key
-    );
 
     match event {
         SagaChoreographyEvent::SagaStarted { payload, .. }
@@ -101,7 +45,7 @@ pub fn handle_saga_event_with_emit<P, F>(
             // A new saga run may legitimately reuse a saga_id after process restart.
             // Reset per-saga in-memory dependency/state tracking so old runs cannot
             // satisfy dependencies for the new run.
-            participant.terminal_sagas().remove(&context.saga_id);
+            participant.unlatch_terminal_saga(context.saga_id);
             participant.saga_states().remove(&context.saga_id);
             participant
                 .dependency_completions()
@@ -114,7 +58,7 @@ pub fn handle_saga_event_with_emit<P, F>(
             // Even when this participant does not execute on saga start, clear stale
             // dependency/state entries for this saga id so downstream dependency checks
             // are scoped to the current run.
-            participant.terminal_sagas().remove(&context.saga_id);
+            participant.unlatch_terminal_saga(context.saga_id);
             participant.saga_states().remove(&context.saga_id);
             participant
                 .dependency_completions()
@@ -134,13 +78,6 @@ pub fn handle_saga_event_with_emit<P, F>(
                 context.saga_id,
                 &dependency_spec,
                 &step_ctx.step_name,
-            );
-            eprintln!(
-                "[saga-helper] participant_step={} dependency_check saga_id={} completed_step={} should_fire={}",
-                participant.step_name(),
-                context.saga_id.get(),
-                step_ctx.step_name.as_ref(),
-                should_fire
             );
             if should_fire {
                 let next_context = context.next_step(participant.step_name().into());
@@ -163,32 +100,25 @@ pub fn handle_saga_event_with_emit<P, F>(
         }
 
         SagaChoreographyEvent::SagaCompleted { .. } => {
-            participant.terminal_sagas().insert(context.saga_id);
+            participant.latch_terminal_saga(context.saga_id);
             participant.on_saga_completed(&context);
             participant.prune_saga(context.saga_id);
         }
 
         SagaChoreographyEvent::SagaFailed { reason, .. } => {
-            participant.terminal_sagas().insert(context.saga_id);
+            participant.latch_terminal_saga(context.saga_id);
             participant.on_saga_failed(&context, &reason);
             participant.prune_saga(context.saga_id);
         }
 
         SagaChoreographyEvent::SagaQuarantined { reason, .. } => {
-            participant.terminal_sagas().insert(context.saga_id);
+            participant.latch_terminal_saga(context.saga_id);
             participant.on_quarantined(&context, &reason);
             participant.prune_saga(context.saga_id);
         }
 
         _ => {}
     }
-}
-
-pub async fn handle_async_saga_event<P>(participant: &mut P, event: SagaChoreographyEvent)
-where
-    P: AsyncSagaParticipant + SagaStateExt,
-{
-    handle_async_saga_event_with_emit(participant, event, |_| {}).await;
 }
 
 pub async fn handle_async_saga_event_with_emit<P, F>(
@@ -201,62 +131,30 @@ pub async fn handle_async_saga_event_with_emit<P, F>(
 {
     let context = event.context().clone();
     let now = participant.now_millis();
-    eprintln!(
-        "[saga-helper] participant_step={} received type={} saga_id={} step={}",
-        participant.step_name(),
-        event.event_type(),
-        context.saga_id.get(),
-        context.step_name.as_ref()
-    );
 
     if !participant
         .saga_types()
         .iter()
         .any(|t| *t == context.saga_type.as_ref())
     {
-        eprintln!(
-            "[saga-helper] participant_step={} ignored saga_type={}",
-            participant.step_name(),
-            context.saga_type.as_ref()
-        );
         return;
     }
 
     let is_saga_started = matches!(event, SagaChoreographyEvent::SagaStarted { .. });
     if !is_saga_started && participant.is_terminal_saga_latched(context.saga_id) {
-        eprintln!(
-            "[saga-helper] participant_step={} ignored post-terminal replay type={} saga_id={}",
-            participant.step_name(),
-            event.event_type(),
-            context.saga_id.get()
-        );
         return;
     }
 
     let dedupe_key = dedupe_key_for_event(&event);
     if !participant.check_dedupe(context.saga_id, &dedupe_key) {
-        eprintln!(
-            "[saga-helper] participant_step={} deduped type={} saga_id={} key={}",
-            participant.step_name(),
-            event.event_type(),
-            context.saga_id.get(),
-            dedupe_key
-        );
         return;
     }
-    eprintln!(
-        "[saga-helper] participant_step={} accepted type={} saga_id={} key={}",
-        participant.step_name(),
-        event.event_type(),
-        context.saga_id.get(),
-        dedupe_key
-    );
 
     match event {
         SagaChoreographyEvent::SagaStarted { payload, .. }
             if participant.depends_on().is_on_saga_start() =>
         {
-            participant.terminal_sagas().remove(&context.saga_id);
+            participant.unlatch_terminal_saga(context.saga_id);
             participant.saga_states().remove(&context.saga_id);
             participant
                 .dependency_completions()
@@ -272,7 +170,7 @@ pub async fn handle_async_saga_event_with_emit<P, F>(
             .await;
         }
         SagaChoreographyEvent::SagaStarted { .. } => {
-            participant.terminal_sagas().remove(&context.saga_id);
+            participant.unlatch_terminal_saga(context.saga_id);
             participant.saga_states().remove(&context.saga_id);
             participant
                 .dependency_completions()
@@ -291,13 +189,6 @@ pub async fn handle_async_saga_event_with_emit<P, F>(
                 context.saga_id,
                 &dependency_spec,
                 &step_ctx.step_name,
-            );
-            eprintln!(
-                "[saga-helper] participant_step={} dependency_check saga_id={} completed_step={} should_fire={}",
-                participant.step_name(),
-                context.saga_id.get(),
-                step_ctx.step_name.as_ref(),
-                should_fire
             );
             if should_fire {
                 let next_context = context.next_step(participant.step_name().into());
@@ -325,17 +216,17 @@ pub async fn handle_async_saga_event_with_emit<P, F>(
             }
         }
         SagaChoreographyEvent::SagaCompleted { .. } => {
-            participant.terminal_sagas().insert(context.saga_id);
+            participant.latch_terminal_saga(context.saga_id);
             participant.on_saga_completed(&context);
             participant.prune_saga(context.saga_id);
         }
         SagaChoreographyEvent::SagaFailed { reason, .. } => {
-            participant.terminal_sagas().insert(context.saga_id);
+            participant.latch_terminal_saga(context.saga_id);
             participant.on_saga_failed(&context, &reason);
             participant.prune_saga(context.saga_id);
         }
         SagaChoreographyEvent::SagaQuarantined { reason, .. } => {
-            participant.terminal_sagas().insert(context.saga_id);
+            participant.latch_terminal_saga(context.saga_id);
             participant.on_quarantined(&context, &reason);
             participant.prune_saga(context.saga_id);
         }
@@ -466,15 +357,6 @@ fn dedupe_key_for_event(event: &SagaChoreographyEvent) -> String {
             failed_step
         ),
     }
-}
-
-/// Execute a step with full state management
-pub fn execute_step_wrapper<P>(participant: &mut P, context: SagaContext, input: Vec<u8>, now: u64)
-where
-    P: SagaParticipant + SagaStateExt,
-{
-    let mut ignore_emit = |_| {};
-    execute_step_wrapper_with_emit(participant, context, input, now, &mut ignore_emit);
 }
 
 fn execute_step_wrapper_with_emit<P, F>(
@@ -767,15 +649,6 @@ fn fail_step_async<P, F>(
     });
 }
 
-/// Execute compensation with state management
-pub fn compensate_wrapper<P>(participant: &mut P, context: &SagaContext, now: u64)
-where
-    P: SagaParticipant + SagaStateExt,
-{
-    let mut ignore_emit = |_| {};
-    compensate_wrapper_with_emit(participant, context, now, &mut ignore_emit);
-}
-
 fn compensate_wrapper_with_emit<P, F>(
     participant: &mut P,
     context: &SagaContext,
@@ -1022,85 +895,6 @@ fn fail_compensation_async<P, F>(
     participant.on_quarantined(context, &reason);
 }
 
-/// Recovery bootstrap - find and resume pending sagas
-pub fn recover_sagas<P>(participant: &mut P) -> Vec<SagaId>
-where
-    P: SagaParticipant + SagaStateExt,
-{
-    let mut recovered = Vec::new();
-
-    if let Ok(saga_ids) = participant.saga_journal().list_sagas() {
-        for saga_id in saga_ids {
-            if let Ok(events) = participant.saga_journal().read(saga_id) {
-                let state = rebuild_state(&events);
-
-                if !state.is_terminal() {
-                    recovered.push(saga_id);
-                    // TODO: Resume based on state
-                }
-            }
-        }
-    }
-
-    recovered
-}
-
-/// Rebuild state from event history
-fn rebuild_state(entries: &[crate::JournalEntry]) -> RebuiltState {
-    let mut state = RebuiltState::Unknown;
-
-    for entry in entries {
-        state = match (state, &entry.event) {
-            (_, ParticipantEvent::StepExecutionStarted { .. }) => RebuiltState::Executing,
-            (_, ParticipantEvent::StepExecutionCompleted { .. }) => RebuiltState::Completed,
-            (
-                _,
-                ParticipantEvent::StepExecutionFailed {
-                    requires_compensation: true,
-                    ..
-                },
-            ) => RebuiltState::FailedNeedsCompensation,
-            (
-                _,
-                ParticipantEvent::StepExecutionFailed {
-                    requires_compensation: false,
-                    ..
-                },
-            ) => RebuiltState::FailedTerminal,
-            (_, ParticipantEvent::CompensationStarted { .. }) => RebuiltState::Compensating,
-            (_, ParticipantEvent::CompensationCompleted { .. }) => RebuiltState::Compensated,
-            (_, ParticipantEvent::Quarantined { .. }) => RebuiltState::Quarantined,
-            _ => state,
-        };
-    }
-
-    state
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RebuiltState {
-    Unknown,
-    Executing,
-    Completed,
-    FailedNeedsCompensation,
-    FailedTerminal,
-    Compensating,
-    Compensated,
-    Quarantined,
-}
-
-impl RebuiltState {
-    fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            RebuiltState::Completed
-                | RebuiltState::FailedTerminal
-                | RebuiltState::Compensated
-                | RebuiltState::Quarantined
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -1326,13 +1120,6 @@ mod tests {
 
         assert_eq!(participant.executed, 0);
         assert!(emitted.is_empty());
-    }
-
-    #[test]
-    fn handle_saga_event_compat_wrapper_still_executes() {
-        let mut participant = TestParticipant::default();
-        handle_saga_event(&mut participant, started_event());
-        assert_eq!(participant.executed, 1);
     }
 
     #[test]

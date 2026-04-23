@@ -1,6 +1,8 @@
 //! First-class embedded saga support for participants.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+
+use icanact_core::local::PublishStats;
 
 use crate::{
     ParticipantDedupeStore, ParticipantJournal, ParticipantStats, SagaChoreographyBus,
@@ -21,6 +23,7 @@ where
     pub dependency_completions: HashMap<SagaId, HashSet<Box<str>>>,
     pub dependency_fired: HashSet<SagaId>,
     pub terminal_sagas: HashSet<SagaId>,
+    pub terminal_saga_order: VecDeque<SagaId>,
     pub journal: J,
     pub dedupe: D,
     pub stats: ParticipantStats,
@@ -39,6 +42,7 @@ where
             dependency_completions: HashMap::new(),
             dependency_fired: HashSet::new(),
             terminal_sagas: HashSet::new(),
+            terminal_saga_order: VecDeque::new(),
             journal,
             dedupe,
             stats: ParticipantStats::new(),
@@ -60,9 +64,12 @@ where
         self.bus = Some(bus);
     }
 
-    pub fn publish(&self, event: SagaChoreographyEvent) {
+    pub fn publish(&self, event: SagaChoreographyEvent) -> Result<PublishStats, String> {
         if let Some(bus) = &self.bus {
-            let _ = bus.publish(event);
+            bus.publish_strict(event)
+                .map_err(|err| format!("saga bus strict publish failed: {err:?}"))
+        } else {
+            Err("saga bus is not attached".to_string())
         }
     }
 }
@@ -81,6 +88,7 @@ where
             )
             .field("dependency_fired_len", &self.dependency_fired.len())
             .field("terminal_sagas_len", &self.terminal_sagas.len())
+            .field("terminal_saga_order_len", &self.terminal_saga_order.len())
             .field(
                 "startup_recovery_events_len",
                 &self.startup_recovery_events.len(),
@@ -106,8 +114,8 @@ pub trait SagaParticipantSupportExt: HasSagaParticipantSupport {
         self.saga_support_mut().attach_bus(bus);
     }
 
-    fn publish_saga_event(&self, event: SagaChoreographyEvent) {
-        self.saga_support().publish(event);
+    fn publish_saga_event(&self, event: SagaChoreographyEvent) -> Result<PublishStats, String> {
+        self.saga_support().publish(event)
     }
 
     fn take_startup_recovery_events(&mut self) -> Vec<SagaChoreographyEvent> {
@@ -170,7 +178,7 @@ mod tests {
         let mut support =
             SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new());
         support.attach_bus(bus);
-        support.publish(SagaChoreographyEvent::SagaCompleted {
+        let published = support.publish(SagaChoreographyEvent::SagaCompleted {
             context: SagaContext {
                 saga_id: SagaId::new(11),
                 saga_type: "order_lifecycle".into(),
@@ -185,6 +193,7 @@ mod tests {
                 event_timestamp_millis: 300,
             },
         });
+        assert!(published.is_ok(), "publish should succeed: {published:?}");
 
         assert_eq!(delivered.load(Ordering::Relaxed), 1);
     }

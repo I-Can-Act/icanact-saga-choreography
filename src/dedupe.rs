@@ -168,9 +168,17 @@ impl ParticipantDedupeStore for InMemoryDedupe {
     }
 
     fn contains(&self, saga_id: SagaId, key: &str) -> bool {
-        let data = self.data.read().ok();
-        data.map(|d| d.contains(&(saga_id.0, key.into())))
-            .unwrap_or(false)
+        match self.data.read() {
+            Ok(data) => data.contains(&(saga_id.0, key.into())),
+            Err(err) => {
+                tracing::error!(
+                    target: "core::saga",
+                    event = "in_memory_dedupe_read_lock_failed",
+                    error = %err
+                );
+                false
+            }
+        }
     }
 
     fn mark_processed(&self, saga_id: SagaId, key: &str) -> Result<(), DedupeError> {

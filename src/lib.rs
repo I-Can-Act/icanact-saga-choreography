@@ -32,7 +32,7 @@
 //! impl SagaParticipant for MyActor { /* ... */ }
 //!
 //! // 4. Handle saga events in Actor::handle
-//! MyActorCommand::SagaEvent { event } => handle_saga_event(self, event),
+//! MyActorCommand::SagaEvent { event } => handle_saga_event_with_emit(self, event, |_| {}),
 //! ```
 
 #![allow(missing_docs)]
@@ -65,18 +65,20 @@ mod helpers;
 mod reply_registry;
 mod resolver;
 mod testkit;
+mod workflow_contract;
 
 // === Re-exports ===
 
 // Types
 pub use binding::{
     bind_async_participant_channel, bind_async_participant_tell,
-    bind_async_workflow_participant_channel, bind_sync_participant_channel,
-    bind_sync_participant_tell, bind_sync_workflow_participant_channel,
-    bind_sync_workflow_participant_tell, checked_workflow_saga_types, workflow_saga_types,
-    SagaParticipantChannel,
+    bind_async_workflow_participant_channel, bind_async_workflow_participant_channel_strict,
+    bind_sync_participant_channel, bind_sync_participant_tell,
+    bind_sync_workflow_participant_channel, bind_sync_workflow_participant_channel_strict,
+    bind_sync_workflow_participant_tell, bind_sync_workflow_participant_tell_strict,
+    checked_workflow_saga_types, workflow_saga_types, SagaParticipantChannel,
 };
-pub use bus::{global_saga_choreography_bus, SagaChoreographyBus};
+pub use bus::{global_saga_choreography_bus, SagaBusPublishError, SagaChoreographyBus};
 pub use context::{PeerId, SagaContext, SagaId, StepId};
 pub use durability::*;
 pub use idempotency::IdempotencyKey;
@@ -114,14 +116,11 @@ pub use stats::{ParticipantStats, ParticipantStatsSnapshot};
 
 // Helpers
 pub use helpers::{
-    compensate_wrapper, execute_step_wrapper, handle_async_saga_event,
-    handle_async_saga_event_with_emit, handle_saga_event, handle_saga_event_with_emit,
-    recover_sagas,
+    handle_async_saga_event_with_emit, handle_saga_event_with_emit,
 };
 pub use reply_registry::{SagaReplyToHandle, SagaReplyToResult};
 pub use resolver::{
-    FailureAuthority, SagaTerminalPolicyProvider, SuccessCriteria, TerminalPolicy,
-    TerminalResolver, TERMINAL_RESOLVER_STEP,
+    FailureAuthority, SuccessCriteria, TerminalPolicy, TerminalResolver, TERMINAL_RESOLVER_STEP,
 };
 #[cfg(any(test, feature = "test-harness"))]
 pub use testkit::AsyncSagaParticipantHandle;
@@ -131,3 +130,7 @@ pub use testkit::{
 };
 #[cfg(any(test, feature = "test-harness"))]
 pub use testkit::{SagaTestWorld, SyncSagaParticipantHandle};
+pub use workflow_contract::{
+    required_steps_from_success_criteria, validate_workflow_contract, SagaWorkflowContract,
+    SagaWorkflowStepContract, WorkflowDependencySpec,
+};

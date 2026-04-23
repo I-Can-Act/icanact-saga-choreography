@@ -8,10 +8,16 @@
 //! provide `SagaStateExt` automatically.
 
 use crate::{
-    HasSagaParticipantSupport, ParticipantDedupeStore, ParticipantEvent, ParticipantJournal,
-    SagaId, SagaStateEntry,
+    DedupeError, HasSagaParticipantSupport, JournalError, ParticipantDedupeStore, ParticipantEvent,
+    ParticipantJournal, SagaId, SagaStateEntry,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+
+#[derive(Debug)]
+pub enum SagaStateStoreError {
+    Dedupe(DedupeError),
+    Journal(JournalError),
+}
 
 /// Extension trait providing common saga state management operations.
 ///
@@ -81,10 +87,44 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
         &mut self.saga_support_mut().terminal_sagas
     }
 
+    fn terminal_saga_order(&mut self) -> &mut VecDeque<SagaId> {
+        &mut self.saga_support_mut().terminal_saga_order
+    }
+
     /// Returns true when this participant has already observed terminal saga state
     /// for the given saga id and should ignore late replays until a new SagaStarted resets it.
     fn is_terminal_saga_latched(&self, saga_id: SagaId) -> bool {
         self.saga_support().terminal_sagas.contains(&saga_id)
+    }
+
+    fn terminal_latch_retention_limit(&self) -> usize {
+        match std::env::var("SAGA_PARTICIPANT_TERMINAL_LATCH_RETENTION") {
+            Ok(raw) => match raw.parse::<usize>() {
+                Ok(parsed) if parsed > 0 => parsed,
+                _ => 4096,
+            },
+            Err(_) => 4096,
+        }
+    }
+
+    fn latch_terminal_saga(&mut self, saga_id: SagaId) {
+        let inserted = self.terminal_sagas().insert(saga_id);
+        if !inserted {
+            return;
+        }
+        self.terminal_saga_order().push_back(saga_id);
+        let cap = self.terminal_latch_retention_limit();
+        while self.terminal_saga_order().len() > cap {
+            let Some(evicted) = self.terminal_saga_order().pop_front() else {
+                break;
+            };
+            self.terminal_sagas().remove(&evicted);
+        }
+    }
+
+    fn unlatch_terminal_saga(&mut self, saga_id: SagaId) {
+        self.terminal_sagas().remove(&saga_id);
+        self.terminal_saga_order().retain(|entry| *entry != saga_id);
     }
 
     /// Returns the participant journal for event persistence.
@@ -108,10 +148,17 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
     /// This should return a monotonically increasing value suitable for
     /// time-based operations such as timeouts and expiration checks.
     fn now_millis(&self) -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
+        match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(duration) => duration.as_millis() as u64,
+            Err(err) => {
+                tracing::error!(
+                    target: "core::saga",
+                    event = "saga_state_now_millis_failed",
+                    error = %err
+                );
+                0
+            }
+        }
     }
 
     /// Checks and marks a deduplication key for the given saga.
@@ -130,10 +177,26 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
     ///
     /// `true` if the operation is new and should proceed, `false` if it
     /// has already been processed.
-    fn check_dedupe(&self, saga_id: SagaId, key: &str) -> bool {
+    fn check_dedupe_strict(&self, saga_id: SagaId, key: &str) -> Result<bool, SagaStateStoreError> {
         self.saga_dedupe()
             .check_and_mark(saga_id, key)
-            .unwrap_or(false)
+            .map_err(SagaStateStoreError::Dedupe)
+    }
+
+    fn check_dedupe(&self, saga_id: SagaId, key: &str) -> bool {
+        match self.saga_dedupe().check_and_mark(saga_id, key) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::error!(
+                    target: "core::saga",
+                    event = "saga_state_dedupe_check_failed",
+                    saga_id = saga_id.get(),
+                    key,
+                    error = %err
+                );
+                false
+            }
+        }
     }
 
     /// Records an event to the saga journal.
@@ -146,8 +209,26 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
     ///
     /// * `saga_id` - The unique identifier of the saga
     /// * `event` - The participant event to record
+    fn record_event_strict(
+        &self,
+        saga_id: SagaId,
+        event: ParticipantEvent,
+    ) -> Result<(), SagaStateStoreError> {
+        self.saga_journal()
+            .append(saga_id, event)
+            .map(|_| ())
+            .map_err(SagaStateStoreError::Journal)
+    }
+
     fn record_event(&self, saga_id: SagaId, event: ParticipantEvent) {
-        let _ = self.saga_journal().append(saga_id, event);
+        if let Err(err) = self.record_event_strict(saga_id, event) {
+            tracing::error!(
+                target: "core::saga",
+                event = "saga_state_journal_append_failed",
+                saga_id = saga_id.get(),
+                error = ?err
+            );
+        }
     }
 
     /// Removes all state associated with a saga.
@@ -159,11 +240,24 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
     /// # Arguments
     ///
     /// * `saga_id` - The unique identifier of the saga to prune
-    fn prune_saga(&mut self, saga_id: SagaId) {
+    fn prune_saga_strict(&mut self, saga_id: SagaId) -> Result<(), SagaStateStoreError> {
         self.saga_states().remove(&saga_id);
         self.dependency_completions().remove(&saga_id);
         self.dependency_fired().remove(&saga_id);
-        let _ = self.saga_dedupe().prune(saga_id);
+        self.saga_dedupe()
+            .prune(saga_id)
+            .map_err(SagaStateStoreError::Dedupe)
+    }
+
+    fn prune_saga(&mut self, saga_id: SagaId) {
+        if let Err(err) = self.prune_saga_strict(saga_id) {
+            tracing::error!(
+                target: "core::saga",
+                event = "saga_state_prune_failed",
+                saga_id = saga_id.get(),
+                error = ?err
+            );
+        }
     }
 
     /// Checks whether a saga is still actively running.
@@ -179,10 +273,10 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
     ///
     /// `true` if the saga is active, `false` if completed, failed, or not found.
     fn is_saga_active(&self, saga_id: SagaId) -> bool {
-        self.saga_states_ref()
-            .get(&saga_id)
-            .map(|e| !e.is_terminal())
-            .unwrap_or(false)
+        match self.saga_states_ref().get(&saga_id) {
+            Some(entry) => !entry.is_terminal(),
+            None => false,
+        }
     }
 
     /// Returns a list of all active saga identifiers.

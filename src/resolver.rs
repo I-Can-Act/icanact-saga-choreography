@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use crate::{SagaChoreographyEvent, SagaContext, SagaFailureDetails, SagaId};
@@ -92,28 +92,46 @@ pub struct TerminalPolicy {
     pub policy_id: Box<str>,
     pub failure_authority: FailureAuthority,
     pub success_criteria: SuccessCriteria,
-    pub timeout: Option<Duration>,
+    /// Hard wall-clock budget measured from saga start.
+    pub overall_timeout: Duration,
+    /// Progress watchdog budget measured since last observed progress event.
+    /// This window resets on each non-terminal participant progress event.
+    pub stalled_timeout: Duration,
 }
 
-/// Declarative workflow contract used to enforce terminal-policy registration.
-///
-/// Implementers provide the saga type and terminal policy that must be present
-/// before `SagaStarted` events are accepted by the bus.
-pub trait SagaTerminalPolicyProvider {
-    fn terminal_policy() -> TerminalPolicy;
+impl TerminalPolicy {
+    pub fn new(
+        saga_type: Box<str>,
+        policy_id: Box<str>,
+        failure_authority: FailureAuthority,
+        success_criteria: SuccessCriteria,
+        overall_timeout: Duration,
+        stalled_timeout: Duration,
+    ) -> Self {
+        Self {
+            saga_type,
+            policy_id,
+            failure_authority,
+            success_criteria,
+            overall_timeout,
+            stalled_timeout,
+        }
+    }
 }
 
+#[cfg(test)]
 impl TerminalPolicy {
     pub fn order_lifecycle_default() -> Self {
         let mut required_steps: HashSet<Box<str>> = HashSet::new();
         required_steps.insert("create_order".into());
-        Self {
-            saga_type: "order_lifecycle".into(),
-            policy_id: "order_lifecycle/default".into(),
-            failure_authority: FailureAuthority::AnyParticipant,
-            success_criteria: SuccessCriteria::AllOf(required_steps),
-            timeout: Some(Duration::from_secs(30)),
-        }
+        Self::new(
+            "order_lifecycle".into(),
+            "order_lifecycle/default".into(),
+            FailureAuthority::AnyParticipant,
+            SuccessCriteria::AllOf(required_steps),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        )
     }
 }
 
@@ -125,11 +143,15 @@ struct SagaResolutionState {
     pending_compensation_steps: HashSet<Box<str>>,
     pending_failure: Option<SagaFailureDetails>,
     started_at_millis: u64,
+    last_progress_at_millis: u64,
+    last_context: SagaContext,
     terminal_latched: bool,
 }
 
 impl SagaResolutionState {
-    fn new(started_at_millis: u64) -> Self {
+    fn new(seed_context: &SagaContext, now_millis: u64) -> Self {
+        let started_at_millis = now_millis.max(seed_context.saga_started_at_millis);
+        let progress_at_millis = now_millis.max(started_at_millis);
         Self {
             completed_steps: HashSet::new(),
             compensable_steps: Vec::new(),
@@ -137,6 +159,8 @@ impl SagaResolutionState {
             pending_compensation_steps: HashSet::new(),
             pending_failure: None,
             started_at_millis,
+            last_progress_at_millis: progress_at_millis,
+            last_context: seed_context.clone(),
             terminal_latched: false,
         }
     }
@@ -146,6 +170,9 @@ impl SagaResolutionState {
 pub struct TerminalResolver {
     policy: TerminalPolicy,
     states: HashMap<SagaId, SagaResolutionState>,
+    terminal_latched_order: VecDeque<SagaId>,
+    terminal_latched_set: HashSet<SagaId>,
+    terminal_latch_retention: usize,
 }
 
 impl TerminalResolver {
@@ -153,6 +180,9 @@ impl TerminalResolver {
         Self {
             policy,
             states: HashMap::new(),
+            terminal_latched_order: VecDeque::new(),
+            terminal_latched_set: HashSet::new(),
+            terminal_latch_retention: terminal_latch_retention_limit(),
         }
     }
 
@@ -161,21 +191,38 @@ impl TerminalResolver {
     }
 
     pub fn ingest(&mut self, event: &SagaChoreographyEvent) -> Vec<SagaChoreographyEvent> {
+        self.ingest_at(event, SagaContext::now_millis())
+    }
+
+    pub fn poll_timeouts(&mut self) -> Vec<SagaChoreographyEvent> {
+        self.poll_timeouts_at(SagaContext::now_millis())
+    }
+
+    fn ingest_at(
+        &mut self,
+        event: &SagaChoreographyEvent,
+        now_millis: u64,
+    ) -> Vec<SagaChoreographyEvent> {
         if event.context().saga_type.as_ref() != self.policy.saga_type.as_ref() {
             return Vec::new();
         }
 
         let saga_id = event.context().saga_id;
+        let mut out = Vec::new();
+        let mut should_latch_terminal = false;
         let state = self
             .states
             .entry(saga_id)
-            .or_insert_with(|| SagaResolutionState::new(event.context().saga_started_at_millis));
+            .or_insert_with(|| SagaResolutionState::new(event.context(), now_millis));
 
         if state.terminal_latched {
             return Vec::new();
         }
 
-        let mut out = Vec::new();
+        state.last_context = event.context().clone();
+        if is_progress_event(event) {
+            state.last_progress_at_millis = now_millis;
+        }
 
         match event {
             SagaChoreographyEvent::SagaStarted { .. } => {}
@@ -321,47 +368,153 @@ impl TerminalResolver {
         }
 
         if !state.terminal_latched {
-            if let Some(timeout) = self.policy.timeout {
-                let now = SagaContext::now_millis();
-                if now.saturating_sub(state.started_at_millis) > timeout.as_millis() as u64 {
-                    let missing = self
-                        .policy
-                        .success_criteria
-                        .missing_required_steps(&state.completed_steps);
-                    let reason = if missing.is_empty() {
-                        format!(
-                            "timeout after {}ms policy={}",
-                            timeout.as_millis(),
-                            self.policy.policy_id
-                        )
-                    } else {
-                        format!(
-                            "timeout after {}ms missing_steps={} policy={}",
-                            timeout.as_millis(),
-                            missing
-                                .iter()
-                                .map(|s| s.as_ref())
-                                .collect::<Vec<_>>()
-                                .join(","),
-                            self.policy.policy_id
-                        )
-                    };
-                    out.push(SagaChoreographyEvent::SagaFailed {
-                        context: terminal_context(event.context()),
-                        reason: reason.into(),
-                        failure: None,
-                    });
-                    state.terminal_latched = true;
-                }
+            if let Some(timeout_event) = timeout_terminal_event(&self.policy, state, now_millis) {
+                out.push(timeout_event);
+                state.terminal_latched = true;
             }
         }
 
+        if state.terminal_latched {
+            should_latch_terminal = true;
+        }
+
+        if should_latch_terminal {
+            self.latch_terminal(saga_id);
+        }
+
         out
+    }
+
+    fn poll_timeouts_at(&mut self, now_millis: u64) -> Vec<SagaChoreographyEvent> {
+        let mut out = Vec::new();
+        let mut newly_latched = Vec::new();
+        for (saga_id, state) in self.states.iter_mut() {
+            if state.terminal_latched {
+                continue;
+            }
+            if let Some(timeout_event) = timeout_terminal_event(&self.policy, state, now_millis) {
+                state.terminal_latched = true;
+                newly_latched.push(*saga_id);
+                out.push(timeout_event);
+            }
+        }
+        for saga_id in newly_latched {
+            self.latch_terminal(saga_id);
+        }
+        out
+    }
+
+    fn latch_terminal(&mut self, saga_id: SagaId) {
+        if !self.terminal_latched_set.insert(saga_id) {
+            return;
+        }
+
+        self.terminal_latched_order.push_back(saga_id);
+        while self.terminal_latched_order.len() > self.terminal_latch_retention {
+            let Some(evicted) = self.terminal_latched_order.pop_front() else {
+                break;
+            };
+            self.terminal_latched_set.remove(&evicted);
+            self.states.remove(&evicted);
+        }
+    }
+}
+
+fn terminal_latch_retention_limit() -> usize {
+    match std::env::var("SAGA_TERMINAL_LATCH_RETENTION") {
+        Ok(raw) => match raw.parse::<usize>() {
+            Ok(parsed) if parsed > 0 => parsed,
+            _ => 4096,
+        },
+        Err(_) => 4096,
     }
 }
 
 fn terminal_context(context: &SagaContext) -> SagaContext {
     context.next_step(TERMINAL_RESOLVER_STEP.into())
+}
+
+fn terminal_context_at(context: &SagaContext, now_millis: u64) -> SagaContext {
+    let mut next = terminal_context(context);
+    next.event_timestamp_millis = now_millis;
+    next
+}
+
+fn is_progress_event(event: &SagaChoreographyEvent) -> bool {
+    matches!(
+        event,
+        SagaChoreographyEvent::SagaStarted { .. }
+            | SagaChoreographyEvent::StepStarted { .. }
+            | SagaChoreographyEvent::StepAck { .. }
+            | SagaChoreographyEvent::StepCompleted { .. }
+            | SagaChoreographyEvent::StepFailed { .. }
+            | SagaChoreographyEvent::CompensationRequested { .. }
+            | SagaChoreographyEvent::CompensationStarted { .. }
+            | SagaChoreographyEvent::CompensationCompleted { .. }
+            | SagaChoreographyEvent::CompensationFailed { .. }
+    )
+}
+
+fn timeout_terminal_event(
+    policy: &TerminalPolicy,
+    state: &SagaResolutionState,
+    now_millis: u64,
+) -> Option<SagaChoreographyEvent> {
+    let missing_steps = || {
+        policy
+            .success_criteria
+            .missing_required_steps(&state.completed_steps)
+            .iter()
+            .map(|step| step.as_ref())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+
+    let elapsed_ms = now_millis.saturating_sub(state.started_at_millis);
+    let overall_timeout_ms = policy.overall_timeout.as_millis() as u64;
+    if elapsed_ms > overall_timeout_ms {
+        let missing_steps = missing_steps();
+        let reason = if missing_steps.is_empty() {
+            format!(
+                "overall_timeout after {}ms policy={}",
+                overall_timeout_ms, policy.policy_id
+            )
+        } else {
+            format!(
+                "overall_timeout after {}ms missing_steps={} policy={}",
+                overall_timeout_ms, missing_steps, policy.policy_id
+            )
+        };
+        return Some(SagaChoreographyEvent::SagaFailed {
+            context: terminal_context_at(&state.last_context, now_millis),
+            reason: reason.into(),
+            failure: None,
+        });
+    }
+
+    let stalled_ms = now_millis.saturating_sub(state.last_progress_at_millis);
+    let stalled_timeout_ms = policy.stalled_timeout.as_millis() as u64;
+    if stalled_ms > stalled_timeout_ms {
+        let missing_steps = missing_steps();
+        let reason = if missing_steps.is_empty() {
+            format!(
+                "stalled_timeout after {}ms without progress policy={}",
+                stalled_timeout_ms, policy.policy_id
+            )
+        } else {
+            format!(
+                "stalled_timeout after {}ms without progress missing_steps={} policy={}",
+                stalled_timeout_ms, missing_steps, policy.policy_id
+            )
+        };
+        return Some(SagaChoreographyEvent::SagaFailed {
+            context: terminal_context_at(&state.last_context, now_millis),
+            reason: reason.into(),
+            failure: None,
+        });
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -389,6 +542,27 @@ mod tests {
         }
     }
 
+    fn ctx_at(
+        step: &str,
+        saga_id: u64,
+        started_at_millis: u64,
+        event_timestamp_millis: u64,
+    ) -> SagaContext {
+        SagaContext {
+            saga_id: SagaId::new(saga_id),
+            saga_type: "order_lifecycle".into(),
+            step_name: step.into(),
+            correlation_id: saga_id,
+            causation_id: saga_id,
+            trace_id: saga_id,
+            step_index: 0,
+            attempt: 0,
+            initiator_peer_id: [0; 32],
+            saga_started_at_millis: started_at_millis,
+            event_timestamp_millis,
+        }
+    }
+
     #[test]
     fn allof_success_emits_single_saga_completed() {
         let mut required: HashSet<Box<str>> = HashSet::new();
@@ -399,7 +573,8 @@ mod tests {
             policy_id: "test".into(),
             failure_authority: FailureAuthority::AnyParticipant,
             success_criteria: SuccessCriteria::AllOf(required),
-            timeout: None,
+            overall_timeout: Duration::from_secs(60),
+            stalled_timeout: Duration::from_secs(60),
         };
         let mut resolver = TerminalResolver::new(policy);
 
@@ -448,7 +623,8 @@ mod tests {
             policy_id: "test".into(),
             failure_authority: FailureAuthority::OnlySteps(only_steps),
             success_criteria: SuccessCriteria::AnyOf(HashSet::new()),
-            timeout: Some(Duration::from_secs(30)),
+            overall_timeout: Duration::from_secs(30),
+            stalled_timeout: Duration::from_secs(30),
         };
         let mut resolver = TerminalResolver::new(policy);
         let out = resolver.ingest(&SagaChoreographyEvent::StepFailed {
@@ -459,5 +635,74 @@ mod tests {
             requires_compensation: false,
         });
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn hard_timeout_triggers_without_new_events() {
+        let mut required_steps = HashSet::new();
+        required_steps.insert("create_order".into());
+        let policy = TerminalPolicy {
+            saga_type: "order_lifecycle".into(),
+            policy_id: "hard-timeout".into(),
+            failure_authority: FailureAuthority::AnyParticipant,
+            success_criteria: SuccessCriteria::AllOf(required_steps),
+            overall_timeout: Duration::from_millis(100),
+            stalled_timeout: Duration::from_secs(60),
+        };
+        let mut resolver = TerminalResolver::new(policy);
+        let start = SagaChoreographyEvent::SagaStarted {
+            context: ctx_at("risk_check", 9, 1_000, 1_000),
+            payload: Vec::new(),
+        };
+        let _ = resolver.ingest_at(&start, 1_000);
+
+        assert!(resolver.poll_timeouts_at(1_099).is_empty());
+        let timed_out = resolver.poll_timeouts_at(1_101);
+        assert!(
+            matches!(
+                timed_out.first(),
+                Some(SagaChoreographyEvent::SagaFailed { reason, .. })
+                if reason.as_ref().contains("overall_timeout")
+            ),
+            "expected hard-timeout failure, got: {timed_out:?}"
+        );
+    }
+
+    #[test]
+    fn progress_timeout_resets_after_progress_event() {
+        let mut required_steps = HashSet::new();
+        required_steps.insert("create_order".into());
+        let policy = TerminalPolicy {
+            saga_type: "order_lifecycle".into(),
+            policy_id: "progress-timeout".into(),
+            failure_authority: FailureAuthority::AnyParticipant,
+            success_criteria: SuccessCriteria::AllOf(required_steps),
+            overall_timeout: Duration::from_secs(5),
+            stalled_timeout: Duration::from_millis(100),
+        };
+        let mut resolver = TerminalResolver::new(policy);
+        let start = SagaChoreographyEvent::SagaStarted {
+            context: ctx_at("risk_check", 9, 1_000, 1_000),
+            payload: Vec::new(),
+        };
+        let _ = resolver.ingest_at(&start, 1_000);
+
+        assert!(resolver.poll_timeouts_at(1_080).is_empty());
+
+        let progress = SagaChoreographyEvent::StepStarted {
+            context: ctx_at("positions_check", 9, 1_000, 1_090),
+        };
+        let _ = resolver.ingest_at(&progress, 1_090);
+
+        assert!(resolver.poll_timeouts_at(1_180).is_empty());
+        let timed_out = resolver.poll_timeouts_at(1_191);
+        assert!(
+            matches!(
+                timed_out.first(),
+                Some(SagaChoreographyEvent::SagaFailed { reason, .. })
+                if reason.as_ref().contains("stalled_timeout")
+            ),
+            "expected stalled-timeout failure, got: {timed_out:?}"
+        );
     }
 }

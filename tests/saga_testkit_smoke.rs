@@ -1,7 +1,7 @@
 #![cfg(feature = "test-harness")]
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use icanact_core::local_async::{self, AsyncActor};
@@ -12,7 +12,7 @@ use icanact_saga_choreography::{
     InMemoryJournal, JournalEntry, ParticipantDedupeStore, ParticipantJournal,
     SagaChoreographyEvent, SagaParticipant, SagaParticipantChannel, SagaParticipantSupport,
     SagaStateExt, SagaTerminalOutcome, SagaTestWorld, SagaWorkflowParticipant, StepError,
-    StepOutput, SuccessCriteria, TerminalPolicy,
+    StepOutput, SuccessCriteria, TerminalPolicy, define_saga_workflow_contract,
 };
 
 #[derive(Clone, Debug)]
@@ -162,11 +162,8 @@ struct AsyncSnapshot {
     executed_inputs: Vec<Vec<u8>>,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
-enum AsyncCtl {
-    Noop,
-}
+struct AsyncCtl;
 
 impl icanact_core::TellAskTell for AsyncCtl {}
 
@@ -293,7 +290,8 @@ fn test_terminal_policy() -> TerminalPolicy {
         policy_id: "order_lifecycle/test".into(),
         failure_authority: FailureAuthority::AnyParticipant,
         success_criteria: SuccessCriteria::AllOf(required),
-        timeout: None,
+        overall_timeout: Duration::from_secs(60),
+        stalled_timeout: Duration::from_secs(60),
     }
 }
 
@@ -305,7 +303,113 @@ fn workflow_terminal_policy() -> TerminalPolicy {
         policy_id: "workflow_beta/test".into(),
         failure_authority: FailureAuthority::AnyParticipant,
         success_criteria: SuccessCriteria::AllOf(required),
-        timeout: None,
+        overall_timeout: Duration::from_secs(60),
+        stalled_timeout: Duration::from_secs(60),
+    }
+}
+
+define_saga_workflow_contract! {
+    struct OrderLifecycleSyncTestContract {
+        saga_type: "order_lifecycle",
+        first_step: start,
+        failure_authority: any (),
+        required_steps: [step_b],
+        overall_timeout_ms: 30_000,
+        stalled_timeout_ms: 10_000,
+        steps: {
+            start => {
+                participant: "saga-start",
+                depends_on: on_start ()
+            },
+            step_a => {
+                participant: "step-a",
+                depends_on: after [start]
+            },
+            step_b => {
+                participant: "step-b",
+                depends_on: after [step_a]
+            }
+        }
+    }
+}
+
+define_saga_workflow_contract! {
+    struct OrderLifecycleAsyncTestContract {
+        saga_type: "order_lifecycle",
+        first_step: start,
+        failure_authority: any (),
+        required_steps: [async_step],
+        overall_timeout_ms: 30_000,
+        stalled_timeout_ms: 10_000,
+        steps: {
+            start => {
+                participant: "saga-start",
+                depends_on: on_start ()
+            },
+            async_step => {
+                participant: "async-step",
+                depends_on: after [start]
+            }
+        }
+    }
+}
+
+define_saga_workflow_contract! {
+    struct WorkflowBetaTestContract {
+        saga_type: "workflow_beta",
+        first_step: start,
+        failure_authority: any (),
+        required_steps: [beta_step],
+        overall_timeout_ms: 30_000,
+        stalled_timeout_ms: 10_000,
+        steps: {
+            start => {
+                participant: "saga-start",
+                depends_on: on_start ()
+            },
+            beta_step => {
+                participant: "beta-step",
+                depends_on: after [start]
+            }
+        }
+    }
+}
+
+fn register_sync_order_lifecycle_contract(world: &SagaTestWorld) {
+    let bus = world.bus();
+    bus.register_workflow_contract_provider::<OrderLifecycleSyncTestContract>()
+        .expect("sync order_lifecycle test contract registration should succeed");
+    for step in ["start", "step_a", "step_b"] {
+        bus.register_bound_workflow_step("order_lifecycle", step)
+            .expect("sync order_lifecycle test step binding should succeed");
+    }
+}
+
+fn register_async_order_lifecycle_contract(world: &SagaTestWorld) {
+    let bus = world.bus();
+    bus.register_workflow_contract_provider::<OrderLifecycleAsyncTestContract>()
+        .expect("async order_lifecycle test contract registration should succeed");
+    for step in ["start", "async_step"] {
+        bus.register_bound_workflow_step("order_lifecycle", step)
+            .expect("async order_lifecycle test step binding should succeed");
+    }
+}
+
+fn register_workflow_beta_contract(world: &SagaTestWorld) {
+    let bus = world.bus();
+    bus.register_workflow_contract_provider::<WorkflowBetaTestContract>()
+        .expect("workflow_beta test contract registration should succeed");
+    for step in ["start", "beta_step"] {
+        bus.register_bound_workflow_step("workflow_beta", step)
+            .expect("workflow_beta test step binding should succeed");
+    }
+}
+
+fn suite_guard() -> MutexGuard<'static, ()> {
+    static SUITE_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    match SUITE_MUTEX.get_or_init(|| Mutex::new(())).lock() {
+        Ok(guard) => guard,
+        Err(err) => err.into_inner(),
     }
 }
 
@@ -626,9 +730,13 @@ where
 
 #[test]
 fn sync_world_runs_real_saga_workflow_and_exposes_actor_state() {
+    let _guard = suite_guard();
     SagaTestWorld::init_test_logging();
     let world = SagaTestWorld::new();
-    let _resolver = world.attach_terminal_resolver(test_terminal_policy(), "testkit");
+    register_sync_order_lifecycle_contract(&world);
+    let _resolver = world
+        .attach_terminal_resolver(test_terminal_policy(), "testkit")
+        .expect("terminal resolver should attach");
 
     let step_a_journal = Arc::new(InMemoryJournal::new());
     let step_a_dedupe = Arc::new(InMemoryDedupe::new());
@@ -665,7 +773,10 @@ fn sync_world_runs_real_saga_workflow_and_exposes_actor_state() {
     world.start_saga(ctx, b"payload".to_vec());
 
     let terminal = world.wait_for_terminal(saga_id, Duration::from_secs(2));
-    assert!(matches!(terminal, SagaTerminalOutcome::Completed { .. }));
+    assert!(
+        matches!(terminal, SagaTerminalOutcome::Completed { .. }),
+        "unexpected terminal outcome: {terminal:?}"
+    );
 
     let a_state = wait_for_sync_snapshot(
         &step_a.actor_ref(),
@@ -701,8 +812,12 @@ fn sync_world_runs_real_saga_workflow_and_exposes_actor_state() {
 
 #[test]
 fn sync_world_runs_real_workflow_participant_path() {
+    let _guard = suite_guard();
     let world = SagaTestWorld::new();
-    let _resolver = world.attach_terminal_resolver(workflow_terminal_policy(), "testkit");
+    register_workflow_beta_contract(&world);
+    let _resolver = world
+        .attach_terminal_resolver(workflow_terminal_policy(), "testkit")
+        .expect("terminal resolver should attach");
 
     let actor = world.spawn_sync_workflow_channel_participant::<WorkflowActor, ()>(
         WorkflowActor::default(),
@@ -719,7 +834,10 @@ fn sync_world_runs_real_workflow_participant_path() {
     world.start_saga(ctx.clone(), b"workflow-input".to_vec());
 
     let terminal = world.wait_for_terminal(ctx.saga_id, Duration::from_secs(2));
-    assert!(matches!(terminal, SagaTerminalOutcome::Completed { .. }));
+    assert!(
+        matches!(terminal, SagaTerminalOutcome::Completed { .. }),
+        "unexpected terminal outcome: {terminal:?}"
+    );
 
     let snapshot = wait_for_sync_snapshot(
         &actor.actor_ref(),
@@ -739,6 +857,7 @@ fn sync_world_runs_real_workflow_participant_path() {
 #[test]
 #[should_panic(expected = "workflow participant saga type registration should be valid")]
 fn sync_workflow_spawn_rejects_duplicate_saga_type_registration() {
+    let _guard = suite_guard();
     let world = SagaTestWorld::new();
 
     let _ = world.spawn_sync_workflow_channel_participant::<DuplicateWorkflowActor, ()>(
@@ -750,8 +869,12 @@ fn sync_workflow_spawn_rejects_duplicate_saga_type_registration() {
 
 #[test]
 fn sync_world_spawn_args_runs_real_saga_workflow() {
+    let _guard = suite_guard();
     let world = SagaTestWorld::new();
-    let _resolver = world.attach_terminal_resolver(test_terminal_policy(), "testkit");
+    register_sync_order_lifecycle_contract(&world);
+    let _resolver = world
+        .attach_terminal_resolver(test_terminal_policy(), "testkit")
+        .expect("terminal resolver should attach");
 
     let step_a = world.spawn_sync_channel_participant(
         SyncParticipant::new(
@@ -782,7 +905,10 @@ fn sync_world_spawn_args_runs_real_saga_workflow() {
     world.start_saga(ctx.clone(), b"payload".to_vec());
 
     let terminal = world.wait_for_terminal(ctx.saga_id, Duration::from_secs(2));
-    assert!(matches!(terminal, SagaTerminalOutcome::Completed { .. }));
+    assert!(
+        matches!(terminal, SagaTerminalOutcome::Completed { .. }),
+        "unexpected terminal outcome: {terminal:?}"
+    );
 
     step_a.shutdown();
     step_b.shutdown();
@@ -790,8 +916,12 @@ fn sync_world_spawn_args_runs_real_saga_workflow() {
 
 #[test]
 fn sync_world_drives_compensation_flow_without_changing_actor_contracts() {
+    let _guard = suite_guard();
     let world = SagaTestWorld::new();
-    let _resolver = world.attach_terminal_resolver(test_terminal_policy(), "testkit");
+    register_sync_order_lifecycle_contract(&world);
+    let _resolver = world
+        .attach_terminal_resolver(test_terminal_policy(), "testkit")
+        .expect("terminal resolver should attach");
 
     let step_a = world.spawn_sync_channel_participant(
         SyncParticipant::new(
@@ -829,10 +959,12 @@ fn sync_world_drives_compensation_flow_without_changing_actor_contracts() {
         Duration::from_secs(1),
     );
     assert_eq!(a_state.compensated, 1);
-    assert!(world
-        .transcript_for_saga(ctx.saga_id)
-        .iter()
-        .any(|event| { matches!(event, SagaChoreographyEvent::CompensationRequested { .. }) }));
+    assert!(
+        world
+            .transcript_for_saga(ctx.saga_id)
+            .iter()
+            .any(|event| { matches!(event, SagaChoreographyEvent::CompensationRequested { .. }) })
+    );
 
     step_a.shutdown();
     step_b.shutdown();
@@ -840,7 +972,16 @@ fn sync_world_drives_compensation_flow_without_changing_actor_contracts() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_world_runs_real_async_participant_path() {
+    let _guard = suite_guard();
     let world = SagaTestWorld::new();
+    register_async_order_lifecycle_contract(&world);
+    let _resolver = world
+        .bus()
+        .attach_terminal_resolver_for_contract::<OrderLifecycleAsyncTestContract>("testkit")
+        .expect("terminal resolver should attach");
+    let _pad_sub = world
+        .bus()
+        .subscribe_saga_type_fn("order_lifecycle", |_event| true);
     let actor = world
         .spawn_async_channel_participant(AsyncParticipant::default(), "saga", 1024)
         .await;
@@ -883,7 +1024,16 @@ async fn async_world_runs_real_async_participant_path() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_world_spawn_args_runs_real_async_participant_path() {
+    let _guard = suite_guard();
     let world = SagaTestWorld::new();
+    register_async_order_lifecycle_contract(&world);
+    let _resolver = world
+        .bus()
+        .attach_terminal_resolver_for_contract::<OrderLifecycleAsyncTestContract>("testkit")
+        .expect("terminal resolver should attach");
+    let _pad_sub = world
+        .bus()
+        .subscribe_saga_type_fn("order_lifecycle", |_event| true);
     let actor = world
         .spawn_async_channel_participant(AsyncParticipant::default(), "saga", 1024)
         .await;

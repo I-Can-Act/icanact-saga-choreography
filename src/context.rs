@@ -70,10 +70,17 @@ pub struct SagaContext {
 impl SagaContext {
     /// Get current time in milliseconds since UNIX epoch
     pub fn now_millis() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
+        match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(duration) => duration.as_millis() as u64,
+            Err(err) => {
+                tracing::error!(
+                    target: "core::saga",
+                    event = "saga_now_millis_failed",
+                    error = %err
+                );
+                0
+            }
+        }
     }
 
     /// Create a context for the next step in sequence

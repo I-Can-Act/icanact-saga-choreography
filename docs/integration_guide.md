@@ -8,6 +8,7 @@ This crate does not require any specific actor folder layout or project structur
 - participant traits
 - embedded saga support state
 - helper functions for execution, compensation, and recovery
+- workflow contract + startup gate enforcement APIs
 
 Your application decides how actors, modules, and messages are organized.
 
@@ -19,6 +20,16 @@ To make an actor saga-capable:
 2. implement `HasSagaParticipantSupport`
 3. implement `SagaParticipant`
 4. route incoming `SagaChoreographyEvent` messages through `apply_sync_participant_saga_ingress(...)` or `apply_async_participant_saga_ingress(...)`
+
+To make a workflow startup-safe (required for non-test runtime):
+
+1. declare a `SagaWorkflowContract` for each `saga_type`
+2. register the contract on startup (`register_workflow_contract_provider`)
+3. attach terminal resolver/policy for that contract
+4. register bound participant steps before any `SagaStarted`
+
+If any of these are missing, `SagaStarted` is rejected immediately with terminal failure instead of allowing a latent stall.
+`register_workflow_contract_provider` does not implicitly attach a resolver; resolver attachment must succeed explicitly.
 
 ## Generic Example Workflow
 
@@ -109,6 +120,51 @@ impl SagaParticipant for StepAActor {
 - they return `DependencySpec::After("step_a")` or `DependencySpec::After("step_b")`
 - they implement their own forward and compensation behavior
 
+## Startup Registration Pattern
+
+Use startup wiring like this:
+
+```rust,ignore
+use icanact_saga_choreography::{
+    define_saga_workflow_contract, SagaChoreographyBus,
+};
+
+define_saga_workflow_contract! {
+    pub struct ExampleWorkflowContract {
+        saga_type: "example_workflow",
+        first_step: step_a,
+        failure_authority: any (),
+        required_steps: [step_c],
+        overall_timeout_ms: 30_000,
+        stalled_timeout_ms: 10_000,
+        steps: {
+            step_a => { participant: "step-a", depends_on: on_start () },
+            step_b => { participant: "step-b", depends_on: after [step_a] },
+            step_c => { participant: "step-c", depends_on: after [step_b] }
+        }
+    }
+}
+
+let bus = SagaChoreographyBus::new();
+bus.register_workflow_contract_provider::<ExampleWorkflowContract>()?;
+let _resolver =
+    bus.attach_terminal_resolver_for_contract::<ExampleWorkflowContract>("terminal-resolver")?;
+
+// If you do not use strict workflow bind helpers, register steps explicitly:
+bus.register_bound_workflow_step("example_workflow", "step_a")?;
+bus.register_bound_workflow_step("example_workflow", "step_b")?;
+bus.register_bound_workflow_step("example_workflow", "step_c")?;
+```
+
+For actors implementing `HasSagaWorkflowParticipants`, prefer:
+
+- `bind_sync_workflow_participant_channel_strict(...)`
+- `bind_sync_workflow_participant_tell_strict(...)`
+- `bind_async_workflow_participant_channel_strict(...)`
+
+These bind the subscriber path and auto-register workflow steps as bound.
+Do not register steps as bound unless a real participant is wired for that step; otherwise the saga can still stall after start.
+
 ## Event Flow
 
 Typical flow:
@@ -119,9 +175,18 @@ Typical flow:
 4. `step_c` reacts to `StepCompleted` from `step_b`
 5. if a step fails with compensation required, `CompensationRequested` is published and earlier participants compensate
 
+At step 1, the bus validates startup invariants:
+
+- terminal policy present
+- workflow contract present
+- started step equals contract `first_step`
+- all contract steps are bound
+
+For runtime publishing paths, prefer `publish_strict(...)` so partial delivery is surfaced immediately as an error instead of being silently ignored.
+
 ## Routing Saga Events
 
-When your actor receives a saga event inside its normal actor command handling, pass it through the ingress helper rather than calling `handle_saga_event(...)` directly. The ingress helper is the runtime-facing path because it validates emitted transitions and republishes emitted choreography events through the attached bus.
+When your actor receives a saga event inside its normal actor command handling, pass it through the ingress helper rather than calling low-level event handlers (for example `handle_saga_event_with_emit(...)`) directly. The ingress helper is the runtime-facing path because it validates emitted transitions and republishes emitted choreography events through the attached bus.
 
 ```rust
 use icanact_saga_choreography::{
@@ -177,35 +242,56 @@ impl SyncActor for MyActor {
 }
 
 let world = SagaTestWorld::new();
-let _resolver = world.attach_order_lifecycle_terminal_resolver("testkit");
+let bus = world.bus();
+bus.register_workflow_contract_provider::<ExampleWorkflowContract>()?;
+let _resolver =
+    bus.attach_terminal_resolver_for_contract::<ExampleWorkflowContract>("testkit")?;
+bus.register_bound_workflow_step("example_workflow", "step_a")?;
+bus.register_bound_workflow_step("example_workflow", "step_b")?;
+bus.register_bound_workflow_step("example_workflow", "step_c")?;
 let actor = world.spawn_sync_participant(MyActor::default(), MyCmd::SagaEvent);
 
 let ctx = DeterministicContextBuilder::default()
     .with_saga_id(7)
-    .with_saga_type("order_lifecycle")
-    .with_step_name("start")
+    .with_saga_type("example_workflow")
+    .with_step_name("step_a")
     .build();
 
 world.start_saga(ctx.clone(), b"payload".to_vec());
-let terminal = world.wait_for_terminal(ctx.saga_id, Duration::from_secs(1));
+let _first_step = world.wait_for_event(
+    |event| {
+        matches!(
+            event,
+            SagaChoreographyEvent::StepCompleted { context, .. }
+                if context.saga_id == ctx.saga_id && context.step_name.as_ref() == "step_a"
+        )
+    },
+    Duration::from_secs(1),
+);
 let transcript = world.transcript_for_saga(ctx.saga_id);
 
 // Assert on:
-// - terminal outcome
+// - expected step progression
 // - transcript sequence
 // - normal actor ask/snapshot replies
 // - shared journal/dedupe stores if provided to the actor
+// If your test wires all participants from the contract, also assert terminal outcome.
 
 actor.shutdown();
 ```
 
 ## Recovery
 
-On startup or restart, use `recover_sagas(...)` to enumerate non-terminal sagas from the journal and decide how your app should resume or reconcile them.
+On startup or restart, enumerate participant journal state through your durability layer and decide how your application should resume or reconcile non-terminal workflows.
+
+## Timeout Model
+
+- `overall_timeout`: hard maximum elapsed wall-clock from saga start.
+- `stalled_timeout`: resettable stall watchdog that resets on each participant progress event.
 
 ## Notes
 
 - `SagaParticipantSupport` is the canonical integration path.
 - The crate stays storage-generic; your app can choose in-memory, LMDB, or another backend.
 - Keep your actor business logic generic to your domain; this crate does not impose any actor module structure.
-- For e2e tests, prefer `SagaTestWorld` over calling `handle_saga_event(...)` directly in unit-style loops.
+- For e2e tests, prefer `SagaTestWorld` over manually looping on low-level handlers in unit-style tests.

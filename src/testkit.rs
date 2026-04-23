@@ -1,11 +1,9 @@
 //! Test helpers for participant choreography tests.
 
 use crate::{
-    apply_sync_workflow_participant_saga_ingress, bind_async_participant_channel,
-    bind_sync_participant_channel, bind_sync_workflow_participant_channel,
-    checked_workflow_saga_types, handle_saga_event, HasSagaWorkflowParticipants,
-    SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant,
-    SagaParticipantChannel, SagaStateExt, SagaTerminalOutcome, TerminalPolicy,
+    apply_sync_workflow_participant_saga_ingress, handle_saga_event_with_emit,
+    HasSagaWorkflowParticipants, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant,
+    SagaStateExt,
 };
 
 /// Small deterministic builder for saga test contexts.
@@ -131,7 +129,7 @@ pub fn drive_scenario<P>(
     P: SagaParticipant + SagaStateExt,
 {
     for event in events {
-        handle_saga_event(participant, event);
+        handle_saga_event_with_emit(participant, event, |_| {});
     }
 }
 
@@ -154,6 +152,12 @@ use std::sync::{Arc, Condvar, Mutex, Once};
 #[cfg(any(test, feature = "test-harness"))]
 use std::time::{Duration, Instant};
 
+#[cfg(any(test, feature = "test-harness"))]
+use crate::{
+    bind_async_participant_channel, bind_sync_participant_channel,
+    bind_sync_workflow_participant_channel_strict, checked_workflow_saga_types,
+    SagaChoreographyBus, SagaParticipantChannel, SagaTerminalOutcome, TerminalPolicy,
+};
 #[cfg(any(test, feature = "test-harness"))]
 use crate::{AsyncSagaParticipant, HasSagaParticipantSupport, SagaParticipantSupportExt};
 #[cfg(any(test, feature = "test-harness"))]
@@ -257,21 +261,11 @@ impl SagaTestWorld {
         &self,
         policy: TerminalPolicy,
         responder: &'static str,
-    ) -> EventSubscription {
+    ) -> Result<EventSubscription, String> {
         self.ensure_capture_saga_type(policy.saga_type.as_ref());
-        let sub = self.bus.attach_terminal_resolver(policy, responder);
+        let sub = self.bus.attach_terminal_resolver(policy, responder)?;
         self.remember_subscription(sub.clone());
-        sub
-    }
-
-    pub fn attach_order_lifecycle_terminal_resolver(
-        &self,
-        responder: &'static str,
-    ) -> EventSubscription {
-        self.ensure_capture_saga_type("order_lifecycle");
-        let sub = self.bus.attach_order_lifecycle_terminal_resolver(responder);
-        self.remember_subscription(sub.clone());
-        sub
+        Ok(sub)
     }
 
     pub fn transcript(&self) -> Vec<SagaChoreographyEvent> {
@@ -415,7 +409,7 @@ impl SagaTestWorld {
         }
 
         let (actor_ref, handle) = icanact_core::local_sync::spawn(actor);
-        let subs = bind_sync_workflow_participant_channel::<A, C>(
+        let subs = bind_sync_workflow_participant_channel_strict::<A, C>(
             &self.bus,
             &actor_ref,
             channel_name,

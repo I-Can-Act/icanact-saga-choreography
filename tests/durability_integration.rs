@@ -9,7 +9,7 @@ use icanact_saga_choreography::durability::{
     panic_quarantine_reason, panic_quarantine_reason_from_entries,
     publish_active_saga_panic_quarantine, run_participant_phase_with_panic_quarantine,
     ActiveSagaExecution, ActiveSagaExecutionPhase, HasActiveSagaExecution, RecoveryDecision,
-    RecoveryPolicy, PANIC_QUARANTINE_PUBLISH_KEY,
+    RecoveryPolicy, DEFAULT_RECOVERY_SAGA_TYPE, PANIC_QUARANTINE_PUBLISH_KEY,
 };
 use icanact_saga_choreography::{
     CompensationError, DependencySpec, HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal,
@@ -285,7 +285,8 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
         &dedupe,
         "risk_gate",
         "mature_pool_refresh",
-    );
+    )
+    .expect("startup recovery should collect");
     assert_eq!(first.len(), 1);
     assert!(matches!(
         &first[0],
@@ -298,7 +299,8 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
         &dedupe,
         "risk_gate",
         "mature_pool_refresh",
-    );
+    )
+    .expect("startup recovery should collect");
     assert!(
         second.is_empty(),
         "dedupe should prevent duplicate replay events"
@@ -684,7 +686,8 @@ fn startup_recovery_collectors_cover_default_and_stale_paths() {
         &InMemoryDedupe::new(),
         "risk_gate",
         "mature_pool_refresh",
-    );
+    )
+    .expect("startup recovery should collect");
     assert_eq!(stale_events.len(), 1);
     assert!(matches!(
         &stale_events[0],
@@ -706,12 +709,14 @@ fn startup_recovery_collectors_cover_default_and_stale_paths() {
         )
         .expect("append should succeed");
     let default_events =
-        collect_startup_recovery_events(&default_journal, &InMemoryDedupe::new(), "risk_gate");
+        collect_startup_recovery_events(&default_journal, &InMemoryDedupe::new(), "risk_gate")
+            .expect("startup recovery should collect");
     assert_eq!(default_events.len(), 1);
     assert!(matches!(
         &default_events[0],
         SagaChoreographyEvent::SagaQuarantined { context, .. }
-            if context.saga_type.as_ref() == ORDER_LIFECYCLE && context.saga_id == default_saga
+            if context.saga_type.as_ref() == DEFAULT_RECOVERY_SAGA_TYPE
+                && context.saga_id == default_saga
     ));
 
     let mixed_saga_empty = SagaId::new(90);
@@ -746,7 +751,8 @@ fn startup_recovery_collectors_cover_default_and_stale_paths() {
         &InMemoryDedupe::new(),
         "risk_gate",
         "mature_pool_refresh",
-    );
+    )
+    .expect("startup recovery should collect");
     assert!(
         mixed_events.is_empty(),
         "empty, continue and terminal recovery states should not emit recovery events"
