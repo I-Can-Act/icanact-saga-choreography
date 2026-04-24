@@ -11,7 +11,7 @@ use crate::workflow_contract::required_path_steps_from_success_criteria;
 use crate::{
     required_steps_from_success_criteria, validate_workflow_contract, HasSagaWorkflowParticipants,
     SagaChoreographyEvent, SagaId, SagaReplyTo, SagaTerminalOutcome, SagaWorkflowContract,
-    TerminalPolicy, TerminalResolver, TERMINAL_RESOLVER_STEP,
+    SagaWorkflowStepContract, TerminalPolicy, TerminalResolver, TERMINAL_RESOLVER_STEP,
 };
 
 #[derive(Clone, Debug)]
@@ -19,6 +19,7 @@ struct WorkflowContractState {
     first_step: Box<str>,
     declared_steps: HashSet<Box<str>>,
     required_path_steps: HashSet<Box<str>>,
+    required_path_description: Box<str>,
 }
 
 type TerminalReplyMap = Arc<Mutex<HashMap<SagaId, SagaReplyTo>>>;
@@ -50,6 +51,20 @@ fn saturating_u32_from_usize(value: usize) -> u32 {
     value as u32
 }
 
+fn required_path_description(
+    steps: &[SagaWorkflowStepContract],
+    required_path_steps: &HashSet<Box<str>>,
+) -> String {
+    let mut labels = Vec::new();
+    for step in steps {
+        if required_path_steps.contains(step.step_name) {
+            labels.push(format!("{}({})", step.step_name, step.participant_id));
+        }
+    }
+    labels.sort_unstable();
+    labels.join(",")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SagaBusPublishError {
     PartialDelivery {
@@ -73,6 +88,7 @@ pub enum SagaBusPublishError {
         attempted: u32,
         delivered: u32,
         required_min_delivered: u32,
+        required_path: Box<str>,
     },
 }
 
@@ -105,6 +121,7 @@ impl SagaChoreographyBus {
     pub fn publish(&self, event: SagaChoreographyEvent) -> PublishStats {
         let event_type = event.event_type();
         let mut expected_min_delivery: Option<u32> = None;
+        let mut expected_required_path: Box<str> = "".into();
         let mut expected_context: Option<crate::SagaContext> = None;
         if let SagaChoreographyEvent::SagaStarted { context, .. } = &event {
             if !self.has_terminal_policy_for_saga_type(context.saga_type.as_ref()) {
@@ -136,11 +153,17 @@ impl SagaChoreographyBus {
             }
             expected_min_delivery =
                 self.saga_start_expected_min_delivery(context.saga_type.as_ref());
+            expected_required_path = self
+                .required_path_description(context.saga_type.as_ref())
+                .into();
             expected_context = Some(context.clone());
         } else if let Some(required_min_delivery) =
             self.required_path_expected_min_delivery_for_event(&event)
         {
             expected_min_delivery = Some(required_min_delivery);
+            expected_required_path = self
+                .required_path_description(event.context().saga_type.as_ref())
+                .into();
             expected_context = Some(event.context().clone());
         }
         if let Some(outcome) = event.terminal_outcome() {
@@ -154,13 +177,14 @@ impl SagaChoreographyBus {
                 let terminal = SagaChoreographyEvent::SagaFailed {
                     context: context.next_step(TERMINAL_RESOLVER_STEP.into()),
                     reason: format!(
-                        "required_path_delivery_shortfall: saga_type={} event_type={} step={} delivered={} attempted={} required_min_delivered={}",
+                        "required_path_delivery_shortfall: saga_type={} event_type={} step={} delivered={} attempted={} required_min_delivered={} required_path={}",
                         context.saga_type,
                         event_type,
                         context.step_name,
                         stats.delivered,
                         stats.attempted,
-                        required_min_delivery
+                        required_min_delivery,
+                        expected_required_path
                     )
                     .into(),
                     failure: None,
@@ -192,6 +216,9 @@ impl SagaChoreographyBus {
                     attempted: stats.attempted,
                     delivered: stats.delivered,
                     required_min_delivered: required_min_delivery,
+                    required_path: self
+                        .required_path_description(context.saga_type.as_ref())
+                        .into(),
                 });
             }
         }
@@ -264,10 +291,12 @@ impl SagaChoreographyBus {
         }
         let required_path_steps =
             required_path_steps_from_success_criteria(C::steps(), &policy.success_criteria);
+        let required_path_description = required_path_description(C::steps(), &required_path_steps);
         let contract_state = WorkflowContractState {
             first_step: C::first_step().into(),
             declared_steps: declared_steps.clone(),
             required_path_steps,
+            required_path_description: required_path_description.into(),
         };
 
         {
@@ -593,6 +622,17 @@ impl SagaChoreographyBus {
         Some(saturating_u32_from_usize(
             required_path_steps.saturating_add(1),
         ))
+    }
+
+    fn required_path_description(&self, saga_type: &str) -> String {
+        let contracts = self
+            .workflow_contracts_by_saga_type
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(contract) = contracts.get(saga_type) else {
+            return String::new();
+        };
+        contract.required_path_description.to_string()
     }
 
     fn required_path_expected_min_delivery_for_event(
@@ -1196,6 +1236,7 @@ mod tests {
                 success_criteria: SuccessCriteria::AllOf(required_steps),
                 overall_timeout: Duration::from_secs(30),
                 stalled_timeout: Duration::from_secs(30),
+                workflow_steps: Self::steps(),
             }
         }
     }
@@ -1351,6 +1392,10 @@ mod tests {
             reason.contains("required_min_delivered=3"),
             "expected minimum delivery requirement in reason, got: {reason}"
         );
+        assert!(
+            reason.contains("required_path=create_order(order-manager),risk_check(risk-engine)"),
+            "expected required path participants in reason, got: {reason}"
+        );
     }
 
     #[test]
@@ -1405,6 +1450,10 @@ mod tests {
             reason.contains("step=risk_check"),
             "expected source step in reason, got: {reason}"
         );
+        assert!(
+            reason.contains("required_path=create_order(order-manager),risk_check(risk-engine)"),
+            "expected required path participants in reason, got: {reason}"
+        );
     }
 
     #[test]
@@ -1430,15 +1479,21 @@ mod tests {
                 compensation_available: false,
             })
             .expect_err("strict publish should report required path shortfall");
-        assert!(matches!(
-            err,
-            super::SagaBusPublishError::RequiredPathDeliveryShortfall {
-                step_name,
-                event_type: "step_completed",
-                required_min_delivered: 3,
-                ..
-            } if step_name.as_ref() == "risk_check"
-        ));
+        let super::SagaBusPublishError::RequiredPathDeliveryShortfall {
+            step_name,
+            event_type: "step_completed",
+            required_min_delivered: 3,
+            required_path,
+            ..
+        } = err
+        else {
+            panic!("unexpected publish error: {err:?}");
+        };
+        assert_eq!(step_name.as_ref(), "risk_check");
+        assert_eq!(
+            required_path.as_ref(),
+            "create_order(order-manager),risk_check(risk-engine)"
+        );
     }
 
     struct DeniedRequiredStepContract;
@@ -1472,6 +1527,7 @@ mod tests {
                 success_criteria: SuccessCriteria::AllOf(required_steps),
                 overall_timeout: Duration::from_secs(30),
                 stalled_timeout: Duration::from_secs(30),
+                workflow_steps: Self::steps(),
             }
         }
     }
@@ -1590,6 +1646,7 @@ mod tests {
             success_criteria: SuccessCriteria::AllOf(required_steps),
             overall_timeout: Duration::from_secs(5),
             stalled_timeout: Duration::from_millis(120),
+            workflow_steps: MultiStepOrderLifecycleContract::steps(),
         };
         let _resolver_sub = bus
             .attach_terminal_resolver(policy, "terminal-resolver")
