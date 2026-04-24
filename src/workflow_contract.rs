@@ -348,6 +348,7 @@ macro_rules! define_saga_workflow_contract {
                     success_criteria: $crate::__saga_contract_required_steps_allof!([$($required_step),+]),
                     overall_timeout: std::time::Duration::from_millis($overall_timeout_ms as u64),
                     stalled_timeout: std::time::Duration::from_millis($stalled_timeout_ms as u64),
+                    workflow_steps: Self::steps(),
                 }
             }
         }
@@ -378,6 +379,7 @@ mod tests {
             success_criteria: SuccessCriteria::AllOf(required),
             overall_timeout: Duration::from_secs(30),
             stalled_timeout: Duration::from_secs(10),
+            workflow_steps: &[],
         }
     }
 

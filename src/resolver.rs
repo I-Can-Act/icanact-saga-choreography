@@ -1,7 +1,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
-use crate::{SagaChoreographyEvent, SagaContext, SagaFailureDetails, SagaId};
+use crate::{
+    SagaChoreographyEvent, SagaContext, SagaFailureDetails, SagaId, SagaWorkflowStepContract,
+    WorkflowDependencySpec,
+};
 
 pub const TERMINAL_RESOLVER_STEP: &str = "terminal_resolver";
 
@@ -97,6 +100,8 @@ pub struct TerminalPolicy {
     /// Progress watchdog budget measured since last observed progress event.
     /// This window resets on each non-terminal participant progress event.
     pub stalled_timeout: Duration,
+    /// Declared workflow graph used to diagnose stalled required paths.
+    pub workflow_steps: &'static [SagaWorkflowStepContract],
 }
 
 impl TerminalPolicy {
@@ -107,6 +112,7 @@ impl TerminalPolicy {
         success_criteria: SuccessCriteria,
         overall_timeout: Duration,
         stalled_timeout: Duration,
+        workflow_steps: &'static [SagaWorkflowStepContract],
     ) -> Self {
         Self {
             saga_type,
@@ -115,6 +121,7 @@ impl TerminalPolicy {
             success_criteria,
             overall_timeout,
             stalled_timeout,
+            workflow_steps,
         }
     }
 }
@@ -131,13 +138,17 @@ impl TerminalPolicy {
             SuccessCriteria::AllOf(required_steps),
             Duration::from_secs(30),
             Duration::from_secs(30),
+            &[],
         )
     }
 }
 
 #[derive(Clone, Debug)]
 struct SagaResolutionState {
+    started_steps: HashSet<Box<str>>,
+    acked_steps: HashSet<Box<str>>,
     completed_steps: HashSet<Box<str>>,
+    failed_steps: HashSet<Box<str>>,
     compensable_steps: Vec<Box<str>>,
     compensation_requested: bool,
     pending_compensation_steps: HashSet<Box<str>>,
@@ -154,6 +165,9 @@ impl SagaResolutionState {
         let progress_at_millis = now_millis.max(started_at_millis);
         Self {
             completed_steps: HashSet::new(),
+            started_steps: HashSet::new(),
+            acked_steps: HashSet::new(),
+            failed_steps: HashSet::new(),
             compensable_steps: Vec::new(),
             compensation_requested: false,
             pending_compensation_steps: HashSet::new(),
@@ -226,12 +240,20 @@ impl TerminalResolver {
 
         match event {
             SagaChoreographyEvent::SagaStarted { .. } => {}
+            SagaChoreographyEvent::StepStarted { context } => {
+                state.started_steps.insert(context.step_name.clone());
+            }
+            SagaChoreographyEvent::StepAck { context, .. } => {
+                state.started_steps.insert(context.step_name.clone());
+                state.acked_steps.insert(context.step_name.clone());
+            }
             SagaChoreographyEvent::StepCompleted {
                 context,
                 compensation_available,
                 ..
             } => {
                 let step_name = context.step_name.clone();
+                state.started_steps.insert(step_name.clone());
                 state.completed_steps.insert(step_name.clone());
                 if *compensation_available
                     && !state
@@ -259,6 +281,8 @@ impl TerminalResolver {
                 error,
                 requires_compensation,
             } => {
+                state.started_steps.insert(context.step_name.clone());
+                state.failed_steps.insert(context.step_name.clone());
                 if !self
                     .policy
                     .failure_authority
@@ -362,9 +386,7 @@ impl TerminalResolver {
             | SagaChoreographyEvent::SagaFailed { .. }
             | SagaChoreographyEvent::SagaQuarantined { .. }
             | SagaChoreographyEvent::CompensationRequested { .. }
-            | SagaChoreographyEvent::CompensationStarted { .. }
-            | SagaChoreographyEvent::StepStarted { .. }
-            | SagaChoreographyEvent::StepAck { .. } => {}
+            | SagaChoreographyEvent::CompensationStarted { .. } => {}
         }
 
         if !state.terminal_latched {
@@ -455,36 +477,232 @@ fn is_progress_event(event: &SagaChoreographyEvent) -> bool {
     )
 }
 
+#[derive(Debug)]
+struct TimeoutDiagnostics {
+    missing_steps: String,
+    ready_not_started: String,
+    started_not_completed: String,
+    blocked_steps: String,
+    completed_steps: String,
+    started_steps: String,
+    failed_steps: String,
+    acked_steps: String,
+}
+
+impl TimeoutDiagnostics {
+    fn reason(&self, timeout_prefix: String, policy_id: &str) -> String {
+        let mut parts = vec![timeout_prefix];
+        push_non_empty(&mut parts, "missing_steps", &self.missing_steps);
+        push_non_empty(&mut parts, "ready_not_started", &self.ready_not_started);
+        push_non_empty(
+            &mut parts,
+            "started_not_completed",
+            &self.started_not_completed,
+        );
+        push_non_empty(&mut parts, "blocked_steps", &self.blocked_steps);
+        push_non_empty(&mut parts, "completed_steps", &self.completed_steps);
+        push_non_empty(&mut parts, "started_steps", &self.started_steps);
+        push_non_empty(&mut parts, "acked_steps", &self.acked_steps);
+        push_non_empty(&mut parts, "failed_steps", &self.failed_steps);
+        parts.push(format!("policy={policy_id}"));
+        parts.join(" ")
+    }
+}
+
+fn push_non_empty(parts: &mut Vec<String>, key: &str, value: &str) {
+    if !value.is_empty() {
+        parts.push(format!("{key}={value}"));
+    }
+}
+
+fn sorted_set_values(values: &HashSet<Box<str>>) -> String {
+    let mut sorted = values
+        .iter()
+        .map(|value| value.as_ref())
+        .collect::<Vec<_>>();
+    sorted.sort_unstable();
+    sorted.join(",")
+}
+
+fn step_label(step: &SagaWorkflowStepContract) -> String {
+    format!("{}({})", step.step_name, step.participant_id)
+}
+
+fn dependency_names(depends_on: WorkflowDependencySpec) -> Vec<&'static str> {
+    match depends_on {
+        WorkflowDependencySpec::OnSagaStart => Vec::new(),
+        WorkflowDependencySpec::After(step) => vec![step],
+        WorkflowDependencySpec::AnyOf(steps) | WorkflowDependencySpec::AllOf(steps) => {
+            steps.to_vec()
+        }
+    }
+}
+
+fn missing_dependencies(
+    depends_on: WorkflowDependencySpec,
+    completed_steps: &HashSet<Box<str>>,
+) -> Vec<&'static str> {
+    match depends_on {
+        WorkflowDependencySpec::OnSagaStart => Vec::new(),
+        WorkflowDependencySpec::After(step) => {
+            if completed_steps.contains(step) {
+                Vec::new()
+            } else {
+                vec![step]
+            }
+        }
+        WorkflowDependencySpec::AnyOf(steps) => {
+            if steps.iter().any(|step| completed_steps.contains(*step)) {
+                Vec::new()
+            } else {
+                steps.to_vec()
+            }
+        }
+        WorkflowDependencySpec::AllOf(steps) => steps
+            .iter()
+            .filter(|step| !completed_steps.contains(**step))
+            .copied()
+            .collect(),
+    }
+}
+
+fn collect_step_blockers(
+    step_name: &str,
+    by_step: &HashMap<&'static str, &SagaWorkflowStepContract>,
+    state: &SagaResolutionState,
+    ready_not_started: &mut Vec<String>,
+    started_not_completed: &mut Vec<String>,
+    blocked_steps: &mut Vec<String>,
+    visited: &mut HashSet<Box<str>>,
+) {
+    if state.completed_steps.contains(step_name) {
+        return;
+    }
+    if state.failed_steps.contains(step_name) {
+        return;
+    }
+    if !visited.insert(step_name.into()) {
+        return;
+    }
+
+    let Some(step) = by_step.get(step_name) else {
+        ready_not_started.push(step_name.to_string());
+        return;
+    };
+
+    if state.started_steps.contains(step_name) {
+        started_not_completed.push(step_label(step));
+        return;
+    }
+
+    let missing_deps = missing_dependencies(step.depends_on, &state.completed_steps);
+    if missing_deps.is_empty() {
+        ready_not_started.push(step_label(step));
+        return;
+    }
+
+    blocked_steps.push(format!("{}<-{}", step_label(step), missing_deps.join("+")));
+    for dependency in dependency_names(step.depends_on) {
+        collect_step_blockers(
+            dependency,
+            by_step,
+            state,
+            ready_not_started,
+            started_not_completed,
+            blocked_steps,
+            visited,
+        );
+    }
+}
+
+fn timeout_diagnostics(policy: &TerminalPolicy, state: &SagaResolutionState) -> TimeoutDiagnostics {
+    let mut missing = policy
+        .success_criteria
+        .missing_required_steps(&state.completed_steps)
+        .iter()
+        .map(|step| step.to_string())
+        .collect::<Vec<_>>();
+    missing.sort_unstable();
+
+    let mut by_step: HashMap<&'static str, &SagaWorkflowStepContract> = HashMap::new();
+    for step in policy.workflow_steps {
+        by_step.insert(step.step_name, step);
+    }
+
+    let mut ready_not_started = Vec::new();
+    let mut started_not_completed = Vec::new();
+    let mut blocked_steps = Vec::new();
+    let mut visited = HashSet::new();
+    for step in &missing {
+        collect_step_blockers(
+            step,
+            &by_step,
+            state,
+            &mut ready_not_started,
+            &mut started_not_completed,
+            &mut blocked_steps,
+            &mut visited,
+        );
+    }
+
+    ready_not_started.sort_unstable();
+    ready_not_started.dedup();
+    started_not_completed.sort_unstable();
+    started_not_completed.dedup();
+    blocked_steps.sort_unstable();
+    blocked_steps.dedup();
+
+    TimeoutDiagnostics {
+        missing_steps: missing.join(","),
+        ready_not_started: ready_not_started.join(","),
+        started_not_completed: started_not_completed.join(","),
+        blocked_steps: blocked_steps.join(","),
+        completed_steps: sorted_set_values(&state.completed_steps),
+        started_steps: sorted_set_values(&state.started_steps),
+        failed_steps: sorted_set_values(&state.failed_steps),
+        acked_steps: sorted_set_values(&state.acked_steps),
+    }
+}
+
+fn emit_timeout_diagnostic(
+    policy: &TerminalPolicy,
+    state: &SagaResolutionState,
+    timeout_kind: &str,
+    diagnostic: &TimeoutDiagnostics,
+) {
+    tracing::error!(
+        target: "core::saga",
+        event = "saga_terminal_timeout_diagnostic",
+        saga_type = policy.saga_type.as_ref(),
+        saga_id = state.last_context.saga_id.get(),
+        policy = policy.policy_id.as_ref(),
+        timeout_kind,
+        missing_steps = diagnostic.missing_steps.as_str(),
+        ready_not_started = diagnostic.ready_not_started.as_str(),
+        started_not_completed = diagnostic.started_not_completed.as_str(),
+        blocked_steps = diagnostic.blocked_steps.as_str(),
+        completed_steps = diagnostic.completed_steps.as_str(),
+        started_steps = diagnostic.started_steps.as_str(),
+        acked_steps = diagnostic.acked_steps.as_str(),
+        failed_steps = diagnostic.failed_steps.as_str(),
+        last_step = state.last_context.step_name.as_ref()
+    );
+}
+
 fn timeout_terminal_event(
     policy: &TerminalPolicy,
     state: &SagaResolutionState,
     now_millis: u64,
 ) -> Option<SagaChoreographyEvent> {
-    let missing_steps = || {
-        policy
-            .success_criteria
-            .missing_required_steps(&state.completed_steps)
-            .iter()
-            .map(|step| step.as_ref())
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-
     let elapsed_ms = now_millis.saturating_sub(state.started_at_millis);
     let overall_timeout_ms = policy.overall_timeout.as_millis() as u64;
     if elapsed_ms > overall_timeout_ms {
-        let missing_steps = missing_steps();
-        let reason = if missing_steps.is_empty() {
-            format!(
-                "overall_timeout after {}ms policy={}",
-                overall_timeout_ms, policy.policy_id
-            )
-        } else {
-            format!(
-                "overall_timeout after {}ms missing_steps={} policy={}",
-                overall_timeout_ms, missing_steps, policy.policy_id
-            )
-        };
+        let diagnostic = timeout_diagnostics(policy, state);
+        emit_timeout_diagnostic(policy, state, "overall_timeout", &diagnostic);
+        let reason = diagnostic.reason(
+            format!("overall_timeout after {overall_timeout_ms}ms"),
+            &policy.policy_id,
+        );
         return Some(SagaChoreographyEvent::SagaFailed {
             context: terminal_context_at(&state.last_context, now_millis),
             reason: reason.into(),
@@ -495,18 +713,12 @@ fn timeout_terminal_event(
     let stalled_ms = now_millis.saturating_sub(state.last_progress_at_millis);
     let stalled_timeout_ms = policy.stalled_timeout.as_millis() as u64;
     if stalled_ms > stalled_timeout_ms {
-        let missing_steps = missing_steps();
-        let reason = if missing_steps.is_empty() {
-            format!(
-                "stalled_timeout after {}ms without progress policy={}",
-                stalled_timeout_ms, policy.policy_id
-            )
-        } else {
-            format!(
-                "stalled_timeout after {}ms without progress missing_steps={} policy={}",
-                stalled_timeout_ms, missing_steps, policy.policy_id
-            )
-        };
+        let diagnostic = timeout_diagnostics(policy, state);
+        emit_timeout_diagnostic(policy, state, "stalled_timeout", &diagnostic);
+        let reason = diagnostic.reason(
+            format!("stalled_timeout after {stalled_timeout_ms}ms without progress"),
+            &policy.policy_id,
+        );
         return Some(SagaChoreographyEvent::SagaFailed {
             context: terminal_context_at(&state.last_context, now_millis),
             reason: reason.into(),
@@ -522,9 +734,58 @@ mod tests {
     use std::collections::HashSet;
     use std::time::Duration;
 
-    use crate::{SagaChoreographyEvent, SagaContext, SagaId};
+    use crate::{
+        SagaChoreographyEvent, SagaContext, SagaId, SagaWorkflowStepContract,
+        WorkflowDependencySpec,
+    };
 
     use super::{FailureAuthority, SuccessCriteria, TerminalPolicy, TerminalResolver};
+
+    static OPEN_POSITION_STEPS: &[SagaWorkflowStepContract] = &[
+        SagaWorkflowStepContract {
+            step_name: "risk_check",
+            participant_id: "account-balance",
+            depends_on: WorkflowDependencySpec::OnSagaStart,
+        },
+        SagaWorkflowStepContract {
+            step_name: "positions_check",
+            participant_id: "positions",
+            depends_on: WorkflowDependencySpec::OnSagaStart,
+        },
+        SagaWorkflowStepContract {
+            step_name: "universe_filter_hold",
+            participant_id: "options-universe",
+            depends_on: WorkflowDependencySpec::OnSagaStart,
+        },
+        SagaWorkflowStepContract {
+            step_name: "book_snapshot_check",
+            participant_id: "options-books",
+            depends_on: WorkflowDependencySpec::AllOf(&[
+                "risk_check",
+                "positions_check",
+                "universe_filter_hold",
+            ]),
+        },
+        SagaWorkflowStepContract {
+            step_name: "create_order",
+            participant_id: "order-manager",
+            depends_on: WorkflowDependencySpec::After("book_snapshot_check"),
+        },
+    ];
+
+    fn open_position_policy(stalled_timeout: Duration) -> TerminalPolicy {
+        let mut required_steps = HashSet::new();
+        required_steps.insert("create_order".into());
+        TerminalPolicy {
+            saga_type: "order_lifecycle".into(),
+            policy_id: "open_position/default".into(),
+            failure_authority: FailureAuthority::AnyParticipant,
+            success_criteria: SuccessCriteria::AllOf(required_steps),
+            overall_timeout: Duration::from_secs(5),
+            stalled_timeout,
+            workflow_steps: OPEN_POSITION_STEPS,
+        }
+    }
 
     fn ctx(step: &str) -> SagaContext {
         SagaContext {
@@ -575,6 +836,7 @@ mod tests {
             success_criteria: SuccessCriteria::AllOf(required),
             overall_timeout: Duration::from_secs(60),
             stalled_timeout: Duration::from_secs(60),
+            workflow_steps: &[],
         };
         let mut resolver = TerminalResolver::new(policy);
 
@@ -625,6 +887,7 @@ mod tests {
             success_criteria: SuccessCriteria::AnyOf(HashSet::new()),
             overall_timeout: Duration::from_secs(30),
             stalled_timeout: Duration::from_secs(30),
+            workflow_steps: &[],
         };
         let mut resolver = TerminalResolver::new(policy);
         let out = resolver.ingest(&SagaChoreographyEvent::StepFailed {
@@ -648,6 +911,7 @@ mod tests {
             success_criteria: SuccessCriteria::AllOf(required_steps),
             overall_timeout: Duration::from_millis(100),
             stalled_timeout: Duration::from_secs(60),
+            workflow_steps: &[],
         };
         let mut resolver = TerminalResolver::new(policy);
         let start = SagaChoreographyEvent::SagaStarted {
@@ -679,6 +943,7 @@ mod tests {
             success_criteria: SuccessCriteria::AllOf(required_steps),
             overall_timeout: Duration::from_secs(5),
             stalled_timeout: Duration::from_millis(100),
+            workflow_steps: &[],
         };
         let mut resolver = TerminalResolver::new(policy);
         let start = SagaChoreographyEvent::SagaStarted {
@@ -703,6 +968,92 @@ mod tests {
                 if reason.as_ref().contains("stalled_timeout")
             ),
             "expected stalled-timeout failure, got: {timed_out:?}"
+        );
+    }
+
+    #[test]
+    fn stalled_timeout_reports_ready_root_blocker_and_dependency_chain() {
+        let mut resolver = TerminalResolver::new(open_position_policy(Duration::from_millis(100)));
+        let start = SagaChoreographyEvent::SagaStarted {
+            context: ctx_at("risk_check", 10, 1_000, 1_000),
+            payload: Vec::new(),
+        };
+        let _ = resolver.ingest_at(&start, 1_000);
+        let _ = resolver.ingest_at(
+            &SagaChoreographyEvent::StepCompleted {
+                context: ctx_at("positions_check", 10, 1_000, 1_010),
+                output: Vec::new(),
+                saga_input: Vec::new(),
+                compensation_available: false,
+            },
+            1_010,
+        );
+        let _ = resolver.ingest_at(
+            &SagaChoreographyEvent::StepCompleted {
+                context: ctx_at("universe_filter_hold", 10, 1_000, 1_020),
+                output: Vec::new(),
+                saga_input: Vec::new(),
+                compensation_available: false,
+            },
+            1_020,
+        );
+
+        let timed_out = resolver.poll_timeouts_at(1_121);
+        let Some(SagaChoreographyEvent::SagaFailed { reason, .. }) = timed_out.first() else {
+            panic!("expected stalled timeout, got: {timed_out:?}");
+        };
+        assert!(
+            reason.contains("missing_steps=create_order"),
+            "missing terminal step was not reported: {reason}"
+        );
+        assert!(
+            reason.contains("ready_not_started=risk_check(account-balance)"),
+            "root ready step was not reported: {reason}"
+        );
+        assert!(
+            reason.contains("book_snapshot_check(options-books)<-risk_check"),
+            "intermediate dependency blocker was not reported: {reason}"
+        );
+        assert!(
+            reason.contains("create_order(order-manager)<-book_snapshot_check"),
+            "terminal dependency blocker was not reported: {reason}"
+        );
+        assert!(
+            reason.contains("completed_steps=positions_check,universe_filter_hold"),
+            "completed progress was not reported: {reason}"
+        );
+        assert!(
+            reason.contains("started_steps=positions_check,universe_filter_hold"),
+            "started progress was not reported: {reason}"
+        );
+    }
+
+    #[test]
+    fn stalled_timeout_reports_started_but_uncompleted_blocker() {
+        let mut resolver = TerminalResolver::new(open_position_policy(Duration::from_millis(100)));
+        let start = SagaChoreographyEvent::SagaStarted {
+            context: ctx_at("risk_check", 11, 1_000, 1_000),
+            payload: Vec::new(),
+        };
+        let _ = resolver.ingest_at(&start, 1_000);
+        let _ = resolver.ingest_at(
+            &SagaChoreographyEvent::StepStarted {
+                context: ctx_at("risk_check", 11, 1_000, 1_010),
+            },
+            1_010,
+        );
+
+        let timed_out = resolver.poll_timeouts_at(1_111);
+        let Some(SagaChoreographyEvent::SagaFailed { reason, .. }) = timed_out.first() else {
+            panic!("expected stalled timeout, got: {timed_out:?}");
+        };
+        assert!(
+            reason.contains("started_not_completed=risk_check(account-balance)"),
+            "started root blocker was not reported: {reason}"
+        );
+        assert!(
+            !reason.contains("ready_not_started=risk_check(account-balance)"),
+            "started blocker must not also be reported as never started: {reason}"
         );
     }
 }

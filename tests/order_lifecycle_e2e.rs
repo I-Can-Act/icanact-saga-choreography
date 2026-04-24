@@ -361,6 +361,7 @@ fn test_policy() -> TerminalPolicy {
         success_criteria: SuccessCriteria::AllOf(required),
         overall_timeout: Duration::from_secs(60),
         stalled_timeout: Duration::from_secs(60),
+        workflow_steps: OrderLifecycleE2eContract::steps(),
     }
 }
 
