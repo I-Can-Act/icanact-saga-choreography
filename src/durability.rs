@@ -1138,6 +1138,21 @@ pub mod lmdb {
         ParticipantJournal, SagaId, SagaParticipantSupport,
     };
 
+    const DEFAULT_LMDB_MAP_SIZE_BYTES: usize = 1024 * 1024 * 1024;
+    const SAGA_LMDB_MAP_SIZE_ENV: &str = "SAGA_LMDB_MAP_SIZE_BYTES";
+
+    fn lmdb_map_size_bytes() -> Result<usize, Box<str>> {
+        match std::env::var(SAGA_LMDB_MAP_SIZE_ENV) {
+            Ok(raw) => match raw.parse::<usize>() {
+                Ok(value) if value > 0 => Ok(value),
+                Ok(_) => Err(format!("{SAGA_LMDB_MAP_SIZE_ENV} must be greater than zero").into()),
+                Err(err) => Err(format!("{SAGA_LMDB_MAP_SIZE_ENV} parse failed: {err}").into()),
+            },
+            Err(std::env::VarError::NotPresent) => Ok(DEFAULT_LMDB_MAP_SIZE_BYTES),
+            Err(err) => Err(format!("{SAGA_LMDB_MAP_SIZE_ENV} read failed: {err}").into()),
+        }
+    }
+
     fn now_millis() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1153,6 +1168,10 @@ pub mod lmdb {
         format!("{:020}:", saga_id.get())
     }
 
+    fn key_saga_index(saga_id: SagaId) -> String {
+        format!("{:020}", saga_id.get())
+    }
+
     #[derive(Debug)]
     pub struct LmdbJournal {
         env: Env,
@@ -1165,8 +1184,14 @@ pub mod lmdb {
         pub fn open(path: &Path) -> Result<Self, JournalError> {
             std::fs::create_dir_all(path)
                 .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            let env = unsafe { EnvOpenOptions::new().max_dbs(16).open(path) }
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
+            let map_size = lmdb_map_size_bytes().map_err(JournalError::Storage)?;
+            let env = unsafe {
+                EnvOpenOptions::new()
+                    .max_dbs(16)
+                    .map_size(map_size)
+                    .open(path)
+            }
+            .map_err(|err| JournalError::Storage(err.to_string().into()))?;
             let mut wtxn = env
                 .write_txn()
                 .map_err(|err| JournalError::Storage(err.to_string().into()))?;
@@ -1227,7 +1252,7 @@ pub mod lmdb {
                 )
                 .map_err(|err| JournalError::Storage(err.to_string().into()))?;
             self.saga_index
-                .put(&mut wtxn, &format!("{:020}", saga_id.get()), "1")
+                .put(&mut wtxn, &key_saga_index(saga_id), "1")
                 .map_err(|err| JournalError::Storage(err.to_string().into()))?;
             wtxn.commit()
                 .map_err(|err| JournalError::Storage(err.to_string().into()))?;
@@ -1276,6 +1301,29 @@ pub mod lmdb {
             out.sort_by_key(|id| id.get());
             Ok(out)
         }
+
+        fn prune(&self, saga_id: SagaId) -> Result<(), JournalError> {
+            let mut wtxn = self
+                .env
+                .write_txn()
+                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
+            let prefix = key_saga_prefix(saga_id);
+            let mut iter = self
+                .rows
+                .prefix_iter_mut(&mut wtxn, &prefix)
+                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
+            while iter.next().is_some() {
+                unsafe { iter.del_current() }
+                    .map_err(|err| JournalError::Storage(err.to_string().into()))?;
+            }
+            drop(iter);
+            self.saga_index
+                .delete(&mut wtxn, &key_saga_index(saga_id))
+                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
+            wtxn.commit()
+                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
+            Ok(())
+        }
     }
 
     #[derive(Debug)]
@@ -1288,8 +1336,14 @@ pub mod lmdb {
         pub fn open(path: &Path) -> Result<Self, DedupeError> {
             std::fs::create_dir_all(path)
                 .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            let env = unsafe { EnvOpenOptions::new().max_dbs(8).open(path) }
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
+            let map_size = lmdb_map_size_bytes().map_err(DedupeError::Storage)?;
+            let env = unsafe {
+                EnvOpenOptions::new()
+                    .max_dbs(8)
+                    .map_size(map_size)
+                    .open(path)
+            }
+            .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
             let mut wtxn = env
                 .write_txn()
                 .map_err(|err| DedupeError::Storage(err.to_string().into()))?;

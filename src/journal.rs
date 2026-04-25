@@ -97,6 +97,13 @@ pub trait ParticipantJournal: Send + Sync + 'static {
     ///
     /// Returns [`JournalError::Storage`] if the underlying storage fails.
     fn list_sagas(&self) -> Result<Vec<SagaId>, JournalError>;
+
+    /// Deletes all journal entries for a specific SAGA.
+    ///
+    /// Terminal saga cleanup uses this to keep durable participant journals
+    /// bounded. Active, non-terminal SAGAs remain journaled for startup
+    /// recovery until they reach a terminal event.
+    fn prune(&self, saga_id: SagaId) -> Result<(), JournalError>;
 }
 
 /// A single entry in the participant's journal.
@@ -223,6 +230,15 @@ impl ParticipantJournal for InMemoryJournal {
             .map_err(|e| JournalError::Storage(e.to_string().into()))?;
         Ok(data.keys().map(|&id| SagaId::new(id)).collect())
     }
+
+    fn prune(&self, saga_id: SagaId) -> Result<(), JournalError> {
+        let mut data = self
+            .data
+            .write()
+            .map_err(|e| JournalError::Storage(e.to_string().into()))?;
+        data.remove(&saga_id.0);
+        Ok(())
+    }
 }
 
 impl Default for InMemoryJournal {
@@ -245,5 +261,9 @@ where
 
     fn list_sagas(&self) -> Result<Vec<SagaId>, JournalError> {
         (**self).list_sagas()
+    }
+
+    fn prune(&self, saga_id: SagaId) -> Result<(), JournalError> {
+        (**self).prune(saga_id)
     }
 }

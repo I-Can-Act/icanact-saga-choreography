@@ -12,7 +12,8 @@ use icanact_saga_choreography::{
     HasSagaWorkflowParticipants, InMemoryDedupe, InMemoryJournal, JournalEntry,
     ParticipantDedupeStore, ParticipantJournal, SagaChoreographyEvent, SagaParticipant,
     SagaParticipantChannel, SagaParticipantSupport, SagaStateExt, SagaTerminalOutcome,
-    SagaTestWorld, SagaWorkflowParticipant, StepError, StepOutput, SuccessCriteria, TerminalPolicy,
+    SagaTestWorld, SagaWorkflowContract, SagaWorkflowParticipant, StepError, StepOutput,
+    SuccessCriteria, TerminalPolicy,
 };
 
 #[derive(Clone, Debug)]
@@ -306,7 +307,7 @@ fn workflow_terminal_policy() -> TerminalPolicy {
         success_criteria: SuccessCriteria::AllOf(required),
         overall_timeout: Duration::from_secs(60),
         stalled_timeout: Duration::from_secs(60),
-        workflow_steps: WorkflowBetaContract::steps(),
+        workflow_steps: WorkflowBetaTestContract::steps(),
     }
 }
 
@@ -802,7 +803,10 @@ fn sync_world_runs_real_saga_workflow_and_exposes_actor_state() {
     let entries: Vec<JournalEntry> = step_a_journal
         .read(saga_id)
         .expect("shared journal should be readable");
-    assert!(!entries.is_empty());
+    assert!(
+        entries.is_empty(),
+        "terminal processing should prune participant journal rows"
+    );
     assert!(
         !step_a_dedupe.contains(saga_id, "1:1700000000000:saga_started:start"),
         "terminal processing should prune participant dedupe keys"
@@ -971,6 +975,7 @@ fn sync_world_drives_compensation_flow_without_changing_actor_contracts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
 async fn async_world_runs_real_async_participant_path() {
     let _guard = suite_guard();
     let world = SagaTestWorld::new();
@@ -1023,6 +1028,7 @@ async fn async_world_runs_real_async_participant_path() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
 async fn async_world_spawn_args_runs_real_async_participant_path() {
     let _guard = suite_guard();
     let world = SagaTestWorld::new();

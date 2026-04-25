@@ -233,9 +233,9 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
 
     /// Removes all state associated with a saga.
     ///
-    /// This removes the saga from the state map and prunes its deduplication
-    /// entries. Use this when a saga has completed and its state is no longer
-    /// needed.
+    /// This removes the saga from the state map, durable journal, and
+    /// deduplication entries. Use this when a saga has completed and its state
+    /// is no longer needed for recovery.
     ///
     /// # Arguments
     ///
@@ -244,6 +244,9 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
         self.saga_states().remove(&saga_id);
         self.dependency_completions().remove(&saga_id);
         self.dependency_fired().remove(&saga_id);
+        self.saga_journal()
+            .prune(saga_id)
+            .map_err(SagaStateStoreError::Journal)?;
         self.saga_dedupe()
             .prune(saga_id)
             .map_err(SagaStateStoreError::Dedupe)

@@ -8,8 +8,8 @@ use icanact_saga_choreography::durability::lmdb::{
 };
 use icanact_saga_choreography::durability::{panic_quarantine_reason, ActiveSagaExecutionPhase};
 use icanact_saga_choreography::{
-    ParticipantDedupeStore, ParticipantEvent, ParticipantJournal, SagaChoreographyEvent,
-    SagaContext, SagaId,
+    HasSagaParticipantSupport, ParticipantDedupeStore, ParticipantEvent, ParticipantJournal,
+    SagaChoreographyEvent, SagaContext, SagaId, SagaParticipantSupport, SagaStateExt,
 };
 
 #[test]
@@ -55,6 +55,22 @@ fn lmdb_journal_and_dedupe_roundtrip() {
     saga_ids.sort_by_key(|id| id.get());
     assert_eq!(saga_ids, vec![saga_a, saga_b]);
 
+    journal.prune(saga_a).expect("journal prune should succeed");
+    assert!(
+        journal
+            .read(saga_a)
+            .expect("read pruned saga should succeed")
+            .is_empty(),
+        "journal prune must remove saga rows"
+    );
+    assert_eq!(
+        journal
+            .list_sagas()
+            .expect("list after prune should succeed"),
+        vec![saga_b],
+        "journal prune must remove saga index entry"
+    );
+
     assert!(dedupe
         .check_and_mark(saga_a, "probe")
         .expect("first check_and_mark should succeed"));
@@ -70,6 +86,84 @@ fn lmdb_journal_and_dedupe_roundtrip() {
 
     dedupe.prune(saga_a).expect("prune should succeed");
     assert!(!dedupe.contains(saga_a, "probe"));
+}
+
+struct LmdbParticipant {
+    saga: SagaParticipantSupport<LmdbJournal, LmdbDedupe>,
+}
+
+impl HasSagaParticipantSupport for LmdbParticipant {
+    type Journal = LmdbJournal;
+    type Dedupe = LmdbDedupe;
+
+    fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+        &self.saga
+    }
+
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+        &mut self.saga
+    }
+}
+
+#[test]
+fn prune_saga_removes_lmdb_journal_and_dedupe_state() {
+    let temp = tempfile::tempdir().expect("tempdir should open");
+    let journal = LmdbJournal::open(&temp.path().join("journal")).expect("journal should open");
+    let dedupe = LmdbDedupe::open(&temp.path().join("dedupe")).expect("dedupe should open");
+    let saga_a = SagaId::new(300);
+    let saga_b = SagaId::new(301);
+
+    journal
+        .append(
+            saga_a,
+            ParticipantEvent::StepExecutionStarted {
+                attempt: 1,
+                started_at_millis: 1200,
+            },
+        )
+        .expect("append saga_a should succeed");
+    journal
+        .append(
+            saga_b,
+            ParticipantEvent::StepExecutionStarted {
+                attempt: 1,
+                started_at_millis: 1300,
+            },
+        )
+        .expect("append saga_b should succeed");
+    dedupe
+        .mark_processed(saga_a, "started")
+        .expect("dedupe mark should succeed");
+
+    let mut actor = LmdbParticipant {
+        saga: SagaParticipantSupport::new(journal, dedupe),
+    };
+    actor
+        .prune_saga_strict(saga_a)
+        .expect("terminal saga prune should succeed");
+
+    assert!(
+        actor
+            .saga
+            .journal
+            .read(saga_a)
+            .expect("read pruned saga should succeed")
+            .is_empty(),
+        "terminal cleanup must remove durable journal rows"
+    );
+    assert_eq!(
+        actor
+            .saga
+            .journal
+            .list_sagas()
+            .expect("list after prune should succeed"),
+        vec![saga_b],
+        "terminal cleanup must remove only the pruned saga index"
+    );
+    assert!(
+        !actor.saga.dedupe.contains(saga_a, "started"),
+        "terminal cleanup must still prune dedupe rows"
+    );
 }
 
 #[test]

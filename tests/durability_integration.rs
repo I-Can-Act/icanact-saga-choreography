@@ -503,6 +503,10 @@ impl ParticipantJournal for StaticJournal {
     fn list_sagas(&self) -> Result<Vec<SagaId>, icanact_saga_choreography::JournalError> {
         Ok(self.rows.iter().map(|(id, _)| *id).collect())
     }
+
+    fn prune(&self, _saga_id: SagaId) -> Result<(), icanact_saga_choreography::JournalError> {
+        Ok(())
+    }
 }
 
 #[test]
