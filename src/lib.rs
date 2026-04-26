@@ -71,12 +71,17 @@ mod workflow_contract;
 
 // Types
 pub use binding::{
-    bind_async_participant_channel, bind_async_participant_tell,
-    bind_async_workflow_participant_channel, bind_async_workflow_participant_channel_strict,
-    bind_sync_participant_channel, bind_sync_participant_tell,
-    bind_sync_workflow_participant_channel, bind_sync_workflow_participant_channel_strict,
-    bind_sync_workflow_participant_tell, bind_sync_workflow_participant_tell_strict,
-    checked_workflow_saga_types, workflow_saga_types, SagaParticipantChannel,
+    bind_async_participant_channel, bind_async_participant_channel_lazy,
+    bind_async_participant_tell, bind_async_workflow_participant_channel,
+    bind_async_workflow_participant_channel_lazy,
+    bind_async_workflow_participant_channel_lazy_strict,
+    bind_async_workflow_participant_channel_strict, bind_sync_participant_channel,
+    bind_sync_participant_channel_lazy, bind_sync_participant_tell,
+    bind_sync_workflow_participant_channel, bind_sync_workflow_participant_channel_lazy,
+    bind_sync_workflow_participant_channel_lazy_strict,
+    bind_sync_workflow_participant_channel_strict, bind_sync_workflow_participant_tell,
+    bind_sync_workflow_participant_tell_strict, checked_workflow_saga_types, workflow_saga_types,
+    SagaParticipantChannel,
 };
 pub use bus::{global_saga_choreography_bus, SagaBusPublishError, SagaChoreographyBus};
 pub use context::{PeerId, SagaContext, SagaId, StepId};
@@ -102,8 +107,8 @@ pub use errors::{CompensationError, StepError, StepOutput};
 // Traits
 pub use state_ext::SagaStateExt;
 pub use traits::{
-    AsyncSagaParticipant, DependencySpec, HasSagaWorkflowParticipants, SagaBoxFuture,
-    SagaParticipant, SagaWorkflowParticipant,
+    AllowsSagaTellIngress, AsyncSagaParticipant, DependencySpec, HasSagaWorkflowParticipants,
+    SagaBoxFuture, SagaParticipant, SagaWorkflowParticipant,
 };
 
 // Storage

@@ -1,7 +1,7 @@
 use icanact_core::local::EventSubscription;
 
 use crate::{
-    HasSagaWorkflowParticipants, SagaChoreographyBus, SagaChoreographyEvent,
+    AllowsSagaTellIngress, HasSagaWorkflowParticipants, SagaChoreographyBus, SagaChoreographyEvent,
     SagaWorkflowParticipant,
 };
 
@@ -51,6 +51,75 @@ where
         }
     }
     Ok(saga_types)
+}
+
+pub fn bind_sync_participant_channel_lazy<A, C>(
+    bus: &SagaChoreographyBus,
+    actor_ref: &icanact_core::local_sync::SyncActorRef<A>,
+    saga_types: &[&'static str],
+    channel_name: &str,
+    capacity: usize,
+) -> Result<Vec<EventSubscription>, String>
+where
+    A: icanact_core::local_sync::SyncActor + Send + 'static,
+    <A as icanact_core::local_sync::SyncActor>::Channel: Send + 'static,
+    <A as icanact_core::local_sync::SyncActor>::Channel: From<SagaParticipantChannel<C>>,
+    A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
+    C: Send + 'static,
+{
+    let actor_ref = actor_ref.clone();
+    let channel_name: std::sync::Arc<str> = std::sync::Arc::from(channel_name);
+    let sender: std::sync::Arc<
+        std::sync::Mutex<
+            Option<
+                icanact_core::local_sync::ChannelSender<
+                    <A as icanact_core::local_sync::SyncActor>::Channel,
+                >,
+            >,
+        >,
+    > = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let capacity = capacity.max(1);
+
+    Ok(saga_types
+        .iter()
+        .map(|saga_type| {
+            let actor_ref = actor_ref.clone();
+            let channel_name = std::sync::Arc::clone(&channel_name);
+            let sender = std::sync::Arc::clone(&sender);
+            bus.subscribe_saga_type_fn(saga_type, move |event| {
+                let mut guard = match sender.lock() {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        tracing::error!(
+                            target: "core::saga",
+                            event = "sync_channel_sender_lock_poisoned",
+                            error = %err
+                        );
+                        return false;
+                    }
+                };
+                if guard.is_none() {
+                    let Some(channel_sender) =
+                        actor_ref.add_channel(channel_name.to_string(), capacity)
+                    else {
+                        tracing::error!(
+                            target: "core::saga",
+                            event = "sync_saga_channel_registration_unavailable",
+                            channel_name = %channel_name
+                        );
+                        return false;
+                    };
+                    *guard = Some(channel_sender);
+                }
+                let Some(sender) = guard.as_ref() else {
+                    return false;
+                };
+                sender
+                    .try_send(SagaParticipantChannel::Saga(event.clone()).into())
+                    .is_ok()
+            })
+        })
+        .collect())
 }
 
 pub fn bind_sync_participant_channel<A, C>(
@@ -139,6 +208,46 @@ where
     Ok(subs)
 }
 
+pub fn bind_sync_workflow_participant_channel_lazy<A, C>(
+    bus: &SagaChoreographyBus,
+    actor_ref: &icanact_core::local_sync::SyncActorRef<A>,
+    channel_name: &str,
+    capacity: usize,
+) -> Result<Vec<EventSubscription>, String>
+where
+    A: icanact_core::local_sync::SyncActor + HasSagaWorkflowParticipants + Send + 'static,
+    <A as icanact_core::local_sync::SyncActor>::Channel: Send + 'static,
+    <A as icanact_core::local_sync::SyncActor>::Channel: From<SagaParticipantChannel<C>>,
+    A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
+    C: Send + 'static,
+{
+    let saga_types = checked_workflow_saga_types::<A>()?;
+    bind_sync_participant_channel_lazy::<A, C>(bus, actor_ref, &saga_types, channel_name, capacity)
+}
+
+pub fn bind_sync_workflow_participant_channel_lazy_strict<A, C>(
+    bus: &SagaChoreographyBus,
+    actor_ref: &icanact_core::local_sync::SyncActorRef<A>,
+    channel_name: &str,
+    capacity: usize,
+) -> Result<Vec<EventSubscription>, String>
+where
+    A: icanact_core::local_sync::SyncActor + HasSagaWorkflowParticipants + Send + 'static,
+    <A as icanact_core::local_sync::SyncActor>::Channel: Send + 'static,
+    <A as icanact_core::local_sync::SyncActor>::Channel: From<SagaParticipantChannel<C>>,
+    A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
+    C: Send + 'static,
+{
+    let subs = bind_sync_workflow_participant_channel_lazy::<A, C>(
+        bus,
+        actor_ref,
+        channel_name,
+        capacity,
+    )?;
+    bus.register_bound_workflow_participants_for_actor::<A>()?;
+    Ok(subs)
+}
+
 pub fn bind_sync_participant_tell<A, F>(
     bus: &SagaChoreographyBus,
     actor_ref: &icanact_core::local_sync::SyncActorRef<A>,
@@ -146,7 +255,7 @@ pub fn bind_sync_participant_tell<A, F>(
     map_event: F,
 ) -> Result<Vec<EventSubscription>, String>
 where
-    A: icanact_core::local_sync::SyncActor + Send + 'static,
+    A: icanact_core::local_sync::SyncActor + AllowsSagaTellIngress + Send + 'static,
     A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
     F: Fn(SagaChoreographyEvent) -> A::Tell + Send + Sync + 'static,
 {
@@ -169,7 +278,11 @@ pub fn bind_sync_workflow_participant_tell<A, F>(
     map_event: F,
 ) -> Result<Vec<EventSubscription>, String>
 where
-    A: icanact_core::local_sync::SyncActor + HasSagaWorkflowParticipants + Send + 'static,
+    A: icanact_core::local_sync::SyncActor
+        + HasSagaWorkflowParticipants
+        + AllowsSagaTellIngress
+        + Send
+        + 'static,
     A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
     F: Fn(SagaChoreographyEvent) -> A::Tell + Send + Sync + 'static,
 {
@@ -183,13 +296,86 @@ pub fn bind_sync_workflow_participant_tell_strict<A, F>(
     map_event: F,
 ) -> Result<Vec<EventSubscription>, String>
 where
-    A: icanact_core::local_sync::SyncActor + HasSagaWorkflowParticipants + Send + 'static,
+    A: icanact_core::local_sync::SyncActor
+        + HasSagaWorkflowParticipants
+        + AllowsSagaTellIngress
+        + Send
+        + 'static,
     A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
     F: Fn(SagaChoreographyEvent) -> A::Tell + Send + Sync + 'static,
 {
     let subs = bind_sync_workflow_participant_tell::<A, F>(bus, actor_ref, map_event)?;
     bus.register_bound_workflow_participants_for_actor::<A>()?;
     Ok(subs)
+}
+
+pub fn bind_async_participant_channel_lazy<A, C>(
+    bus: &SagaChoreographyBus,
+    actor_ref: &icanact_core::local_async::AsyncActorRef<A>,
+    saga_types: &[&'static str],
+    channel_name: &str,
+    capacity: usize,
+) -> Result<Vec<EventSubscription>, String>
+where
+    A: icanact_core::local_async::AsyncActor + Send + 'static,
+    <A as icanact_core::local_async::AsyncActor>::Channel: Send + 'static,
+    <A as icanact_core::local_async::AsyncActor>::Channel: From<SagaParticipantChannel<C>>,
+    A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
+    C: Send + 'static,
+{
+    let actor_ref = actor_ref.clone();
+    let channel_name: std::sync::Arc<str> = std::sync::Arc::from(channel_name);
+    let sender: std::sync::Arc<
+        std::sync::Mutex<
+            Option<
+                icanact_core::local_async::ChannelSender<
+                    <A as icanact_core::local_async::AsyncActor>::Channel,
+                >,
+            >,
+        >,
+    > = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let capacity = capacity.max(1);
+
+    Ok(saga_types
+        .iter()
+        .map(|saga_type| {
+            let actor_ref = actor_ref.clone();
+            let channel_name = std::sync::Arc::clone(&channel_name);
+            let sender = std::sync::Arc::clone(&sender);
+            bus.subscribe_saga_type_fn(saga_type, move |event| {
+                let mut guard = match sender.lock() {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        tracing::error!(
+                            target: "core::saga",
+                            event = "async_channel_sender_lock_poisoned",
+                            error = %err
+                        );
+                        return false;
+                    }
+                };
+                if guard.is_none() {
+                    let Some(channel_sender) =
+                        actor_ref.add_channel(channel_name.to_string(), capacity)
+                    else {
+                        tracing::error!(
+                            target: "core::saga",
+                            event = "async_saga_channel_registration_unavailable",
+                            channel_name = %channel_name
+                        );
+                        return false;
+                    };
+                    *guard = Some(channel_sender);
+                }
+                let Some(sender) = guard.as_ref() else {
+                    return false;
+                };
+                sender
+                    .try_send(SagaParticipantChannel::Saga(event.clone()).into())
+                    .is_ok()
+            })
+        })
+        .collect())
 }
 
 pub fn bind_async_participant_channel<A, C>(
@@ -278,6 +464,46 @@ where
     Ok(subs)
 }
 
+pub fn bind_async_workflow_participant_channel_lazy<A, C>(
+    bus: &SagaChoreographyBus,
+    actor_ref: &icanact_core::local_async::AsyncActorRef<A>,
+    channel_name: &str,
+    capacity: usize,
+) -> Result<Vec<EventSubscription>, String>
+where
+    A: icanact_core::local_async::AsyncActor + HasSagaWorkflowParticipants + Send + 'static,
+    <A as icanact_core::local_async::AsyncActor>::Channel: Send + 'static,
+    <A as icanact_core::local_async::AsyncActor>::Channel: From<SagaParticipantChannel<C>>,
+    A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
+    C: Send + 'static,
+{
+    let saga_types = checked_workflow_saga_types::<A>()?;
+    bind_async_participant_channel_lazy::<A, C>(bus, actor_ref, &saga_types, channel_name, capacity)
+}
+
+pub fn bind_async_workflow_participant_channel_lazy_strict<A, C>(
+    bus: &SagaChoreographyBus,
+    actor_ref: &icanact_core::local_async::AsyncActorRef<A>,
+    channel_name: &str,
+    capacity: usize,
+) -> Result<Vec<EventSubscription>, String>
+where
+    A: icanact_core::local_async::AsyncActor + HasSagaWorkflowParticipants + Send + 'static,
+    <A as icanact_core::local_async::AsyncActor>::Channel: Send + 'static,
+    <A as icanact_core::local_async::AsyncActor>::Channel: From<SagaParticipantChannel<C>>,
+    A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
+    C: Send + 'static,
+{
+    let subs = bind_async_workflow_participant_channel_lazy::<A, C>(
+        bus,
+        actor_ref,
+        channel_name,
+        capacity,
+    )?;
+    bus.register_bound_workflow_participants_for_actor::<A>()?;
+    Ok(subs)
+}
+
 pub fn bind_async_participant_tell<A, F>(
     bus: &SagaChoreographyBus,
     actor_ref: &icanact_core::local_async::AsyncActorRef<A>,
@@ -285,7 +511,7 @@ pub fn bind_async_participant_tell<A, F>(
     map_event: F,
 ) -> Result<Vec<EventSubscription>, String>
 where
-    A: icanact_core::local_async::AsyncActor + Send + 'static,
+    A: icanact_core::local_async::AsyncActor + AllowsSagaTellIngress + Send + 'static,
     A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
     F: Fn(SagaChoreographyEvent) -> A::Tell + Send + Sync + 'static,
 {
@@ -312,8 +538,8 @@ mod tests {
     use icanact_core::local_sync::{self, SyncActor};
 
     use super::{
-        bind_sync_workflow_participant_channel, bind_sync_workflow_participant_channel_strict,
-        SagaParticipantChannel,
+        bind_sync_workflow_participant_channel, bind_sync_workflow_participant_channel_lazy_strict,
+        bind_sync_workflow_participant_channel_strict, SagaParticipantChannel,
     };
 
     #[derive(Clone, Debug)]
@@ -575,6 +801,25 @@ mod tests {
             let _ = bus.unsubscribe(sub);
         }
         handle.shutdown();
+    }
+
+    #[test]
+    fn lazy_strict_workflow_binding_does_not_require_eager_channel_registration() {
+        let bus = SagaChoreographyBus::new();
+        bus.register_workflow_contract_provider::<BindingWorkflowContract>()
+            .expect("workflow contract registration should succeed");
+        let actor_ref = icanact_core::SyncActorRef::<BindingActor>::new_unset();
+
+        let subs = bind_sync_workflow_participant_channel_lazy_strict::<BindingActor, ()>(
+            &bus, &actor_ref, "saga", 8,
+        )
+        .expect("lazy strict workflow binding should not require the channel lane yet");
+
+        assert_eq!(subs.len(), 1);
+
+        for sub in subs {
+            let _ = bus.unsubscribe(sub);
+        }
     }
 
     #[test]

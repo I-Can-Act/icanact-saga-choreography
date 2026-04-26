@@ -177,6 +177,16 @@ pub trait HasSagaWorkflowParticipants: Sized + Send + 'static {
     fn saga_workflows() -> &'static [&'static dyn SagaWorkflowParticipant<Self>];
 }
 
+/// Explicit opt-in for routing saga choreography events through an actor's public `Tell` command.
+///
+/// Most actors should prefer internal channel ingress with [`SagaParticipantChannel`](crate::SagaParticipantChannel)
+/// so saga events stay on the choreography/control plane and are then handled by
+/// `apply_*_participant_saga_ingress`.
+///
+/// Implement this trait only when saga events are intentionally part of the actor's public command
+/// surface, and the actor's `Tell` type has a dedicated internal saga event variant.
+pub trait AllowsSagaTellIngress {}
+
 pub type SagaBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Async variant of [`SagaParticipant`].
