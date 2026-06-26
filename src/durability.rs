@@ -529,7 +529,7 @@ fn complete_workflow_step<A, F>(
     };
 
     if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&saga_id) {
-        let new_state = state.complete(out_data.clone(), comp_data, now);
+        let new_state = state.complete(out_data.clone(), comp_data.clone(), now);
         actor
             .saga_states()
             .insert(saga_id, SagaStateEntry::Completed(new_state));
@@ -540,7 +540,7 @@ fn complete_workflow_step<A, F>(
         saga_id,
         ParticipantEvent::StepExecutionCompleted {
             output: out_data,
-            compensation_data: vec![],
+            compensation_data: comp_data,
             completed_at_millis: now,
         },
     );
