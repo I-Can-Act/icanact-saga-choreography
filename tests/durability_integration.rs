@@ -12,11 +12,12 @@ use icanact_saga_choreography::durability::{
     RecoveryPolicy, DEFAULT_RECOVERY_SAGA_TYPE, PANIC_QUARANTINE_PUBLISH_KEY,
 };
 use icanact_saga_choreography::{
-    CompensationError, DependencySpec, HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal,
-    JournalEntry, ParticipantDedupeStore, ParticipantEvent, ParticipantJournal,
-    SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant,
-    SagaParticipantState, SagaParticipantSupport, SagaStateEntry, SagaStateExt, StepError,
-    StepOutput,
+    accept_workflow_step, complete_accepted_workflow_step, AcceptedStepCompletion,
+    AcceptedStepPolicy, AcceptedStepTimeoutOutcome, CompensationError, DependencySpec,
+    HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal, JournalEntry,
+    ParticipantDedupeStore, ParticipantEvent, ParticipantJournal, SagaChoreographyBus,
+    SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant, SagaParticipantState,
+    SagaParticipantSupport, SagaStateEntry, SagaStateExt, StepError, StepExecutionId, StepOutput,
 };
 
 const ORDER_LIFECYCLE: &str = "order_lifecycle";
@@ -49,6 +50,28 @@ impl TestParticipant {
 impl HasSagaParticipantSupport for TestParticipant {
     type Journal = InMemoryJournal;
     type Dedupe = InMemoryDedupe;
+
+    fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+        &self.saga
+    }
+
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+        &mut self.saga
+    }
+}
+
+#[cfg(feature = "lmdb")]
+struct LmdbAcceptedStepActor {
+    saga: SagaParticipantSupport<
+        icanact_saga_choreography::durability::lmdb::LmdbJournal,
+        icanact_saga_choreography::durability::lmdb::LmdbDedupe,
+    >,
+}
+
+#[cfg(feature = "lmdb")]
+impl HasSagaParticipantSupport for LmdbAcceptedStepActor {
+    type Journal = icanact_saga_choreography::durability::lmdb::LmdbJournal;
+    type Dedupe = icanact_saga_choreography::durability::lmdb::LmdbDedupe;
 
     fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
         &self.saga
@@ -119,6 +142,71 @@ fn context(saga_id: u64, saga_type: &'static str, step_name: &'static str) -> Sa
         saga_started_at_millis: now,
         event_timestamp_millis: now,
     }
+}
+
+#[cfg(feature = "lmdb")]
+#[test]
+fn lmdb_open_recovers_accepted_step_metadata_for_restart_completion() {
+    let temp = tempfile::tempdir().expect("tempdir should open");
+    let ctx = context(90, ORDER_LIFECYCLE, TEST_STEP);
+    let execution_id = StepExecutionId::new("external-90");
+    let policy = AcceptedStepPolicy {
+        idle_timeout: std::time::Duration::from_millis(100),
+        hard_timeout: std::time::Duration::from_millis(250),
+        timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
+            requires_compensation: false,
+        },
+    };
+
+    let support =
+        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_type(
+            temp.path(),
+            TEST_STEP,
+            ORDER_LIFECYCLE,
+        )
+        .expect("support should open before restart");
+    let mut actor = LmdbAcceptedStepActor { saga: support };
+    accept_workflow_step(
+        &mut actor,
+        ctx.clone(),
+        "order-manager".into(),
+        execution_id.clone(),
+        policy,
+    )
+    .expect("step should be accepted before restart");
+    drop(actor);
+
+    let support =
+        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_type(
+            temp.path(),
+            TEST_STEP,
+            ORDER_LIFECYCLE,
+        )
+        .expect("support should reopen after restart");
+    let mut reopened = LmdbAcceptedStepActor { saga: support };
+    let completed = complete_accepted_workflow_step(
+        &mut reopened,
+        ctx.saga_id,
+        execution_id,
+        AcceptedStepCompletion {
+            completed_at_millis: 1_700_000_000_900,
+            output: b"completed-after-lmdb-restart".to_vec(),
+            saga_input: b"input".to_vec(),
+            compensation_data: Vec::new(),
+        },
+    )
+    .expect("recovered accepted step should complete after lmdb restart");
+
+    assert!(matches!(
+        completed,
+        SagaChoreographyEvent::StepCompleted {
+            ref context,
+            ref output,
+            ..
+        } if context.saga_id == ctx.saga_id
+            && context.event_timestamp_millis == 1_700_000_000_900
+            && output == b"completed-after-lmdb-restart"
+    ));
 }
 
 #[test]

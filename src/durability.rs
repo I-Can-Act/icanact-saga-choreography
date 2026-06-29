@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::{
     handle_async_saga_event_with_emit, handle_saga_event_with_emit, AcceptedStepCompletion,
@@ -179,6 +180,20 @@ where
     actor
         .saga_states()
         .insert(saga_id, SagaStateEntry::Executing(state));
+    actor.record_event(
+        saga_id,
+        ParticipantEvent::AcceptedStepRecorded {
+            context: accepted_context.clone(),
+            participant_id: participant_id.clone(),
+            execution_id: execution_id.clone(),
+            idle_timeout_millis: policy.idle_timeout.as_millis() as u64,
+            hard_timeout_millis: policy.hard_timeout.as_millis() as u64,
+            timeout_outcome: policy.timeout_outcome.clone(),
+            accepted_at_millis,
+            deadline_at_millis,
+            hard_deadline_at_millis,
+        },
+    );
     actor.record_event(
         saga_id,
         ParticipantEvent::StepExecutionStarted {
@@ -376,6 +391,98 @@ where
             resolve_accepted_timeout(actor, saga_id, execution_id, hard_timeout, now_millis).ok()
         })
         .collect()
+}
+
+pub fn recover_accepted_workflow_steps_for_saga_type<J, D>(
+    support: &mut SagaParticipantSupport<J, D>,
+    step_name: &'static str,
+    saga_type: &'static str,
+) -> Result<(), RecoveryCollectionError>
+where
+    J: ParticipantJournal,
+    D: ParticipantDedupeStore,
+{
+    let saga_ids = support
+        .journal
+        .list_sagas()
+        .map_err(RecoveryCollectionError::ListSagas)?;
+    for saga_id in saga_ids {
+        let entries = support
+            .journal
+            .read(saga_id)
+            .map_err(|source| RecoveryCollectionError::ReadSaga { saga_id, source })?;
+        let Some(accepted) = recover_accepted_workflow_step_from_entries(&entries) else {
+            continue;
+        };
+        if accepted.context.saga_type.as_ref() != saga_type
+            || accepted.context.step_name.as_ref() != step_name
+        {
+            continue;
+        }
+        let state = crate::SagaParticipantState::new(
+            saga_id,
+            accepted.context.saga_type.clone(),
+            accepted.context.step_name.clone(),
+            accepted.context.correlation_id,
+            accepted.context.trace_id,
+            accepted.context.initiator_peer_id,
+            accepted.context.saga_started_at_millis,
+        )
+        .trigger("step_accepted", accepted.accepted_at_millis)
+        .start_execution(accepted.accepted_at_millis);
+        support
+            .saga_states
+            .insert(saga_id, SagaStateEntry::Executing(state));
+        support.accepted_workflow_steps.insert(saga_id, accepted);
+    }
+    Ok(())
+}
+
+fn recover_accepted_workflow_step_from_entries(
+    entries: &[JournalEntry],
+) -> Option<AcceptedWorkflowStep> {
+    let mut accepted = None;
+    for entry in entries {
+        match &entry.event {
+            ParticipantEvent::AcceptedStepRecorded {
+                context,
+                participant_id,
+                execution_id,
+                idle_timeout_millis,
+                hard_timeout_millis,
+                timeout_outcome,
+                accepted_at_millis,
+                deadline_at_millis,
+                hard_deadline_at_millis,
+            } => {
+                accepted = Some(AcceptedWorkflowStep {
+                    context: context.clone(),
+                    participant_id: participant_id.clone(),
+                    execution_id: execution_id.clone(),
+                    policy: AcceptedStepPolicy {
+                        idle_timeout: Duration::from_millis(*idle_timeout_millis),
+                        hard_timeout: Duration::from_millis(*hard_timeout_millis),
+                        timeout_outcome: timeout_outcome.clone(),
+                    },
+                    accepted_at_millis: *accepted_at_millis,
+                    deadline_at_millis: *deadline_at_millis,
+                    hard_deadline_at_millis: *hard_deadline_at_millis,
+                });
+            }
+            ParticipantEvent::StepExecutionCompleted { .. }
+            | ParticipantEvent::StepExecutionFailed { .. }
+            | ParticipantEvent::Quarantined { .. }
+            | ParticipantEvent::CompensationStarted { .. }
+            | ParticipantEvent::CompensationCompleted { .. }
+            | ParticipantEvent::CompensationFailed { .. } => {
+                accepted = None;
+            }
+            ParticipantEvent::SagaRegistered { .. }
+            | ParticipantEvent::StepTriggered { .. }
+            | ParticipantEvent::StepExecutionStarted { .. } => {}
+        }
+    }
+    accepted
 }
 
 fn resolve_accepted_timeout<A>(
@@ -1549,7 +1656,10 @@ pub mod lmdb {
     use heed::types::{Bytes, Str};
     use heed::{Database, Env, EnvOpenOptions};
 
-    use super::{collect_startup_recovery_events_for_saga_type, DEFAULT_RECOVERY_SAGA_TYPE};
+    use super::{
+        collect_startup_recovery_events_for_saga_type,
+        recover_accepted_workflow_steps_for_saga_type, DEFAULT_RECOVERY_SAGA_TYPE,
+    };
     use crate::{
         DedupeError, JournalEntry, JournalError, ParticipantDedupeStore, ParticipantEvent,
         ParticipantJournal, SagaId, SagaParticipantSupport,
@@ -1861,8 +1971,11 @@ pub mod lmdb {
         let startup_recovery_events =
             collect_startup_recovery_events_for_saga_type(&journal, &dedupe, step_name, saga_type)
                 .map_err(|err| format!("startup recovery collection failed: {err:?}"))?;
-        Ok(SagaParticipantSupport::new(journal, dedupe)
-            .with_startup_recovery_events(startup_recovery_events))
+        let mut support = SagaParticipantSupport::new(journal, dedupe)
+            .with_startup_recovery_events(startup_recovery_events);
+        recover_accepted_workflow_steps_for_saga_type(&mut support, step_name, saga_type)
+            .map_err(|err| format!("accepted step recovery failed: {err:?}"))?;
+        Ok(support)
     }
 
     #[cfg(test)]

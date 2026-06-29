@@ -1,7 +1,18 @@
 //! Saga context and identity types
 
 /// Unique identifier for a saga execution
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct SagaId(pub u64);
 
 impl SagaId {
@@ -41,7 +52,7 @@ pub struct StepId {
 pub type PeerId = [u8; 32];
 
 /// Correlation context passed with every saga event
-#[derive(Clone)]
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct SagaContext {
     /// Unique saga execution identifier
     pub saga_id: SagaId,

@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct StepExecutionId(Box<str>);
 
 impl StepExecutionId {
@@ -23,7 +23,7 @@ impl std::fmt::Display for StepExecutionId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum AcceptedStepTimeoutOutcome {
     FailStep { requires_compensation: bool },
     QuarantineSaga,

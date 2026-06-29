@@ -1,15 +1,17 @@
 #![cfg(feature = "test-harness")]
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use icanact_saga_choreography::{
     accept_workflow_step, complete_accepted_workflow_step, fail_accepted_workflow_step,
     poll_accepted_workflow_step_timeouts, record_accepted_workflow_step_progress,
-    AcceptedStepCompletion, AcceptedStepError, AcceptedStepFailure, AcceptedStepPolicy,
-    AcceptedStepTimeoutOutcome, FailureAuthority, HasSagaParticipantSupport, InMemoryDedupe,
-    InMemoryJournal, ParticipantEvent, ParticipantJournal, SagaChoreographyEvent, SagaContext,
-    SagaId, SagaParticipantSupport, SagaStateExt, SagaTerminalOutcome, SagaTestWorld,
-    StepExecutionId, SuccessCriteria, TerminalPolicy, TerminalResolver,
+    recover_accepted_workflow_steps_for_saga_type, AcceptedStepCompletion, AcceptedStepError,
+    AcceptedStepFailure, AcceptedStepPolicy, AcceptedStepTimeoutOutcome, FailureAuthority,
+    HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal, ParticipantEvent,
+    ParticipantJournal, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipantSupport,
+    SagaStateExt, SagaTerminalOutcome, SagaTestWorld, StepExecutionId, SuccessCriteria,
+    TerminalPolicy, TerminalResolver,
 };
 
 struct HarnessActor {
@@ -26,6 +28,31 @@ impl Default for HarnessActor {
 
 impl HasSagaParticipantSupport for HarnessActor {
     type Journal = InMemoryJournal;
+    type Dedupe = InMemoryDedupe;
+
+    fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+        &self.saga
+    }
+
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+        &mut self.saga
+    }
+}
+
+struct RestartedHarnessActor {
+    saga: SagaParticipantSupport<Arc<InMemoryJournal>, InMemoryDedupe>,
+}
+
+impl RestartedHarnessActor {
+    fn new(journal: Arc<InMemoryJournal>) -> Self {
+        Self {
+            saga: SagaParticipantSupport::new(journal, InMemoryDedupe::new()),
+        }
+    }
+}
+
+impl HasSagaParticipantSupport for RestartedHarnessActor {
+    type Journal = Arc<InMemoryJournal>;
     type Dedupe = InMemoryDedupe;
 
     fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
@@ -218,6 +245,56 @@ fn saga_run_tracking_reset_allows_same_saga_id_to_accept_again() {
         ),
         "reset/prune must clear accepted and resolved step maps for saga id reuse"
     );
+}
+
+#[test]
+fn accepted_step_can_complete_after_participant_restart() {
+    let journal = Arc::new(InMemoryJournal::new());
+    let mut actor = RestartedHarnessActor::new(journal.clone());
+    let ctx = context("create_order", 23);
+    let execution_id = StepExecutionId::new("effect-23");
+
+    accept_workflow_step(
+        &mut actor,
+        ctx.clone(),
+        "order-manager".into(),
+        execution_id.clone(),
+        policy(AcceptedStepTimeoutOutcome::FailStep {
+            requires_compensation: false,
+        }),
+    )
+    .expect("step should be accepted before restart");
+
+    let mut reopened = RestartedHarnessActor::new(journal);
+    recover_accepted_workflow_steps_for_saga_type(
+        reopened.saga_support_mut(),
+        "create_order",
+        "order_lifecycle",
+    )
+    .expect("accepted step metadata should recover");
+
+    let completed = complete_accepted_workflow_step(
+        &mut reopened,
+        ctx.saga_id,
+        execution_id,
+        completion(
+            1_700_000_000_230,
+            b"created-after-restart",
+            b"input",
+            Vec::new(),
+        ),
+    )
+    .expect("recovered accepted step should complete after restart");
+    assert!(matches!(
+        completed,
+        SagaChoreographyEvent::StepCompleted {
+            ref context,
+            ref output,
+            ..
+        } if context.saga_id == ctx.saga_id
+            && context.event_timestamp_millis == 1_700_000_000_230
+            && output == b"created-after-restart"
+    ));
 }
 
 #[test]
