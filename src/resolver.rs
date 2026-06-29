@@ -511,9 +511,6 @@ fn accepted_step_timeout_events(
 
     let (step_name, accepted, hard_timeout) = expired;
     state.accepted_steps.remove(step_name.as_ref());
-    if !policy.failure_authority.is_authorized(step_name.as_ref()) {
-        return Some(Vec::new());
-    }
 
     let timeout_kind = if hard_timeout { "hard" } else { "idle" };
     let mut context = state.last_context.next_step(step_name.clone());
@@ -531,6 +528,9 @@ fn accepted_step_timeout_events(
         AcceptedStepTimeoutOutcome::FailStep {
             requires_compensation,
         } => {
+            if !policy.failure_authority.is_authorized(step_name.as_ref()) {
+                return Some(Vec::new());
+            }
             let mut out = Vec::new();
             state.started_steps.insert(step_name.clone());
             state.failed_steps.insert(step_name);
@@ -1118,6 +1118,46 @@ mod tests {
             [SagaChoreographyEvent::SagaQuarantined { reason, step, participant_id, .. }]
                 if reason.contains("accepted step hard timeout")
                     && step.as_ref() == "create_order"
+                    && participant_id.as_ref() == "order-manager"
+        ));
+    }
+
+    #[test]
+    fn accepted_step_quarantine_timeout_ignores_failure_authority() {
+        let mut denied_steps = HashSet::new();
+        denied_steps.insert("create_order".into());
+        let mut required_steps = HashSet::new();
+        required_steps.insert("create_order".into());
+        let policy = TerminalPolicy {
+            saga_type: "order_lifecycle".into(),
+            policy_id: "accepted-timeout-deny".into(),
+            failure_authority: FailureAuthority::DenySteps(denied_steps),
+            success_criteria: SuccessCriteria::AllOf(required_steps),
+            overall_timeout: Duration::from_secs(5),
+            stalled_timeout: Duration::from_secs(5),
+            workflow_steps: &[],
+        };
+        let mut resolver = TerminalResolver::new(policy);
+        let start = SagaChoreographyEvent::SagaStarted {
+            context: ctx_at("create_order", 9, 1_000, 1_000),
+            payload: Vec::new(),
+        };
+        let _ = resolver.ingest_at(&start, 1_000);
+        let accepted = SagaChoreographyEvent::StepAccepted {
+            context: ctx_at("create_order", 9, 1_000, 1_010),
+            participant_id: "order-manager".into(),
+            execution_id: StepExecutionId::new("external-9"),
+            deadline_at_millis: 1_110,
+            hard_deadline_at_millis: 1_120,
+            timeout_outcome: AcceptedStepTimeoutOutcome::QuarantineSaga,
+        };
+        let _ = resolver.ingest_at(&accepted, 1_010);
+
+        let timed_out = resolver.poll_timeouts_at(1_121);
+        assert!(matches!(
+            timed_out.as_slice(),
+            [SagaChoreographyEvent::SagaQuarantined { step, participant_id, .. }]
+                if step.as_ref() == "create_order"
                     && participant_id.as_ref() == "order-manager"
         ));
     }

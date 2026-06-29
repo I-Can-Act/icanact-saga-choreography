@@ -213,6 +213,68 @@ fn lmdb_open_recovers_accepted_step_metadata_for_restart_completion() {
     ));
 }
 
+#[cfg(feature = "lmdb")]
+#[test]
+fn lmdb_open_does_not_rehydrate_expired_accepted_step() {
+    let temp = tempfile::tempdir().expect("tempdir should open");
+    let ctx = context(91, ORDER_LIFECYCLE, TEST_STEP);
+    let execution_id = StepExecutionId::new("external-91");
+    let support =
+        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_type(
+            temp.path(),
+            TEST_STEP,
+            ORDER_LIFECYCLE,
+        )
+        .expect("support should open before restart");
+    support
+        .journal
+        .append(
+            ctx.saga_id,
+            ParticipantEvent::AcceptedStepRecorded {
+                context: ctx.clone(),
+                participant_id: "order-manager".into(),
+                execution_id: execution_id.clone(),
+                idle_timeout_millis: 1,
+                hard_timeout_millis: 1,
+                timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
+                    requires_compensation: false,
+                },
+                accepted_at_millis: 1,
+                deadline_at_millis: 1,
+                hard_deadline_at_millis: 1,
+            },
+        )
+        .expect("accepted metadata append should succeed");
+    drop(support);
+
+    let support =
+        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_type(
+            temp.path(),
+            TEST_STEP,
+            ORDER_LIFECYCLE,
+        )
+        .expect("support should reopen after restart");
+    assert_eq!(support.accepted_workflow_step_count(), 0);
+    assert!(
+        support.startup_recovery_events.iter().any(|event| matches!(
+            event,
+            SagaChoreographyEvent::StepFailed { context, .. } if context.saga_id == ctx.saga_id
+        )),
+        "expired accepted step should recover as timeout event"
+    );
+    let mut reopened = LmdbAcceptedStepActor { saga: support };
+    let completion = AcceptedStepCompletion {
+        completed_at_millis: SagaContext::now_millis(),
+        output: Vec::new(),
+        saga_input: Vec::new(),
+        compensation_data: Vec::new(),
+    };
+    assert!(matches!(
+        complete_accepted_workflow_step(&mut reopened, ctx.saga_id, execution_id, completion),
+        Err(icanact_saga_choreography::AcceptedStepError::NotFound { .. })
+    ));
+}
+
 #[test]
 fn ingress_applies_side_effects_and_publishes_valid_emitted_events() {
     let mut participant = TestParticipant::new(TEST_STEP, ExecuteMode::Normal);

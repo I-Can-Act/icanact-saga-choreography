@@ -275,24 +275,18 @@ struct TerminalResolverRuntime {
     handle: local_sync::ActorHandle,
 }
 
-enum TerminalResolverRegistryTell {
-    Insert {
+enum TerminalResolverRegistryAsk {
+    Existing(Box<str>),
+    Register {
         saga_type: Box<str>,
         runtime: TerminalResolverRuntime,
     },
-}
-
-impl icanact_core::TellAskTell for TerminalResolverRegistryTell {}
-
-#[derive(Clone, Debug)]
-enum TerminalResolverRegistryAsk {
-    Existing(Box<str>),
     ShutdownAll,
 }
 
-#[derive(Clone, Debug)]
 enum TerminalResolverRegistryReply {
     Existing(Option<EventSubscription>),
+    Registered(EventSubscription),
     ShutdownComplete,
 }
 
@@ -302,29 +296,13 @@ struct TerminalResolverRegistryActor {
 }
 
 impl SyncActor for TerminalResolverRegistryActor {
-    type Contract = local_sync::contract::TellAsk;
-    type Tell = TerminalResolverRegistryTell;
+    type Contract = local_sync::contract::AskOnly;
+    type Tell = ();
     type Ask = TerminalResolverRegistryAsk;
     type Reply = TerminalResolverRegistryReply;
     type Channel = ();
     type PubSub = ();
     type Broadcast = ();
-
-    fn handle_tell(&mut self, msg: Self::Tell) {
-        match msg {
-            TerminalResolverRegistryTell::Insert { saga_type, runtime } => {
-                match self.runtimes.entry(saga_type) {
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        entry.insert(runtime);
-                    }
-                    std::collections::hash_map::Entry::Occupied(_) => {
-                        runtime.shutdown.store(true, Ordering::Release);
-                        runtime.handle.shutdown();
-                    }
-                }
-            }
-        }
-    }
 
     fn handle_ask(&mut self, msg: Self::Ask) -> Self::Reply {
         match msg {
@@ -334,6 +312,20 @@ impl SyncActor for TerminalResolverRegistryActor {
                         .get(saga_type.as_ref())
                         .map(|runtime| runtime.subscription.clone()),
                 )
+            }
+            TerminalResolverRegistryAsk::Register { saga_type, runtime } => {
+                match self.runtimes.entry(saga_type) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let subscription = runtime.subscription.clone();
+                        entry.insert(runtime);
+                        TerminalResolverRegistryReply::Registered(subscription)
+                    }
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        runtime.shutdown.store(true, Ordering::Release);
+                        runtime.handle.shutdown();
+                        TerminalResolverRegistryReply::Registered(entry.get().subscription.clone())
+                    }
+                }
             }
             TerminalResolverRegistryAsk::ShutdownAll => {
                 for (_, runtime) in self.runtimes.drain() {
@@ -865,6 +857,12 @@ impl SagaChoreographyBus {
                     saga_type_topic.clone(),
                 )) {
                 Ok(TerminalResolverRegistryReply::Existing(existing)) => existing,
+                Ok(TerminalResolverRegistryReply::Registered(_)) => {
+                    return Err(format!(
+                        "terminal resolver registry returned register reply saga_type={}",
+                        saga_type_topic
+                    ));
+                }
                 Ok(TerminalResolverRegistryReply::ShutdownComplete) => {
                     return Err(format!(
                         "terminal resolver registry returned shutdown reply saga_type={}",
@@ -906,16 +904,25 @@ impl SagaChoreographyBus {
 
                 true
             });
-        self.terminal_resolver_registry_ref
-            .tell(TerminalResolverRegistryTell::Insert {
+        match self
+            .terminal_resolver_registry_ref
+            .ask(TerminalResolverRegistryAsk::Register {
                 saga_type: saga_type_topic,
                 runtime: TerminalResolverRuntime {
-                    subscription: subscription.clone(),
+                    subscription,
                     shutdown,
                     handle: resolver_handle,
                 },
-            });
-        Ok(subscription)
+            }) {
+            Ok(TerminalResolverRegistryReply::Registered(subscription)) => Ok(subscription),
+            Ok(TerminalResolverRegistryReply::Existing(_)) => {
+                Err("terminal resolver registry returned unexpected existing reply".to_string())
+            }
+            Ok(TerminalResolverRegistryReply::ShutdownComplete) => {
+                Err("terminal resolver registry returned shutdown reply".to_string())
+            }
+            Err(err) => Err(format!("terminal resolver registry unavailable: {err:?}")),
+        }
     }
 
     pub fn attach_terminal_resolver_for_contract<C: SagaWorkflowContract>(
@@ -1719,6 +1726,35 @@ mod tests {
         assert!(
             cloned.take_terminal_outcome(saga_id).is_none(),
             "clone should retain workflow contract, bound steps, and resolver actors"
+        );
+    }
+
+    #[test]
+    fn concurrent_terminal_resolver_attach_is_idempotent() {
+        let bus = Arc::new(SagaChoreographyBus::new());
+        bus.register_workflow_contract_provider::<OrderLifecycleContract>()
+            .expect("workflow contract registration should succeed");
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let bus = Arc::clone(&bus);
+            workers.push(thread::spawn(move || {
+                bus.attach_terminal_resolver_for_contract::<OrderLifecycleContract>("test-resolver")
+                    .expect("resolver attach should succeed")
+            }));
+        }
+        let subscriptions = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("attach worker should not panic"))
+            .collect::<Vec<_>>();
+        let first = subscriptions
+            .first()
+            .expect("at least one subscription should be returned")
+            .clone();
+        assert!(
+            subscriptions
+                .iter()
+                .all(|subscription| *subscription == first),
+            "concurrent attaches must all return the same resolver subscription"
         );
     }
 

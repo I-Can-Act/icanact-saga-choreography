@@ -453,6 +453,7 @@ where
         .journal
         .list_sagas()
         .map_err(RecoveryCollectionError::ListSagas)?;
+    let now_millis = SagaContext::now_millis();
     for saga_id in saga_ids {
         let entries = support
             .journal
@@ -463,6 +464,10 @@ where
         };
         if accepted.context.saga_type.as_ref() != saga_type
             || accepted.context.step_name.as_ref() != step_name
+        {
+            continue;
+        }
+        if accepted.deadline_at_millis < now_millis || accepted.hard_deadline_at_millis < now_millis
         {
             continue;
         }
