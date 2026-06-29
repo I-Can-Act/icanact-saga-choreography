@@ -4,12 +4,12 @@ use std::time::Duration;
 use crate::state_ext::SagaStateStoreError;
 use crate::support::AcceptedWorkflowStep;
 use crate::{
-    handle_async_saga_event_with_emit, handle_saga_event_with_emit, AcceptedStepCompletion,
-    AcceptedStepError, AcceptedStepFailure, AcceptedStepPolicy, AcceptedStepTimeoutOutcome,
-    AsyncSagaParticipant, DedupeError, HasSagaParticipantSupport, HasSagaWorkflowParticipants,
-    JournalEntry, JournalError, ParticipantDedupeStore, ParticipantEvent, ParticipantJournal,
-    SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant, SagaParticipantSupport,
-    SagaStateEntry, SagaStateExt, SagaWorkflowParticipant, StepExecutionId,
+    AcceptedStepCompletion, AcceptedStepError, AcceptedStepFailure, AcceptedStepPolicy,
+    AcceptedStepTimeoutOutcome, AsyncSagaParticipant, DedupeError, HasSagaParticipantSupport,
+    HasSagaWorkflowParticipants, JournalEntry, JournalError, ParticipantDedupeStore,
+    ParticipantEvent, ParticipantJournal, SagaChoreographyEvent, SagaContext, SagaId,
+    SagaParticipant, SagaParticipantSupport, SagaStateEntry, SagaStateExt, SagaWorkflowParticipant,
+    StepExecutionId, handle_async_saga_event_with_emit, handle_saga_event_with_emit,
 };
 
 pub const PANIC_QUARANTINE_REASON_PREFIX: &str = "panic_during_active_";
@@ -673,6 +673,43 @@ where
         .insert((saga_id, execution_id));
 }
 
+fn mark_matching_accepted_step_failed<A>(actor: &mut A, event: &SagaChoreographyEvent)
+where
+    A: HasSagaParticipantSupport,
+{
+    let SagaChoreographyEvent::StepFailed {
+        context,
+        error_code,
+        error,
+        ..
+    } = event
+    else {
+        return;
+    };
+    if !matches!(error_code.as_deref(), Some("idle" | "hard"))
+        || !error.starts_with("accepted step ")
+        || !error.contains(" timeout")
+    {
+        return;
+    }
+    let saga_id = context.saga_id;
+    let Some(accepted) = actor
+        .saga_support_mut()
+        .accepted_workflow_steps
+        .remove(&saga_id)
+    else {
+        return;
+    };
+    if accepted.context.step_name == context.step_name {
+        mark_accepted_step_resolved(actor, saga_id, accepted.execution_id);
+    } else {
+        actor
+            .saga_support_mut()
+            .accepted_workflow_steps
+            .insert(saga_id, accepted);
+    }
+}
+
 pub fn apply_sync_participant_saga_ingress<P, FApplyTerminal, FOnInvalid>(
     participant: &mut P,
     event: SagaChoreographyEvent,
@@ -705,6 +742,7 @@ pub fn apply_sync_participant_saga_ingress_with_hooks<P, FApplyTerminal, FOnInva
     FOnEmitted: FnMut(&mut P, &SagaChoreographyEvent),
 {
     apply_terminal_side_effects(participant, &event);
+    mark_matching_accepted_step_failed(participant, &event);
 
     let mut emitted = Vec::new();
     handle_saga_event_with_emit(participant, event, |next_event| emitted.push(next_event));
@@ -723,14 +761,14 @@ pub fn apply_sync_participant_saga_ingress_with_hooks<P, FApplyTerminal, FOnInva
 
         on_emitted_transition(participant, &next_event);
 
-        if let Some(bus) = &saga_bus {
-            if let Err(err) = bus.publish_strict(next_event) {
-                tracing::error!(
-                    target: "core::saga",
-                    event = "participant_ingress_emit_publish_failed",
-                    error = ?err
-                );
-            }
+        if let Some(bus) = &saga_bus
+            && let Err(err) = bus.publish_strict(next_event)
+        {
+            tracing::error!(
+                target: "core::saga",
+                event = "participant_ingress_emit_publish_failed",
+                error = ?err
+            );
         }
     }
 }
@@ -793,6 +831,7 @@ pub fn apply_sync_workflow_participant_saga_ingress_with_hooks<
     FOnInvalid: FnMut(&SagaChoreographyEvent),
     FOnEmitted: FnMut(&mut A, &SagaChoreographyEvent),
 {
+    mark_matching_accepted_step_failed(actor, &event);
     let workflow = match workflow_for_event::<A>(&event) {
         Ok(Some(workflow)) => workflow,
         Ok(None) => return,
@@ -805,14 +844,14 @@ pub fn apply_sync_workflow_participant_saga_ingress_with_hooks<
                 failure: None,
             };
             on_invalid_transition(&framework_failure);
-            if let Some(bus) = actor.saga_support().bus.as_ref() {
-                if let Err(publish_err) = bus.publish_strict(framework_failure) {
-                    tracing::error!(
-                        target: "core::saga",
-                        event = "workflow_resolution_failure_publish_failed",
-                        error = ?publish_err
-                    );
-                }
+            if let Some(bus) = actor.saga_support().bus.as_ref()
+                && let Err(publish_err) = bus.publish_strict(framework_failure)
+            {
+                tracing::error!(
+                    target: "core::saga",
+                    event = "workflow_resolution_failure_publish_failed",
+                    error = ?publish_err
+                );
             }
             return;
         }
@@ -837,14 +876,14 @@ pub fn apply_sync_workflow_participant_saga_ingress_with_hooks<
 
         on_emitted_transition(actor, &next_event);
 
-        if let Some(bus) = &saga_bus {
-            if let Err(err) = bus.publish_strict(next_event) {
-                tracing::error!(
-                    target: "core::saga",
-                    event = "workflow_participant_ingress_emit_publish_failed",
-                    error = ?err
-                );
-            }
+        if let Some(bus) = &saga_bus
+            && let Err(err) = bus.publish_strict(next_event)
+        {
+            tracing::error!(
+                target: "core::saga",
+                event = "workflow_participant_ingress_emit_publish_failed",
+                error = ?err
+            );
         }
     }
 }
@@ -893,6 +932,7 @@ fn handle_workflow_saga_event_with_emit<A, F>(
             return;
         }
     }
+    mark_matching_accepted_step_failed(actor, &event);
 
     match event {
         SagaChoreographyEvent::SagaStarted { payload, .. }
@@ -1107,7 +1147,7 @@ fn complete_workflow_step<A, F>(
     };
 
     if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&saga_id) {
-        let new_state = state.complete(out_data.clone(), comp_data, now);
+        let new_state = state.complete(out_data.clone(), comp_data.clone(), now);
         actor
             .saga_states()
             .insert(saga_id, SagaStateEntry::Completed(new_state));
@@ -1118,7 +1158,7 @@ fn complete_workflow_step<A, F>(
         saga_id,
         ParticipantEvent::StepExecutionCompleted {
             output: out_data,
-            compensation_data: vec![],
+            compensation_data: comp_data,
             completed_at_millis: now,
         },
     );
@@ -1349,14 +1389,14 @@ pub async fn apply_async_participant_saga_ingress_with_hooks<
 
         on_emitted_transition(participant, &next_event);
 
-        if let Some(bus) = &saga_bus {
-            if let Err(err) = bus.publish_strict(next_event) {
-                tracing::error!(
-                    target: "core::saga",
-                    event = "async_participant_ingress_emit_publish_failed",
-                    error = ?err
-                );
-            }
+        if let Some(bus) = &saga_bus
+            && let Err(err) = bus.publish_strict(next_event)
+        {
+            tracing::error!(
+                target: "core::saga",
+                event = "async_participant_ingress_emit_publish_failed",
+                error = ?err
+            );
         }
     }
 }
@@ -1475,18 +1515,17 @@ pub fn publish_active_saga_panic_quarantine<J, D>(
     if let Some(bus) = &saga.bus {
         match bus.publish_strict(emitted) {
             Ok(stats) => {
-                if stats.delivered > 0 {
-                    if let Err(err) = saga
+                if stats.delivered > 0
+                    && let Err(err) = saga
                         .dedupe
                         .mark_processed(context.saga_id, PANIC_QUARANTINE_PUBLISH_KEY)
-                    {
-                        tracing::error!(
-                            target: "core::saga",
-                            event = "panic_quarantine_dedupe_mark_failed",
-                            saga_id = context.saga_id.get(),
-                            error = %err
-                        );
-                    }
+                {
+                    tracing::error!(
+                        target: "core::saga",
+                        event = "panic_quarantine_dedupe_mark_failed",
+                        saga_id = context.saga_id.get(),
+                        error = %err
+                    );
                 }
             }
             Err(err) => {
@@ -1628,15 +1667,13 @@ pub fn collect_startup_recovery_events_for_saga_type<
         // before journaling StepExecutionStarted, there is no local execution
         // intent to resume here; the saga remains externally visible and is
         // resolved by terminal timeout policy instead of silent replay.
-        if let Some(accepted) = recover_accepted_workflow_step_from_entries(&entries) {
-            if accepted.context.saga_type.as_ref() == saga_type
-                && accepted.context.step_name.as_ref() == step_name
-            {
-                if let Some(timeout_event) = startup_accepted_step_timeout_event(accepted, now) {
-                    out.push(timeout_event);
-                    continue;
-                }
-            }
+        if let Some(accepted) = recover_accepted_workflow_step_from_entries(&entries)
+            && accepted.context.saga_type.as_ref() == saga_type
+            && accepted.context.step_name.as_ref() == step_name
+            && let Some(timeout_event) = startup_accepted_step_timeout_event(accepted, now)
+        {
+            out.push(timeout_event);
+            continue;
         }
         match classify_recovery(&entries, now, policy) {
             RecoveryDecision::QuarantineStale => {
@@ -1736,7 +1773,14 @@ fn startup_accepted_step_timeout_event(
 }
 
 pub fn default_runtime_dir(var: &str, fallback: &str) -> PathBuf {
-    if let Ok(value) = std::env::var(var) {
+    default_runtime_dir_from_value(std::env::var_os(var), fallback)
+}
+
+pub(crate) fn default_runtime_dir_from_value(
+    value: Option<std::ffi::OsString>,
+    fallback: &str,
+) -> PathBuf {
+    if let Some(value) = value {
         return PathBuf::from(value);
     }
     if cfg!(test) {
@@ -1778,8 +1822,8 @@ pub mod lmdb {
     use heed::{Database, Env, EnvOpenOptions};
 
     use super::{
-        collect_startup_recovery_events_for_saga_type,
-        recover_accepted_workflow_steps_for_saga_type, DEFAULT_RECOVERY_SAGA_TYPE,
+        DEFAULT_RECOVERY_SAGA_TYPE, collect_startup_recovery_events_for_saga_type,
+        recover_accepted_workflow_steps_for_saga_type,
     };
     use crate::{
         DedupeError, JournalEntry, JournalError, ParticipantDedupeStore, ParticipantEvent,
@@ -2152,14 +2196,16 @@ pub mod lmdb {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_sync_workflow_participant_saga_ingress_with_hooks, default_runtime_dir,
-        workflow_for_event, ActiveSagaExecution, HasActiveSagaExecution,
+        ActiveSagaExecution, HasActiveSagaExecution,
+        apply_sync_workflow_participant_saga_ingress_with_hooks, default_runtime_dir_from_value,
+        workflow_for_event,
     };
     use crate::{
         DependencySpec, DeterministicContextBuilder, HasSagaParticipantSupport,
-        HasSagaWorkflowParticipants, InMemoryDedupe, InMemoryJournal, SagaParticipantSupport,
-        SagaWorkflowParticipant, StepOutput,
+        HasSagaWorkflowParticipants, InMemoryDedupe, InMemoryJournal, ParticipantJournal,
+        SagaParticipantSupport, SagaWorkflowParticipant, StepOutput,
     };
+    use std::path::PathBuf;
 
     struct WorkflowTestActor {
         saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
@@ -2260,7 +2306,7 @@ mod tests {
             actor.beta_calls += 1;
             Ok(StepOutput::Completed {
                 output: Vec::new(),
-                compensation_data: Vec::new(),
+                compensation_data: vec![8],
             })
         }
 
@@ -2360,14 +2406,21 @@ mod tests {
 
     #[test]
     fn default_runtime_dir_uses_test_tmp_path_when_env_is_missing() {
-        let key = "SAGA_DURABILITY_UNITTEST_RUNTIME_DIR";
-        std::env::remove_var(key);
-        let runtime_dir = default_runtime_dir(key, "fallback-runtime");
+        let runtime_dir = default_runtime_dir_from_value(None, "fallback-runtime");
         assert!(
             runtime_dir.to_string_lossy().contains("target/test-tmp"),
             "expected test runtime dir under target/test-tmp, got {:?}",
             runtime_dir
         );
+    }
+
+    #[test]
+    fn default_runtime_dir_uses_provided_env_value() {
+        let runtime_dir = default_runtime_dir_from_value(
+            Some(std::ffi::OsString::from("/tmp/durability-runtime-dir")),
+            "unused-fallback",
+        );
+        assert_eq!(runtime_dir, PathBuf::from("/tmp/durability-runtime-dir"));
     }
 
     #[test]
@@ -2417,6 +2470,24 @@ mod tests {
             started_index < completed_index,
             "workflow ingress should emit started before completed: {emitted:?}"
         );
+        let entries = actor
+            .saga
+            .journal
+            .read(crate::SagaId::new(77))
+            .expect("journal read should succeed");
+        assert!(matches!(
+            entries.as_slice(),
+            [
+                _,
+                crate::JournalEntry {
+                    event: crate::ParticipantEvent::StepExecutionCompleted {
+                        compensation_data,
+                        ..
+                    },
+                    ..
+                }
+            ] if compensation_data == &[8]
+        ));
     }
 
     #[test]

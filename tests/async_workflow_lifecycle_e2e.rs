@@ -2,14 +2,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use icanact_saga_choreography::{
-    accept_workflow_step, complete_accepted_workflow_step, fail_accepted_workflow_step,
-    poll_accepted_workflow_step_timeouts, record_accepted_workflow_step_progress,
-    recover_accepted_workflow_steps_for_saga_type, AcceptedStepCompletion, AcceptedStepError,
-    AcceptedStepFailure, AcceptedStepPolicy, AcceptedStepTimeoutOutcome, FailureAuthority,
-    HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal, ParticipantEvent,
+    AcceptedStepCompletion, AcceptedStepError, AcceptedStepFailure, AcceptedStepPolicy,
+    AcceptedStepTimeoutOutcome, FailureAuthority, HasSagaParticipantSupport,
+    HasSagaWorkflowParticipants, InMemoryDedupe, InMemoryJournal, ParticipantEvent,
     ParticipantJournal, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipantSupport,
-    SagaStateExt, SagaTerminalOutcome, SagaTestWorld, StepExecutionId, SuccessCriteria,
-    TerminalPolicy, TerminalResolver,
+    SagaStateExt, SagaTerminalOutcome, SagaTestWorld, SagaWorkflowParticipant, StepExecutionId,
+    SuccessCriteria, TerminalPolicy, TerminalResolver, accept_workflow_step,
+    complete_accepted_workflow_step, fail_accepted_workflow_step,
+    poll_accepted_workflow_step_timeouts, record_accepted_workflow_step_progress,
+    recover_accepted_workflow_steps_for_saga_type,
 };
 
 struct HarnessActor {
@@ -34,6 +35,12 @@ impl HasSagaParticipantSupport for HarnessActor {
 
     fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
         &mut self.saga
+    }
+}
+
+impl HasSagaWorkflowParticipants for HarnessActor {
+    fn saga_workflows() -> &'static [&'static dyn SagaWorkflowParticipant<Self>] {
+        &[]
     }
 }
 
@@ -148,12 +155,14 @@ fn accepted_step_rejects_idle_timeout_after_hard_timeout() {
         result,
         Err(AcceptedStepError::InvalidPolicy { .. })
     ));
-    assert!(actor
-        .saga_support()
-        .journal
-        .read(ctx.saga_id)
-        .expect("journal read should succeed")
-        .is_empty());
+    assert!(
+        actor
+            .saga_support()
+            .journal
+            .read(ctx.saga_id)
+            .expect("journal read should succeed")
+            .is_empty()
+    );
 }
 
 #[test]
@@ -747,6 +756,53 @@ fn accepted_step_progress_extends_idle_deadline_but_not_hard_deadline() {
 }
 
 #[test]
+fn resolver_timeout_step_failure_blocks_late_accepted_completion() {
+    let mut actor = HarnessActor::default();
+    let ctx = context("create_order", 7);
+    let execution_id = StepExecutionId::new("effect-7");
+
+    let accepted = accept_workflow_step(
+        &mut actor,
+        ctx.clone(),
+        "order-manager".into(),
+        execution_id.clone(),
+        policy(AcceptedStepTimeoutOutcome::FailStep {
+            requires_compensation: false,
+        }),
+    )
+    .expect("step should be accepted");
+    if !matches!(accepted, SagaChoreographyEvent::StepAccepted { .. }) {
+        panic!("expected accepted step");
+    }
+    let mut timeout_context = ctx.next_step("create_order".into());
+    timeout_context.event_timestamp_millis = 1_700_000_000_101;
+    let timeout_event = SagaChoreographyEvent::StepFailed {
+        context: timeout_context,
+        participant_id: "order-manager".into(),
+        error_code: Some("idle".into()),
+        error: "accepted step idle timeout: step=create_order execution_id=effect-7 deadline_at_millis=1700000000100 hard_deadline_at_millis=1700000000250".into(),
+        requires_compensation: false,
+    };
+
+    icanact_saga_choreography::apply_sync_workflow_participant_saga_ingress(
+        &mut actor,
+        timeout_event,
+        |_actor, _event| {},
+        |_| {},
+    );
+
+    assert!(matches!(
+        complete_accepted_workflow_step(
+            &mut actor,
+            ctx.saga_id,
+            execution_id,
+            completion(1_700_000_000_260, b"too-late", Vec::new(), Vec::new()),
+        ),
+        Err(AcceptedStepError::AlreadyResolved { .. })
+    ));
+}
+
+#[test]
 fn saga_test_world_waits_for_and_resolves_accepted_steps() {
     let world = SagaTestWorld::new();
     let _resolver = world
@@ -787,6 +843,105 @@ fn saga_test_world_waits_for_and_resolves_accepted_steps() {
         )
         .expect("testkit helper should publish late completion");
 
+    assert!(matches!(
+        world.wait_for_terminal(ctx.saga_id, Duration::from_secs(1)),
+        SagaTerminalOutcome::Completed { .. }
+    ));
+}
+
+#[test]
+fn saga_test_world_progress_helper_publishes_resolver_heartbeat() {
+    let world = SagaTestWorld::new();
+    let _resolver = world
+        .attach_terminal_resolver(
+            TerminalPolicy::new(
+                "order_lifecycle".into(),
+                "order_lifecycle/progress-testkit".into(),
+                FailureAuthority::AnyParticipant,
+                SuccessCriteria::AllOf(["create_order".into()].into()),
+                Duration::from_secs(30),
+                Duration::from_millis(100),
+                &[],
+            ),
+            "testkit-progress-terminal",
+        )
+        .expect("terminal resolver should attach");
+    let mut actor = HarnessActor::default();
+    let now_millis = SagaContext::now_millis();
+    let mut ctx = context("create_order", 8);
+    ctx.saga_started_at_millis = now_millis;
+    ctx.event_timestamp_millis = now_millis;
+    let execution_id = StepExecutionId::new("effect-8");
+
+    world
+        .accept_step(
+            &mut actor,
+            ctx.clone(),
+            "order-manager".into(),
+            execution_id.clone(),
+            policy(AcceptedStepTimeoutOutcome::FailStep {
+                requires_compensation: false,
+            }),
+        )
+        .expect("testkit helper should publish accepted step");
+    let accepted =
+        world.wait_for_step_accepted(ctx.saga_id, "create_order", Duration::from_secs(1));
+    let SagaChoreographyEvent::StepAccepted {
+        context,
+        deadline_at_millis,
+        ..
+    } = accepted
+    else {
+        panic!("expected accepted step");
+    };
+    let accepted_at_millis = context.event_timestamp_millis;
+
+    world
+        .record_accepted_step_progress(
+            &mut actor,
+            ctx.saga_id,
+            execution_id,
+            accepted_at_millis + 90,
+        )
+        .expect("testkit helper should publish progress heartbeat");
+    let progress = world.wait_for_event(
+        move |event| {
+            matches!(
+                event,
+                SagaChoreographyEvent::StepAccepted { context, .. }
+                    if context.saga_id == SagaId::new(8)
+                        && context.step_name.as_ref() == "create_order"
+                        && context.event_timestamp_millis == accepted_at_millis + 90
+            )
+        },
+        Duration::from_secs(1),
+    );
+    assert!(matches!(
+        progress,
+        SagaChoreographyEvent::StepAccepted {
+            context,
+            deadline_at_millis: refreshed_deadline_at_millis,
+            ..
+        } if context.event_timestamp_millis == accepted_at_millis + 90
+            && refreshed_deadline_at_millis > deadline_at_millis
+    ));
+
+    assert!(
+        world
+            .transcript_for_saga(ctx.saga_id)
+            .into_iter()
+            .all(|event| !matches!(event, SagaChoreographyEvent::StepFailed { .. })),
+        "published progress should refresh resolver deadline before the old deadline fires"
+    );
+
+    world
+        .complete_accepted_step(
+            &mut actor,
+            ctx.saga_id,
+            StepExecutionId::new("effect-8"),
+            completion(SagaContext::now_millis(), b"created", b"input", Vec::new()),
+        )
+        .expect("completion after refreshed deadline should publish");
     assert!(matches!(
         world.wait_for_terminal(ctx.saga_id, Duration::from_secs(1)),
         SagaTerminalOutcome::Completed { .. }

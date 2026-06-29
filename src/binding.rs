@@ -301,6 +301,9 @@ where
         .map(|saga_type| {
             let forwarder_ref = forwarder_ref.clone();
             bus.subscribe_saga_type_fn(saga_type, move |event| {
+                // Strict publish accounting needs the callback to report whether
+                // the actor channel accepted the event; the forwarder only does
+                // a non-blocking try_send and replies immediately.
                 forwarder_ref
                     .ask(ForwardSagaEvent(event.clone()))
                     .unwrap_or(false)
@@ -335,6 +338,9 @@ where
         .map(|saga_type| {
             let forwarder_ref = forwarder_ref.clone();
             bus.subscribe_saga_type_fn(saga_type, move |event| {
+                // Strict publish accounting needs the callback to report whether
+                // the actor channel accepted the event; the forwarder only does
+                // a non-blocking try_send and replies immediately.
                 forwarder_ref
                     .ask(ForwardSagaEvent(event.clone()))
                     .unwrap_or(false)
@@ -506,6 +512,9 @@ where
         .map(|saga_type| {
             let forwarder_ref = forwarder_ref.clone();
             bus.subscribe_saga_type_fn(saga_type, move |event| {
+                // Strict publish accounting needs the callback to report whether
+                // the actor channel accepted the event; the forwarder only does
+                // a non-blocking try_send and replies immediately.
                 forwarder_ref
                     .ask(ForwardSagaEvent(event.clone()))
                     .unwrap_or(false)
@@ -540,6 +549,9 @@ where
         .map(|saga_type| {
             let forwarder_ref = forwarder_ref.clone();
             bus.subscribe_saga_type_fn(saga_type, move |event| {
+                // Strict publish accounting needs the callback to report whether
+                // the actor channel accepted the event; the forwarder only does
+                // a non-blocking try_send and replies immediately.
                 forwarder_ref
                     .ask(ForwardSagaEvent(event.clone()))
                     .unwrap_or(false)
@@ -651,15 +663,16 @@ where
 #[cfg(test)]
 mod tests {
     use crate::{
-        define_saga_workflow_contract, CompensationError, HasSagaWorkflowParticipants,
-        SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId, SagaTerminalOutcome,
-        SagaWorkflowParticipant, StepError, StepOutput,
+        CompensationError, HasSagaWorkflowParticipants, SagaChoreographyBus, SagaChoreographyEvent,
+        SagaContext, SagaId, SagaTerminalOutcome, SagaWorkflowParticipant, StepError, StepOutput,
+        define_saga_workflow_contract,
     };
     use icanact_core::local_sync::{self, SyncActor};
 
     use super::{
-        bind_sync_workflow_participant_channel, bind_sync_workflow_participant_channel_lazy_strict,
-        bind_sync_workflow_participant_channel_strict, SagaParticipantChannel,
+        SagaParticipantChannel, bind_sync_workflow_participant_channel,
+        bind_sync_workflow_participant_channel_lazy_strict,
+        bind_sync_workflow_participant_channel_strict,
     };
 
     #[derive(Clone, Debug)]

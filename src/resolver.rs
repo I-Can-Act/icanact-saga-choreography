@@ -496,10 +496,10 @@ fn accepted_step_timeout_events(
     state: &mut SagaResolutionState,
     now_millis: u64,
 ) -> Option<Vec<SagaChoreographyEvent>> {
-    let expired = state
+    let expired: Vec<_> = state
         .accepted_steps
         .iter()
-        .find_map(|(step_name, accepted)| {
+        .filter_map(|(step_name, accepted)| {
             if now_millis > accepted.hard_deadline_at_millis {
                 Some((step_name.clone(), accepted.clone(), true))
             } else if now_millis > accepted.deadline_at_millis {
@@ -507,15 +507,20 @@ fn accepted_step_timeout_events(
             } else {
                 None
             }
-        })?;
+        })
+        .collect();
+    if expired.is_empty() {
+        return None;
+    }
 
-    let (step_name, accepted, hard_timeout) = expired;
-    state.accepted_steps.remove(step_name.as_ref());
+    let mut timeout_events = Vec::new();
+    for (step_name, accepted, hard_timeout) in expired {
+        state.accepted_steps.remove(step_name.as_ref());
 
-    let timeout_kind = if hard_timeout { "hard" } else { "idle" };
-    let mut context = state.last_context.next_step(step_name.clone());
-    context.event_timestamp_millis = now_millis;
-    let reason: Box<str> = format!(
+        let timeout_kind = if hard_timeout { "hard" } else { "idle" };
+        let mut context = state.last_context.next_step(step_name.clone());
+        context.event_timestamp_millis = now_millis;
+        let reason: Box<str> = format!(
         "accepted step {timeout_kind} timeout: step={} execution_id={} deadline_at_millis={} hard_deadline_at_millis={}",
         step_name,
         accepted.execution_id,
@@ -524,37 +529,40 @@ fn accepted_step_timeout_events(
     )
     .into();
 
-    match accepted.timeout_outcome {
-        AcceptedStepTimeoutOutcome::FailStep {
-            requires_compensation,
-        } => {
-            if !policy.failure_authority.is_authorized(step_name.as_ref()) {
-                return Some(Vec::new());
-            }
-            let mut out = Vec::new();
-            state.started_steps.insert(step_name.clone());
-            state.failed_steps.insert(step_name);
-            apply_step_failure(
-                state,
-                &context,
-                accepted.participant_id,
-                Some(timeout_kind.into()),
-                reason,
+        match accepted.timeout_outcome {
+            AcceptedStepTimeoutOutcome::FailStep {
                 requires_compensation,
-                &mut out,
-            );
-            Some(out)
-        }
-        AcceptedStepTimeoutOutcome::QuarantineSaga => {
-            state.terminal_latched = true;
-            Some(vec![SagaChoreographyEvent::SagaQuarantined {
-                context: terminal_context_at(&context, now_millis),
-                reason,
-                step: context.step_name.clone(),
-                participant_id: accepted.participant_id,
-            }])
+            } => {
+                if !policy.failure_authority.is_authorized(step_name.as_ref()) {
+                    return Some(Vec::new());
+                }
+                state.started_steps.insert(step_name.clone());
+                state.failed_steps.insert(step_name);
+                apply_step_failure(
+                    state,
+                    &context,
+                    accepted.participant_id,
+                    Some(timeout_kind.into()),
+                    reason,
+                    requires_compensation,
+                    &mut timeout_events,
+                );
+                if state.terminal_latched {
+                    break;
+                }
+            }
+            AcceptedStepTimeoutOutcome::QuarantineSaga => {
+                state.terminal_latched = true;
+                return Some(vec![SagaChoreographyEvent::SagaQuarantined {
+                    context: terminal_context_at(&context, now_millis),
+                    reason,
+                    step: context.step_name.clone(),
+                    participant_id: accepted.participant_id,
+                }]);
+            }
         }
     }
+    Some(timeout_events)
 }
 
 fn apply_step_failure(

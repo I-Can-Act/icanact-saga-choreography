@@ -186,13 +186,13 @@ For runtime publishing paths, prefer `publish_strict(...)` so partial delivery i
 
 ## Async Accepted-Step Model
 
-Saga choreography is async by nature. A sync actor and an async actor can participate in the same workflow because the bus carries choreography events, not runtime-specific calls.
+Saga choreography is async by nature. A sync actor or async actor can participate in the same workflow because the bus carries choreography events, not runtime-specific calls.
 
-Participants should accept responsibility on the control plane with `accept_workflow_step(...)`, then resolve later with `complete_accepted_workflow_step(...)`, `fail_accepted_workflow_step(...)`, or the timeout/quarantine helpers. Sync actors usually resolve from a later tell/ask handler. Async actors usually resolve after awaited I/O in their native async handler. Originators can also be sync or async; they only need a bus handle and must publish `SagaStarted` through the normal choreography path.
+Participants should accept responsibility on the control plane with `accept_workflow_step(...)`, then resolve later with `complete_accepted_workflow_step(...)`, `fail_accepted_workflow_step(...)`, or timeout/quarantine helpers. Sync actors usually resolve from a later tell/ask handler. Async actors usually resolve after awaited I/O in their native async handler. Originators can also be sync or async; they only need a bus handle and must publish `SagaStarted` through the normal choreography path.
 
-Accepted steps carry an `AcceptedStepPolicy` with resettable `idle_timeout`, non-resettable `hard_timeout`, and `timeout_outcome`. Participant support persists this metadata before returning `StepAccepted`; application code should treat that event as helper output, not hand-build it. The terminal resolver observes `StepAccepted` and enforces per-step deadlines from its watchdog. On restart, persisted accepted-step metadata is recovered and expired deadlines emit the configured timeout outcome instead of falling back to stale saga recovery.
+Accepted steps carry an `AcceptedStepPolicy`: resettable `idle_timeout`, non-resettable `hard_timeout`, and `timeout_outcome`. Participant support persists metadata before returning `StepAccepted`; application code should publish helper output, not hand-build it. Publish `StepAccepted` from `accept_workflow_step(...)` so terminal resolver can enforce accepted-step deadlines. Publish `StepAccepted` from `record_accepted_workflow_step_progress(...)` on each progress heartbeat; participant-local idle deadline refresh alone does not refresh resolver state, so resolver can still time out active external execution. Terminal resolver observes published `StepAccepted` events and enforces per-step deadlines from watchdog. On restart, persisted accepted-step metadata is recovered and expired deadlines emit configured timeout outcome instead of stale saga recovery.
 
-In tests, use `SagaTestWorld::wait_for_step_accepted(saga_id, step_name, ...)`, `complete_accepted_step(...)`, and `fail_accepted_step(...)` instead of hand-building late `StepCompleted` or `StepFailed` events.
+In tests, use `SagaTestWorld::accept_step(...)`, `record_accepted_step_progress(...)`, `wait_for_step_accepted(saga_id, step_name, ...)`, `complete_accepted_step(...)`, and `fail_accepted_step(...)` instead of hand-building accepted-step, progress, completion, or failure events.
 
 ## Routing Saga Events
 
@@ -298,7 +298,7 @@ On startup or restart, enumerate participant journal state through your durabili
 
 - `overall_timeout`: hard maximum elapsed wall-clock from saga start.
 - `stalled_timeout`: resettable stall watchdog that resets on each participant progress event.
-- accepted-step `idle_timeout`: resettable per-step deadline refreshed by accepted-step progress.
+- accepted-step `idle_timeout`: resettable per-step deadline; publish progress heartbeat to refresh resolver deadline.
 - accepted-step `hard_timeout`: non-resettable per-step deadline from accept time.
 - accepted-step `timeout_outcome`: per-step deadline result, either `FailStep` or `QuarantineSaga`.
 

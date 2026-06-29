@@ -16,15 +16,15 @@ use icanact_core::local_sync::contract::TellAsk;
 use icanact_core::testkit::TestWorld;
 
 use icanact_saga_choreography::durability::{
-    run_participant_phase_with_panic_quarantine, ActiveSagaExecution, ActiveSagaExecutionPhase,
-    HasActiveSagaExecution,
+    ActiveSagaExecution, ActiveSagaExecutionPhase, HasActiveSagaExecution,
+    run_participant_phase_with_panic_quarantine,
 };
 use icanact_saga_choreography::{
-    bind_sync_participant_channel, handle_saga_event_with_emit, CompensationError, DependencySpec,
-    FailureAuthority, HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal,
-    SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant,
-    SagaParticipantChannel, SagaParticipantSupport, SagaWorkflowContract, SagaWorkflowStepContract,
-    StepError, StepOutput, SuccessCriteria, TerminalPolicy, WorkflowDependencySpec,
+    CompensationError, DependencySpec, FailureAuthority, HasSagaParticipantSupport, InMemoryDedupe,
+    InMemoryJournal, SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId,
+    SagaParticipant, SagaParticipantChannel, SagaParticipantSupport, SagaWorkflowContract,
+    SagaWorkflowStepContract, StepError, StepOutput, SuccessCriteria, TerminalPolicy,
+    WorkflowDependencySpec, bind_sync_participant_channel, handle_saga_event_with_emit,
 };
 
 const SAGA_TYPE: &str = "order_lifecycle";

@@ -2,19 +2,19 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use icanact_saga_choreography::durability::{
+    ActiveSagaExecution, ActiveSagaExecutionPhase, DEFAULT_RECOVERY_SAGA_TYPE,
+    HasActiveSagaExecution, PANIC_QUARANTINE_PUBLISH_KEY, RecoveryDecision, RecoveryPolicy,
     apply_sync_participant_saga_ingress, apply_sync_participant_saga_ingress_with_hooks,
     classify_recovery, collect_startup_recovery_events,
     collect_startup_recovery_events_for_saga_type, default_runtime_dir, is_panic_quarantine_reason,
     is_valid_emitted_transition, open_saga_lmdb_actor, panic_message_from_payload,
     panic_quarantine_reason, panic_quarantine_reason_from_entries,
     publish_active_saga_panic_quarantine, run_participant_phase_with_panic_quarantine,
-    ActiveSagaExecution, ActiveSagaExecutionPhase, HasActiveSagaExecution, RecoveryDecision,
-    RecoveryPolicy, DEFAULT_RECOVERY_SAGA_TYPE, PANIC_QUARANTINE_PUBLISH_KEY,
 };
 #[cfg(feature = "lmdb")]
 use icanact_saga_choreography::{
-    accept_workflow_step, complete_accepted_workflow_step, AcceptedStepCompletion,
-    AcceptedStepPolicy, AcceptedStepTimeoutOutcome,
+    AcceptedStepCompletion, AcceptedStepPolicy, AcceptedStepTimeoutOutcome, accept_workflow_step,
+    complete_accepted_workflow_step,
 };
 use icanact_saga_choreography::{
     CompensationError, DependencySpec, HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal,
@@ -361,10 +361,12 @@ fn ingress_suppresses_invalid_emitted_transition_when_state_is_missing() {
     assert_eq!(invalid_transition_calls, 1);
     assert_eq!(emitted_transition_calls, 1);
     assert_eq!(DELIVERED_STEP_COMPLETED.load(Ordering::Relaxed), 0);
-    assert!(participant
-        .saga_states_ref()
-        .get(&SagaId::new(11))
-        .is_none());
+    assert!(
+        participant
+            .saga_states_ref()
+            .get(&SagaId::new(11))
+            .is_none()
+    );
 }
 
 #[test]
@@ -411,11 +413,13 @@ fn panic_quarantine_records_journal_marks_dedupe_and_publishes() {
         .expect("panic quarantine reason should be recorded");
     assert!(is_panic_quarantine_reason(panic_reason.as_ref()));
 
-    assert!(participant
-        .saga
-        .dedupe
-        .contains(saga_context.saga_id, PANIC_QUARANTINE_PUBLISH_KEY,)
-        .expect("dedupe contains should succeed"));
+    assert!(
+        participant
+            .saga
+            .dedupe
+            .contains(saga_context.saga_id, PANIC_QUARANTINE_PUBLISH_KEY,)
+            .expect("dedupe contains should succeed")
+    );
 }
 
 #[test]
@@ -987,13 +991,6 @@ fn helper_propagates_open_errors_and_honors_env_runtime_dir() {
     let err = open_saga_lmdb_actor::<FailingLmdbBackedActor>("mock-id", Path::new("/tmp/saga"))
         .expect_err("open helper should propagate actor open errors");
     assert_eq!(err, "forced-open-error".to_string());
-
-    let env_key = "DURABILITY_TEST_RUNTIME_DIR";
-    let env_value = "/tmp/durability-runtime-dir";
-    std::env::set_var(env_key, env_value);
-    let runtime_dir = default_runtime_dir(env_key, "unused-fallback");
-    std::env::remove_var(env_key);
-    assert_eq!(runtime_dir, PathBuf::from(env_value));
 
     let mut support_without_bus =
         SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new());

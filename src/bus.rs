@@ -4,16 +4,16 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
+use icanact_core::CorrelationRegistry;
 use icanact_core::local::{EventBus, EventSubscription, PublishStats};
 use icanact_core::local_sync::{self, SyncActor};
-use icanact_core::CorrelationRegistry;
 
 use crate::reply_registry::{SagaReplyToHandle, SagaReplyToResult};
 use crate::workflow_contract::required_path_steps_from_success_criteria;
 use crate::{
-    required_steps_from_success_criteria, validate_workflow_contract, HasSagaWorkflowParticipants,
-    SagaChoreographyEvent, SagaId, SagaReplyTo, SagaTerminalOutcome, SagaWorkflowContract,
-    SagaWorkflowStepContract, TerminalPolicy, TerminalResolver, TERMINAL_RESOLVER_STEP,
+    HasSagaWorkflowParticipants, SagaChoreographyEvent, SagaId, SagaReplyTo, SagaTerminalOutcome,
+    SagaWorkflowContract, SagaWorkflowStepContract, TERMINAL_RESOLVER_STEP, TerminalPolicy,
+    TerminalResolver, required_steps_from_success_criteria, validate_workflow_contract,
 };
 
 #[derive(Clone, Debug)]
@@ -593,9 +593,9 @@ impl SagaChoreographyBus {
         let stats = self.bus.publish(event);
         if let (Some(required_min_delivery), Some(context)) =
             (expected_min_delivery, expected_context)
+            && stats.delivered < required_min_delivery
         {
-            if stats.delivered < required_min_delivery {
-                let terminal = SagaChoreographyEvent::SagaFailed {
+            let terminal = SagaChoreographyEvent::SagaFailed {
                     context: context.next_step(TERMINAL_RESOLVER_STEP.into()),
                     reason: format!(
                         "required_path_delivery_shortfall: saga_type={} event_type={} step={} delivered={} attempted={} required_min_delivered={} required_path={}",
@@ -610,11 +610,10 @@ impl SagaChoreographyBus {
                     .into(),
                     failure: None,
                 };
-                if let Some(outcome) = terminal.terminal_outcome() {
-                    self.store_terminal_outcome(terminal.context().saga_id, outcome);
-                }
-                let _ = self.bus.publish(terminal);
+            if let Some(outcome) = terminal.terminal_outcome() {
+                self.store_terminal_outcome(terminal.context().saga_id, outcome);
             }
+            let _ = self.bus.publish(terminal);
         }
         stats
     }
@@ -626,22 +625,21 @@ impl SagaChoreographyBus {
         let stats = self.publish(event.clone());
         if let Some(required_min_delivery) =
             self.required_path_expected_min_delivery_for_event(&event)
+            && stats.delivered < required_min_delivery
         {
-            if stats.delivered < required_min_delivery {
-                let context = event.context();
-                return Err(SagaBusPublishError::RequiredPathDeliveryShortfall {
-                    saga_id: context.saga_id,
-                    saga_type: context.saga_type.clone(),
-                    step_name: context.step_name.clone(),
-                    event_type: event.event_type(),
-                    attempted: stats.attempted,
-                    delivered: stats.delivered,
-                    required_min_delivered: required_min_delivery,
-                    required_path: self
-                        .required_path_description(context.saga_type.as_ref())
-                        .into(),
-                });
-            }
+            let context = event.context();
+            return Err(SagaBusPublishError::RequiredPathDeliveryShortfall {
+                saga_id: context.saga_id,
+                saga_type: context.saga_type.clone(),
+                step_name: context.step_name.clone(),
+                event_type: event.event_type(),
+                attempted: stats.attempted,
+                delivered: stats.delivered,
+                required_min_delivered: required_min_delivery,
+                required_path: self
+                    .required_path_description(context.saga_type.as_ref())
+                    .into(),
+            });
         }
         if stats.attempted == stats.delivered {
             return Ok(stats);
@@ -775,13 +773,13 @@ impl SagaChoreographyBus {
             Some(BusStateReply::WorkflowContract(contract)) => contract,
             _ => None,
         };
-        if let Some(contract) = contract {
-            if !contract.declared_steps.contains(step_name) {
-                return Err(format!(
-                    "bound workflow step is not declared by contract: saga_type={} step={}",
-                    saga_type, step_name
-                ));
-            }
+        if let Some(contract) = contract
+            && !contract.declared_steps.contains(step_name)
+        {
+            return Err(format!(
+                "bound workflow step is not declared by contract: saga_type={} step={}",
+                saga_type, step_name
+            ));
         }
 
         let _ = self.ask_state(BusStateAsk::RegisterBoundWorkflowStep {
@@ -1142,9 +1140,8 @@ fn spawn_terminal_watchdog_if_needed(
 ) -> Result<(), String> {
     let saga_type = policy.saga_type.clone();
     let watchdog_name = format!("saga-terminal-watchdog:{saga_type}");
-    let spawn_result = thread::Builder::new()
-        .name(watchdog_name)
-        .spawn(move || loop {
+    let spawn_result = thread::Builder::new().name(watchdog_name).spawn(move || {
+        loop {
             thread::sleep(terminal_watchdog_tick_interval());
             if shutdown.load(Ordering::Acquire) {
                 break;
@@ -1157,7 +1154,8 @@ fn spawn_terminal_watchdog_if_needed(
                 );
                 break;
             }
-        });
+        }
+    });
     if let Err(err) = spawn_result {
         return Err(format!(
             "terminal watchdog spawn failed saga_type={}: {}",
@@ -1193,8 +1191,8 @@ impl Default for SagaChoreographyBus {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -1203,10 +1201,10 @@ mod tests {
     use crate::{
         FailureAuthority, SagaChoreographyEvent, SagaContext, SagaId, SagaReplyToResult,
         SagaTerminalOutcome, SagaWorkflowContract, SagaWorkflowStepContract, SuccessCriteria,
-        TerminalPolicy, WorkflowDependencySpec, TERMINAL_RESOLVER_STEP,
+        TERMINAL_RESOLVER_STEP, TerminalPolicy, WorkflowDependencySpec,
     };
 
-    use super::{SagaChoreographyBus, DEFAULT_TERMINAL_RETENTION_LIMIT};
+    use super::{DEFAULT_TERMINAL_RETENTION_LIMIT, SagaChoreographyBus};
 
     fn context_for(saga_type: &str, step_name: &str, saga_id: u64) -> SagaContext {
         let now = SagaContext::now_millis();

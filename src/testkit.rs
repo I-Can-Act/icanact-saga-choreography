@@ -1,9 +1,8 @@
 //! Test helpers for participant choreography tests.
 
 use crate::{
-    apply_sync_workflow_participant_saga_ingress, handle_saga_event_with_emit,
     HasSagaWorkflowParticipants, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant,
-    SagaStateExt,
+    SagaStateExt, apply_sync_workflow_participant_saga_ingress, handle_saga_event_with_emit,
 };
 
 /// Small deterministic builder for saga test contexts.
@@ -147,8 +146,9 @@ pub fn drive_workflow_scenario<A>(
 
 #[cfg(any(test, feature = "test-harness"))]
 use crate::{
-    complete_accepted_workflow_step, fail_accepted_workflow_step, AcceptedStepCompletion,
-    AcceptedStepError, AcceptedStepFailure, StepExecutionId,
+    AcceptedStepCompletion, AcceptedStepError, AcceptedStepFailure, AcceptedStepPolicy,
+    StepExecutionId, accept_workflow_step, complete_accepted_workflow_step,
+    fail_accepted_workflow_step, record_accepted_workflow_step_progress,
 };
 #[cfg(any(test, feature = "test-harness"))]
 use std::collections::HashSet;
@@ -158,13 +158,13 @@ use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 #[cfg(any(test, feature = "test-harness"))]
+use crate::{AsyncSagaParticipant, HasSagaParticipantSupport, SagaParticipantSupportExt};
+#[cfg(any(test, feature = "test-harness"))]
 use crate::{
+    SagaChoreographyBus, SagaParticipantChannel, SagaTerminalOutcome, TerminalPolicy,
     bind_async_participant_channel, bind_sync_participant_channel,
     bind_sync_workflow_participant_channel_strict, checked_workflow_saga_types,
-    SagaChoreographyBus, SagaParticipantChannel, SagaTerminalOutcome, TerminalPolicy,
 };
-#[cfg(any(test, feature = "test-harness"))]
-use crate::{AsyncSagaParticipant, HasSagaParticipantSupport, SagaParticipantSupportExt};
 #[cfg(any(test, feature = "test-harness"))]
 use icanact_core::local::{EventSubscription, PublishStats};
 
@@ -353,6 +353,36 @@ impl SagaTestWorld {
         A: SagaStateExt,
     {
         let event = complete_accepted_workflow_step(actor, saga_id, execution_id, completion)?;
+        Ok(self.publish(event))
+    }
+
+    pub fn accept_step<A>(
+        &self,
+        actor: &mut A,
+        context: SagaContext,
+        participant_id: Box<str>,
+        execution_id: StepExecutionId,
+        policy: AcceptedStepPolicy,
+    ) -> Result<icanact_core::local::PublishStats, AcceptedStepError>
+    where
+        A: SagaStateExt,
+    {
+        let event = accept_workflow_step(actor, context, participant_id, execution_id, policy)?;
+        Ok(self.publish(event))
+    }
+
+    pub fn record_accepted_step_progress<A>(
+        &self,
+        actor: &mut A,
+        saga_id: SagaId,
+        execution_id: StepExecutionId,
+        now_millis: u64,
+    ) -> Result<icanact_core::local::PublishStats, AcceptedStepError>
+    where
+        A: SagaStateExt,
+    {
+        let event =
+            record_accepted_workflow_step_progress(actor, saga_id, execution_id, now_millis)?;
         Ok(self.publish(event))
     }
 

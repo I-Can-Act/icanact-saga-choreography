@@ -6,12 +6,12 @@ use std::time::Duration;
 use icanact_core::local_async::{self, AsyncActor};
 use icanact_core::local_sync::{self, SyncActor};
 use icanact_saga_choreography::{
-    define_saga_workflow_contract, AsyncSagaParticipant, CompensationError, DependencySpec,
-    DeterministicContextBuilder, FailureAuthority, HasSagaParticipantSupport,
-    HasSagaWorkflowParticipants, InMemoryDedupe, InMemoryJournal, ParticipantDedupeStore,
-    ParticipantJournal, SagaChoreographyEvent, SagaId, SagaParticipant, SagaParticipantChannel,
-    SagaParticipantSupport, SagaStateExt, SagaTerminalOutcome, SagaTestWorld, SagaWorkflowContract,
-    SagaWorkflowParticipant, StepError, StepOutput, SuccessCriteria, TerminalPolicy,
+    AsyncSagaParticipant, CompensationError, DependencySpec, DeterministicContextBuilder,
+    FailureAuthority, HasSagaParticipantSupport, HasSagaWorkflowParticipants, InMemoryDedupe,
+    InMemoryJournal, ParticipantDedupeStore, ParticipantJournal, SagaChoreographyEvent, SagaId,
+    SagaParticipant, SagaParticipantChannel, SagaParticipantSupport, SagaStateExt,
+    SagaTerminalOutcome, SagaTestWorld, SagaWorkflowContract, SagaWorkflowParticipant, StepError,
+    StepOutput, SuccessCriteria, TerminalPolicy, define_saga_workflow_contract,
 };
 
 #[derive(Clone, Debug)]
@@ -955,10 +955,12 @@ fn sync_world_drives_compensation_flow_without_changing_actor_contracts() {
         Duration::from_secs(1),
     );
     assert_eq!(a_state.compensated, 1);
-    assert!(world
-        .transcript_for_saga(ctx.saga_id)
-        .iter()
-        .any(|event| { matches!(event, SagaChoreographyEvent::CompensationRequested { .. }) }));
+    assert!(
+        world
+            .transcript_for_saga(ctx.saga_id)
+            .iter()
+            .any(|event| { matches!(event, SagaChoreographyEvent::CompensationRequested { .. }) })
+    );
 
     step_a.shutdown();
     step_b.shutdown();

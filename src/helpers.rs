@@ -481,7 +481,7 @@ fn complete_step<P, F>(
 
     // State: Executing -> Completed
     if let Some(SagaStateEntry::Executing(state)) = participant.saga_states().remove(&saga_id) {
-        let new_state = state.complete(out_data.clone(), comp_data, now);
+        let new_state = state.complete(out_data.clone(), comp_data.clone(), now);
         participant
             .saga_states()
             .insert(saga_id, SagaStateEntry::Completed(new_state));
@@ -493,7 +493,7 @@ fn complete_step<P, F>(
         saga_id,
         ParticipantEvent::StepExecutionCompleted {
             output: out_data,
-            compensation_data: vec![],
+            compensation_data: comp_data,
             completed_at_millis: now,
         },
     );
@@ -537,7 +537,7 @@ fn complete_step_async<P, F>(
     };
 
     if let Some(SagaStateEntry::Executing(state)) = participant.saga_states().remove(&saga_id) {
-        let new_state = state.complete(out_data.clone(), comp_data, now);
+        let new_state = state.complete(out_data.clone(), comp_data.clone(), now);
         participant
             .saga_states()
             .insert(saga_id, SagaStateEntry::Completed(new_state));
@@ -548,7 +548,7 @@ fn complete_step_async<P, F>(
         saga_id,
         ParticipantEvent::StepExecutionCompleted {
             output: out_data,
-            compensation_data: vec![],
+            compensation_data: comp_data,
             completed_at_millis: now,
         },
     );
@@ -896,7 +896,7 @@ fn fail_compensation_async<P, F>(
 mod tests {
     use crate::{
         DeterministicContextBuilder, HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal,
-        SagaContext, SagaParticipantSupport,
+        ParticipantJournal, SagaContext, SagaParticipantSupport,
     };
 
     use super::*;
@@ -1015,6 +1015,24 @@ mod tests {
                 compensation_available: true,
                 ..
             })
+        ));
+        let entries = participant
+            .saga
+            .journal
+            .read(SagaId::new(1))
+            .expect("journal read should succeed");
+        assert!(matches!(
+            entries.as_slice(),
+            [
+                _,
+                crate::JournalEntry {
+                    event: ParticipantEvent::StepExecutionCompleted {
+                        compensation_data,
+                        ..
+                    },
+                    ..
+                }
+            ] if compensation_data == &[9]
         ));
     }
 

@@ -363,8 +363,8 @@ mod tests {
     use crate::{FailureAuthority, SuccessCriteria};
 
     use super::{
-        required_steps_from_success_criteria, validate_workflow_contract, SagaWorkflowStepContract,
-        WorkflowDependencySpec,
+        SagaWorkflowStepContract, WorkflowDependencySpec, required_steps_from_success_criteria,
+        validate_workflow_contract,
     };
 
     fn policy_all_of(saga_type: &str, required_steps: &[&str]) -> crate::TerminalPolicy {
