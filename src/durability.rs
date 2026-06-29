@@ -113,8 +113,13 @@ pub fn is_valid_emitted_transition(
         SagaChoreographyEvent::CompensationCompleted { .. } => {
             matches!(entry, Some(SagaStateEntry::Compensated(_)))
         }
-        SagaChoreographyEvent::CompensationFailed { .. }
-        | SagaChoreographyEvent::SagaQuarantined { .. } => {
+        SagaChoreographyEvent::CompensationFailed { .. } => {
+            matches!(
+                entry,
+                Some(SagaStateEntry::Failed(_) | SagaStateEntry::Quarantined(_))
+            )
+        }
+        SagaChoreographyEvent::SagaQuarantined { .. } => {
             matches!(entry, Some(SagaStateEntry::Quarantined(_)))
         }
         _ => true,
@@ -1336,19 +1341,37 @@ fn fail_workflow_compensation<A, F>(
     };
 
     if let Some(SagaStateEntry::Compensating(state)) = actor.saga_states().remove(&saga_id) {
-        let new_state = state.quarantine(reason.clone(), now);
-        actor
-            .saga_states()
-            .insert(saga_id, SagaStateEntry::Quarantined(new_state));
+        if is_ambiguous {
+            let new_state = state.quarantine(reason.clone(), now);
+            actor
+                .saga_states()
+                .insert(saga_id, SagaStateEntry::Quarantined(new_state));
+        } else {
+            let new_state = state.fail(reason.clone(), false, now);
+            actor
+                .saga_states()
+                .insert(saga_id, SagaStateEntry::Failed(new_state));
+        }
     }
 
-    actor.record_event(
-        saga_id,
-        ParticipantEvent::Quarantined {
-            reason: reason.clone(),
-            quarantined_at_millis: now,
-        },
-    );
+    if is_ambiguous {
+        actor.record_event(
+            saga_id,
+            ParticipantEvent::Quarantined {
+                reason: reason.clone(),
+                quarantined_at_millis: now,
+            },
+        );
+    } else {
+        actor.record_event(
+            saga_id,
+            ParticipantEvent::CompensationFailed {
+                error: reason.clone(),
+                is_ambiguous,
+                failed_at_millis: now,
+            },
+        );
+    }
 
     let event_context = context.next_step(workflow.step_name().into());
     emit(SagaChoreographyEvent::CompensationFailed {
@@ -2695,8 +2718,10 @@ mod property_tests {
             2 => entry_idx == 5,
             // CompensationCompleted: only from Compensated (idempotent re-ack).
             3 => entry_idx == 7,
-            // CompensationFailed | SagaQuarantined: only from Quarantined.
-            4 | 5 => entry_idx == 8,
+            // CompensationFailed: non-ambiguous errors are Failed; ambiguous errors are Quarantined.
+            4 => matches!(entry_idx, 5 | 8),
+            // SagaQuarantined: only from Quarantined.
+            5 => entry_idx == 8,
             // Wildcard class (StepStarted, SagaStarted, ...): always allowed.
             _ => true,
         }

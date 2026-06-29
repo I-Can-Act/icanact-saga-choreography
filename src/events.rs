@@ -132,7 +132,7 @@ pub enum SagaChoreographyEvent {
         /// The saga context containing identifiers and metadata.
         context: SagaContext,
         /// The identifier of the participant sending the acknowledgment.
-        participant_id: super::PeerId,
+        participant_id: Box<str>,
         /// The status of the acknowledgment.
         status: AckStatus,
     },

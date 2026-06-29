@@ -1616,6 +1616,48 @@ mod tests {
         }
     }
 
+    struct AnyOfOrderLifecycleContract;
+
+    impl SagaWorkflowContract for AnyOfOrderLifecycleContract {
+        fn saga_type() -> &'static str {
+            "order_lifecycle"
+        }
+
+        fn first_step() -> &'static str {
+            "risk_check"
+        }
+
+        fn steps() -> &'static [SagaWorkflowStepContract] {
+            &[
+                SagaWorkflowStepContract {
+                    step_name: "risk_check",
+                    participant_id: "risk-engine",
+                    depends_on: WorkflowDependencySpec::OnSagaStart,
+                },
+                SagaWorkflowStepContract {
+                    step_name: "manual_review",
+                    participant_id: "risk-human",
+                    depends_on: WorkflowDependencySpec::OnSagaStart,
+                },
+            ]
+        }
+
+        fn terminal_policy() -> TerminalPolicy {
+            let mut possible_success_steps = HashSet::new();
+            possible_success_steps.insert("risk_check".into());
+            possible_success_steps.insert("manual_review".into());
+            TerminalPolicy {
+                saga_type: "order_lifecycle".into(),
+                policy_id: "order_lifecycle/any-of".into(),
+                failure_authority: FailureAuthority::AnyParticipant,
+                success_criteria: SuccessCriteria::AnyOf(possible_success_steps),
+                overall_timeout: Duration::from_secs(30),
+                stalled_timeout: Duration::from_secs(5),
+                workflow_steps: Self::steps(),
+            }
+        }
+    }
+
     struct MismatchedPolicySagaTypeContract;
 
     impl SagaWorkflowContract for MismatchedPolicySagaTypeContract {
@@ -1860,6 +1902,36 @@ mod tests {
         assert!(
             reason.contains("required_path=create_order(order-manager),risk_check(risk-engine)"),
             "expected required path participants in reason, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn any_of_success_does_not_require_every_branch_delivery() {
+        let bus = SagaChoreographyBus::new();
+        bus.register_workflow_contract_provider::<AnyOfOrderLifecycleContract>()
+            .expect("workflow contract registration should succeed");
+        bus.register_bound_workflow_step("order_lifecycle", "risk_check")
+            .expect("risk_check binding should succeed");
+        bus.register_bound_workflow_step("order_lifecycle", "manual_review")
+            .expect("manual_review binding should succeed");
+        let _resolver = bus
+            .attach_terminal_resolver_for_contract::<AnyOfOrderLifecycleContract>("test-resolver")
+            .expect("terminal resolver should attach");
+        let _risk_sub = bus.subscribe_saga_type_fn("order_lifecycle", |_event| true);
+
+        let saga_id = SagaId::new(900_511);
+        let publish = bus.publish_strict(SagaChoreographyEvent::SagaStarted {
+            context: context("risk_check", saga_id.get()),
+            payload: Vec::new(),
+        });
+
+        assert!(
+            publish.is_ok(),
+            "AnyOf success should not require every alternate branch delivery: {publish:?}"
+        );
+        assert!(
+            bus.take_terminal_outcome(saga_id).is_none(),
+            "AnyOf success should not terminally fail when one alternate branch is undelivered"
         );
     }
 

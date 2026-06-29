@@ -135,7 +135,8 @@ sequenceDiagram
 
 - Journal records participant-local events in append order (`ParticipantEvent`).
 - Dedupe store prevents duplicate processing for the same saga event.
-- The framework uses a dedupe key of `trace_id:event_type` when handling incoming events.
+- The framework uses a dedupe key of `trace_id:saga_started_at_millis:event_type:step_name`
+  when handling incoming events, with `failed_step` appended for compensation requests.
 - In this repository, in-memory implementations are available for tests/examples.
 - For production, use a durable backend by implementing the storage traits (for example LMDB/Heed).
 - Accepted-step metadata is journaled before `StepAccepted` is published so restart recovery can rehydrate pending external executions.

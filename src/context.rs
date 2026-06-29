@@ -64,7 +64,7 @@ pub struct SagaContext {
     pub correlation_id: u64,
     /// ID of the event that caused this one
     pub causation_id: u64,
-    /// Distributed tracing ID
+    /// Per-event trace/span ID. `correlation_id` is stable for the saga.
     pub trace_id: u64,
     /// Index of this step in the workflow
     pub step_index: usize,

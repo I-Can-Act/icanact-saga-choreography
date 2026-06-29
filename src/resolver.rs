@@ -233,6 +233,9 @@ impl TerminalResolver {
         }
 
         let saga_id = event.context().saga_id;
+        if self.terminal_latched_set.contains(&saga_id) {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         let mut should_latch_terminal = false;
         let state = self
@@ -433,7 +436,6 @@ impl TerminalResolver {
             let Some(evicted) = self.terminal_latched_order.pop_front() else {
                 break;
             };
-            self.terminal_latched_set.remove(&evicted);
             self.states.remove(&evicted);
         }
     }
@@ -534,7 +536,7 @@ fn accepted_step_timeout_events(
                 requires_compensation,
             } => {
                 if !policy.failure_authority.is_authorized(step_name.as_ref()) {
-                    return Some(Vec::new());
+                    continue;
                 }
                 state.started_steps.insert(step_name.clone());
                 state.failed_steps.insert(step_name);
@@ -1168,6 +1170,143 @@ mod tests {
                 if step.as_ref() == "create_order"
                     && participant_id.as_ref() == "order-manager"
         ));
+    }
+
+    #[test]
+    fn unauthorized_accepted_timeout_does_not_swallow_sibling_timeout_events() {
+        let mut authorized = HashSet::new();
+        authorized.insert("create_order".into());
+        let mut required = HashSet::new();
+        required.insert("create_order".into());
+        let policy = TerminalPolicy {
+            saga_type: "order_lifecycle".into(),
+            policy_id: "accepted-timeout/sibling".into(),
+            failure_authority: FailureAuthority::OnlySteps(authorized),
+            success_criteria: SuccessCriteria::AllOf(required),
+            overall_timeout: Duration::from_secs(5),
+            stalled_timeout: Duration::from_secs(5),
+            workflow_steps: OPEN_POSITION_STEPS,
+        };
+        let mut resolver = TerminalResolver::new(policy);
+        let _ = resolver.ingest_at(
+            &SagaChoreographyEvent::SagaStarted {
+                context: ctx_at("risk_check", 19, 1_000, 1_000),
+                payload: Vec::new(),
+            },
+            1_000,
+        );
+        let _ = resolver.ingest_at(
+            &SagaChoreographyEvent::StepCompleted {
+                context: ctx_at("risk_check", 19, 1_000, 1_010),
+                output: Vec::new(),
+                saga_input: Vec::new(),
+                compensation_available: true,
+            },
+            1_010,
+        );
+        let _ = resolver.ingest_at(
+            &SagaChoreographyEvent::StepAccepted {
+                context: ctx_at("risk_check", 19, 1_000, 1_020),
+                participant_id: "risk".into(),
+                execution_id: StepExecutionId::new("external-risk"),
+                deadline_at_millis: 1_100,
+                hard_deadline_at_millis: 1_500,
+                timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
+                    requires_compensation: false,
+                },
+            },
+            1_020,
+        );
+        let _ = resolver.ingest_at(
+            &SagaChoreographyEvent::StepAccepted {
+                context: ctx_at("create_order", 19, 1_000, 1_030),
+                participant_id: "order-manager".into(),
+                execution_id: StepExecutionId::new("external-order"),
+                deadline_at_millis: 1_100,
+                hard_deadline_at_millis: 1_500,
+                timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
+                    requires_compensation: true,
+                },
+            },
+            1_030,
+        );
+
+        let timed_out = resolver.poll_timeouts_at(1_101);
+        assert!(
+            matches!(
+                timed_out.as_slice(),
+                [SagaChoreographyEvent::CompensationRequested { failed_step, steps_to_compensate, .. }]
+                    if failed_step.as_ref() == "create_order"
+                        && steps_to_compensate.as_slice() == ["risk_check".into()]
+            ),
+            "unauthorized sibling timeout must not swallow compensation request: {timed_out:?}"
+        );
+    }
+
+    #[test]
+    fn evicted_terminal_state_keeps_latch_tombstone() {
+        let mut resolver = TerminalResolver::new(open_position_policy(Duration::from_secs(5)));
+        resolver.terminal_latch_retention = 1;
+
+        let _ = resolver.ingest_at(
+            &SagaChoreographyEvent::SagaStarted {
+                context: ctx_at("create_order", 21, 1_000, 1_000),
+                payload: Vec::new(),
+            },
+            1_000,
+        );
+        let completed_first = resolver.ingest_at(
+            &SagaChoreographyEvent::StepCompleted {
+                context: ctx_at("create_order", 21, 1_000, 1_010),
+                output: Vec::new(),
+                saga_input: Vec::new(),
+                compensation_available: false,
+            },
+            1_010,
+        );
+        assert!(matches!(
+            completed_first.as_slice(),
+            [SagaChoreographyEvent::SagaCompleted { .. }]
+        ));
+
+        let _ = resolver.ingest_at(
+            &SagaChoreographyEvent::SagaStarted {
+                context: ctx_at("create_order", 22, 2_000, 2_000),
+                payload: Vec::new(),
+            },
+            2_000,
+        );
+        let _ = resolver.ingest_at(
+            &SagaChoreographyEvent::StepCompleted {
+                context: ctx_at("create_order", 22, 2_000, 2_010),
+                output: Vec::new(),
+                saga_input: Vec::new(),
+                compensation_available: false,
+            },
+            2_010,
+        );
+        assert!(
+            !resolver.states.contains_key(&SagaId::new(21)),
+            "retention should evict detailed state for the oldest terminal saga"
+        );
+
+        let late = resolver.ingest_at(
+            &SagaChoreographyEvent::StepCompleted {
+                context: ctx_at("create_order", 21, 1_000, 3_000),
+                output: Vec::new(),
+                saga_input: Vec::new(),
+                compensation_available: false,
+            },
+            3_000,
+        );
+        assert!(
+            late.is_empty(),
+            "late events for evicted terminal sagas must stay latched"
+        );
+        assert!(
+            !resolver.states.contains_key(&SagaId::new(21)),
+            "late event must not resurrect evicted terminal saga state"
+        );
     }
 
     #[test]

@@ -1,8 +1,9 @@
 use icanact_saga_choreography::durability::apply_async_participant_saga_ingress_with_hooks;
 use icanact_saga_choreography::{
     AsyncSagaParticipant, CompensationError, DependencySpec, HasSagaParticipantSupport,
-    InMemoryDedupe, InMemoryJournal, PeerId, SagaChoreographyEvent, SagaContext, SagaId,
-    SagaParticipantSupport, SagaStateEntry, SagaStateExt, StepError, StepOutput,
+    InMemoryDedupe, InMemoryJournal, ParticipantEvent, ParticipantJournal, PeerId,
+    SagaChoreographyEvent, SagaContext, SagaId, SagaParticipantSupport, SagaStateEntry,
+    SagaStateExt, StepError, StepOutput,
 };
 
 struct AsyncTestParticipant {
@@ -180,7 +181,7 @@ async fn async_ingress_waits_for_all_dependencies_before_execution() {
 }
 
 #[tokio::test]
-async fn async_ingress_non_ambiguous_compensation_failure_keeps_local_quarantine_only() {
+async fn async_ingress_non_ambiguous_compensation_failure_keeps_local_failed_state() {
     let mut participant = AsyncTestParticipant {
         compensation_result: Err(CompensationError::Terminal {
             reason: "undo failed".into(),
@@ -224,6 +225,22 @@ async fn async_ingress_non_ambiguous_compensation_failure_keeps_local_quarantine
     ));
     assert!(matches!(
         participant.saga_states_ref().values().next(),
-        Some(SagaStateEntry::Quarantined(_))
+        Some(SagaStateEntry::Failed(_))
+    ));
+    let entries = participant
+        .saga
+        .journal
+        .read(SagaId::new(1))
+        .expect("journal read should succeed");
+    assert!(matches!(
+        entries.last(),
+        Some(icanact_saga_choreography::JournalEntry {
+            event: ParticipantEvent::CompensationFailed {
+                error,
+                is_ambiguous: false,
+                ..
+            },
+            ..
+        }) if error.as_ref() == "undo failed"
     ));
 }

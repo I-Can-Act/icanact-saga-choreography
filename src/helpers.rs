@@ -804,22 +804,38 @@ fn fail_compensation<P, F>(
         CompensationError::Terminal { reason } => (reason, false),
     };
 
-    // State: Compensating -> Quarantined
     if let Some(SagaStateEntry::Compensating(state)) = participant.saga_states().remove(&saga_id) {
-        let new_state = state.quarantine(reason.clone(), now);
-        participant
-            .saga_states()
-            .insert(saga_id, SagaStateEntry::Quarantined(new_state));
+        if is_ambiguous {
+            let new_state = state.quarantine(reason.clone(), now);
+            participant
+                .saga_states()
+                .insert(saga_id, SagaStateEntry::Quarantined(new_state));
+        } else {
+            let new_state = state.fail(reason.clone(), false, now);
+            participant
+                .saga_states()
+                .insert(saga_id, SagaStateEntry::Failed(new_state));
+        }
     }
 
-    // Persist
-    participant.record_event(
-        saga_id,
-        ParticipantEvent::Quarantined {
-            reason: reason.clone(),
-            quarantined_at_millis: now,
-        },
-    );
+    if is_ambiguous {
+        participant.record_event(
+            saga_id,
+            ParticipantEvent::Quarantined {
+                reason: reason.clone(),
+                quarantined_at_millis: now,
+            },
+        );
+    } else {
+        participant.record_event(
+            saga_id,
+            ParticipantEvent::CompensationFailed {
+                error: reason.clone(),
+                is_ambiguous,
+                failed_at_millis: now,
+            },
+        );
+    }
 
     let event_context = context.next_step(participant.step_name().into());
     emit(SagaChoreographyEvent::CompensationFailed {
@@ -859,19 +875,37 @@ fn fail_compensation_async<P, F>(
     };
 
     if let Some(SagaStateEntry::Compensating(state)) = participant.saga_states().remove(&saga_id) {
-        let new_state = state.quarantine(reason.clone(), now);
-        participant
-            .saga_states()
-            .insert(saga_id, SagaStateEntry::Quarantined(new_state));
+        if is_ambiguous {
+            let new_state = state.quarantine(reason.clone(), now);
+            participant
+                .saga_states()
+                .insert(saga_id, SagaStateEntry::Quarantined(new_state));
+        } else {
+            let new_state = state.fail(reason.clone(), false, now);
+            participant
+                .saga_states()
+                .insert(saga_id, SagaStateEntry::Failed(new_state));
+        }
     }
 
-    participant.record_event(
-        saga_id,
-        ParticipantEvent::Quarantined {
-            reason: reason.clone(),
-            quarantined_at_millis: now,
-        },
-    );
+    if is_ambiguous {
+        participant.record_event(
+            saga_id,
+            ParticipantEvent::Quarantined {
+                reason: reason.clone(),
+                quarantined_at_millis: now,
+            },
+        );
+    } else {
+        participant.record_event(
+            saga_id,
+            ParticipantEvent::CompensationFailed {
+                error: reason.clone(),
+                is_ambiguous,
+                failed_at_millis: now,
+            },
+        );
+    }
 
     let event_context = context.next_step(participant.step_name().into());
     emit(SagaChoreographyEvent::CompensationFailed {
@@ -1239,6 +1273,26 @@ mod tests {
             emitted.first(),
             Some(SagaChoreographyEvent::CompensationFailed { .. })
         ));
+        assert!(matches!(
+            participant.saga_states().get(&SagaId::new(1)),
+            Some(SagaStateEntry::Failed(_))
+        ));
+        let entries = participant
+            .saga
+            .journal
+            .read(SagaId::new(1))
+            .expect("journal read should succeed");
+        assert!(matches!(
+            entries.last(),
+            Some(crate::JournalEntry {
+                event: ParticipantEvent::CompensationFailed {
+                    error,
+                    is_ambiguous: false,
+                    ..
+                },
+                ..
+            }) if error.as_ref() == "cannot compensate"
+        ));
     }
 
     #[test]
@@ -1272,6 +1326,22 @@ mod tests {
                 is_ambiguous: true,
                 ..
             })
+        ));
+        assert!(matches!(
+            participant.saga_states().get(&SagaId::new(1)),
+            Some(SagaStateEntry::Quarantined(_))
+        ));
+        let entries = participant
+            .saga
+            .journal
+            .read(SagaId::new(1))
+            .expect("journal read should succeed");
+        assert!(matches!(
+            entries.last(),
+            Some(crate::JournalEntry {
+                event: ParticipantEvent::Quarantined { reason, .. },
+                ..
+            }) if reason.as_ref() == "cannot confirm rollback"
         ));
         assert!(matches!(
             emitted.get(1),
