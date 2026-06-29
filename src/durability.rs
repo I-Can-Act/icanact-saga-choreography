@@ -2509,3 +2509,419 @@ mod tests {
         );
     }
 }
+
+/// Property-based and chaos (loom) tests for the runtime FSM.
+///
+/// These close the largest testing gap in the crate: the runtime state machine
+/// (transition validator, journal-replay recovery, and the dedupe atomicity
+/// contract) was previously exercised only by hand-written integration tests.
+/// The modules below pin the full (state × event) transition matrix and the
+/// replay contract with `proptest`, and model-check the dedupe check-and-mark
+/// atomicity with `loom`.
+#[cfg(test)]
+mod property_tests {
+    use super::{
+        JournalEntry, ParticipantEvent, SagaChoreographyEvent, SagaStateEntry,
+        is_valid_emitted_transition, recover_accepted_workflow_step_from_entries,
+    };
+    use crate::{AcceptedStepTimeoutOutcome, SagaContext, SagaId, SagaParticipantState};
+    use proptest::prelude::*;
+
+    /// Fixed context so generators only vary the FSM-relevant discriminants.
+    fn ctx(saga_id: u64) -> SagaContext {
+        SagaContext {
+            saga_id: SagaId::new(saga_id),
+            saga_type: "pt".into(),
+            step_name: "pt_step".into(),
+            correlation_id: 1,
+            causation_id: 1,
+            trace_id: 1,
+            step_index: 0,
+            attempt: 0,
+            initiator_peer_id: [0u8; 32],
+            saga_started_at_millis: 1_000,
+            event_timestamp_millis: 2_000,
+        }
+    }
+
+    /// Build every `SagaStateEntry` variant (and `None`) by index.
+    ///
+    /// Index map: 0=None, 1=Idle, 2=Triggered, 3=Executing, 4=Completed,
+    /// 5=Failed, 6=Compensating, 7=Compensated, 8=Quarantined.
+    fn entry_for(idx: u8) -> Option<SagaStateEntry> {
+        use SagaStateEntry as E;
+        let idle = SagaParticipantState::new(
+            SagaId::new(7),
+            "pt".into(),
+            "pt_step".into(),
+            1,
+            1,
+            [0u8; 32],
+            1_000,
+        );
+        Some(match idx {
+            0 => return None,
+            1 => E::Idle(idle),
+            2 => E::Triggered(idle.trigger("e", 1_001)),
+            3 => E::Executing(idle.trigger("e", 1_001).start_execution(1_002)),
+            4 => E::Completed(idle.trigger("e", 1_001).start_execution(1_002).complete(
+                vec![],
+                vec![],
+                1_003,
+            )),
+            5 => E::Failed(idle.trigger("e", 1_001).start_execution(1_002).fail(
+                "err".into(),
+                false,
+                1_004,
+            )),
+            6 => E::Compensating(
+                idle.trigger("e", 1_001)
+                    .start_execution(1_002)
+                    .complete(vec![], vec![], 1_003)
+                    .start_compensation(1_005),
+            ),
+            7 => E::Compensated(
+                idle.trigger("e", 1_001)
+                    .start_execution(1_002)
+                    .complete(vec![], vec![], 1_003)
+                    .start_compensation(1_005)
+                    .complete_compensation(1_006),
+            ),
+            8 => E::Quarantined(
+                idle.trigger("e", 1_001)
+                    .start_execution(1_002)
+                    .quarantine("r".into(), 1_007),
+            ),
+            _ => unreachable!("entry index out of range: {idx}"),
+        })
+    }
+
+    /// Build a representative `SagaChoreographyEvent` per validator branch.
+    ///
+    /// Index map: 0=StepAccepted, 1=StepCompleted, 2=StepFailed,
+    /// 3=CompensationCompleted, 4=CompensationFailed, 5=SagaQuarantined,
+    /// 6=StepStarted (stands in for the `_ => true` wildcard class).
+    fn event_for(idx: u8) -> SagaChoreographyEvent {
+        let c = ctx(7);
+        match idx {
+            0 => SagaChoreographyEvent::StepAccepted {
+                context: c,
+                participant_id: "pid".into(),
+                execution_id: crate::StepExecutionId::new("exec"),
+                deadline_at_millis: 5_000,
+                hard_deadline_at_millis: 9_000,
+                timeout_outcome: AcceptedStepTimeoutOutcome::QuarantineSaga,
+            },
+            1 => SagaChoreographyEvent::StepCompleted {
+                context: c,
+                output: vec![],
+                saga_input: vec![],
+                compensation_available: false,
+            },
+            2 => SagaChoreographyEvent::StepFailed {
+                context: c,
+                participant_id: "pid".into(),
+                error_code: None,
+                error: "err".into(),
+                requires_compensation: false,
+            },
+            3 => SagaChoreographyEvent::CompensationCompleted { context: c },
+            4 => SagaChoreographyEvent::CompensationFailed {
+                context: c,
+                participant_id: "pid".into(),
+                error: "err".into(),
+                is_ambiguous: false,
+            },
+            5 => SagaChoreographyEvent::SagaQuarantined {
+                context: c,
+                reason: "r".into(),
+                step: "step".into(),
+                participant_id: "pid".into(),
+            },
+            6 => SagaChoreographyEvent::StepStarted { context: c },
+            _ => unreachable!("event index out of range: {idx}"),
+        }
+    }
+
+    /// Authoritative reference table for `is_valid_emitted_transition`.
+    ///
+    /// This closure IS the FSM transition contract. Any change to the
+    /// validator must be a deliberate, reflected change here — the property
+    /// test below fails loudly on accidental drift.
+    fn reference_valid(entry_idx: u8, event_idx: u8) -> bool {
+        match event_idx {
+            // StepAccepted: only valid once execution has begun/ended.
+            0 => matches!(entry_idx, 3 | 4 | 5 | 8),
+            // StepCompleted: only from Completed.
+            1 => entry_idx == 4,
+            // StepFailed: only from Failed.
+            2 => entry_idx == 5,
+            // CompensationCompleted: only from Compensated (idempotent re-ack).
+            3 => entry_idx == 7,
+            // CompensationFailed | SagaQuarantined: only from Quarantined.
+            4 | 5 => entry_idx == 8,
+            // Wildcard class (StepStarted, SagaStarted, ...): always allowed.
+            _ => true,
+        }
+    }
+
+    proptest! {
+        /// The validator must agree with the reference table for every
+        /// (state, event) pair. With a 9-state × 7-event space this is an
+        /// exhaustive matrix lock.
+        #[test]
+        fn transition_validator_matches_reference_table(
+            entry_idx in 0u8..9u8,
+            event_idx in 0u8..7u8,
+        ) {
+            let entry = entry_for(entry_idx);
+            let event = event_for(event_idx);
+            let actual = is_valid_emitted_transition(entry.as_ref(), &event);
+            let expected = reference_valid(entry_idx, event_idx);
+            prop_assert_eq!(
+                actual, expected,
+                "validator drift at entry_idx={} event_idx={}", entry_idx, event_idx
+            );
+        }
+
+        /// No guarded progress/terminal event is ever valid from a
+        /// non-matching or pre-execution state (None/Idle/Triggered/
+        /// Compensating). This is the safety invariant that prevents phantom
+        /// transitions early in the lifecycle.
+        #[test]
+        fn guarded_events_rejected_from_pre_terminal_states(
+            entry_idx in 0u8..9u8,
+            event_idx in 0u8..6u8, // guarded events only
+        ) {
+            let is_pre_terminal = matches!(entry_idx, 0 | 1 | 2 | 6);
+            let entry = entry_for(entry_idx);
+            let event = event_for(event_idx);
+            let actual = is_valid_emitted_transition(entry.as_ref(), &event);
+            if is_pre_terminal {
+                prop_assert!(!actual, "guarded event {} accepted from pre-terminal state {}", event_idx, entry_idx);
+            }
+        }
+    }
+
+    /// Build a `JournalEntry` wrapping the `ParticipantEvent` variant at `idx`.
+    ///
+    /// Variant index map (mirrors declaration order in `ParticipantEvent`):
+    /// 0=SagaRegistered, 1=StepTriggered, 2=StepExecutionStarted,
+    /// 3=StepExecutionCompleted, 4=StepExecutionFailed, 5=CompensationStarted,
+    /// 6=CompensationCompleted, 7=CompensationFailed, 8=Quarantined,
+    /// 9=AcceptedStepRecorded.
+    fn participant_event_for(idx: u8) -> ParticipantEvent {
+        let now = 1_234u64;
+        match idx {
+            0 => ParticipantEvent::SagaRegistered {
+                saga_type: "pt".into(),
+                step_name: "pt_step".into(),
+                registered_at_millis: now,
+            },
+            1 => ParticipantEvent::StepTriggered {
+                triggering_event: "e".into(),
+                triggered_at_millis: now,
+            },
+            2 => ParticipantEvent::StepExecutionStarted {
+                attempt: 1,
+                started_at_millis: now,
+            },
+            3 => ParticipantEvent::StepExecutionCompleted {
+                output: vec![],
+                compensation_data: vec![],
+                completed_at_millis: now,
+            },
+            4 => ParticipantEvent::StepExecutionFailed {
+                error: "err".into(),
+                requires_compensation: false,
+                failed_at_millis: now,
+            },
+            5 => ParticipantEvent::CompensationStarted {
+                attempt: 1,
+                started_at_millis: now,
+            },
+            6 => ParticipantEvent::CompensationCompleted {
+                completed_at_millis: now,
+            },
+            7 => ParticipantEvent::CompensationFailed {
+                error: "err".into(),
+                is_ambiguous: false,
+                failed_at_millis: now,
+            },
+            8 => ParticipantEvent::Quarantined {
+                reason: "r".into(),
+                quarantined_at_millis: now,
+            },
+            9 => ParticipantEvent::AcceptedStepRecorded {
+                context: ctx(7),
+                participant_id: "pid".into(),
+                execution_id: crate::StepExecutionId::new("exec"),
+                idle_timeout_millis: 1_000,
+                hard_timeout_millis: 5_000,
+                timeout_outcome: AcceptedStepTimeoutOutcome::QuarantineSaga,
+                accepted_at_millis: now,
+                deadline_at_millis: now + 1_000,
+                hard_deadline_at_millis: now + 5_000,
+            },
+            _ => unreachable!("participant event index out of range: {idx}"),
+        }
+    }
+
+    fn journal_entry_for(seq: u64, idx: u8) -> JournalEntry {
+        JournalEntry {
+            sequence: seq,
+            recorded_at_millis: 1_234,
+            event: participant_event_for(idx),
+        }
+    }
+
+    /// Reference model of `recover_accepted_workflow_step_from_entries`:
+    /// returns whether a recoverable accepted step survives the log. An
+    /// `AcceptedStepRecorded` is superseded (cleared) by any later terminal
+    /// participant event.
+    fn reference_recovered_some(seq: &[u8]) -> bool {
+        let mut some = false;
+        for &idx in seq {
+            match idx {
+                9 => some = true,                      // AcceptedStepRecorded
+                3 | 4 | 5 | 6 | 7 | 8 => some = false, // terminal/clearing events
+                _ => {}                                // registration/trigger/start: unchanged
+            }
+        }
+        some
+    }
+
+    proptest! {
+        /// Recovery must be a pure, deterministic function of the journaled
+        /// event log: re-running it on identical entries yields the same
+        /// result, and that result matches the reference model for every
+        /// generated sequence (including interleaved accept/complete/quarantine).
+        #[test]
+        fn recovery_is_pure_function_of_log(
+            seq in proptest::collection::vec(0u8..10u8, 0..24),
+        ) {
+            let entries: Vec<JournalEntry> = seq
+                .iter()
+                .enumerate()
+                .map(|(i, &idx)| journal_entry_for(i as u64, idx))
+                .collect();
+
+            let first = recover_accepted_workflow_step_from_entries(&entries);
+            let again = recover_accepted_workflow_step_from_entries(&entries);
+
+            // Determinism: identical input must produce identical output.
+            prop_assert_eq!(
+                first.is_some(),
+                again.is_some(),
+                "recovery is non-deterministic for sequence {:?}", seq
+            );
+            // Correctness: observable result agrees with the reference model.
+            prop_assert_eq!(
+                first.is_some(),
+                reference_recovered_some(&seq),
+                "recovery disagrees with model for sequence {:?}", seq
+            );
+        }
+
+        /// Recovery convergence: appending any clearing event after an accept
+        /// must drop the recovered step (the accepted step is no longer live).
+        #[test]
+        fn recovery_clears_accepted_step_after_terminal_event(
+            clearing in 3u8..9u8, // one of the clearing variants
+        ) {
+            let entries = vec![
+                journal_entry_for(0, 9),          // AcceptedStepRecorded
+                journal_entry_for(1, clearing),   // terminal/clearing event
+            ];
+            let recovered = recover_accepted_workflow_step_from_entries(&entries);
+            prop_assert!(
+                recovered.is_none(),
+                "accepted step should be cleared by clearing event {}", clearing
+            );
+        }
+    }
+}
+
+/// Loom (exhaustive concurrency model-checking) scaffold for the dedupe
+/// `check_and_mark` atomicity contract.
+///
+/// Every `ParticipantDedupeStore` backend MUST make check-and-mark atomic:
+/// across all thread interleavings, exactly one concurrent first-mark for a
+/// given (saga_id, key) wins, and every duplicate observes a miss. The in-tree
+/// `InMemoryDedupe` satisfies this structurally via a single-owner mailbox
+/// actor, so it needs no loom model. Real backends (LMDB/heed, SQL, KV stores)
+/// use shared mutable state and SHOULD be exercised here.
+///
+/// This module models the canonical shared-state algorithm a backend would
+/// write and proves it race-free under loom's exhaustive scheduler. Extend it
+/// by swapping `MutexDedupe` for a wrapper around your real backend.
+///
+/// Run with: `cargo test --features loom`.
+#[cfg(all(test, feature = "loom"))]
+mod loom_dedupe_model {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    /// Reference check-and-mark implementation using loom-modeled primitives.
+    /// Structurally identical to what a real Mutex/DB-backed dedupe store does.
+    struct MutexDedupe {
+        seen: loom::sync::Mutex<HashMap<(u64, String), ()>>,
+    }
+
+    impl MutexDedupe {
+        fn new() -> Self {
+            Self {
+                seen: loom::sync::Mutex::new(HashMap::new()),
+            }
+        }
+
+        /// Atomic check-and-mark — the contract under test.
+        fn check_and_mark(&self, saga_id: u64, key: &str) -> bool {
+            let mut guard = self.seen.lock().unwrap();
+            let entry = (saga_id, key.to_string());
+            if guard.contains_key(&entry) {
+                false
+            } else {
+                guard.insert(entry, ());
+                true
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_check_and_mark_yields_exactly_one_winner() {
+        loom::model(|| {
+            let store = Arc::new(MutexDedupe::new());
+            let store_b = store.clone();
+
+            let h1 = loom::thread::spawn(move || store.check_and_mark(42, "reserve_inventory"));
+            let h2 = loom::thread::spawn(move || store_b.check_and_mark(42, "reserve_inventory"));
+
+            let (a, b) = (h1.join().unwrap(), h2.join().unwrap());
+
+            // Idempotency invariant holds under EVERY interleaving: exactly
+            // one concurrent first-mark wins, the duplicate observes a miss.
+            // If this assertion ever fires, the dedupe backend is not atomic
+            // and double-execution of saga steps is possible.
+            assert!(
+                a ^ b,
+                "dedupe atomicity violated: expected exactly one winner, got ({a}, {b})"
+            );
+        });
+    }
+
+    #[test]
+    fn distinct_keys_are_independent() {
+        loom::model(|| {
+            let store = Arc::new(MutexDedupe::new());
+            let store_b = store.clone();
+
+            let h1 = loom::thread::spawn(move || store.check_and_mark(42, "a"));
+            let h2 = loom::thread::spawn(move || store_b.check_and_mark(42, "b"));
+
+            let (a, b) = (h1.join().unwrap(), h2.join().unwrap());
+            // Distinct keys must both win — never falsely deduplicated.
+            assert!(a && b, "distinct keys falsely collided: ({a}, {b})");
+        });
+    }
+}

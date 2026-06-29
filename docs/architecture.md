@@ -54,7 +54,7 @@ flowchart LR
 
 | Area | Framework (`icanact-saga-choreography`) | Actor Implementation |
 |---|---|---|
-| Identity and context | `SagaId`, `SagaContext`, `IdempotencyKey` | Populate context at saga start and across steps |
+| Identity and context | `SagaId`, `SagaContext` | Populate context at saga start and across steps |
 | State model | Typestate containers and transitions (`Idle`, `Executing`, `Completed`, etc.) plus `SagaParticipantSupport<J, D>` | Embed one `saga` field on the actor |
 | Events | `SagaChoreographyEvent`, `ParticipantEvent` | Publish/consume events for the saga type |
 | Execution contract | `SagaParticipant` trait | Implement `execute_step`, `compensate_step`, and dependencies |

@@ -12,6 +12,9 @@ diagnostics = []
 test-harness = ["icanact-core/test-support", "dep:tracing-subscriber"]
 test-support = ["test-harness"]
 lmdb = ["dep:heed"]
+# Opt-in exhaustive concurrency model checking for the dedupe/journal atomicity
+# contracts. Run with: cargo test --features loom (slower; explores all interleavings).
+loom = []
 
 [[test]]
 name = "async_workflow_lifecycle_e2e"
@@ -46,3 +49,10 @@ tempfile = "3"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros", "sync", "test-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Property-based testing for the FSM transition validator and journal replay.
+proptest = "1"
+# Exhaustive concurrency model checking. The crate is always built as a
+# dev-dependency; the `loom` feature only gates the (slow) exhaustive test
+# module so default `cargo test` stays fast.
+loom = "0.7"

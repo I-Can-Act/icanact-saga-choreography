@@ -44,7 +44,6 @@ mod context;
 pub mod durability;
 mod errors;
 mod events;
-mod idempotency;
 mod state;
 mod support;
 
@@ -86,7 +85,6 @@ pub use binding::{
 pub use bus::{SagaBusPublishError, SagaChoreographyBus, global_saga_choreography_bus};
 pub use context::{PeerId, SagaContext, SagaId, StepId};
 pub use durability::*;
-pub use idempotency::IdempotencyKey;
 
 // State (typestate)
 pub use state::{
