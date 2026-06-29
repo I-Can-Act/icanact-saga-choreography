@@ -298,6 +298,50 @@ fn accepted_step_can_complete_after_participant_restart() {
 }
 
 #[test]
+fn accepted_step_restart_recovers_refreshed_progress_deadline() {
+    let journal = Arc::new(InMemoryJournal::new());
+    let mut actor = RestartedHarnessActor::new(journal.clone());
+    let ctx = context("create_order", 24);
+    let execution_id = StepExecutionId::new("effect-24");
+
+    let accepted = accept_workflow_step(
+        &mut actor,
+        ctx.clone(),
+        "order-manager".into(),
+        execution_id.clone(),
+        policy(AcceptedStepTimeoutOutcome::FailStep {
+            requires_compensation: false,
+        }),
+    )
+    .expect("step should be accepted before restart");
+    let SagaChoreographyEvent::StepAccepted { context, .. } = accepted else {
+        panic!("expected accepted step event");
+    };
+    let accepted_at_millis = context.event_timestamp_millis;
+
+    record_accepted_workflow_step_progress(
+        &mut actor,
+        ctx.saga_id,
+        execution_id,
+        accepted_at_millis + 90,
+    )
+    .expect("progress should refresh deadline before restart");
+
+    let mut reopened = RestartedHarnessActor::new(journal);
+    recover_accepted_workflow_steps_for_saga_type(
+        reopened.saga_support_mut(),
+        "create_order",
+        "order_lifecycle",
+    )
+    .expect("accepted step metadata should recover");
+
+    assert!(
+        poll_accepted_workflow_step_timeouts(&mut reopened, accepted_at_millis + 180).is_empty(),
+        "recovered accepted step must use the refreshed progress deadline"
+    );
+}
+
+#[test]
 fn accepted_step_late_completion_completes_saga_once() {
     let mut actor = HarnessActor::default();
     let ctx = context("create_order", 2);

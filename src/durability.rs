@@ -180,20 +180,16 @@ where
     actor
         .saga_states()
         .insert(saga_id, SagaStateEntry::Executing(state));
-    actor.record_event(
-        saga_id,
-        ParticipantEvent::AcceptedStepRecorded {
-            context: accepted_context.clone(),
-            participant_id: participant_id.clone(),
-            execution_id: execution_id.clone(),
-            idle_timeout_millis: policy.idle_timeout.as_millis() as u64,
-            hard_timeout_millis: policy.hard_timeout.as_millis() as u64,
-            timeout_outcome: policy.timeout_outcome.clone(),
-            accepted_at_millis,
-            deadline_at_millis,
-            hard_deadline_at_millis,
-        },
-    );
+    let accepted_step = AcceptedWorkflowStep {
+        context: accepted_context.clone(),
+        participant_id: participant_id.clone(),
+        execution_id: execution_id.clone(),
+        policy,
+        accepted_at_millis,
+        deadline_at_millis,
+        hard_deadline_at_millis,
+    };
+    record_accepted_step_metadata(actor, &accepted_step);
     actor.record_event(
         saga_id,
         ParticipantEvent::StepExecutionStarted {
@@ -202,18 +198,10 @@ where
         },
     );
 
-    actor.saga_support_mut().accepted_workflow_steps.insert(
-        saga_id,
-        AcceptedWorkflowStep {
-            context: accepted_context.clone(),
-            participant_id: participant_id.clone(),
-            execution_id: execution_id.clone(),
-            policy,
-            accepted_at_millis,
-            deadline_at_millis,
-            hard_deadline_at_millis,
-        },
-    );
+    actor
+        .saga_support_mut()
+        .accepted_workflow_steps
+        .insert(saga_id, accepted_step);
 
     Ok(SagaChoreographyEvent::StepAccepted {
         context: accepted_context,
@@ -354,13 +342,39 @@ where
     accepted.deadline_at_millis = next_idle_deadline.min(accepted.hard_deadline_at_millis);
     let mut context = accepted.context.clone();
     context.event_timestamp_millis = now_millis;
+    let mut accepted_snapshot = accepted.clone();
+    accepted_snapshot.context = context.clone();
+    let participant_id = accepted_snapshot.participant_id.clone();
+    let deadline_at_millis = accepted.deadline_at_millis;
+    let hard_deadline_at_millis = accepted.hard_deadline_at_millis;
+    record_accepted_step_metadata(actor, &accepted_snapshot);
     Ok(SagaChoreographyEvent::StepAccepted {
         context,
-        participant_id: accepted.participant_id.clone(),
+        participant_id,
         execution_id,
-        deadline_at_millis: accepted.deadline_at_millis,
-        hard_deadline_at_millis: accepted.hard_deadline_at_millis,
+        deadline_at_millis,
+        hard_deadline_at_millis,
     })
+}
+
+fn record_accepted_step_metadata<A>(actor: &A, accepted: &AcceptedWorkflowStep)
+where
+    A: SagaStateExt,
+{
+    actor.record_event(
+        accepted.context.saga_id,
+        ParticipantEvent::AcceptedStepRecorded {
+            context: accepted.context.clone(),
+            participant_id: accepted.participant_id.clone(),
+            execution_id: accepted.execution_id.clone(),
+            idle_timeout_millis: accepted.policy.idle_timeout.as_millis() as u64,
+            hard_timeout_millis: accepted.policy.hard_timeout.as_millis() as u64,
+            timeout_outcome: accepted.policy.timeout_outcome.clone(),
+            accepted_at_millis: accepted.accepted_at_millis,
+            deadline_at_millis: accepted.deadline_at_millis,
+            hard_deadline_at_millis: accepted.hard_deadline_at_millis,
+        },
+    );
 }
 
 pub fn poll_accepted_workflow_step_timeouts<A>(

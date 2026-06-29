@@ -334,27 +334,6 @@ pub enum ParticipantEvent {
         /// The timestamp (in milliseconds since epoch) when execution started.
         started_at_millis: u64,
     },
-    /// Emitted when an async step is accepted and must survive participant restart.
-    AcceptedStepRecorded {
-        /// Saga context stamped at acceptance time.
-        context: SagaContext,
-        /// Participant that accepted responsibility for the step.
-        participant_id: Box<str>,
-        /// External or participant-local execution identifier.
-        execution_id: StepExecutionId,
-        /// Resettable idle timeout duration in milliseconds.
-        idle_timeout_millis: u64,
-        /// Non-resettable hard timeout duration in milliseconds.
-        hard_timeout_millis: u64,
-        /// Terminal outcome used when the accepted step times out.
-        timeout_outcome: AcceptedStepTimeoutOutcome,
-        /// Timestamp when the participant accepted the step.
-        accepted_at_millis: u64,
-        /// Current resettable idle deadline in epoch milliseconds.
-        deadline_at_millis: u64,
-        /// Non-resettable hard deadline in epoch milliseconds.
-        hard_deadline_at_millis: u64,
-    },
     /// Emitted when step execution completes successfully.
     StepExecutionCompleted {
         /// The output produced by the step execution.
@@ -400,5 +379,26 @@ pub enum ParticipantEvent {
         reason: Box<str>,
         /// The timestamp (in milliseconds since epoch) when quarantine occurred.
         quarantined_at_millis: u64,
+    },
+    /// Emitted when an async step is accepted and must survive participant restart.
+    AcceptedStepRecorded {
+        /// Saga context stamped at acceptance time.
+        context: SagaContext,
+        /// Participant that accepted responsibility for the step.
+        participant_id: Box<str>,
+        /// External or participant-local execution identifier.
+        execution_id: StepExecutionId,
+        /// Resettable idle timeout duration in milliseconds.
+        idle_timeout_millis: u64,
+        /// Non-resettable hard timeout duration in milliseconds.
+        hard_timeout_millis: u64,
+        /// Terminal outcome used when the accepted step times out.
+        timeout_outcome: AcceptedStepTimeoutOutcome,
+        /// Timestamp when the participant accepted the step.
+        accepted_at_millis: u64,
+        /// Current resettable idle deadline in epoch milliseconds.
+        deadline_at_millis: u64,
+        /// Non-resettable hard deadline in epoch milliseconds.
+        hard_deadline_at_millis: u64,
     },
 }
