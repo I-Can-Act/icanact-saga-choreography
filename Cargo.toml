@@ -15,7 +15,7 @@ lmdb = ["dep:heed"]
 
 [dependencies]
 # Core dependencies
-icanact-core = { git = "ssh://git@github.com/moofone/actor-framework-core.git", branch = "main", features = ["async-actors"] }
+icanact-core = { git = "ssh://git@github.com/moofone/actor-framework-core.git", rev = "51625c21cd0d39428d33e35e25733a2d058d27f6", features = ["async-actors"] }
 rkyv = { version = "0.8", features = ["std", "bytecheck"] }
 thiserror = "1.0"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros", "sync"] }
@@ -26,7 +26,7 @@ heed = { version = "0.20", optional = true }
 tracing-subscriber = { version = "0.3", optional = true }
 
 [dev-dependencies]
-icanact-core = { git = "ssh://git@github.com/moofone/actor-framework-core.git", branch = "main", features = ["async-actors", "test-support"] }
+icanact-core = { git = "ssh://git@github.com/moofone/actor-framework-core.git", rev = "51625c21cd0d39428d33e35e25733a2d058d27f6", features = ["async-actors", "test-support"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros", "sync", "test-util"] }
 tracing = "0.1"
