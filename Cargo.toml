@@ -13,6 +13,21 @@ test-harness = ["icanact-core/test-support", "dep:tracing-subscriber"]
 test-support = ["test-harness"]
 lmdb = ["dep:heed"]
 
+[[test]]
+name = "async_workflow_lifecycle_e2e"
+path = "tests/async_workflow_lifecycle_e2e.rs"
+required-features = ["test-harness"]
+
+[[test]]
+name = "durability_lmdb_integration"
+path = "tests/durability_lmdb_integration.rs"
+required-features = ["lmdb"]
+
+[[test]]
+name = "saga_testkit_smoke"
+path = "tests/saga_testkit_smoke.rs"
+required-features = ["test-harness"]
+
 [dependencies]
 # Core dependencies
 icanact-core = { git = "ssh://git@github.com/moofone/actor-framework-core.git", rev = "ec5d25e3285c4f306749860bfdd57f1e7264b25a", features = ["async-actors"] }

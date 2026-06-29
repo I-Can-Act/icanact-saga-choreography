@@ -1,7 +1,6 @@
 #![cfg(feature = "test-harness")]
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use icanact_core::local_async::{self, AsyncActor};
@@ -9,11 +8,10 @@ use icanact_core::local_sync::{self, SyncActor};
 use icanact_saga_choreography::{
     define_saga_workflow_contract, AsyncSagaParticipant, CompensationError, DependencySpec,
     DeterministicContextBuilder, FailureAuthority, HasSagaParticipantSupport,
-    HasSagaWorkflowParticipants, InMemoryDedupe, InMemoryJournal, JournalEntry,
-    ParticipantDedupeStore, ParticipantJournal, SagaChoreographyEvent, SagaParticipant,
-    SagaParticipantChannel, SagaParticipantSupport, SagaStateExt, SagaTerminalOutcome,
-    SagaTestWorld, SagaWorkflowContract, SagaWorkflowParticipant, StepError, StepOutput,
-    SuccessCriteria, TerminalPolicy,
+    HasSagaWorkflowParticipants, InMemoryDedupe, InMemoryJournal, ParticipantDedupeStore,
+    ParticipantJournal, SagaChoreographyEvent, SagaId, SagaParticipant, SagaParticipantChannel,
+    SagaParticipantSupport, SagaStateExt, SagaTerminalOutcome, SagaTestWorld, SagaWorkflowContract,
+    SagaWorkflowParticipant, StepError, StepOutput, SuccessCriteria, TerminalPolicy,
 };
 
 #[derive(Clone, Debug)]
@@ -29,49 +27,68 @@ struct SyncSnapshot {
     compensated: usize,
     business_flags: Vec<&'static str>,
     active_sagas: usize,
+    journal_entry_count: usize,
+    start_dedupe_present: bool,
 }
 
 struct SyncParticipant {
-    saga: SagaParticipantSupport<Arc<InMemoryJournal>, Arc<InMemoryDedupe>>,
+    saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
     step_name: &'static str,
     dependency: DependencySpec,
     fail_on_execute: bool,
     executed_inputs: Vec<Vec<u8>>,
     compensation_calls: usize,
     business_flags: Vec<&'static str>,
+    last_saga_id: Option<SagaId>,
 }
 
 impl SyncParticipant {
-    fn new(
-        step_name: &'static str,
-        dependency: DependencySpec,
-        journal: Arc<InMemoryJournal>,
-        dedupe: Arc<InMemoryDedupe>,
-    ) -> Self {
+    fn new(step_name: &'static str, dependency: DependencySpec) -> Self {
         Self {
-            saga: SagaParticipantSupport::new(journal, dedupe),
+            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
             step_name,
             dependency,
             fail_on_execute: false,
             executed_inputs: Vec::new(),
             compensation_calls: 0,
             business_flags: Vec::new(),
+            last_saga_id: None,
         }
     }
 
     fn snapshot(&self) -> SyncSnapshot {
+        let journal_entry_count = self
+            .last_saga_id
+            .map(|saga_id| {
+                self.saga
+                    .journal
+                    .read(saga_id)
+                    .expect("participant journal should be readable")
+                    .len()
+            })
+            .unwrap_or(0);
+        let start_dedupe_present = self
+            .last_saga_id
+            .map(|saga_id| {
+                self.saga
+                    .dedupe
+                    .contains(saga_id, "1:1700000000000:saga_started:start")
+            })
+            .unwrap_or(false);
         SyncSnapshot {
             executed_inputs: self.executed_inputs.clone(),
             compensated: self.compensation_calls,
             business_flags: self.business_flags.clone(),
             active_sagas: self.active_saga_count(),
+            journal_entry_count,
+            start_dedupe_present,
         }
     }
 }
 
 impl HasSagaParticipantSupport for SyncParticipant {
-    type Journal = Arc<InMemoryJournal>;
-    type Dedupe = Arc<InMemoryDedupe>;
+    type Journal = InMemoryJournal;
+    type Dedupe = InMemoryDedupe;
 
     fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
         &self.saga
@@ -99,9 +116,10 @@ impl SagaParticipant for SyncParticipant {
 
     fn execute_step(
         &mut self,
-        _context: &icanact_saga_choreography::SagaContext,
+        context: &icanact_saga_choreography::SagaContext,
         input: &[u8],
     ) -> Result<StepOutput, StepError> {
+        self.last_saga_id = Some(context.saga_id);
         self.executed_inputs.push(input.to_vec());
         if self.fail_on_execute {
             return Err(StepError::RequireCompensation {
@@ -405,14 +423,6 @@ fn register_workflow_beta_contract(world: &SagaTestWorld) {
     for step in ["start", "beta_step"] {
         bus.register_bound_workflow_step("workflow_beta", step)
             .expect("workflow_beta test step binding should succeed");
-    }
-}
-
-fn suite_guard() -> MutexGuard<'static, ()> {
-    static SUITE_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-    match SUITE_MUTEX.get_or_init(|| Mutex::new(())).lock() {
-        Ok(guard) => guard,
-        Err(err) => err.into_inner(),
     }
 }
 
@@ -733,7 +743,6 @@ where
 
 #[test]
 fn sync_world_runs_real_saga_workflow_and_exposes_actor_state() {
-    let _guard = suite_guard();
     SagaTestWorld::init_test_logging();
     let world = SagaTestWorld::new();
     register_sync_order_lifecycle_contract(&world);
@@ -741,26 +750,13 @@ fn sync_world_runs_real_saga_workflow_and_exposes_actor_state() {
         .attach_terminal_resolver(test_terminal_policy(), "testkit")
         .expect("terminal resolver should attach");
 
-    let step_a_journal = Arc::new(InMemoryJournal::new());
-    let step_a_dedupe = Arc::new(InMemoryDedupe::new());
-
     let step_a = world.spawn_sync_channel_participant(
-        SyncParticipant::new(
-            "step_a",
-            DependencySpec::OnSagaStart,
-            Arc::clone(&step_a_journal),
-            Arc::clone(&step_a_dedupe),
-        ),
+        SyncParticipant::new("step_a", DependencySpec::OnSagaStart),
         "saga",
         1024,
     );
     let step_b = world.spawn_sync_channel_participant(
-        SyncParticipant::new(
-            "step_b",
-            DependencySpec::After("step_a"),
-            Arc::new(InMemoryJournal::new()),
-            Arc::new(InMemoryDedupe::new()),
-        ),
+        SyncParticipant::new("step_b", DependencySpec::After("step_a")),
         "saga",
         1024,
     );
@@ -799,16 +795,16 @@ fn sync_world_runs_real_saga_workflow_and_exposes_actor_state() {
         .transcript_for_saga(saga_id)
         .iter()
         .any(|event| matches!(event, SagaChoreographyEvent::StepCompleted { context, .. } if context.step_name.as_ref() == "step_b")));
-
-    let entries: Vec<JournalEntry> = step_a_journal
-        .read(saga_id)
-        .expect("shared journal should be readable");
-    assert!(
-        entries.is_empty(),
-        "terminal processing should prune participant journal rows"
+    let a_state = wait_for_sync_snapshot(
+        &step_a.actor_ref(),
+        |snapshot: &SyncSnapshot| {
+            snapshot.journal_entry_count == 0 && !snapshot.start_dedupe_present
+        },
+        Duration::from_secs(1),
     );
+    assert_eq!(a_state.journal_entry_count, 0);
     assert!(
-        !step_a_dedupe.contains(saga_id, "1:1700000000000:saga_started:start"),
+        !a_state.start_dedupe_present,
         "terminal processing should prune participant dedupe keys"
     );
 
@@ -818,7 +814,6 @@ fn sync_world_runs_real_saga_workflow_and_exposes_actor_state() {
 
 #[test]
 fn sync_world_runs_real_workflow_participant_path() {
-    let _guard = suite_guard();
     let world = SagaTestWorld::new();
     register_workflow_beta_contract(&world);
     let _resolver = world
@@ -853,6 +848,10 @@ fn sync_world_runs_real_workflow_participant_path() {
     assert!(snapshot.alpha_inputs.is_empty());
     assert_eq!(snapshot.beta_inputs, vec![b"workflow-input".to_vec()]);
     let workflow_events = world.transcript_for_saga(ctx.saga_id);
+    let started_index = workflow_events
+        .iter()
+        .position(|event| matches!(event, SagaChoreographyEvent::StepStarted { context } if context.step_name.as_ref() == "beta_step"))
+        .expect("workflow participant should start step");
     let accepted_index = workflow_events
         .iter()
         .position(|event| matches!(event, SagaChoreographyEvent::StepAccepted { context, .. } if context.step_name.as_ref() == "beta_step"))
@@ -860,10 +859,10 @@ fn sync_world_runs_real_workflow_participant_path() {
     let completed_index = workflow_events
         .iter()
         .position(|event| matches!(event, SagaChoreographyEvent::StepCompleted { context, .. } if context.step_name.as_ref() == "beta_step"))
-        .expect("workflow participant should complete the step");
+        .expect("workflow participant should complete step");
     assert!(
-        accepted_index < completed_index,
-        "workflow transcript should record accepted before completed: {workflow_events:?}"
+        started_index < accepted_index && accepted_index < completed_index,
+        "workflow transcript should record started before accepted before completed: {workflow_events:?}"
     );
 
     actor.shutdown();
@@ -872,7 +871,6 @@ fn sync_world_runs_real_workflow_participant_path() {
 #[test]
 #[should_panic(expected = "workflow participant saga type registration should be valid")]
 fn sync_workflow_spawn_rejects_duplicate_saga_type_registration() {
-    let _guard = suite_guard();
     let world = SagaTestWorld::new();
 
     let _ = world.spawn_sync_workflow_channel_participant::<DuplicateWorkflowActor, ()>(
@@ -884,7 +882,6 @@ fn sync_workflow_spawn_rejects_duplicate_saga_type_registration() {
 
 #[test]
 fn sync_world_spawn_args_runs_real_saga_workflow() {
-    let _guard = suite_guard();
     let world = SagaTestWorld::new();
     register_sync_order_lifecycle_contract(&world);
     let _resolver = world
@@ -892,22 +889,12 @@ fn sync_world_spawn_args_runs_real_saga_workflow() {
         .expect("terminal resolver should attach");
 
     let step_a = world.spawn_sync_channel_participant(
-        SyncParticipant::new(
-            "step_a",
-            DependencySpec::OnSagaStart,
-            Arc::new(InMemoryJournal::new()),
-            Arc::new(InMemoryDedupe::new()),
-        ),
+        SyncParticipant::new("step_a", DependencySpec::OnSagaStart),
         "saga",
         1024,
     );
     let step_b = world.spawn_sync_channel_participant(
-        SyncParticipant::new(
-            "step_b",
-            DependencySpec::After("step_a"),
-            Arc::new(InMemoryJournal::new()),
-            Arc::new(InMemoryDedupe::new()),
-        ),
+        SyncParticipant::new("step_b", DependencySpec::After("step_a")),
         "saga",
         1024,
     );
@@ -931,7 +918,6 @@ fn sync_world_spawn_args_runs_real_saga_workflow() {
 
 #[test]
 fn sync_world_drives_compensation_flow_without_changing_actor_contracts() {
-    let _guard = suite_guard();
     let world = SagaTestWorld::new();
     register_sync_order_lifecycle_contract(&world);
     let _resolver = world
@@ -939,21 +925,11 @@ fn sync_world_drives_compensation_flow_without_changing_actor_contracts() {
         .expect("terminal resolver should attach");
 
     let step_a = world.spawn_sync_channel_participant(
-        SyncParticipant::new(
-            "step_a",
-            DependencySpec::OnSagaStart,
-            Arc::new(InMemoryJournal::new()),
-            Arc::new(InMemoryDedupe::new()),
-        ),
+        SyncParticipant::new("step_a", DependencySpec::OnSagaStart),
         "saga",
         1024,
     );
-    let mut failing_step_b = SyncParticipant::new(
-        "step_b",
-        DependencySpec::After("step_a"),
-        Arc::new(InMemoryJournal::new()),
-        Arc::new(InMemoryDedupe::new()),
-    );
+    let mut failing_step_b = SyncParticipant::new("step_b", DependencySpec::After("step_a"));
     failing_step_b.fail_on_execute = true;
     let step_b = world.spawn_sync_channel_participant(failing_step_b, "saga", 1024);
 
@@ -984,9 +960,7 @@ fn sync_world_drives_compensation_flow_without_changing_actor_contracts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(clippy::await_holding_lock)]
 async fn async_world_runs_real_async_participant_path() {
-    let _guard = suite_guard();
     let world = SagaTestWorld::new();
     register_async_order_lifecycle_contract(&world);
     let _resolver = world
@@ -1039,7 +1013,6 @@ async fn async_world_runs_real_async_participant_path() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn async_world_spawn_args_runs_real_async_participant_path() {
-    let _guard = suite_guard();
     let world = SagaTestWorld::new();
     register_async_order_lifecycle_contract(&world);
     let _resolver = world

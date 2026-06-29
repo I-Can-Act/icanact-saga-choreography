@@ -2042,8 +2042,8 @@ pub mod lmdb {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_sync_workflow_participant_saga_ingress, default_runtime_dir, workflow_for_event,
-        ActiveSagaExecution, HasActiveSagaExecution,
+        apply_sync_workflow_participant_saga_ingress_with_hooks, default_runtime_dir,
+        workflow_for_event, ActiveSagaExecution, HasActiveSagaExecution,
     };
     use crate::{
         DependencySpec, DeterministicContextBuilder, HasSagaParticipantSupport,
@@ -2262,7 +2262,10 @@ mod tests {
 
     #[test]
     fn workflow_ingress_routes_to_matching_workflow_spec() {
+        use std::cell::RefCell;
+
         let mut actor = WorkflowTestActor::default();
+        let emitted = RefCell::new(Vec::new());
         let event = crate::SagaChoreographyEvent::SagaStarted {
             context: DeterministicContextBuilder::default()
                 .with_saga_id(77)
@@ -2272,15 +2275,34 @@ mod tests {
             payload: Vec::new(),
         };
 
-        apply_sync_workflow_participant_saga_ingress(
+        apply_sync_workflow_participant_saga_ingress_with_hooks(
             &mut actor,
             event,
             |_actor, _event| {},
-            |_| {},
+            |event| emitted.borrow_mut().push(event.clone()),
+            |_actor, event| emitted.borrow_mut().push(event.clone()),
         );
 
         assert_eq!(actor.alpha_calls, 0);
         assert_eq!(actor.beta_calls, 1);
+        assert!(actor.saga.accepted_workflow_steps.is_empty());
+        let emitted = emitted.into_inner();
+        let started_index = emitted
+        .iter()
+        .position(|event| matches!(event, crate::SagaChoreographyEvent::StepStarted { context } if context.step_name.as_ref() == "beta_step"))
+        .expect("workflow ingress should emit step started");
+        let accepted_index = emitted
+        .iter()
+        .position(|event| matches!(event, crate::SagaChoreographyEvent::StepAccepted { context, .. } if context.step_name.as_ref() == "beta_step"))
+        .expect("workflow ingress should emit step accepted before resolving it");
+        let completed_index = emitted
+        .iter()
+        .position(|event| matches!(event, crate::SagaChoreographyEvent::StepCompleted { context, .. } if context.step_name.as_ref() == "beta_step"))
+        .expect("workflow ingress should emit step completed");
+        assert!(
+            started_index < accepted_index && accepted_index < completed_index,
+            "workflow ingress should emit started before accepted before completed: {emitted:?}"
+        );
     }
 
     #[test]

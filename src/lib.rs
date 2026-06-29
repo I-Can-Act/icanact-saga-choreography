@@ -64,6 +64,7 @@ mod stats;
 mod helpers;
 mod reply_registry;
 mod resolver;
+#[cfg(any(test, feature = "test-harness"))]
 mod testkit;
 mod workflow_contract;
 
@@ -133,6 +134,7 @@ pub use resolver::{
 };
 #[cfg(any(test, feature = "test-harness"))]
 pub use testkit::AsyncSagaParticipantHandle;
+#[cfg(any(test, feature = "test-harness"))]
 pub use testkit::{
     compensation_requested, drive_scenario, drive_workflow_scenario, saga_started, step_completed,
     step_failed, DeterministicContextBuilder,

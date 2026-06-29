@@ -11,13 +11,17 @@ use icanact_saga_choreography::durability::{
     ActiveSagaExecution, ActiveSagaExecutionPhase, HasActiveSagaExecution, RecoveryDecision,
     RecoveryPolicy, DEFAULT_RECOVERY_SAGA_TYPE, PANIC_QUARANTINE_PUBLISH_KEY,
 };
+#[cfg(feature = "lmdb")]
 use icanact_saga_choreography::{
     accept_workflow_step, complete_accepted_workflow_step, AcceptedStepCompletion,
-    AcceptedStepPolicy, AcceptedStepTimeoutOutcome, CompensationError, DependencySpec,
-    HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal, JournalEntry,
-    ParticipantDedupeStore, ParticipantEvent, ParticipantJournal, SagaChoreographyBus,
-    SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant, SagaParticipantState,
-    SagaParticipantSupport, SagaStateEntry, SagaStateExt, StepError, StepExecutionId, StepOutput,
+    AcceptedStepPolicy, AcceptedStepTimeoutOutcome, StepExecutionId,
+};
+use icanact_saga_choreography::{
+    CompensationError, DependencySpec, HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal,
+    JournalEntry, ParticipantDedupeStore, ParticipantEvent, ParticipantJournal,
+    SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant,
+    SagaParticipantState, SagaParticipantSupport, SagaStateEntry, SagaStateExt, StepError,
+    StepOutput,
 };
 
 const ORDER_LIFECYCLE: &str = "order_lifecycle";

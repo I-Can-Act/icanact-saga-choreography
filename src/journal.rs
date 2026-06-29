@@ -160,9 +160,8 @@ pub enum JournalError {
 /// This implementation should NOT be used in production as all data
 /// is lost when the process terminates.
 ///
-/// # Thread Safety
-///
-/// Uses `RwLock` internally to provide thread-safe access to the journal.
+/// The backing map is owned by a local actor so test storage follows the same
+/// single-owner state model as saga participants.
 pub struct InMemoryJournal {
     /// The backing store mapping SAGA IDs to their journal entries.
     data: std::sync::RwLock<std::collections::HashMap<u64, Vec<JournalEntry>>>,

@@ -1,5 +1,3 @@
-#![cfg(feature = "lmdb")]
-
 use std::path::PathBuf;
 
 use icanact_saga_choreography::durability::lmdb::{

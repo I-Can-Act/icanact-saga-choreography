@@ -1,7 +1,7 @@
 use icanact_saga_choreography::durability::apply_async_participant_saga_ingress_with_hooks;
 use icanact_saga_choreography::{
-    AsyncSagaParticipant, CompensationError, DependencySpec, DeterministicContextBuilder,
-    HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal, SagaChoreographyEvent, SagaContext,
+    AsyncSagaParticipant, CompensationError, DependencySpec, HasSagaParticipantSupport,
+    InMemoryDedupe, InMemoryJournal, PeerId, SagaChoreographyEvent, SagaContext, SagaId,
     SagaParticipantSupport, SagaStateEntry, SagaStateExt, StepError, StepOutput,
 };
 
@@ -81,8 +81,24 @@ impl AsyncSagaParticipant for AsyncTestParticipant {
 
 fn started_event() -> SagaChoreographyEvent {
     SagaChoreographyEvent::SagaStarted {
-        context: DeterministicContextBuilder::default().build(),
+        context: test_context(1),
         payload: vec![7, 8, 9],
+    }
+}
+
+fn test_context(saga_id: u64) -> SagaContext {
+    SagaContext {
+        saga_id: SagaId::new(saga_id),
+        saga_type: "order_lifecycle".into(),
+        step_name: "risk_check".into(),
+        correlation_id: saga_id,
+        causation_id: saga_id,
+        trace_id: saga_id,
+        step_index: 0,
+        attempt: 0,
+        initiator_peer_id: PeerId::default(),
+        saga_started_at_millis: 1_700_000_000_000,
+        event_timestamp_millis: 1_700_000_000_000,
     }
 }
 
@@ -122,7 +138,7 @@ async fn async_ingress_waits_for_all_dependencies_before_execution() {
         dependency_spec: DependencySpec::AllOf(&["a", "b"]),
         ..AsyncTestParticipant::default()
     };
-    let ctx = DeterministicContextBuilder::default().build();
+    let ctx = test_context(1);
 
     apply_async_participant_saga_ingress_with_hooks(
         &mut participant,
@@ -171,7 +187,7 @@ async fn async_ingress_non_ambiguous_compensation_failure_keeps_local_quarantine
         }),
         ..AsyncTestParticipant::default()
     };
-    let context = DeterministicContextBuilder::default().build();
+    let context = test_context(1);
 
     apply_async_participant_saga_ingress_with_hooks(
         &mut participant,

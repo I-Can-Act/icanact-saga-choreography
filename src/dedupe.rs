@@ -140,9 +140,8 @@ pub enum DedupeError {
 /// state is lost when the process terminates, which could lead to duplicate
 /// processing of redelivered messages after a crash.
 ///
-/// # Thread Safety
-///
-/// Uses `RwLock` internally to provide thread-safe access to the store.
+/// The backing set is owned by a local actor so test storage follows the same
+/// single-owner state model as saga participants.
 pub struct InMemoryDedupe {
     /// The backing store containing tuples of (SAGA ID, operation key).
     data: std::sync::RwLock<std::collections::HashSet<(u64, Box<str>)>>,
