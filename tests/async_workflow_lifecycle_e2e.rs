@@ -175,6 +175,52 @@ fn accepted_step_uses_actor_clock_for_context_and_deadlines() {
 }
 
 #[test]
+fn saga_run_tracking_reset_allows_same_saga_id_to_accept_again() {
+    let mut actor = HarnessActor::default();
+    let ctx = context("create_order", 22);
+    let execution_id = StepExecutionId::new("effect-22");
+
+    accept_workflow_step(
+        &mut actor,
+        ctx.clone(),
+        "order-manager".into(),
+        execution_id.clone(),
+        policy(AcceptedStepTimeoutOutcome::FailStep {
+            requires_compensation: false,
+        }),
+    )
+    .expect("first run should accept step");
+
+    let failed = fail_accepted_workflow_step(
+        &mut actor,
+        ctx.saga_id,
+        execution_id.clone(),
+        failure(1_700_000_000_175, "late participant failure", false),
+    )
+    .expect("first run should resolve step");
+    assert!(matches!(failed, SagaChoreographyEvent::StepFailed { .. }));
+
+    actor.clear_in_memory_saga_run_tracking(ctx.saga_id);
+
+    let accepted_again = accept_workflow_step(
+        &mut actor,
+        ctx,
+        "order-manager".into(),
+        execution_id,
+        policy(AcceptedStepTimeoutOutcome::FailStep {
+            requires_compensation: false,
+        }),
+    );
+    assert!(
+        matches!(
+            accepted_again,
+            Ok(SagaChoreographyEvent::StepAccepted { .. })
+        ),
+        "reset/prune must clear accepted and resolved step maps for saga id reuse"
+    );
+}
+
+#[test]
 fn accepted_step_late_completion_completes_saga_once() {
     let mut actor = HarnessActor::default();
     let ctx = context("create_order", 2);
@@ -436,6 +482,15 @@ fn accepted_step_progress_extends_idle_deadline_but_not_hard_deadline() {
     let mut actor = HarnessActor::default();
     let ctx = context("create_order", 5);
     let execution_id = StepExecutionId::new("effect-5");
+    let mut resolver = TerminalResolver::new(TerminalPolicy::new(
+        "order_lifecycle".into(),
+        "order_lifecycle/stalled-test".into(),
+        FailureAuthority::AnyParticipant,
+        SuccessCriteria::AllOf(["create_order".into()].into()),
+        Duration::from_secs(30),
+        Duration::from_millis(100),
+        &[],
+    ));
 
     let accepted = accept_workflow_step(
         &mut actor,
@@ -456,14 +511,27 @@ fn accepted_step_progress_extends_idle_deadline_but_not_hard_deadline() {
         panic!("expected accepted step");
     };
     let accepted_at_millis = context.event_timestamp_millis;
+    assert!(resolver.ingest(&accepted).is_empty());
 
-    record_accepted_workflow_step_progress(
+    let progress = record_accepted_workflow_step_progress(
         &mut actor,
         ctx.saga_id,
         execution_id.clone(),
         accepted_at_millis + 90,
     )
     .expect("progress should extend idle deadline");
+    assert!(matches!(
+        progress,
+        SagaChoreographyEvent::StepAccepted {
+            ref context,
+            ref execution_id,
+            deadline_at_millis,
+            ..
+        } if context.event_timestamp_millis == accepted_at_millis + 90
+            && execution_id.as_ref() == "effect-5"
+            && deadline_at_millis > accepted_at_millis + 180
+    ));
+    assert!(resolver.ingest(&progress).is_empty());
     assert!(
         poll_accepted_workflow_step_timeouts(&mut actor, accepted_at_millis + 180).is_empty(),
         "idle timeout should be refreshed by progress"

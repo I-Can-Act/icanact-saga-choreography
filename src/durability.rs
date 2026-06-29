@@ -297,7 +297,7 @@ pub fn record_accepted_workflow_step_progress<A>(
     saga_id: SagaId,
     execution_id: StepExecutionId,
     now_millis: u64,
-) -> Result<(), AcceptedStepError>
+) -> Result<SagaChoreographyEvent, AcceptedStepError>
 where
     A: HasSagaParticipantSupport,
 {
@@ -337,7 +337,15 @@ where
     let next_idle_deadline =
         now_millis.saturating_add(accepted.policy.idle_timeout.as_millis() as u64);
     accepted.deadline_at_millis = next_idle_deadline.min(accepted.hard_deadline_at_millis);
-    Ok(())
+    let mut context = accepted.context.clone();
+    context.event_timestamp_millis = now_millis;
+    Ok(SagaChoreographyEvent::StepAccepted {
+        context,
+        participant_id: accepted.participant_id.clone(),
+        execution_id,
+        deadline_at_millis: accepted.deadline_at_millis,
+        hard_deadline_at_millis: accepted.hard_deadline_at_millis,
+    })
 }
 
 pub fn poll_accepted_workflow_step_timeouts<A>(
