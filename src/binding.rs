@@ -87,6 +87,26 @@ where
     }
 }
 
+impl<A, C> SyncChannelForwarder<A, C>
+where
+    A: icanact_core::local_sync::SyncActor + Send + 'static,
+    A::Channel: From<SagaParticipantChannel<C>> + Send + 'static,
+    A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
+    C: Send + 'static,
+{
+    fn forward(&mut self, event: SagaChoreographyEvent) -> bool {
+        if !self.ensure_sender() {
+            return false;
+        }
+        let Some(sender) = self.sender.as_ref() else {
+            return false;
+        };
+        sender
+            .try_send(SagaParticipantChannel::Saga(event).into())
+            .is_ok()
+    }
+}
+
 impl<A, C> icanact_core::local_sync::SyncActor for SyncChannelForwarder<A, C>
 where
     A: icanact_core::local_sync::SyncActor + Send + 'static,
@@ -94,22 +114,16 @@ where
     A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
     C: Send + 'static,
 {
-    type Contract = icanact_core::local_sync::contract::TellOnly;
-    type Tell = ForwardSagaEvent;
-    type Ask = ();
-    type Reply = ();
+    type Contract = icanact_core::local_sync::contract::AskOnly;
+    type Tell = ();
+    type Ask = ForwardSagaEvent;
+    type Reply = bool;
     type Channel = ();
     type PubSub = ();
     type Broadcast = ();
 
-    fn handle_tell(&mut self, msg: Self::Tell) {
-        if !self.ensure_sender() {
-            return;
-        }
-        let Some(sender) = self.sender.as_ref() else {
-            return;
-        };
-        let _ = sender.try_send(SagaParticipantChannel::Saga(msg.0).into());
+    fn handle_ask(&mut self, msg: Self::Ask) -> Self::Reply {
+        self.forward(msg.0)
     }
 }
 
@@ -181,6 +195,26 @@ where
     }
 }
 
+impl<A, C> AsyncChannelForwarder<A, C>
+where
+    A: icanact_core::local_async::AsyncActor + Send + 'static,
+    A::Channel: From<SagaParticipantChannel<C>> + Send + 'static,
+    A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
+    C: Send + 'static,
+{
+    fn forward(&mut self, event: SagaChoreographyEvent) -> bool {
+        if !self.ensure_sender() {
+            return false;
+        }
+        let Some(sender) = self.sender.as_ref() else {
+            return false;
+        };
+        sender
+            .try_send(SagaParticipantChannel::Saga(event).into())
+            .is_ok()
+    }
+}
+
 impl<A, C> icanact_core::local_sync::SyncActor for AsyncChannelForwarder<A, C>
 where
     A: icanact_core::local_async::AsyncActor + Send + 'static,
@@ -188,22 +222,16 @@ where
     A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
     C: Send + 'static,
 {
-    type Contract = icanact_core::local_sync::contract::TellOnly;
-    type Tell = ForwardSagaEvent;
-    type Ask = ();
-    type Reply = ();
+    type Contract = icanact_core::local_sync::contract::AskOnly;
+    type Tell = ();
+    type Ask = ForwardSagaEvent;
+    type Reply = bool;
     type Channel = ();
     type PubSub = ();
     type Broadcast = ();
 
-    fn handle_tell(&mut self, msg: Self::Tell) {
-        if !self.ensure_sender() {
-            return;
-        }
-        let Some(sender) = self.sender.as_ref() else {
-            return;
-        };
-        let _ = sender.try_send(SagaParticipantChannel::Saga(msg.0).into());
+    fn handle_ask(&mut self, msg: Self::Ask) -> Self::Reply {
+        self.forward(msg.0)
     }
 }
 
@@ -273,7 +301,9 @@ where
         .map(|saga_type| {
             let forwarder_ref = forwarder_ref.clone();
             bus.subscribe_saga_type_fn(saga_type, move |event| {
-                forwarder_ref.tell(ForwardSagaEvent(event.clone()))
+                forwarder_ref
+                    .ask(ForwardSagaEvent(event.clone()))
+                    .unwrap_or(false)
             })
         })
         .collect())
@@ -305,7 +335,9 @@ where
         .map(|saga_type| {
             let forwarder_ref = forwarder_ref.clone();
             bus.subscribe_saga_type_fn(saga_type, move |event| {
-                forwarder_ref.tell(ForwardSagaEvent(event.clone()))
+                forwarder_ref
+                    .ask(ForwardSagaEvent(event.clone()))
+                    .unwrap_or(false)
             })
         })
         .collect())
@@ -474,7 +506,9 @@ where
         .map(|saga_type| {
             let forwarder_ref = forwarder_ref.clone();
             bus.subscribe_saga_type_fn(saga_type, move |event| {
-                forwarder_ref.tell(ForwardSagaEvent(event.clone()))
+                forwarder_ref
+                    .ask(ForwardSagaEvent(event.clone()))
+                    .unwrap_or(false)
             })
         })
         .collect())
@@ -506,7 +540,9 @@ where
         .map(|saga_type| {
             let forwarder_ref = forwarder_ref.clone();
             bus.subscribe_saga_type_fn(saga_type, move |event| {
-                forwarder_ref.tell(ForwardSagaEvent(event.clone()))
+                forwarder_ref
+                    .ask(ForwardSagaEvent(event.clone()))
+                    .unwrap_or(false)
             })
         })
         .collect())
@@ -901,6 +937,41 @@ mod tests {
 
         assert_eq!(subs.len(), 1);
 
+        for sub in subs {
+            let _ = bus.unsubscribe(sub);
+        }
+    }
+
+    #[test]
+    fn lazy_channel_delivery_failure_is_reported_to_strict_publish() {
+        let bus = SagaChoreographyBus::new();
+        bus.register_workflow_contract_provider::<BindingWorkflowContract>()
+            .expect("workflow contract registration should succeed");
+        let actor_ref = icanact_core::SyncActorRef::<BindingActor>::new_unset();
+        let subs = bind_sync_workflow_participant_channel_lazy_strict::<BindingActor, ()>(
+            &bus, &actor_ref, "saga", 1,
+        )
+        .expect("lazy strict workflow binding should not require channel lane yet");
+
+        let err = bus
+            .publish_strict(SagaChoreographyEvent::SagaStarted {
+                context: context("gate_step", 7004),
+                payload: Vec::new(),
+            })
+            .expect_err("unset lazy channel must not count as delivered");
+
+        assert!(
+            matches!(
+                err,
+                crate::SagaBusPublishError::RequiredPathDeliveryShortfall { delivered: 0, .. }
+                    | crate::SagaBusPublishError::PartialDelivery { delivered: 0, .. }
+                    | crate::SagaBusPublishError::TerminalEscalationPartialDelivery {
+                        delivered: 0,
+                        ..
+                    }
+            ),
+            "unexpected strict publish error: {err:?}"
+        );
         for sub in subs {
             let _ = bus.unsubscribe(sub);
         }

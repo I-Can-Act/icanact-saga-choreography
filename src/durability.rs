@@ -1534,6 +1534,15 @@ pub fn classify_recovery(
     if terminal {
         return RecoveryDecision::TerminalNoAction;
     }
+    if matches!(
+        &last.event,
+        ParticipantEvent::AcceptedStepRecorded {
+            hard_deadline_at_millis,
+            ..
+        } if now_ms <= *hard_deadline_at_millis
+    ) {
+        return RecoveryDecision::Continue;
+    }
     let age = now_ms.saturating_sub(last.recorded_at_millis);
     if age > policy.stale_after_ms {
         RecoveryDecision::QuarantineStale

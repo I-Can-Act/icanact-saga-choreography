@@ -14,14 +14,14 @@ use icanact_saga_choreography::durability::{
 #[cfg(feature = "lmdb")]
 use icanact_saga_choreography::{
     accept_workflow_step, complete_accepted_workflow_step, AcceptedStepCompletion,
-    AcceptedStepPolicy, AcceptedStepTimeoutOutcome, StepExecutionId,
+    AcceptedStepPolicy, AcceptedStepTimeoutOutcome,
 };
 use icanact_saga_choreography::{
     CompensationError, DependencySpec, HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal,
     JournalEntry, ParticipantDedupeStore, ParticipantEvent, ParticipantJournal,
     SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant,
     SagaParticipantState, SagaParticipantSupport, SagaStateEntry, SagaStateExt, StepError,
-    StepOutput,
+    StepExecutionId, StepOutput,
 };
 
 const ORDER_LIFECYCLE: &str = "order_lifecycle";
@@ -415,6 +415,34 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
             }
         ),
         RecoveryDecision::QuarantineStale
+    );
+
+    let accepted_entries = vec![JournalEntry {
+        sequence: 2,
+        recorded_at_millis: 100,
+        event: ParticipantEvent::AcceptedStepRecorded {
+            context: context(14, ORDER_LIFECYCLE, TEST_STEP),
+            participant_id: TEST_STEP.into(),
+            execution_id: StepExecutionId::new("external-14"),
+            idle_timeout_millis: 1_000,
+            hard_timeout_millis: 20_000,
+            timeout_outcome: icanact_saga_choreography::AcceptedStepTimeoutOutcome::FailStep {
+                requires_compensation: false,
+            },
+            accepted_at_millis: 100,
+            deadline_at_millis: 1_100,
+            hard_deadline_at_millis: 20_100,
+        },
+    }];
+    assert_eq!(
+        classify_recovery(
+            &accepted_entries,
+            10_000,
+            RecoveryPolicy {
+                stale_after_ms: 500
+            }
+        ),
+        RecoveryDecision::Continue
     );
 
     let terminal_entries = vec![JournalEntry {
