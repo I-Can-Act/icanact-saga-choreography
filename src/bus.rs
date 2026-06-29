@@ -401,10 +401,35 @@ pub struct SagaChoreographyBus {
     bus: EventBus<SagaChoreographyEvent>,
     pending_replies: CorrelationRegistry<SagaId, SagaReplyToResult>,
     state_ref: local_sync::SyncActorRef<BusStateActor>,
+    terminal_resolver_registry_ref: local_sync::SyncActorRef<TerminalResolverRegistryActor>,
+    _lifecycle: Arc<BusActorLifecycle>,
+}
+
+struct BusActorLifecycle {
+    pending_replies: CorrelationRegistry<SagaId, SagaReplyToResult>,
+    state_ref: local_sync::SyncActorRef<BusStateActor>,
     state_handle: Option<local_sync::ActorHandle>,
     terminal_resolver_registry_ref: local_sync::SyncActorRef<TerminalResolverRegistryActor>,
     terminal_resolver_registry_handle: Option<local_sync::ActorHandle>,
-    owned: bool,
+}
+
+impl Drop for BusActorLifecycle {
+    fn drop(&mut self) {
+        let _ = self
+            .terminal_resolver_registry_ref
+            .ask(TerminalResolverRegistryAsk::ShutdownAll);
+        if let Some(handle) = self.terminal_resolver_registry_handle.take() {
+            handle.shutdown();
+        }
+        let _ = self.state_ref.ask(BusStateAsk::ShutdownBindingActors);
+        if let Some(handle) = self.state_handle.take() {
+            handle.shutdown();
+        }
+
+        for (_, reply) in self.pending_replies.drain() {
+            let _ = reply.reply(Err("saga bus dropped".to_string()));
+        }
+    }
 }
 
 const DEFAULT_TERMINAL_RETENTION_LIMIT: usize = 1024;
@@ -475,14 +500,20 @@ impl SagaChoreographyBus {
         let (state_ref, state_handle) = local_sync::spawn(BusStateActor::default());
         let (terminal_resolver_registry_ref, terminal_resolver_registry_handle) =
             local_sync::spawn(TerminalResolverRegistryActor::default());
+        let pending_replies = CorrelationRegistry::new();
+        let lifecycle = Arc::new(BusActorLifecycle {
+            pending_replies: pending_replies.clone(),
+            state_ref: state_ref.clone(),
+            state_handle: Some(state_handle),
+            terminal_resolver_registry_ref: terminal_resolver_registry_ref.clone(),
+            terminal_resolver_registry_handle: Some(terminal_resolver_registry_handle),
+        });
         Self {
             bus: EventBus::new(),
-            pending_replies: CorrelationRegistry::new(),
+            pending_replies,
             state_ref,
-            state_handle: Some(state_handle),
             terminal_resolver_registry_ref,
-            terminal_resolver_registry_handle: Some(terminal_resolver_registry_handle),
-            owned: true,
+            _lifecycle: lifecycle,
         }
     }
 
@@ -1140,33 +1171,8 @@ impl Clone for SagaChoreographyBus {
             bus: self.bus.clone(),
             pending_replies: self.pending_replies.clone(),
             state_ref: self.state_ref.clone(),
-            state_handle: None,
             terminal_resolver_registry_ref: self.terminal_resolver_registry_ref.clone(),
-            terminal_resolver_registry_handle: None,
-            owned: false,
-        }
-    }
-}
-
-impl Drop for SagaChoreographyBus {
-    fn drop(&mut self) {
-        if !self.owned {
-            return;
-        }
-
-        let _ = self
-            .terminal_resolver_registry_ref
-            .ask(TerminalResolverRegistryAsk::ShutdownAll);
-        if let Some(handle) = self.terminal_resolver_registry_handle.take() {
-            handle.shutdown();
-        }
-        let _ = self.state_ref.ask(BusStateAsk::ShutdownBindingActors);
-        if let Some(handle) = self.state_handle.take() {
-            handle.shutdown();
-        }
-
-        for (_, reply) in self.pending_replies.drain() {
-            let _ = reply.reply(Err("saga bus dropped".to_string()));
+            _lifecycle: Arc::clone(&self._lifecycle),
         }
     }
 }
@@ -1686,6 +1692,33 @@ mod tests {
         assert!(
             bus.take_terminal_outcome(saga_id).is_none(),
             "contract + resolver + bound step should allow saga start"
+        );
+    }
+
+    #[test]
+    fn cloned_bus_keeps_shared_actors_alive_after_original_drop() {
+        let bus = SagaChoreographyBus::new();
+        bus.register_workflow_contract_provider::<OrderLifecycleContract>()
+            .expect("workflow contract registration should succeed");
+        bus.register_bound_workflow_step("order_lifecycle", "create_order")
+            .expect("bound workflow step registration should succeed");
+        let _resolver = bus
+            .attach_terminal_resolver_for_contract::<OrderLifecycleContract>("test-resolver")
+            .expect("terminal resolver should attach");
+        let _participant_sub = bus.subscribe_saga_type_fn("order_lifecycle", |_event| true);
+        let cloned = bus.clone();
+        drop(bus);
+
+        let saga_id = SagaId::new(90032);
+        let stats = cloned.publish(SagaChoreographyEvent::SagaStarted {
+            context: context("create_order", saga_id.get()),
+            payload: Vec::new(),
+        });
+
+        assert!(stats.delivered >= 1, "clone should still deliver events");
+        assert!(
+            cloned.take_terminal_outcome(saga_id).is_none(),
+            "clone should retain workflow contract, bound steps, and resolver actors"
         );
     }
 

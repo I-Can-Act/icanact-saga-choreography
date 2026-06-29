@@ -229,7 +229,7 @@ impl icanact_core::local_sync::SyncActor for TranscriptActor {
 pub struct SagaTestWorld {
     bus: SagaChoreographyBus,
     transcript_ref: icanact_core::local_sync::SyncActorRef<TranscriptActor>,
-    _transcript_handle: icanact_core::local_sync::ActorHandle,
+    transcript_handle: Option<icanact_core::local_sync::ActorHandle>,
 }
 
 #[cfg(any(test, feature = "test-harness"))]
@@ -241,7 +241,7 @@ impl SagaTestWorld {
         Self {
             bus: SagaChoreographyBus::new(),
             transcript_ref,
-            _transcript_handle: transcript_handle,
+            transcript_handle: Some(transcript_handle),
         }
     }
 
@@ -696,6 +696,15 @@ impl SagaTestWorld {
                 actor_ref.tell(map_event(event.clone()))
             });
             let _ = sub;
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-harness"))]
+impl Drop for SagaTestWorld {
+    fn drop(&mut self) {
+        if let Some(handle) = self.transcript_handle.take() {
+            handle.shutdown();
         }
     }
 }
