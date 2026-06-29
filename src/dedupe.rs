@@ -34,18 +34,19 @@ use super::SagaId;
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use icanact_saga_choreography::{
+///     InMemoryDedupe, ParticipantDedupeStore, SagaId,
+/// };
+///
 /// let dedupe = InMemoryDedupe::new();
 /// let saga_id = SagaId::new(1);
 /// let operation_key = "reserve_inventory";
 ///
-/// // Check and mark atomically - returns true if this is a new operation
-/// if dedupe.check_and_mark(saga_id, operation_key)? {
-///     // First time processing - execute the operation
-///     execute_operation()?;
-/// } else {
-///     // Already processed - skip or return cached result
-/// }
+/// assert!(dedupe.check_and_mark(saga_id, operation_key)?);
+/// assert!(!dedupe.check_and_mark(saga_id, operation_key)?);
+/// assert!(dedupe.contains(saga_id, operation_key));
+/// # Ok::<(), icanact_saga_choreography::DedupeError>(())
 /// ```
 pub trait ParticipantDedupeStore: Send + Sync + 'static {
     /// Atomically checks if an operation has been processed and marks it if not.

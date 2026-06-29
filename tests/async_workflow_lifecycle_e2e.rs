@@ -127,6 +127,40 @@ fn terminal_policy() -> TerminalPolicy {
 }
 
 #[test]
+fn accepted_step_rejects_idle_timeout_after_hard_timeout() {
+    let mut actor = HarnessActor::default();
+    let ctx = context("create_order", 0);
+    let result = accept_workflow_step(
+        &mut actor,
+        ctx.clone(),
+        "order-manager".into(),
+        StepExecutionId::new("effect-invalid-policy"),
+        AcceptedStepPolicy {
+            idle_timeout: Duration::from_millis(300),
+            hard_timeout: Duration::from_millis(100),
+            timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
+                requires_compensation: false,
+            },
+        },
+    );
+
+    assert!(matches!(
+        result,
+        Err(AcceptedStepError::InvalidPolicy { .. })
+    ));
+    assert!(!actor
+        .saga_support()
+        .accepted_workflow_steps
+        .contains_key(&ctx.saga_id));
+    assert!(actor
+        .saga_support()
+        .journal
+        .read(ctx.saga_id)
+        .expect("journal read should succeed")
+        .is_empty());
+}
+
+#[test]
 fn accepted_step_does_not_complete_saga_until_late_completion() {
     let mut actor = HarnessActor::default();
     let ctx = context("create_order", 1);

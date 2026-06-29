@@ -32,7 +32,11 @@ pub fn handle_saga_event_with_emit<P, F>(
         return;
     }
 
-    // Idempotency check
+    // Idempotency is marked before execution so replayed upstream events do
+    // not duplicate business side effects. With persistent dedupe, a crash
+    // between this mark and the StepExecutionStarted journal entry is
+    // fail-loud rather than resumed: startup recovery has no durable execution
+    // intent and the terminal resolver must eventually fail/quarantine the saga.
     let dedupe_key = dedupe_key_for_event(&event);
     if !participant.check_dedupe(context.saga_id, &dedupe_key) {
         return; // Already processed

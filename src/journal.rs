@@ -33,15 +33,23 @@ use super::{ParticipantEvent, SagaId};
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use icanact_saga_choreography::{
+///     InMemoryJournal, ParticipantEvent, ParticipantJournal, SagaId,
+/// };
+///
 /// let journal = InMemoryJournal::new();
 /// let saga_id = SagaId::new(1);
-///
-/// // Record an event
-/// journal.append(saga_id, ParticipantEvent::Started)?;
-///
-/// // Read back all events for a saga
+/// journal.append(
+///     saga_id,
+///     ParticipantEvent::StepExecutionStarted {
+///         attempt: 1,
+///         started_at_millis: 42,
+///     },
+/// )?;
 /// let entries = journal.read(saga_id)?;
+/// assert_eq!(entries.len(), 1);
+/// # Ok::<(), icanact_saga_choreography::JournalError>(())
 /// ```
 pub trait ParticipantJournal: Send + Sync + 'static {
     /// Appends a new event to the journal for the specified SAGA.

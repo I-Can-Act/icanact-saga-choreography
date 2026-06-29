@@ -23,11 +23,12 @@ If startup wiring is incomplete, saga start is failed immediately with a termina
 
 ## Minimal Startup Example
 
-```rust,ignore
+```rust,no_run
 use icanact_saga_choreography::{
     define_saga_workflow_contract, SagaChoreographyBus, SagaWorkflowContract,
 };
 
+fn main() -> Result<(), String> {
 define_saga_workflow_contract! {
     pub struct OpenPositionContract {
         saga_type: "open_position",
@@ -50,6 +51,8 @@ let _resolver = bus.attach_terminal_resolver_for_contract::<OpenPositionContract
 // Register bound steps if not using strict workflow binding helpers.
 bus.register_bound_workflow_step("open_position", "risk_check")?;
 bus.register_bound_workflow_step("open_position", "create_order")?;
+Ok(())
+}
 ```
 
 ## Timeout Semantics

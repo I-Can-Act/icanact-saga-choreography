@@ -10,13 +10,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use std::sync::atomic::Ordering;
+/// use icanact_saga_choreography::ParticipantStats;
+///
 /// let stats = ParticipantStats::new();
 /// stats.events_received.fetch_add(1, Ordering::Relaxed);
 /// stats.steps_completed.fetch_add(1, Ordering::Relaxed);
 ///
 /// let snapshot = stats.snapshot();
-/// println!("Completed {} of {} steps", snapshot.steps_completed, snapshot.steps_started);
+/// assert_eq!(snapshot.events_received, 1);
+/// assert_eq!(snapshot.steps_completed, 1);
 /// ```
 pub struct ParticipantStats {
     /// Total number of events received by this participant from the message broker.

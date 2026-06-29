@@ -36,6 +36,26 @@ pub struct AcceptedStepPolicy {
     pub timeout_outcome: AcceptedStepTimeoutOutcome,
 }
 
+impl AcceptedStepPolicy {
+    pub fn validate(&self) -> Result<(), AcceptedStepPolicyError> {
+        if self.idle_timeout > self.hard_timeout {
+            return Err(AcceptedStepPolicyError::IdleTimeoutExceedsHardTimeout {
+                idle_timeout: self.idle_timeout,
+                hard_timeout: self.hard_timeout,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AcceptedStepPolicyError {
+    IdleTimeoutExceedsHardTimeout {
+        idle_timeout: Duration,
+        hard_timeout: Duration,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcceptedStepCompletion {
     pub completed_at_millis: u64,
@@ -73,6 +93,10 @@ pub enum AcceptedStepError {
     AlreadyTerminal {
         saga_id: super::SagaId,
         execution_id: StepExecutionId,
+    },
+    InvalidPolicy {
+        execution_id: StepExecutionId,
+        source: AcceptedStepPolicyError,
     },
 }
 

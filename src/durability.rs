@@ -131,6 +131,13 @@ where
     A: SagaStateExt,
 {
     let saga_id = context.saga_id;
+    policy
+        .validate()
+        .map_err(|source| AcceptedStepError::InvalidPolicy {
+            execution_id: execution_id.clone(),
+            source,
+        })?;
+
     if actor.saga_support().terminal_sagas.contains(&saga_id) {
         return Err(AcceptedStepError::AlreadyTerminal {
             saga_id,
@@ -836,6 +843,11 @@ fn handle_workflow_saga_event_with_emit<A, F>(
         return;
     }
 
+    // Idempotency is marked before workflow execution so replayed upstream
+    // events do not duplicate business side effects. With persistent dedupe,
+    // a crash between this mark and the StepExecutionStarted journal entry is
+    // fail-loud rather than resumed: startup recovery has no durable execution
+    // intent and the terminal resolver must eventually fail/quarantine the saga.
     let dedupe_key = workflow_dedupe_key_for_event(&event);
     if !actor.check_dedupe(context.saga_id, &dedupe_key) {
         return;
@@ -1572,6 +1584,11 @@ pub fn collect_startup_recovery_events_for_saga_type<
         if entries.is_empty() {
             continue;
         }
+        // Recovery only acts on durable journal evidence. If a persistent
+        // dedupe store marked an upstream event but the participant crashed
+        // before journaling StepExecutionStarted, there is no local execution
+        // intent to resume here; the saga remains externally visible and is
+        // resolved by terminal timeout policy instead of silent replay.
         match classify_recovery(&entries, now, policy) {
             RecoveryDecision::QuarantineStale => {
                 out.push(SagaChoreographyEvent::saga_failed_default(

@@ -108,7 +108,8 @@ pub use events::{
 // Errors
 pub use errors::{
     AcceptedStepCompletion, AcceptedStepError, AcceptedStepFailure, AcceptedStepPolicy,
-    AcceptedStepTimeoutOutcome, CompensationError, StepError, StepExecutionId, StepOutput,
+    AcceptedStepPolicyError, AcceptedStepTimeoutOutcome, CompensationError, StepError,
+    StepExecutionId, StepOutput,
 };
 
 // Traits
