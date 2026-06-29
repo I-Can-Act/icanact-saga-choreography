@@ -190,9 +190,9 @@ Saga choreography is async by nature. A sync actor and an async actor can partic
 
 Participants should accept responsibility on the control plane with `accept_workflow_step(...)`, then resolve later with `complete_accepted_workflow_step(...)`, `fail_accepted_workflow_step(...)`, or the timeout/quarantine helpers. Sync actors usually resolve from a later tell/ask handler. Async actors usually resolve after awaited I/O in their native async handler. Originators can also be sync or async; they only need a bus handle and must publish `SagaStarted` through the normal choreography path.
 
-In tests, use `SagaTestWorld::wait_for_step_accepted(saga_id, step_name, ...)`, `complete_accepted_step(...)`, and `fail_accepted_step(...)` instead of hand-building late `StepCompleted` or `StepFailed` events.
+Accepted steps carry an `AcceptedStepPolicy` with resettable `idle_timeout`, non-resettable `hard_timeout`, and `timeout_outcome`. Participant support persists this metadata before returning `StepAccepted`; application code should treat that event as helper output, not hand-build it. The terminal resolver observes `StepAccepted` and enforces per-step deadlines from its watchdog. On restart, persisted accepted-step metadata is recovered and expired deadlines emit the configured timeout outcome instead of falling back to stale saga recovery.
 
-TODO for Deribit order-manager migration: replace workflow tests that manually drive transport callbacks into `StepCompleted`/`StepFailed` with accepted-step testkit helpers, then remove duplicated local workflow terminal-state assertions that are framework contracts.
+In tests, use `SagaTestWorld::wait_for_step_accepted(saga_id, step_name, ...)`, `complete_accepted_step(...)`, and `fail_accepted_step(...)` instead of hand-building late `StepCompleted` or `StepFailed` events.
 
 ## Routing Saga Events
 
@@ -200,7 +200,7 @@ When your actor receives a saga event inside its normal actor command handling, 
 
 ```rust
 use icanact_saga_choreography::{
-    durability::apply_sync_participant_saga_ingress, SagaChoreographyEvent,
+    apply_sync_participant_saga_ingress, SagaChoreographyEvent,
 };
 
 fn on_saga_event(
@@ -222,8 +222,8 @@ use std::time::Duration;
 
 use icanact_core::local_sync::{self, SyncActor};
 use icanact_saga_choreography::{
-    durability::apply_sync_participant_saga_ingress, DeterministicContextBuilder,
-    SagaChoreographyEvent, SagaTestWorld,
+    apply_sync_participant_saga_ingress, DeterministicContextBuilder, SagaChoreographyEvent,
+    SagaTestWorld,
 };
 
 enum MyCmd {
@@ -298,6 +298,9 @@ On startup or restart, enumerate participant journal state through your durabili
 
 - `overall_timeout`: hard maximum elapsed wall-clock from saga start.
 - `stalled_timeout`: resettable stall watchdog that resets on each participant progress event.
+- accepted-step `idle_timeout`: resettable per-step deadline refreshed by accepted-step progress.
+- accepted-step `hard_timeout`: non-resettable per-step deadline from accept time.
+- accepted-step `timeout_outcome`: per-step deadline result, either `FailStep` or `QuarantineSaga`.
 
 ## Notes
 

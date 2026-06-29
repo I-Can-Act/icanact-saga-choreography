@@ -352,7 +352,8 @@ fn panic_quarantine_records_journal_marks_dedupe_and_publishes() {
     assert!(participant
         .saga
         .dedupe
-        .contains(saga_context.saga_id, PANIC_QUARANTINE_PUBLISH_KEY,));
+        .contains(saga_context.saga_id, PANIC_QUARANTINE_PUBLISH_KEY,)
+        .expect("dedupe contains should succeed"));
 }
 
 #[test]
@@ -444,6 +445,42 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
         ),
         RecoveryDecision::Continue
     );
+
+    let expired_journal = InMemoryJournal::new();
+    let expired_dedupe = InMemoryDedupe::new();
+    expired_journal
+        .append(
+            SagaId::new(15),
+            ParticipantEvent::AcceptedStepRecorded {
+                context: context(15, ORDER_LIFECYCLE, TEST_STEP),
+                participant_id: TEST_STEP.into(),
+                execution_id: StepExecutionId::new("external-15"),
+                idle_timeout_millis: 1,
+                hard_timeout_millis: 1,
+                timeout_outcome: icanact_saga_choreography::AcceptedStepTimeoutOutcome::FailStep {
+                    requires_compensation: true,
+                },
+                accepted_at_millis: 1,
+                deadline_at_millis: 1,
+                hard_deadline_at_millis: 1,
+            },
+        )
+        .expect("append should succeed");
+    let expired = collect_startup_recovery_events_for_saga_type(
+        &expired_journal,
+        &expired_dedupe,
+        TEST_STEP,
+        ORDER_LIFECYCLE,
+    )
+    .expect("startup recovery should collect expired accepted step");
+    assert!(matches!(
+        expired.as_slice(),
+        [SagaChoreographyEvent::StepFailed {
+            error,
+            requires_compensation: true,
+            ..
+        }] if error.contains("accepted step hard timeout after restart")
+    ));
 
     let terminal_entries = vec![JournalEntry {
         sequence: 2,
@@ -910,7 +947,8 @@ fn helper_propagates_open_errors_and_honors_env_runtime_dir() {
     assert!(
         !support_without_bus
             .dedupe
-            .contains(no_bus_context.saga_id, PANIC_QUARANTINE_PUBLISH_KEY),
+            .contains(no_bus_context.saga_id, PANIC_QUARANTINE_PUBLISH_KEY)
+            .expect("dedupe contains should succeed"),
         "without bus delivery we should not mark panic quarantine dedupe key"
     );
 }

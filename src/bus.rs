@@ -937,7 +937,8 @@ impl SagaChoreographyBus {
     }
 
     fn terminal_retention_limit(&self) -> usize {
-        match std::env::var("SAGA_TERMINAL_RETENTION_LIMIT") {
+        static LIMIT: OnceLock<usize> = OnceLock::new();
+        *LIMIT.get_or_init(|| match std::env::var("SAGA_TERMINAL_RETENTION_LIMIT") {
             Ok(raw) => match raw.parse::<usize>() {
                 Ok(value) if value > 0 => value,
                 Ok(_value) => DEFAULT_TERMINAL_RETENTION_LIMIT,
@@ -953,7 +954,7 @@ impl SagaChoreographyBus {
                 }
             },
             Err(_) => DEFAULT_TERMINAL_RETENTION_LIMIT,
-        }
+        })
     }
 
     fn has_terminal_policy_for_saga_type(&self, saga_type: &str) -> bool {
@@ -1076,7 +1077,8 @@ impl SagaChoreographyBus {
 }
 
 fn terminal_watchdog_tick_interval() -> Duration {
-    match std::env::var("SAGA_TERMINAL_WATCHDOG_TICK_MS") {
+    static INTERVAL: OnceLock<Duration> = OnceLock::new();
+    *INTERVAL.get_or_init(|| match std::env::var("SAGA_TERMINAL_WATCHDOG_TICK_MS") {
         Ok(raw) => match raw.parse::<u64>() {
             Ok(value) if value > 0 => Duration::from_millis(value),
             Ok(_value) => Duration::from_millis(DEFAULT_TERMINAL_WATCHDOG_TICK_MS),
@@ -1092,7 +1094,7 @@ fn terminal_watchdog_tick_interval() -> Duration {
             }
         },
         Err(_) => Duration::from_millis(DEFAULT_TERMINAL_WATCHDOG_TICK_MS),
-    }
+    })
 }
 
 fn spawn_terminal_watchdog_if_needed(

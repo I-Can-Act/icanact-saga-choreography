@@ -75,15 +75,21 @@ fn lmdb_journal_and_dedupe_roundtrip() {
     assert!(!dedupe
         .check_and_mark(saga_a, "probe")
         .expect("second check_and_mark should succeed"));
-    assert!(dedupe.contains(saga_a, "probe"));
+    assert!(dedupe
+        .contains(saga_a, "probe")
+        .expect("contains should succeed"));
 
     dedupe
         .mark_processed(saga_b, "manual")
         .expect("mark_processed should succeed");
-    assert!(dedupe.contains(saga_b, "manual"));
+    assert!(dedupe
+        .contains(saga_b, "manual")
+        .expect("contains should succeed"));
 
     dedupe.prune(saga_a).expect("prune should succeed");
-    assert!(!dedupe.contains(saga_a, "probe"));
+    assert!(!dedupe
+        .contains(saga_a, "probe")
+        .expect("contains should succeed"));
 }
 
 struct LmdbParticipant {
@@ -159,7 +165,11 @@ fn prune_saga_removes_lmdb_journal_and_dedupe_state() {
         "terminal cleanup must remove only the pruned saga index"
     );
     assert!(
-        !actor.saga.dedupe.contains(saga_a, "started"),
+        !actor
+            .saga
+            .dedupe
+            .contains(saga_a, "started")
+            .expect("contains should succeed"),
         "terminal cleanup must still prune dedupe rows"
     );
 }

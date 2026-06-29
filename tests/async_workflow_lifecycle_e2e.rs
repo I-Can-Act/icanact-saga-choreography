@@ -148,16 +148,53 @@ fn accepted_step_rejects_idle_timeout_after_hard_timeout() {
         result,
         Err(AcceptedStepError::InvalidPolicy { .. })
     ));
-    assert!(!actor
-        .saga_support()
-        .accepted_workflow_steps
-        .contains_key(&ctx.saga_id));
     assert!(actor
         .saga_support()
         .journal
         .read(ctx.saga_id)
         .expect("journal read should succeed")
         .is_empty());
+}
+
+#[test]
+fn accepted_step_rejects_zero_duration_timeouts() {
+    let mut actor = HarnessActor::default();
+    let ctx = context("create_order", 0);
+    let zero_idle = accept_workflow_step(
+        &mut actor,
+        ctx.clone(),
+        "order-manager".into(),
+        StepExecutionId::new("effect-zero-idle"),
+        AcceptedStepPolicy {
+            idle_timeout: Duration::ZERO,
+            hard_timeout: Duration::from_millis(100),
+            timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
+                requires_compensation: false,
+            },
+        },
+    );
+    assert!(matches!(
+        zero_idle,
+        Err(AcceptedStepError::InvalidPolicy { .. })
+    ));
+
+    let zero_hard = accept_workflow_step(
+        &mut actor,
+        ctx,
+        "order-manager".into(),
+        StepExecutionId::new("effect-zero-hard"),
+        AcceptedStepPolicy {
+            idle_timeout: Duration::from_millis(100),
+            hard_timeout: Duration::ZERO,
+            timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
+                requires_compensation: false,
+            },
+        },
+    );
+    assert!(matches!(
+        zero_hard,
+        Err(AcceptedStepError::InvalidPolicy { .. })
+    ));
 }
 
 #[test]

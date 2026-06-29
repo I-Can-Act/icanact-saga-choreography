@@ -45,7 +45,7 @@ use super::SagaId;
 ///
 /// assert!(dedupe.check_and_mark(saga_id, operation_key)?);
 /// assert!(!dedupe.check_and_mark(saga_id, operation_key)?);
-/// assert!(dedupe.contains(saga_id, operation_key));
+/// assert!(dedupe.contains(saga_id, operation_key)?);
 /// # Ok::<(), icanact_saga_choreography::DedupeError>(())
 /// ```
 pub trait ParticipantDedupeStore: Send + Sync + 'static {
@@ -84,8 +84,12 @@ pub trait ParticipantDedupeStore: Send + Sync + 'static {
     ///
     /// # Returns
     ///
-    /// `true` if the operation has been marked as processed, `false` otherwise.
-    fn contains(&self, saga_id: SagaId, key: &str) -> bool;
+    /// `Ok(true)` if operation marked processed, `Ok(false)` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DedupeError::Storage`] when backing storage cannot answer query.
+    fn contains(&self, saga_id: SagaId, key: &str) -> Result<bool, DedupeError>;
 
     /// Marks an operation as processed without checking first.
     ///
@@ -248,22 +252,16 @@ impl ParticipantDedupeStore for InMemoryDedupe {
             })
     }
 
-    fn contains(&self, saga_id: SagaId, key: &str) -> bool {
-        match self.actor_ref.ask(|reply| InMemoryDedupeMsg::Contains {
-            saga_id,
-            key: key.into(),
-            reply,
-        }) {
-            Ok(contains) => contains,
-            Err(err) => {
-                tracing::error!(
-                    target: "core::saga",
-                    event = "in_memory_dedupe_contains_failed",
-                    error = ?err
-                );
-                false
-            }
-        }
+    fn contains(&self, saga_id: SagaId, key: &str) -> Result<bool, DedupeError> {
+        self.actor_ref
+            .ask(|reply| InMemoryDedupeMsg::Contains {
+                saga_id,
+                key: key.into(),
+                reply,
+            })
+            .map_err(|err| {
+                DedupeError::Storage(format!("in-memory dedupe actor unavailable: {err:?}").into())
+            })
     }
 
     fn mark_processed(&self, saga_id: SagaId, key: &str) -> Result<(), DedupeError> {
@@ -301,7 +299,7 @@ where
         (**self).check_and_mark(saga_id, key)
     }
 
-    fn contains(&self, saga_id: SagaId, key: &str) -> bool {
+    fn contains(&self, saga_id: SagaId, key: &str) -> Result<bool, DedupeError> {
         (**self).contains(saga_id, key)
     }
 

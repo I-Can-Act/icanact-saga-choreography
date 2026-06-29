@@ -38,6 +38,12 @@ pub struct AcceptedStepPolicy {
 
 impl AcceptedStepPolicy {
     pub fn validate(&self) -> Result<(), AcceptedStepPolicyError> {
+        if self.idle_timeout.is_zero() {
+            return Err(AcceptedStepPolicyError::ZeroIdleTimeout);
+        }
+        if self.hard_timeout.is_zero() {
+            return Err(AcceptedStepPolicyError::ZeroHardTimeout);
+        }
         if self.idle_timeout > self.hard_timeout {
             return Err(AcceptedStepPolicyError::IdleTimeoutExceedsHardTimeout {
                 idle_timeout: self.idle_timeout,
@@ -50,6 +56,8 @@ impl AcceptedStepPolicy {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AcceptedStepPolicyError {
+    ZeroIdleTimeout,
+    ZeroHardTimeout,
     IdleTimeoutExceedsHardTimeout {
         idle_timeout: Duration,
         hard_timeout: Duration,
@@ -97,6 +105,11 @@ pub enum AcceptedStepError {
     InvalidPolicy {
         execution_id: StepExecutionId,
         source: AcceptedStepPolicyError,
+    },
+    Durability {
+        saga_id: super::SagaId,
+        execution_id: StepExecutionId,
+        error: Box<str>,
     },
 }
 

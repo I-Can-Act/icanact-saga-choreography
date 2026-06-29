@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use crate::{
-    SagaChoreographyEvent, SagaContext, SagaFailureDetails, SagaId, SagaWorkflowStepContract,
-    WorkflowDependencySpec,
+    AcceptedStepTimeoutOutcome, SagaChoreographyEvent, SagaContext, SagaFailureDetails, SagaId,
+    SagaWorkflowStepContract, StepExecutionId, WorkflowDependencySpec,
 };
 
 pub const TERMINAL_RESOLVER_STEP: &str = "terminal_resolver";
@@ -153,10 +153,20 @@ struct SagaResolutionState {
     compensation_requested: bool,
     pending_compensation_steps: HashSet<Box<str>>,
     pending_failure: Option<SagaFailureDetails>,
+    accepted_steps: HashMap<Box<str>, AcceptedStepResolverState>,
     started_at_millis: u64,
     last_progress_at_millis: u64,
     last_context: SagaContext,
     terminal_latched: bool,
+}
+
+#[derive(Clone, Debug)]
+struct AcceptedStepResolverState {
+    participant_id: Box<str>,
+    execution_id: StepExecutionId,
+    deadline_at_millis: u64,
+    hard_deadline_at_millis: u64,
+    timeout_outcome: AcceptedStepTimeoutOutcome,
 }
 
 impl SagaResolutionState {
@@ -172,6 +182,7 @@ impl SagaResolutionState {
             compensation_requested: false,
             pending_compensation_steps: HashSet::new(),
             pending_failure: None,
+            accepted_steps: HashMap::new(),
             started_at_millis,
             last_progress_at_millis: progress_at_millis,
             last_context: seed_context.clone(),
@@ -243,8 +254,25 @@ impl TerminalResolver {
             SagaChoreographyEvent::StepStarted { context } => {
                 state.started_steps.insert(context.step_name.clone());
             }
-            SagaChoreographyEvent::StepAccepted { context, .. } => {
+            SagaChoreographyEvent::StepAccepted {
+                context,
+                participant_id,
+                execution_id,
+                deadline_at_millis,
+                hard_deadline_at_millis,
+                timeout_outcome,
+            } => {
                 state.started_steps.insert(context.step_name.clone());
+                state.accepted_steps.insert(
+                    context.step_name.clone(),
+                    AcceptedStepResolverState {
+                        participant_id: participant_id.clone(),
+                        execution_id: execution_id.clone(),
+                        deadline_at_millis: *deadline_at_millis,
+                        hard_deadline_at_millis: *hard_deadline_at_millis,
+                        timeout_outcome: timeout_outcome.clone(),
+                    },
+                );
             }
             SagaChoreographyEvent::StepAck { context, .. } => {
                 state.started_steps.insert(context.step_name.clone());
@@ -256,6 +284,7 @@ impl TerminalResolver {
                 ..
             } => {
                 let step_name = context.step_name.clone();
+                state.accepted_steps.remove(step_name.as_ref());
                 state.started_steps.insert(step_name.clone());
                 state.completed_steps.insert(step_name.clone());
                 if *compensation_available
@@ -284,6 +313,7 @@ impl TerminalResolver {
                 error,
                 requires_compensation,
             } => {
+                state.accepted_steps.remove(context.step_name.as_ref());
                 state.started_steps.insert(context.step_name.clone());
                 state.failed_steps.insert(context.step_name.clone());
                 if !self
@@ -294,47 +324,15 @@ impl TerminalResolver {
                     return out;
                 }
 
-                let failure = SagaFailureDetails {
-                    step_name: context.step_name.clone(),
-                    participant_id: participant_id.clone(),
-                    error_code: error_code.clone(),
-                    error_message: error.clone(),
-                    at_millis: context.event_timestamp_millis,
-                };
-
-                if *requires_compensation {
-                    state.pending_failure = Some(failure.clone());
-                    if !state.compensation_requested {
-                        let steps_to_compensate: Vec<Box<str>> =
-                            state.compensable_steps.iter().rev().cloned().collect();
-                        state.pending_compensation_steps =
-                            steps_to_compensate.iter().cloned().collect();
-                        state.compensation_requested = true;
-
-                        out.push(SagaChoreographyEvent::CompensationRequested {
-                            context: terminal_context(context),
-                            failed_step: context.step_name.clone(),
-                            reason: error.clone(),
-                            steps_to_compensate,
-                        });
-                    }
-
-                    if state.pending_compensation_steps.is_empty() {
-                        out.push(SagaChoreographyEvent::SagaFailed {
-                            context: terminal_context(context),
-                            reason: "step failed and no compensations were pending".into(),
-                            failure: Some(failure),
-                        });
-                        state.terminal_latched = true;
-                    }
-                } else {
-                    out.push(SagaChoreographyEvent::SagaFailed {
-                        context: terminal_context(context),
-                        reason: error.clone(),
-                        failure: Some(failure),
-                    });
-                    state.terminal_latched = true;
-                }
+                apply_step_failure(
+                    state,
+                    context,
+                    participant_id.clone(),
+                    error_code.clone(),
+                    error.clone(),
+                    *requires_compensation,
+                    &mut out,
+                );
             }
             SagaChoreographyEvent::CompensationCompleted { context } => {
                 if state.compensation_requested {
@@ -393,10 +391,7 @@ impl TerminalResolver {
         }
 
         if !state.terminal_latched {
-            if let Some(timeout_event) = timeout_terminal_event(&self.policy, state, now_millis) {
-                out.push(timeout_event);
-                state.terminal_latched = true;
-            }
+            out.extend(timeout_events(&self.policy, state, now_millis));
         }
 
         if state.terminal_latched {
@@ -417,10 +412,9 @@ impl TerminalResolver {
             if state.terminal_latched {
                 continue;
             }
-            if let Some(timeout_event) = timeout_terminal_event(&self.policy, state, now_millis) {
-                state.terminal_latched = true;
+            out.extend(timeout_events(&self.policy, state, now_millis));
+            if state.terminal_latched {
                 newly_latched.push(*saga_id);
-                out.push(timeout_event);
             }
         }
         for saga_id in newly_latched {
@@ -446,13 +440,14 @@ impl TerminalResolver {
 }
 
 fn terminal_latch_retention_limit() -> usize {
-    match std::env::var("SAGA_TERMINAL_LATCH_RETENTION") {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| match std::env::var("SAGA_TERMINAL_LATCH_RETENTION") {
         Ok(raw) => match raw.parse::<usize>() {
             Ok(parsed) if parsed > 0 => parsed,
             _ => 4096,
         },
         Err(_) => 4096,
-    }
+    })
 }
 
 fn terminal_context(context: &SagaContext) -> SagaContext {
@@ -479,6 +474,138 @@ fn is_progress_event(event: &SagaChoreographyEvent) -> bool {
             | SagaChoreographyEvent::CompensationCompleted { .. }
             | SagaChoreographyEvent::CompensationFailed { .. }
     )
+}
+
+fn timeout_events(
+    policy: &TerminalPolicy,
+    state: &mut SagaResolutionState,
+    now_millis: u64,
+) -> Vec<SagaChoreographyEvent> {
+    if let Some(events) = accepted_step_timeout_events(policy, state, now_millis) {
+        return events;
+    }
+    if let Some(timeout_event) = timeout_terminal_event(policy, state, now_millis) {
+        state.terminal_latched = true;
+        return vec![timeout_event];
+    }
+    Vec::new()
+}
+
+fn accepted_step_timeout_events(
+    policy: &TerminalPolicy,
+    state: &mut SagaResolutionState,
+    now_millis: u64,
+) -> Option<Vec<SagaChoreographyEvent>> {
+    let expired = state
+        .accepted_steps
+        .iter()
+        .find_map(|(step_name, accepted)| {
+            if now_millis > accepted.hard_deadline_at_millis {
+                Some((step_name.clone(), accepted.clone(), true))
+            } else if now_millis > accepted.deadline_at_millis {
+                Some((step_name.clone(), accepted.clone(), false))
+            } else {
+                None
+            }
+        })?;
+
+    let (step_name, accepted, hard_timeout) = expired;
+    state.accepted_steps.remove(step_name.as_ref());
+    if !policy.failure_authority.is_authorized(step_name.as_ref()) {
+        return Some(Vec::new());
+    }
+
+    let timeout_kind = if hard_timeout { "hard" } else { "idle" };
+    let mut context = state.last_context.next_step(step_name.clone());
+    context.event_timestamp_millis = now_millis;
+    let reason: Box<str> = format!(
+        "accepted step {timeout_kind} timeout: step={} execution_id={} deadline_at_millis={} hard_deadline_at_millis={}",
+        step_name,
+        accepted.execution_id,
+        accepted.deadline_at_millis,
+        accepted.hard_deadline_at_millis
+    )
+    .into();
+
+    match accepted.timeout_outcome {
+        AcceptedStepTimeoutOutcome::FailStep {
+            requires_compensation,
+        } => {
+            let mut out = Vec::new();
+            state.started_steps.insert(step_name.clone());
+            state.failed_steps.insert(step_name);
+            apply_step_failure(
+                state,
+                &context,
+                accepted.participant_id,
+                Some(timeout_kind.into()),
+                reason,
+                requires_compensation,
+                &mut out,
+            );
+            Some(out)
+        }
+        AcceptedStepTimeoutOutcome::QuarantineSaga => {
+            state.terminal_latched = true;
+            Some(vec![SagaChoreographyEvent::SagaQuarantined {
+                context: terminal_context_at(&context, now_millis),
+                reason,
+                step: context.step_name.clone(),
+                participant_id: accepted.participant_id,
+            }])
+        }
+    }
+}
+
+fn apply_step_failure(
+    state: &mut SagaResolutionState,
+    context: &SagaContext,
+    participant_id: Box<str>,
+    error_code: Option<Box<str>>,
+    error: Box<str>,
+    requires_compensation: bool,
+    out: &mut Vec<SagaChoreographyEvent>,
+) {
+    let failure = SagaFailureDetails {
+        step_name: context.step_name.clone(),
+        participant_id,
+        error_code,
+        error_message: error.clone(),
+        at_millis: context.event_timestamp_millis,
+    };
+
+    if requires_compensation {
+        state.pending_failure = Some(failure.clone());
+        if !state.compensation_requested {
+            let steps_to_compensate: Vec<Box<str>> =
+                state.compensable_steps.iter().rev().cloned().collect();
+            state.pending_compensation_steps = steps_to_compensate.iter().cloned().collect();
+            state.compensation_requested = true;
+
+            out.push(SagaChoreographyEvent::CompensationRequested {
+                context: terminal_context(context),
+                failed_step: context.step_name.clone(),
+                reason: error.clone(),
+                steps_to_compensate,
+            });
+        }
+
+        if state.pending_compensation_steps.is_empty() {
+            out.push(SagaChoreographyEvent::SagaFailed {
+                context: terminal_context(context),
+                reason: "step failed and no compensations were pending".into(),
+                failure: Some(failure),
+            });
+            state.terminal_latched = true;
+        }
+    } else {
+        out.push(SagaChoreographyEvent::SagaFailed {
+            context: terminal_context(context),
+            reason: error,
+            failure: Some(failure),
+        });
+        state.terminal_latched = true;
+    }
 }
 
 #[derive(Debug)]
@@ -739,8 +866,8 @@ mod tests {
     use std::time::Duration;
 
     use crate::{
-        SagaChoreographyEvent, SagaContext, SagaId, SagaWorkflowStepContract,
-        WorkflowDependencySpec,
+        AcceptedStepTimeoutOutcome, SagaChoreographyEvent, SagaContext, SagaId,
+        SagaWorkflowStepContract, StepExecutionId, WorkflowDependencySpec,
     };
 
     use super::{FailureAuthority, SuccessCriteria, TerminalPolicy, TerminalResolver};
@@ -934,6 +1061,65 @@ mod tests {
             ),
             "expected hard-timeout failure, got: {timed_out:?}"
         );
+    }
+
+    #[test]
+    fn accepted_step_idle_timeout_is_enforced_by_terminal_resolver() {
+        let mut resolver = TerminalResolver::new(open_position_policy(Duration::from_secs(5)));
+        let start = SagaChoreographyEvent::SagaStarted {
+            context: ctx_at("create_order", 9, 1_000, 1_000),
+            payload: Vec::new(),
+        };
+        let _ = resolver.ingest_at(&start, 1_000);
+        let accepted = SagaChoreographyEvent::StepAccepted {
+            context: ctx_at("create_order", 9, 1_000, 1_010),
+            participant_id: "order-manager".into(),
+            execution_id: StepExecutionId::new("external-9"),
+            deadline_at_millis: 1_110,
+            hard_deadline_at_millis: 1_300,
+            timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
+                requires_compensation: false,
+            },
+        };
+        let _ = resolver.ingest_at(&accepted, 1_010);
+
+        assert!(resolver.poll_timeouts_at(1_110).is_empty());
+        let timed_out = resolver.poll_timeouts_at(1_111);
+        assert!(matches!(
+            timed_out.as_slice(),
+            [SagaChoreographyEvent::SagaFailed { reason, failure: Some(failure), .. }]
+                if reason.contains("accepted step idle timeout")
+                    && failure.step_name.as_ref() == "create_order"
+                    && failure.participant_id.as_ref() == "order-manager"
+        ));
+    }
+
+    #[test]
+    fn accepted_step_hard_timeout_can_quarantine_from_terminal_resolver() {
+        let mut resolver = TerminalResolver::new(open_position_policy(Duration::from_secs(5)));
+        let start = SagaChoreographyEvent::SagaStarted {
+            context: ctx_at("create_order", 9, 1_000, 1_000),
+            payload: Vec::new(),
+        };
+        let _ = resolver.ingest_at(&start, 1_000);
+        let accepted = SagaChoreographyEvent::StepAccepted {
+            context: ctx_at("create_order", 9, 1_000, 1_010),
+            participant_id: "order-manager".into(),
+            execution_id: StepExecutionId::new("external-9"),
+            deadline_at_millis: 1_110,
+            hard_deadline_at_millis: 1_120,
+            timeout_outcome: AcceptedStepTimeoutOutcome::QuarantineSaga,
+        };
+        let _ = resolver.ingest_at(&accepted, 1_010);
+
+        let timed_out = resolver.poll_timeouts_at(1_121);
+        assert!(matches!(
+            timed_out.as_slice(),
+            [SagaChoreographyEvent::SagaQuarantined { reason, step, participant_id, .. }]
+                if reason.contains("accepted step hard timeout")
+                    && step.as_ref() == "create_order"
+                    && participant_id.as_ref() == "order-manager"
+        ));
     }
 
     #[test]

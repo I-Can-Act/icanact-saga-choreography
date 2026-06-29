@@ -73,6 +73,7 @@ impl SyncParticipant {
                 self.saga
                     .dedupe
                     .contains(saga_id, "1:1700000000000:saga_started:start")
+                    .expect("dedupe contains should succeed")
             })
             .unwrap_or(false);
         SyncSnapshot {
@@ -852,17 +853,21 @@ fn sync_world_runs_real_workflow_participant_path() {
         .iter()
         .position(|event| matches!(event, SagaChoreographyEvent::StepStarted { context } if context.step_name.as_ref() == "beta_step"))
         .expect("workflow participant should start step");
-    let accepted_index = workflow_events
-        .iter()
-        .position(|event| matches!(event, SagaChoreographyEvent::StepAccepted { context, .. } if context.step_name.as_ref() == "beta_step"))
-        .expect("workflow participant should accept the step before resolving it");
+    assert!(
+        !workflow_events.iter().any(|event| matches!(
+            event,
+            SagaChoreographyEvent::StepAccepted { context, .. }
+                if context.step_name.as_ref() == "beta_step"
+        )),
+        "sync workflow transcript must not record fake accepted-step events: {workflow_events:?}"
+    );
     let completed_index = workflow_events
         .iter()
         .position(|event| matches!(event, SagaChoreographyEvent::StepCompleted { context, .. } if context.step_name.as_ref() == "beta_step"))
         .expect("workflow participant should complete step");
     assert!(
-        started_index < accepted_index && accepted_index < completed_index,
-        "workflow transcript should record started before accepted before completed: {workflow_events:?}"
+        started_index < completed_index,
+        "workflow transcript should record started before completed: {workflow_events:?}"
     );
 
     actor.shutdown();

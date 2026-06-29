@@ -43,6 +43,7 @@ pub enum SagaChoreographyEvent {
         context: SagaContext,
     },
     /// Emitted when a participant accepts async responsibility for a step.
+    #[non_exhaustive]
     StepAccepted {
         /// The saga context containing identifiers and metadata.
         context: SagaContext,
@@ -54,6 +55,8 @@ pub enum SagaChoreographyEvent {
         deadline_at_millis: u64,
         /// Non-resettable hard deadline in epoch milliseconds.
         hard_deadline_at_millis: u64,
+        /// Terminal outcome to apply when accepted step deadline expires.
+        timeout_outcome: AcceptedStepTimeoutOutcome,
     },
     /// Emitted when a step completes successfully.
     StepCompleted {

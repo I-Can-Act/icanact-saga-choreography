@@ -111,13 +111,16 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
     }
 
     fn terminal_latch_retention_limit(&self) -> usize {
-        match std::env::var("SAGA_PARTICIPANT_TERMINAL_LATCH_RETENTION") {
-            Ok(raw) => match raw.parse::<usize>() {
-                Ok(parsed) if parsed > 0 => parsed,
-                _ => 4096,
+        static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *LIMIT.get_or_init(
+            || match std::env::var("SAGA_PARTICIPANT_TERMINAL_LATCH_RETENTION") {
+                Ok(raw) => match raw.parse::<usize>() {
+                    Ok(parsed) if parsed > 0 => parsed,
+                    _ => 4096,
+                },
+                Err(_) => 4096,
             },
-            Err(_) => 4096,
-        }
+        )
     }
 
     fn latch_terminal_saga(&mut self, saga_id: SagaId) {

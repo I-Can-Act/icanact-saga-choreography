@@ -88,6 +88,27 @@ where
             Err("saga bus is not attached".to_string())
         }
     }
+
+    pub fn has_accepted_workflow_step(&self, saga_id: SagaId) -> bool {
+        self.accepted_workflow_steps.contains_key(&saga_id)
+    }
+
+    pub fn accepted_workflow_step_count(&self) -> usize {
+        self.accepted_workflow_steps.len()
+    }
+
+    pub fn has_resolved_workflow_step(
+        &self,
+        saga_id: SagaId,
+        execution_id: &StepExecutionId,
+    ) -> bool {
+        self.resolved_workflow_steps
+            .contains(&(saga_id, execution_id.clone()))
+    }
+
+    pub fn resolved_workflow_step_count(&self) -> usize {
+        self.resolved_workflow_steps.len()
+    }
 }
 
 impl<J, D> std::fmt::Debug for SagaParticipantSupport<J, D>
