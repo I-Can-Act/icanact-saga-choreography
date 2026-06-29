@@ -8,8 +8,8 @@ use icanact_saga_choreography::{
     AcceptedStepCompletion, AcceptedStepError, AcceptedStepFailure, AcceptedStepPolicy,
     AcceptedStepTimeoutOutcome, FailureAuthority, HasSagaParticipantSupport, InMemoryDedupe,
     InMemoryJournal, ParticipantEvent, ParticipantJournal, SagaChoreographyEvent, SagaContext,
-    SagaId, SagaParticipantSupport, SagaTerminalOutcome, SagaTestWorld, StepExecutionId,
-    SuccessCriteria, TerminalPolicy, TerminalResolver,
+    SagaId, SagaParticipantSupport, SagaStateExt, SagaTerminalOutcome, SagaTestWorld,
+    StepExecutionId, SuccessCriteria, TerminalPolicy, TerminalResolver,
 };
 
 struct HarnessActor {
@@ -134,6 +134,47 @@ fn accepted_step_does_not_complete_saga_until_late_completion() {
 }
 
 #[test]
+fn accepted_step_uses_actor_clock_for_context_and_deadlines() {
+    let mut actor = HarnessActor::default();
+    let mut ctx = context("create_order", 20);
+    ctx.event_timestamp_millis = 1;
+
+    let accepted = accept_workflow_step(
+        &mut actor,
+        ctx.clone(),
+        "order-manager".into(),
+        StepExecutionId::new("effect-20"),
+        policy(AcceptedStepTimeoutOutcome::FailStep {
+            requires_compensation: false,
+        }),
+    )
+    .expect("step should be accepted");
+
+    let SagaChoreographyEvent::StepAccepted {
+        context,
+        deadline_at_millis,
+        hard_deadline_at_millis,
+        ..
+    } = accepted
+    else {
+        panic!("expected step accepted event");
+    };
+
+    assert!(
+        context.event_timestamp_millis > ctx.event_timestamp_millis,
+        "acceptance timestamp must come from participant local time"
+    );
+    assert_eq!(
+        deadline_at_millis,
+        context.event_timestamp_millis + Duration::from_millis(100).as_millis() as u64
+    );
+    assert_eq!(
+        hard_deadline_at_millis,
+        context.event_timestamp_millis + Duration::from_millis(250).as_millis() as u64
+    );
+}
+
+#[test]
 fn accepted_step_late_completion_completes_saga_once() {
     let mut actor = HarnessActor::default();
     let ctx = context("create_order", 2);
@@ -198,13 +239,18 @@ fn accepted_step_completion_records_actual_completion_time() {
     )
     .expect("step should be accepted");
 
-    complete_accepted_workflow_step(
+    let completed = complete_accepted_workflow_step(
         &mut actor,
         ctx.saga_id,
         execution_id,
         completion(completed_at_millis, b"created", b"input", Vec::new()),
     )
     .expect("late completion should resolve accepted step");
+    assert!(matches!(
+    completed,
+    SagaChoreographyEvent::StepCompleted { ref context, .. }
+    if context.event_timestamp_millis == completed_at_millis
+    ));
 
     let entries = actor
         .saga
@@ -220,6 +266,44 @@ fn accepted_step_completion_records_actual_completion_time() {
             } if *observed == completed_at_millis
         )
     }));
+}
+
+#[test]
+fn prune_clears_accepted_and_resolved_workflow_step_state() {
+    let mut actor = HarnessActor::default();
+    let ctx = context("create_order", 23);
+    let execution_id = StepExecutionId::new("effect-23");
+
+    accept_workflow_step(
+        &mut actor,
+        ctx.clone(),
+        "order-manager".into(),
+        execution_id.clone(),
+        policy(AcceptedStepTimeoutOutcome::FailStep {
+            requires_compensation: false,
+        }),
+    )
+    .expect("step should be accepted");
+    complete_accepted_workflow_step(
+        &mut actor,
+        ctx.saga_id,
+        execution_id.clone(),
+        completion(1_700_000_000_050, b"created", b"input", Vec::new()),
+    )
+    .expect("accepted step should complete");
+
+    actor.prune_saga(ctx.saga_id);
+
+    accept_workflow_step(
+        &mut actor,
+        ctx,
+        "order-manager".into(),
+        execution_id,
+        policy(AcceptedStepTimeoutOutcome::FailStep {
+            requires_compensation: false,
+        }),
+    )
+    .expect("pruned saga id should be reusable with the same execution id");
 }
 
 #[test]
@@ -289,19 +373,24 @@ fn accepted_step_late_failure_fails_saga_with_authority() {
     let terminal = resolver.ingest(&failed);
 
     assert!(matches!(
-        failed,
-        SagaChoreographyEvent::StepFailed {
-            ref participant_id,
-            ref error,
-            ..
-        } if participant_id.as_ref() == "order-manager"
-            && error.contains("transport dispatch failed")
+            failed,
+            SagaChoreographyEvent::StepFailed {
+                ref participant_id,
+                ref error,
+                ..
+    } if participant_id.as_ref() == "order-manager"
+    && error.contains("transport dispatch failed")
     ));
     assert!(matches!(
-        terminal.as_slice(),
-        [SagaChoreographyEvent::SagaFailed { failure: Some(details), .. }]
-            if details.participant_id.as_ref() == "order-manager"
+    failed,
+    SagaChoreographyEvent::StepFailed { ref context, .. }
+    if context.event_timestamp_millis == 1_700_000_000_070
     ));
+    assert!(matches!(
+    terminal.as_slice(),
+    [SagaChoreographyEvent::SagaFailed { failure: Some(details), .. }]
+                if details.participant_id.as_ref() == "order-manager"
+        ));
 }
 
 #[test]
@@ -318,18 +407,27 @@ fn accepted_step_timeout_can_quarantine_ambiguous_saga() {
         policy(AcceptedStepTimeoutOutcome::QuarantineSaga),
     )
     .expect("step should be accepted");
+    let SagaChoreographyEvent::StepAccepted {
+        deadline_at_millis, ..
+    } = &accepted
+    else {
+        panic!("expected accepted step");
+    };
     assert!(resolver.ingest(&accepted).is_empty());
 
-    let timed_out = poll_accepted_workflow_step_timeouts(&mut actor, 1_700_000_000_101);
+    let timed_out_at_millis = deadline_at_millis + 1;
+    let timed_out = poll_accepted_workflow_step_timeouts(&mut actor, timed_out_at_millis);
 
     assert!(matches!(
-        timed_out.as_slice(),
+                timed_out.as_slice(),
         [SagaChoreographyEvent::SagaQuarantined {
-            reason,
-            participant_id,
-            ..
-        }] if reason.contains("accepted step idle timeout")
-            && participant_id.as_ref() == "order-manager"
+        context,
+        reason,
+        participant_id,
+    ..
+    }] if context.event_timestamp_millis == timed_out_at_millis
+    && reason.contains("accepted step idle timeout")
+    && participant_id.as_ref() == "order-manager"
     ));
 }
 
@@ -349,28 +447,35 @@ fn accepted_step_progress_extends_idle_deadline_but_not_hard_deadline() {
         }),
     )
     .expect("step should be accepted");
-    assert!(matches!(
-        accepted,
-        SagaChoreographyEvent::StepAccepted { .. }
-    ));
+    let SagaChoreographyEvent::StepAccepted {
+        context,
+        hard_deadline_at_millis,
+        ..
+    } = &accepted
+    else {
+        panic!("expected accepted step");
+    };
+    let accepted_at_millis = context.event_timestamp_millis;
 
     record_accepted_workflow_step_progress(
         &mut actor,
         ctx.saga_id,
         execution_id.clone(),
-        1_700_000_000_090,
+        accepted_at_millis + 90,
     )
     .expect("progress should extend idle deadline");
     assert!(
-        poll_accepted_workflow_step_timeouts(&mut actor, 1_700_000_000_180).is_empty(),
+        poll_accepted_workflow_step_timeouts(&mut actor, accepted_at_millis + 180).is_empty(),
         "idle timeout should be refreshed by progress"
     );
 
-    let hard_timed_out = poll_accepted_workflow_step_timeouts(&mut actor, 1_700_000_000_251);
+    let hard_timed_out_at_millis = hard_deadline_at_millis + 1;
+    let hard_timed_out = poll_accepted_workflow_step_timeouts(&mut actor, hard_timed_out_at_millis);
     assert!(matches!(
-        hard_timed_out.as_slice(),
-        [SagaChoreographyEvent::StepFailed { error, .. }]
-            if error.contains("accepted step hard timeout")
+    hard_timed_out.as_slice(),
+    [SagaChoreographyEvent::StepFailed { context, error, .. }]
+    if context.event_timestamp_millis == hard_timed_out_at_millis
+    && error.contains("accepted step hard timeout")
     ));
     assert!(matches!(
         complete_accepted_workflow_step(

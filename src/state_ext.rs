@@ -82,6 +82,19 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
         &mut self.saga_support_mut().dependency_fired
     }
 
+    /// Clears per-run in-memory tracking for a saga id before a new run or prune.
+    fn clear_in_memory_saga_run_tracking(&mut self, saga_id: SagaId) {
+        self.saga_states().remove(&saga_id);
+        self.dependency_completions().remove(&saga_id);
+        self.dependency_fired().remove(&saga_id);
+        self.saga_support_mut()
+            .accepted_workflow_steps
+            .remove(&saga_id);
+        self.saga_support_mut()
+            .resolved_workflow_steps
+            .retain(|(resolved_saga_id, _)| *resolved_saga_id != saga_id);
+    }
+
     /// Returns mutable access to terminal saga latches.
     fn terminal_sagas(&mut self) -> &mut HashSet<SagaId> {
         &mut self.saga_support_mut().terminal_sagas
@@ -241,9 +254,7 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
     ///
     /// * `saga_id` - The unique identifier of the saga to prune
     fn prune_saga_strict(&mut self, saga_id: SagaId) -> Result<(), SagaStateStoreError> {
-        self.saga_states().remove(&saga_id);
-        self.dependency_completions().remove(&saga_id);
-        self.dependency_fired().remove(&saga_id);
+        self.clear_in_memory_saga_run_tracking(saga_id);
         self.saga_journal()
             .prune(saga_id)
             .map_err(SagaStateStoreError::Journal)?;

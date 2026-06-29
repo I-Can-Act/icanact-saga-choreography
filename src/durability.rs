@@ -157,7 +157,9 @@ where
         });
     }
 
-    let accepted_at_millis = context.event_timestamp_millis;
+    let accepted_at_millis = actor.now_millis();
+    let mut accepted_context = context;
+    accepted_context.event_timestamp_millis = accepted_at_millis;
     let deadline_at_millis =
         accepted_at_millis.saturating_add(policy.idle_timeout.as_millis() as u64);
     let hard_deadline_at_millis =
@@ -165,12 +167,12 @@ where
 
     let state = crate::SagaParticipantState::new(
         saga_id,
-        context.saga_type.clone(),
-        context.step_name.clone(),
-        context.correlation_id,
-        context.trace_id,
-        context.initiator_peer_id,
-        context.saga_started_at_millis,
+        accepted_context.saga_type.clone(),
+        accepted_context.step_name.clone(),
+        accepted_context.correlation_id,
+        accepted_context.trace_id,
+        accepted_context.initiator_peer_id,
+        accepted_context.saga_started_at_millis,
     )
     .trigger("step_accepted", accepted_at_millis)
     .start_execution(accepted_at_millis);
@@ -188,7 +190,7 @@ where
     actor.saga_support_mut().accepted_workflow_steps.insert(
         saga_id,
         AcceptedWorkflowStep {
-            context: context.clone(),
+            context: accepted_context.clone(),
             participant_id: participant_id.clone(),
             execution_id: execution_id.clone(),
             policy,
@@ -199,7 +201,7 @@ where
     );
 
     Ok(SagaChoreographyEvent::StepAccepted {
-        context,
+        context: accepted_context,
         participant_id,
         execution_id,
         deadline_at_millis,
@@ -237,8 +239,11 @@ where
     );
     mark_accepted_step_resolved(actor, saga_id, execution_id.clone());
 
+    let mut context = accepted.context;
+    context.event_timestamp_millis = completion.completed_at_millis;
+
     Ok(SagaChoreographyEvent::StepCompleted {
-        context: accepted.context,
+        context,
         output: completion.output,
         saga_input: completion.saga_input,
         compensation_available: !completion.compensation_data.is_empty(),
@@ -275,8 +280,11 @@ where
     );
     mark_accepted_step_resolved(actor, saga_id, execution_id);
 
+    let mut context = accepted.context;
+    context.event_timestamp_millis = failure.failed_at_millis;
+
     Ok(SagaChoreographyEvent::StepFailed {
-        context: accepted.context,
+        context,
         participant_id: accepted.participant_id,
         error_code: None,
         error: failure.reason,
@@ -402,8 +410,10 @@ where
                     failed_at_millis: timed_out_at_millis,
                 },
             );
+            let mut context = accepted.context;
+            context.event_timestamp_millis = timed_out_at_millis;
             Ok(SagaChoreographyEvent::StepFailed {
-                context: accepted.context,
+                context,
                 participant_id: accepted.participant_id,
                 error_code: None,
                 error: reason,
@@ -425,8 +435,10 @@ where
                 },
             );
             let step = accepted.context.step_name.clone();
+            let mut context = accepted.context;
+            context.event_timestamp_millis = timed_out_at_millis;
             Ok(SagaChoreographyEvent::SagaQuarantined {
-                context: accepted.context,
+                context,
                 reason,
                 step,
                 participant_id: accepted.participant_id,
@@ -705,9 +717,7 @@ fn handle_workflow_saga_event_with_emit<A, F>(
             if workflow.depends_on().is_on_saga_start() =>
         {
             actor.unlatch_terminal_saga(context.saga_id);
-            actor.saga_states().remove(&context.saga_id);
-            actor.dependency_completions().remove(&context.saga_id);
-            actor.dependency_fired().remove(&context.saga_id);
+            actor.clear_in_memory_saga_run_tracking(context.saga_id);
             execute_workflow_step_with_emit(
                 actor,
                 workflow,
@@ -719,9 +729,7 @@ fn handle_workflow_saga_event_with_emit<A, F>(
         }
         SagaChoreographyEvent::SagaStarted { .. } => {
             actor.unlatch_terminal_saga(context.saga_id);
-            actor.saga_states().remove(&context.saga_id);
-            actor.dependency_completions().remove(&context.saga_id);
-            actor.dependency_fired().remove(&context.saga_id);
+            actor.clear_in_memory_saga_run_tracking(context.saga_id);
         }
         SagaChoreographyEvent::StepCompleted {
             context: step_ctx,

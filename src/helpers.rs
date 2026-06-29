@@ -46,11 +46,7 @@ pub fn handle_saga_event_with_emit<P, F>(
             // Reset per-saga in-memory dependency/state tracking so old runs cannot
             // satisfy dependencies for the new run.
             participant.unlatch_terminal_saga(context.saga_id);
-            participant.saga_states().remove(&context.saga_id);
-            participant
-                .dependency_completions()
-                .remove(&context.saga_id);
-            participant.dependency_fired().remove(&context.saga_id);
+            participant.clear_in_memory_saga_run_tracking(context.saga_id);
             execute_step_wrapper_with_emit(participant, context.clone(), payload, now, &mut emit);
         }
 
@@ -59,11 +55,7 @@ pub fn handle_saga_event_with_emit<P, F>(
             // dependency/state entries for this saga id so downstream dependency checks
             // are scoped to the current run.
             participant.unlatch_terminal_saga(context.saga_id);
-            participant.saga_states().remove(&context.saga_id);
-            participant
-                .dependency_completions()
-                .remove(&context.saga_id);
-            participant.dependency_fired().remove(&context.saga_id);
+            participant.clear_in_memory_saga_run_tracking(context.saga_id);
         }
 
         SagaChoreographyEvent::StepCompleted {
@@ -155,11 +147,7 @@ pub async fn handle_async_saga_event_with_emit<P, F>(
             if participant.depends_on().is_on_saga_start() =>
         {
             participant.unlatch_terminal_saga(context.saga_id);
-            participant.saga_states().remove(&context.saga_id);
-            participant
-                .dependency_completions()
-                .remove(&context.saga_id);
-            participant.dependency_fired().remove(&context.saga_id);
+            participant.clear_in_memory_saga_run_tracking(context.saga_id);
             execute_step_wrapper_with_emit_async(
                 participant,
                 context.clone(),
@@ -171,11 +159,7 @@ pub async fn handle_async_saga_event_with_emit<P, F>(
         }
         SagaChoreographyEvent::SagaStarted { .. } => {
             participant.unlatch_terminal_saga(context.saga_id);
-            participant.saga_states().remove(&context.saga_id);
-            participant
-                .dependency_completions()
-                .remove(&context.saga_id);
-            participant.dependency_fired().remove(&context.saga_id);
+            participant.clear_in_memory_saga_run_tracking(context.saga_id);
         }
         SagaChoreographyEvent::StepCompleted {
             context: step_ctx,
