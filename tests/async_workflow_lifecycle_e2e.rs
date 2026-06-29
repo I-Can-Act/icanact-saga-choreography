@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 
 use icanact_saga_choreography::{
@@ -39,6 +42,88 @@ impl HasSagaParticipantSupport for HarnessActor {
 }
 
 impl HasSagaWorkflowParticipants for HarnessActor {
+    fn saga_workflows() -> &'static [&'static dyn SagaWorkflowParticipant<Self>] {
+        &[]
+    }
+}
+
+struct FailOnAppendJournal {
+    inner: InMemoryJournal,
+    fail_on_append: usize,
+    appends: AtomicUsize,
+}
+
+impl FailOnAppendJournal {
+    fn new(fail_on_append: usize) -> Self {
+        Self {
+            inner: InMemoryJournal::new(),
+            fail_on_append,
+            appends: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl ParticipantJournal for FailOnAppendJournal {
+    fn append(
+        &self,
+        saga_id: SagaId,
+        event: ParticipantEvent,
+    ) -> Result<u64, icanact_saga_choreography::JournalError> {
+        let append_number = self.appends.fetch_add(1, Ordering::SeqCst) + 1;
+        if append_number == self.fail_on_append {
+            return Err(icanact_saga_choreography::JournalError::Storage(
+                format!("forced append failure {append_number}").into(),
+            ));
+        }
+        self.inner.append(saga_id, event)
+    }
+
+    fn read(
+        &self,
+        saga_id: SagaId,
+    ) -> Result<Vec<icanact_saga_choreography::JournalEntry>, icanact_saga_choreography::JournalError>
+    {
+        self.inner.read(saga_id)
+    }
+
+    fn list_sagas(&self) -> Result<Vec<SagaId>, icanact_saga_choreography::JournalError> {
+        self.inner.list_sagas()
+    }
+
+    fn prune(&self, saga_id: SagaId) -> Result<(), icanact_saga_choreography::JournalError> {
+        self.inner.prune(saga_id)
+    }
+}
+
+struct FailingJournalActor {
+    saga: SagaParticipantSupport<FailOnAppendJournal, InMemoryDedupe>,
+}
+
+impl FailingJournalActor {
+    fn fail_on_append(fail_on_append: usize) -> Self {
+        Self {
+            saga: SagaParticipantSupport::new(
+                FailOnAppendJournal::new(fail_on_append),
+                InMemoryDedupe::new(),
+            ),
+        }
+    }
+}
+
+impl HasSagaParticipantSupport for FailingJournalActor {
+    type Journal = FailOnAppendJournal;
+    type Dedupe = InMemoryDedupe;
+
+    fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+        &self.saga
+    }
+
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+        &mut self.saga
+    }
+}
+
+impl HasSagaWorkflowParticipants for FailingJournalActor {
     fn saga_workflows() -> &'static [&'static dyn SagaWorkflowParticipant<Self>] {
         &[]
     }
@@ -236,6 +321,187 @@ fn accepted_step_does_not_complete_saga_until_late_completion() {
         resolver.ingest(&accepted).is_empty(),
         "accepted step is progress, not completion"
     );
+}
+
+#[test]
+fn accept_failure_on_started_append_leaves_no_accepted_metadata() {
+    let mut actor = FailingJournalActor::fail_on_append(1);
+    let ctx = context("create_order", 30);
+
+    assert!(matches!(
+        accept_workflow_step(
+            &mut actor,
+            ctx.clone(),
+            "order-manager".into(),
+            StepExecutionId::new("effect-start-fail"),
+            policy(AcceptedStepTimeoutOutcome::FailStep {
+                requires_compensation: false,
+            }),
+        ),
+        Err(AcceptedStepError::Durability { .. })
+    ));
+    assert_eq!(actor.saga.accepted_workflow_step_count(), 0);
+    assert!(
+        actor
+            .saga
+            .journal
+            .read(ctx.saga_id)
+            .expect("journal read should succeed")
+            .is_empty()
+    );
+}
+
+#[test]
+fn accept_failure_on_metadata_append_does_not_orphan_accepted_metadata() {
+    let mut actor = FailingJournalActor::fail_on_append(2);
+    let ctx = context("create_order", 31);
+
+    assert!(matches!(
+        accept_workflow_step(
+            &mut actor,
+            ctx.clone(),
+            "order-manager".into(),
+            StepExecutionId::new("effect-metadata-fail"),
+            policy(AcceptedStepTimeoutOutcome::FailStep {
+                requires_compensation: false,
+            }),
+        ),
+        Err(AcceptedStepError::Durability { .. })
+    ));
+    assert_eq!(actor.saga.accepted_workflow_step_count(), 0);
+    let entries = actor
+        .saga
+        .journal
+        .read(ctx.saga_id)
+        .expect("journal read should succeed");
+    assert!(matches!(
+        entries.as_slice(),
+        [icanact_saga_choreography::JournalEntry {
+            event: ParticipantEvent::StepExecutionStarted { .. },
+            ..
+        }]
+    ));
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| matches!(entry.event, ParticipantEvent::AcceptedStepRecorded { .. }))
+    );
+}
+
+#[test]
+fn accepted_completion_append_failure_keeps_step_pending_for_retry() {
+    let mut actor = FailingJournalActor::fail_on_append(3);
+    let ctx = context("create_order", 32);
+    let execution_id = StepExecutionId::new("effect-complete-retry");
+    accept_workflow_step(
+        &mut actor,
+        ctx.clone(),
+        "order-manager".into(),
+        execution_id.clone(),
+        policy(AcceptedStepTimeoutOutcome::FailStep {
+            requires_compensation: false,
+        }),
+    )
+    .expect("accept should journal start and metadata");
+
+    assert!(matches!(
+        complete_accepted_workflow_step(
+            &mut actor,
+            ctx.saga_id,
+            execution_id.clone(),
+            completion(1_700_000_000_060, b"created", b"input", b"undo"),
+        ),
+        Err(AcceptedStepError::Durability { .. })
+    ));
+    assert_eq!(actor.saga.accepted_workflow_step_count(), 1);
+    assert_eq!(actor.saga.resolved_workflow_step_count(), 0);
+
+    complete_accepted_workflow_step(
+        &mut actor,
+        ctx.saga_id,
+        execution_id,
+        completion(1_700_000_000_070, b"created", b"input", b"undo"),
+    )
+    .expect("retry should append terminal record and complete");
+    assert_eq!(actor.saga.accepted_workflow_step_count(), 0);
+    assert_eq!(actor.saga.resolved_workflow_step_count(), 1);
+}
+
+#[test]
+fn accepted_failure_append_failure_keeps_step_pending_for_retry() {
+    let mut actor = FailingJournalActor::fail_on_append(3);
+    let ctx = context("create_order", 33);
+    let execution_id = StepExecutionId::new("effect-fail-retry");
+    accept_workflow_step(
+        &mut actor,
+        ctx.clone(),
+        "order-manager".into(),
+        execution_id.clone(),
+        policy(AcceptedStepTimeoutOutcome::FailStep {
+            requires_compensation: false,
+        }),
+    )
+    .expect("accept should journal start and metadata");
+
+    assert!(matches!(
+        fail_accepted_workflow_step(
+            &mut actor,
+            ctx.saga_id,
+            execution_id.clone(),
+            failure(1_700_000_000_060, "dispatch failed", false),
+        ),
+        Err(AcceptedStepError::Durability { .. })
+    ));
+    assert_eq!(actor.saga.accepted_workflow_step_count(), 1);
+    assert_eq!(actor.saga.resolved_workflow_step_count(), 0);
+
+    fail_accepted_workflow_step(
+        &mut actor,
+        ctx.saga_id,
+        execution_id,
+        failure(1_700_000_000_070, "dispatch failed", false),
+    )
+    .expect("retry should append terminal record and fail");
+    assert_eq!(actor.saga.accepted_workflow_step_count(), 0);
+    assert_eq!(actor.saga.resolved_workflow_step_count(), 1);
+}
+
+#[test]
+fn accepted_timeout_append_failure_keeps_step_pending_for_retry() {
+    let mut actor = FailingJournalActor::fail_on_append(3);
+    let ctx = context("create_order", 34);
+    let accepted = accept_workflow_step(
+        &mut actor,
+        ctx.clone(),
+        "order-manager".into(),
+        StepExecutionId::new("effect-timeout-retry"),
+        policy(AcceptedStepTimeoutOutcome::FailStep {
+            requires_compensation: false,
+        }),
+    )
+    .expect("accept should journal start and metadata");
+    let SagaChoreographyEvent::StepAccepted {
+        deadline_at_millis, ..
+    } = accepted
+    else {
+        panic!("expected accepted step");
+    };
+
+    assert!(
+        poll_accepted_workflow_step_timeouts(&mut actor, deadline_at_millis + 1).is_empty(),
+        "timeout event must not publish when terminal append fails"
+    );
+    assert_eq!(actor.saga.accepted_workflow_step_count(), 1);
+    assert_eq!(actor.saga.resolved_workflow_step_count(), 0);
+
+    let timed_out = poll_accepted_workflow_step_timeouts(&mut actor, deadline_at_millis + 2);
+    assert!(matches!(
+        timed_out.as_slice(),
+        [SagaChoreographyEvent::StepFailed { error, .. }]
+            if error.contains("accepted step idle timeout")
+    ));
+    assert_eq!(actor.saga.accepted_workflow_step_count(), 0);
+    assert_eq!(actor.saga.resolved_workflow_step_count(), 1);
 }
 
 #[test]

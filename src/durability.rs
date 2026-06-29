@@ -185,9 +185,6 @@ where
     )
     .trigger("step_accepted", accepted_at_millis)
     .start_execution(accepted_at_millis);
-    actor
-        .saga_states()
-        .insert(saga_id, SagaStateEntry::Executing(state));
     let accepted_step = AcceptedWorkflowStep {
         context: accepted_context.clone(),
         participant_id: participant_id.clone(),
@@ -198,13 +195,6 @@ where
         hard_deadline_at_millis,
     };
     let timeout_outcome = accepted_step.policy.timeout_outcome.clone();
-    record_accepted_step_metadata(actor, &accepted_step).map_err(|source| {
-        AcceptedStepError::Durability {
-            saga_id,
-            execution_id: execution_id.clone(),
-            error: format!("{source:?}").into(),
-        }
-    })?;
     actor
         .record_event_strict(
             saga_id,
@@ -218,7 +208,17 @@ where
             execution_id: execution_id.clone(),
             error: format!("{source:?}").into(),
         })?;
+    record_accepted_step_metadata(actor, &accepted_step).map_err(|source| {
+        AcceptedStepError::Durability {
+            saga_id,
+            execution_id: execution_id.clone(),
+            error: format!("{source:?}").into(),
+        }
+    })?;
 
+    actor
+        .saga_states()
+        .insert(saga_id, SagaStateEntry::Executing(state));
     actor
         .saga_support_mut()
         .accepted_workflow_steps
@@ -243,7 +243,22 @@ pub fn complete_accepted_workflow_step<A>(
 where
     A: SagaStateExt,
 {
-    let accepted = take_accepted_step(actor, saga_id, execution_id.clone())?;
+    let accepted = accepted_step_for_resolution(actor, saga_id, &execution_id)?;
+    actor
+        .record_event_strict(
+            saga_id,
+            ParticipantEvent::StepExecutionCompleted {
+                output: completion.output.clone(),
+                compensation_data: completion.compensation_data.clone(),
+                completed_at_millis: completion.completed_at_millis,
+            },
+        )
+        .map_err(|source| AcceptedStepError::Durability {
+            saga_id,
+            execution_id: execution_id.clone(),
+            error: format!("{source:?}").into(),
+        })?;
+    take_accepted_step(actor, saga_id, execution_id.clone())?;
     if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&saga_id) {
         let new_state = state.complete(
             completion.output.clone(),
@@ -254,14 +269,6 @@ where
             .saga_states()
             .insert(saga_id, SagaStateEntry::Completed(new_state));
     }
-    actor.record_event(
-        saga_id,
-        ParticipantEvent::StepExecutionCompleted {
-            output: completion.output.clone(),
-            compensation_data: completion.compensation_data.clone(),
-            completed_at_millis: completion.completed_at_millis,
-        },
-    );
     mark_accepted_step_resolved(actor, saga_id, execution_id.clone());
 
     let mut context = accepted.context;
@@ -284,7 +291,22 @@ pub fn fail_accepted_workflow_step<A>(
 where
     A: SagaStateExt,
 {
-    let accepted = take_accepted_step(actor, saga_id, execution_id.clone())?;
+    let accepted = accepted_step_for_resolution(actor, saga_id, &execution_id)?;
+    actor
+        .record_event_strict(
+            saga_id,
+            ParticipantEvent::StepExecutionFailed {
+                error: failure.reason.clone(),
+                requires_compensation: failure.requires_compensation,
+                failed_at_millis: failure.failed_at_millis,
+            },
+        )
+        .map_err(|source| AcceptedStepError::Durability {
+            saga_id,
+            execution_id: execution_id.clone(),
+            error: format!("{source:?}").into(),
+        })?;
+    take_accepted_step(actor, saga_id, execution_id.clone())?;
     if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&saga_id) {
         let new_state = state.fail(
             failure.reason.clone(),
@@ -295,14 +317,6 @@ where
             .saga_states()
             .insert(saga_id, SagaStateEntry::Failed(new_state));
     }
-    actor.record_event(
-        saga_id,
-        ParticipantEvent::StepExecutionFailed {
-            error: failure.reason.clone(),
-            requires_compensation: failure.requires_compensation,
-            failed_at_millis: failure.failed_at_millis,
-        },
-    );
     mark_accepted_step_resolved(actor, saga_id, execution_id);
 
     let mut context = accepted.context;
@@ -547,7 +561,7 @@ fn resolve_accepted_timeout<A>(
 where
     A: SagaStateExt,
 {
-    let accepted = take_accepted_step(actor, saga_id, execution_id.clone())?;
+    let accepted = accepted_step_for_resolution(actor, saga_id, &execution_id)?;
     let timeout_kind = if hard_timeout { "hard" } else { "idle" };
     let reason: Box<str> = format!(
         "accepted step {timeout_kind} timeout saga_id={} step={} execution_id={}",
@@ -556,12 +570,27 @@ where
         accepted.execution_id
     )
     .into_boxed_str();
-    mark_accepted_step_resolved(actor, saga_id, execution_id.clone());
 
     match accepted.policy.timeout_outcome {
         AcceptedStepTimeoutOutcome::FailStep {
             requires_compensation,
         } => {
+            actor
+                .record_event_strict(
+                    saga_id,
+                    ParticipantEvent::StepExecutionFailed {
+                        error: reason.clone(),
+                        requires_compensation,
+                        failed_at_millis: timed_out_at_millis,
+                    },
+                )
+                .map_err(|source| AcceptedStepError::Durability {
+                    saga_id,
+                    execution_id: execution_id.clone(),
+                    error: format!("{source:?}").into(),
+                })?;
+            take_accepted_step(actor, saga_id, execution_id.clone())?;
+            mark_accepted_step_resolved(actor, saga_id, execution_id.clone());
             if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&saga_id) {
                 let new_state =
                     state.fail(reason.clone(), requires_compensation, timed_out_at_millis);
@@ -569,14 +598,6 @@ where
                     .saga_states()
                     .insert(saga_id, SagaStateEntry::Failed(new_state));
             }
-            actor.record_event(
-                saga_id,
-                ParticipantEvent::StepExecutionFailed {
-                    error: reason.clone(),
-                    requires_compensation,
-                    failed_at_millis: timed_out_at_millis,
-                },
-            );
             let mut context = accepted.context;
             context.event_timestamp_millis = timed_out_at_millis;
             Ok(SagaChoreographyEvent::StepFailed {
@@ -588,19 +609,27 @@ where
             })
         }
         AcceptedStepTimeoutOutcome::QuarantineSaga => {
+            actor
+                .record_event_strict(
+                    saga_id,
+                    ParticipantEvent::Quarantined {
+                        reason: reason.clone(),
+                        quarantined_at_millis: timed_out_at_millis,
+                    },
+                )
+                .map_err(|source| AcceptedStepError::Durability {
+                    saga_id,
+                    execution_id: execution_id.clone(),
+                    error: format!("{source:?}").into(),
+                })?;
+            take_accepted_step(actor, saga_id, execution_id.clone())?;
+            mark_accepted_step_resolved(actor, saga_id, execution_id);
             if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&saga_id) {
                 let new_state = state.quarantine(reason.clone(), timed_out_at_millis);
                 actor
                     .saga_states()
                     .insert(saga_id, SagaStateEntry::Quarantined(new_state));
             }
-            actor.record_event(
-                saga_id,
-                ParticipantEvent::Quarantined {
-                    reason: reason.clone(),
-                    quarantined_at_millis: timed_out_at_millis,
-                },
-            );
             let step = accepted.context.step_name.clone();
             let mut context = accepted.context;
             context.event_timestamp_millis = timed_out_at_millis;
@@ -614,10 +643,10 @@ where
     }
 }
 
-fn take_accepted_step<A>(
-    actor: &mut A,
+fn accepted_step_for_resolution<A>(
+    actor: &A,
     saga_id: SagaId,
-    execution_id: StepExecutionId,
+    execution_id: &StepExecutionId,
 ) -> Result<AcceptedWorkflowStep, AcceptedStepError>
 where
     A: HasSagaParticipantSupport,
@@ -625,7 +654,7 @@ where
     if actor.saga_support().terminal_sagas.contains(&saga_id) {
         return Err(AcceptedStepError::AlreadyTerminal {
             saga_id,
-            execution_id,
+            execution_id: execution_id.clone(),
         });
     }
     if actor
@@ -635,31 +664,39 @@ where
     {
         return Err(AcceptedStepError::AlreadyResolved {
             saga_id,
-            execution_id,
+            execution_id: execution_id.clone(),
         });
     }
-    let Some(accepted) = actor
-        .saga_support_mut()
-        .accepted_workflow_steps
-        .remove(&saga_id)
-    else {
+    let Some(accepted) = actor.saga_support().accepted_workflow_steps.get(&saga_id) else {
         return Err(AcceptedStepError::NotFound {
             saga_id,
-            execution_id,
+            execution_id: execution_id.clone(),
         });
     };
-    if accepted.execution_id != execution_id {
+    if accepted.execution_id != *execution_id {
         let expected = accepted.execution_id.clone();
-        actor
-            .saga_support_mut()
-            .accepted_workflow_steps
-            .insert(saga_id, accepted);
         return Err(AcceptedStepError::ExecutionIdMismatch {
             saga_id,
             expected,
-            actual: execution_id,
+            actual: execution_id.clone(),
         });
     }
+    Ok(accepted.clone())
+}
+
+fn take_accepted_step<A>(
+    actor: &mut A,
+    saga_id: SagaId,
+    execution_id: StepExecutionId,
+) -> Result<AcceptedWorkflowStep, AcceptedStepError>
+where
+    A: HasSagaParticipantSupport,
+{
+    let accepted = accepted_step_for_resolution(actor, saga_id, &execution_id)?;
+    actor
+        .saga_support_mut()
+        .accepted_workflow_steps
+        .remove(&saga_id);
     Ok(accepted)
 }
 
