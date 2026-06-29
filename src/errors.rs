@@ -1,5 +1,81 @@
 //! Error types for saga execution and compensation
 
+use std::time::Duration;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct StepExecutionId(Box<str>);
+
+impl StepExecutionId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into().into_boxed_str())
+    }
+}
+
+impl AsRef<str> for StepExecutionId {
+    fn as_ref(&self) -> &str {
+        self.0.as_ref()
+    }
+}
+
+impl std::fmt::Display for StepExecutionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_ref())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AcceptedStepTimeoutOutcome {
+    FailStep { requires_compensation: bool },
+    QuarantineSaga,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceptedStepPolicy {
+    pub idle_timeout: Duration,
+    pub hard_timeout: Duration,
+    pub timeout_outcome: AcceptedStepTimeoutOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceptedStepCompletion {
+    pub completed_at_millis: u64,
+    pub output: Vec<u8>,
+    pub saga_input: Vec<u8>,
+    pub compensation_data: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceptedStepFailure {
+    pub failed_at_millis: u64,
+    pub reason: Box<str>,
+    pub requires_compensation: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AcceptedStepError {
+    AlreadyAccepted {
+        saga_id: super::SagaId,
+        execution_id: StepExecutionId,
+    },
+    NotFound {
+        saga_id: super::SagaId,
+        execution_id: StepExecutionId,
+    },
+    ExecutionIdMismatch {
+        saga_id: super::SagaId,
+        expected: StepExecutionId,
+        actual: StepExecutionId,
+    },
+    AlreadyResolved {
+        saga_id: super::SagaId,
+        execution_id: StepExecutionId,
+    },
+    AlreadyTerminal {
+        saga_id: super::SagaId,
+        execution_id: StepExecutionId,
+    },
+}
+
 /// Output from step execution
 #[derive(Clone, Debug)]
 pub enum StepOutput {

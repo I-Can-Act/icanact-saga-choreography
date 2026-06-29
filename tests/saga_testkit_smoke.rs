@@ -852,10 +852,19 @@ fn sync_world_runs_real_workflow_participant_path() {
     );
     assert!(snapshot.alpha_inputs.is_empty());
     assert_eq!(snapshot.beta_inputs, vec![b"workflow-input".to_vec()]);
-    assert!(world
-        .transcript_for_saga(ctx.saga_id)
+    let workflow_events = world.transcript_for_saga(ctx.saga_id);
+    let accepted_index = workflow_events
         .iter()
-        .any(|event| matches!(event, SagaChoreographyEvent::StepCompleted { context, .. } if context.step_name.as_ref() == "beta_step")));
+        .position(|event| matches!(event, SagaChoreographyEvent::StepAccepted { context, .. } if context.step_name.as_ref() == "beta_step"))
+        .expect("workflow participant should accept the step before resolving it");
+    let completed_index = workflow_events
+        .iter()
+        .position(|event| matches!(event, SagaChoreographyEvent::StepCompleted { context, .. } if context.step_name.as_ref() == "beta_step"))
+        .expect("workflow participant should complete the step");
+    assert!(
+        accepted_index < completed_index,
+        "workflow transcript should record accepted before completed: {workflow_events:?}"
+    );
 
     actor.shutdown();
 }

@@ -243,6 +243,9 @@ impl TerminalResolver {
             SagaChoreographyEvent::StepStarted { context } => {
                 state.started_steps.insert(context.step_name.clone());
             }
+            SagaChoreographyEvent::StepAccepted { context, .. } => {
+                state.started_steps.insert(context.step_name.clone());
+            }
             SagaChoreographyEvent::StepAck { context, .. } => {
                 state.started_steps.insert(context.step_name.clone());
                 state.acked_steps.insert(context.step_name.clone());
@@ -467,6 +470,7 @@ fn is_progress_event(event: &SagaChoreographyEvent) -> bool {
         event,
         SagaChoreographyEvent::SagaStarted { .. }
             | SagaChoreographyEvent::StepStarted { .. }
+            | SagaChoreographyEvent::StepAccepted { .. }
             | SagaChoreographyEvent::StepAck { .. }
             | SagaChoreographyEvent::StepCompleted { .. }
             | SagaChoreographyEvent::StepFailed { .. }

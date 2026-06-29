@@ -1,6 +1,6 @@
 //! Saga events
 
-use super::SagaContext;
+use super::{SagaContext, StepExecutionId};
 use icanact_core::ActorId;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,6 +41,19 @@ pub enum SagaChoreographyEvent {
     StepStarted {
         /// The saga context containing identifiers and metadata.
         context: SagaContext,
+    },
+    /// Emitted when a participant accepts async responsibility for a step.
+    StepAccepted {
+        /// The saga context containing identifiers and metadata.
+        context: SagaContext,
+        /// Participant that accepted responsibility for this step.
+        participant_id: Box<str>,
+        /// External or participant-local execution identifier.
+        execution_id: StepExecutionId,
+        /// Resettable idle deadline in epoch milliseconds.
+        deadline_at_millis: u64,
+        /// Non-resettable hard deadline in epoch milliseconds.
+        hard_deadline_at_millis: u64,
     },
     /// Emitted when a step completes successfully.
     StepCompleted {
@@ -211,6 +224,7 @@ impl SagaChoreographyEvent {
             Self::SagaCompleted { context } => context,
             Self::SagaFailed { context, .. } => context,
             Self::StepStarted { context } => context,
+            Self::StepAccepted { context, .. } => context,
             Self::StepCompleted { context, .. } => context,
             Self::StepFailed { context, .. } => context,
             Self::CompensationRequested { context, .. } => context,
@@ -231,6 +245,7 @@ impl SagaChoreographyEvent {
             Self::SagaCompleted { .. } => "saga_completed",
             Self::SagaFailed { .. } => "saga_failed",
             Self::StepStarted { .. } => "step_started",
+            Self::StepAccepted { .. } => "step_accepted",
             Self::StepCompleted { .. } => "step_completed",
             Self::StepFailed { .. } => "step_failed",
             Self::CompensationRequested { .. } => "compensation_requested",

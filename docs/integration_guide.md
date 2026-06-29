@@ -184,6 +184,16 @@ At step 1, the bus validates startup invariants:
 
 For runtime publishing paths, prefer `publish_strict(...)` so partial delivery is surfaced immediately as an error instead of being silently ignored.
 
+## Async Accepted-Step Model
+
+Saga choreography is async by nature. A sync actor and an async actor can participate in the same workflow because the bus carries choreography events, not runtime-specific calls.
+
+Participants should accept responsibility on the control plane with `accept_workflow_step(...)`, then resolve later with `complete_accepted_workflow_step(...)`, `fail_accepted_workflow_step(...)`, or the timeout/quarantine helpers. Sync actors usually resolve from a later tell/ask handler. Async actors usually resolve after awaited I/O in their native async handler. Originators can also be sync or async; they only need a bus handle and must publish `SagaStarted` through the normal choreography path.
+
+In tests, use `SagaTestWorld::wait_for_step_accepted(saga_id, step_name, ...)`, `complete_accepted_step(...)`, and `fail_accepted_step(...)` instead of hand-building late `StepCompleted` or `StepFailed` events.
+
+TODO for Deribit order-manager migration: replace workflow tests that manually drive transport callbacks into `StepCompleted`/`StepFailed` with accepted-step testkit helpers, then remove duplicated local workflow terminal-state assertions that are framework contracts.
+
 ## Routing Saga Events
 
 When your actor receives a saga event inside its normal actor command handling, pass it through the ingress helper rather than calling low-level event handlers (for example `handle_saga_event_with_emit(...)`) directly. The ingress helper is the runtime-facing path because it validates emitted transitions and republishes emitted choreography events through the attached bus.

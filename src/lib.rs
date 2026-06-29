@@ -93,7 +93,10 @@ pub use state::{
     Compensated, Compensating, Completed, Executing, Failed, Idle, Quarantined,
     SagaParticipantState, SagaStateEntry, TimestampedEvent, Triggered,
 };
-pub use support::{HasSagaParticipantSupport, SagaParticipantSupport, SagaParticipantSupportExt};
+pub use support::{
+    AcceptedWorkflowStep, HasSagaParticipantSupport, SagaParticipantSupport,
+    SagaParticipantSupportExt,
+};
 
 // Events
 pub use events::{
@@ -102,7 +105,10 @@ pub use events::{
 };
 
 // Errors
-pub use errors::{CompensationError, StepError, StepOutput};
+pub use errors::{
+    AcceptedStepCompletion, AcceptedStepError, AcceptedStepFailure, AcceptedStepPolicy,
+    AcceptedStepTimeoutOutcome, CompensationError, StepError, StepExecutionId, StepOutput,
+};
 
 // Traits
 pub use state_ext::SagaStateExt;

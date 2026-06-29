@@ -146,6 +146,11 @@ pub fn drive_workflow_scenario<A>(
 }
 
 #[cfg(any(test, feature = "test-harness"))]
+use crate::{
+    complete_accepted_workflow_step, fail_accepted_workflow_step, AcceptedStepCompletion,
+    AcceptedStepError, AcceptedStepFailure, StepExecutionId,
+};
+#[cfg(any(test, feature = "test-harness"))]
 use std::collections::HashSet;
 #[cfg(any(test, feature = "test-harness"))]
 use std::sync::{Arc, Condvar, Mutex, Once};
@@ -293,6 +298,55 @@ impl SagaTestWorld {
         )
         .terminal_outcome()
         .expect("terminal wait predicate must only match terminal events")
+    }
+
+    pub fn wait_for_step_accepted(
+        &self,
+        saga_id: SagaId,
+        step_name: &str,
+        timeout: Duration,
+    ) -> SagaChoreographyEvent {
+        self.wait_for_event(
+            {
+                let step_name = step_name.to_string();
+                move |event| {
+                matches!(
+                event,
+                SagaChoreographyEvent::StepAccepted { context, .. } if context.saga_id == saga_id
+                    && context.step_name.as_ref() == step_name
+                )
+                }
+            },
+            timeout,
+        )
+    }
+
+    pub fn complete_accepted_step<A>(
+        &self,
+        actor: &mut A,
+        saga_id: SagaId,
+        execution_id: StepExecutionId,
+        completion: AcceptedStepCompletion,
+    ) -> Result<icanact_core::local::PublishStats, AcceptedStepError>
+    where
+        A: SagaStateExt,
+    {
+        let event = complete_accepted_workflow_step(actor, saga_id, execution_id, completion)?;
+        Ok(self.publish(event))
+    }
+
+    pub fn fail_accepted_step<A>(
+        &self,
+        actor: &mut A,
+        saga_id: SagaId,
+        execution_id: StepExecutionId,
+        failure: AcceptedStepFailure,
+    ) -> Result<icanact_core::local::PublishStats, AcceptedStepError>
+    where
+        A: SagaStateExt,
+    {
+        let event = fail_accepted_workflow_step(actor, saga_id, execution_id, failure)?;
+        Ok(self.publish(event))
     }
 
     pub async fn wait_for_event_async<P>(

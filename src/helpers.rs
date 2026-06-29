@@ -339,6 +339,7 @@ fn dedupe_key_for_event(event: &SagaChoreographyEvent) -> String {
         | SagaChoreographyEvent::SagaFailed { .. }
         | SagaChoreographyEvent::SagaQuarantined { .. }
         | SagaChoreographyEvent::StepStarted { .. }
+        | SagaChoreographyEvent::StepAccepted { .. }
         | SagaChoreographyEvent::StepAck { .. } => {
             format!(
                 "{}:{}:{}:{}",
