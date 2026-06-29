@@ -9,7 +9,6 @@
 //! panics, idempotency, dependency gating, and terminal latch.
 
 use std::collections::HashSet;
-use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use icanact_core::local_sync;
@@ -17,15 +16,15 @@ use icanact_core::local_sync::contract::TellAsk;
 use icanact_core::testkit::TestWorld;
 
 use icanact_saga_choreography::durability::{
-    run_participant_phase_with_panic_quarantine, ActiveSagaExecution, ActiveSagaExecutionPhase,
-    HasActiveSagaExecution,
+    ActiveSagaExecution, ActiveSagaExecutionPhase, HasActiveSagaExecution,
+    run_participant_phase_with_panic_quarantine,
 };
 use icanact_saga_choreography::{
-    bind_sync_participant_channel, handle_saga_event_with_emit, CompensationError, DependencySpec,
-    FailureAuthority, HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal,
-    SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant,
-    SagaParticipantChannel, SagaParticipantSupport, SagaWorkflowContract, SagaWorkflowStepContract,
-    StepError, StepOutput, SuccessCriteria, TerminalPolicy, WorkflowDependencySpec,
+    CompensationError, DependencySpec, FailureAuthority, HasSagaParticipantSupport, InMemoryDedupe,
+    InMemoryJournal, SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId,
+    SagaParticipant, SagaParticipantChannel, SagaParticipantSupport, SagaWorkflowContract,
+    SagaWorkflowStepContract, StepError, StepOutput, SuccessCriteria, TerminalPolicy,
+    WorkflowDependencySpec, bind_sync_participant_channel, handle_saga_event_with_emit,
 };
 
 const SAGA_TYPE: &str = "order_lifecycle";
@@ -422,14 +421,6 @@ fn new_e2e_bus() -> SagaChoreographyBus {
 /// With N subscribers, a single publish can generate O(N^2) messages per actor.
 const MAILBOX_CAPACITY: usize = 512;
 
-fn suite_guard() -> MutexGuard<'static, ()> {
-    static SUITE_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-    match SUITE_MUTEX.get_or_init(|| Mutex::new(())).lock() {
-        Ok(guard) => guard,
-        Err(err) => err.into_inner(),
-    }
-}
-
 /// Spawn a participant as a real SyncActor, subscribe it to the bus, return the actor ref.
 fn spawn_and_subscribe(
     world: &TestWorld,
@@ -523,7 +514,6 @@ fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) {
 
 #[test]
 fn all_succeed_saga_completed() {
-    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
 
@@ -602,7 +592,6 @@ fn all_succeed_saga_completed() {
 
 #[test]
 fn position_fails_terminal_no_compensation() {
-    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus
@@ -679,7 +668,6 @@ fn position_fails_terminal_no_compensation() {
 
 #[test]
 fn balance_fails_terminal_after_position_succeeds() {
-    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus
@@ -748,7 +736,6 @@ fn balance_fails_terminal_after_position_succeeds() {
 
 #[test]
 fn order_fails_terminal_after_both_succeed() {
-    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus
@@ -817,7 +804,6 @@ fn order_fails_terminal_after_both_succeed() {
 
 #[test]
 fn order_fails_require_compensation_triggers_full_compensation() {
-    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus
@@ -878,7 +864,6 @@ fn order_fails_require_compensation_triggers_full_compensation() {
 
 #[test]
 fn position_compensation_fails_terminal_causes_saga_failed() {
-    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus
@@ -939,7 +924,6 @@ fn position_compensation_fails_terminal_causes_saga_failed() {
 
 #[test]
 fn balance_compensation_fails_ambiguous_causes_quarantine() {
-    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus
@@ -991,7 +975,6 @@ fn balance_compensation_fails_ambiguous_causes_quarantine() {
 
 #[test]
 fn balance_compensation_fails_safe_to_retry_causes_failed() {
-    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus
@@ -1049,7 +1032,6 @@ fn balance_compensation_fails_safe_to_retry_causes_failed() {
 
 #[test]
 fn position_panics_emits_quarantined() {
-    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus
@@ -1104,7 +1086,6 @@ fn position_panics_emits_quarantined() {
 
 #[test]
 fn balance_panics_after_position_succeeds() {
-    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus
@@ -1166,7 +1147,6 @@ fn balance_panics_after_position_succeeds() {
 
 #[test]
 fn order_panics_after_both_succeed() {
-    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus
@@ -1241,7 +1221,6 @@ fn order_panics_after_both_succeed() {
 
 #[test]
 fn duplicate_saga_started_is_deduped() {
-    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus
@@ -1295,7 +1274,6 @@ fn duplicate_saga_started_is_deduped() {
 
 #[test]
 fn order_does_not_fire_on_partial_dependency() {
-    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
 
@@ -1348,7 +1326,6 @@ fn order_does_not_fire_on_partial_dependency() {
 
 #[test]
 fn terminal_latch_prevents_duplicate_events() {
-    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus
@@ -1412,7 +1389,6 @@ fn terminal_latch_prevents_duplicate_events() {
 
 #[test]
 fn duplicate_dependency_completion_after_order_executes_is_deduped() {
-    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus
@@ -1476,7 +1452,6 @@ fn duplicate_dependency_completion_after_order_executes_is_deduped() {
 
 #[test]
 fn duplicate_compensation_request_is_deduped() {
-    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus
@@ -1525,7 +1500,6 @@ fn duplicate_compensation_request_is_deduped() {
 
 #[test]
 fn duplicate_position_approval_before_balance_keeps_order_exactly_once() {
-    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
 
@@ -1597,7 +1571,6 @@ fn duplicate_position_approval_before_balance_keeps_order_exactly_once() {
 
 #[test]
 fn duplicate_balance_approval_before_position_keeps_order_exactly_once() {
-    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
 
@@ -1669,7 +1642,6 @@ fn duplicate_balance_approval_before_position_keeps_order_exactly_once() {
 
 #[test]
 fn duplicate_both_approvals_still_produce_single_order_execution() {
-    let _suite = suite_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus

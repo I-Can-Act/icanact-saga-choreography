@@ -54,7 +54,7 @@ flowchart LR
 
 | Area | Framework (`icanact-saga-choreography`) | Actor Implementation |
 |---|---|---|
-| Identity and context | `SagaId`, `SagaContext`, `IdempotencyKey` | Populate context at saga start and across steps |
+| Identity and context | `SagaId`, `SagaContext` | Populate context at saga start and across steps |
 | State model | Typestate containers and transitions (`Idle`, `Executing`, `Completed`, etc.) plus `SagaParticipantSupport<J, D>` | Embed one `saga` field on the actor |
 | Events | `SagaChoreographyEvent`, `ParticipantEvent` | Publish/consume events for the saga type |
 | Execution contract | `SagaParticipant` trait | Implement `execute_step`, `compensate_step`, and dependencies |
@@ -135,9 +135,11 @@ sequenceDiagram
 
 - Journal records participant-local events in append order (`ParticipantEvent`).
 - Dedupe store prevents duplicate processing for the same saga event.
-- The framework uses a dedupe key of `trace_id:event_type` when handling incoming events.
+- The framework uses a dedupe key of `trace_id:saga_started_at_millis:event_type:step_name`
+  when handling incoming events, with `failed_step` appended for compensation requests.
 - In this repository, in-memory implementations are available for tests/examples.
 - For production, use a durable backend by implementing the storage traits (for example LMDB/Heed).
+- Accepted-step metadata is journaled before `StepAccepted` is published so restart recovery can rehydrate pending external executions.
 
 ## Recovery, Cleanup, and Operations
 
@@ -146,8 +148,9 @@ sequenceDiagram
 - On terminal saga events (`SagaCompleted` or `SagaFailed`), participants prune local in-memory state and dedupe keys.
 - Quarantined sagas are intentionally preserved for manual investigation.
 - Terminal policies support two timeout dimensions:
-  - `overall_timeout` (overall wall clock)
-  - `stalled_timeout` (watchdog reset by each progress event)
+- `overall_timeout` (overall wall clock)
+- `stalled_timeout` (watchdog reset by each progress event)
+- Accepted steps add participant-declared `idle_timeout`, `hard_timeout`, and `timeout_outcome`; the terminal resolver watchdog enforces these from `StepAccepted`, and startup recovery emits expired accepted-step outcomes from journaled metadata.
 
 ## Observability
 

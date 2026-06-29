@@ -182,6 +182,28 @@ impl SagaParticipantState<Executing> {
             events: self.events,
         }
     }
+
+    pub fn quarantine(
+        self,
+        reason: Box<str>,
+        now_millis: u64,
+    ) -> SagaParticipantState<Quarantined> {
+        SagaParticipantState {
+            saga_id: self.saga_id,
+            saga_type: self.saga_type,
+            step_name: self.step_name,
+            correlation_id: self.correlation_id,
+            trace_id: self.trace_id,
+            initiator_peer_id: self.initiator_peer_id,
+            saga_started_at_millis: self.saga_started_at_millis,
+            last_updated_at_millis: now_millis,
+            state: Quarantined {
+                quarantined_at_millis: now_millis,
+                reason,
+            },
+            events: self.events,
+        }
+    }
 }
 
 impl SagaParticipantState<Completed> {
@@ -217,6 +239,30 @@ impl SagaParticipantState<Compensating> {
             last_updated_at_millis: now_millis,
             state: Compensated {
                 completed_at_millis: now_millis,
+            },
+            events: self.events,
+        }
+    }
+
+    pub fn fail(
+        self,
+        error: Box<str>,
+        requires_compensation: bool,
+        now_millis: u64,
+    ) -> SagaParticipantState<Failed> {
+        SagaParticipantState {
+            saga_id: self.saga_id,
+            saga_type: self.saga_type,
+            step_name: self.step_name,
+            correlation_id: self.correlation_id,
+            trace_id: self.trace_id,
+            initiator_peer_id: self.initiator_peer_id,
+            saga_started_at_millis: self.saga_started_at_millis,
+            last_updated_at_millis: now_millis,
+            state: Failed {
+                failed_at_millis: now_millis,
+                error,
+                requires_compensation,
             },
             events: self.events,
         }

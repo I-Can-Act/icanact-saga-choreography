@@ -184,13 +184,23 @@ At step 1, the bus validates startup invariants:
 
 For runtime publishing paths, prefer `publish_strict(...)` so partial delivery is surfaced immediately as an error instead of being silently ignored.
 
+## Async Accepted-Step Model
+
+Saga choreography is async by nature. A sync actor or async actor can participate in the same workflow because the bus carries choreography events, not runtime-specific calls.
+
+Participants should accept responsibility on the control plane with `accept_workflow_step(...)`, then resolve later with `complete_accepted_workflow_step(...)`, `fail_accepted_workflow_step(...)`, or timeout/quarantine helpers. Sync actors usually resolve from a later tell/ask handler. Async actors usually resolve after awaited I/O in their native async handler. Originators can also be sync or async; they only need a bus handle and must publish `SagaStarted` through the normal choreography path.
+
+Accepted steps carry an `AcceptedStepPolicy`: resettable `idle_timeout`, non-resettable `hard_timeout`, and `timeout_outcome`. Participant support persists metadata before returning `StepAccepted`; application code should publish helper output, not hand-build it. Publish `StepAccepted` from `accept_workflow_step(...)` so terminal resolver can enforce accepted-step deadlines. Publish `StepAccepted` from `record_accepted_workflow_step_progress(...)` on each progress heartbeat; participant-local idle deadline refresh alone does not refresh resolver state, so resolver can still time out active external execution. Terminal resolver observes published `StepAccepted` events and enforces per-step deadlines from watchdog. On restart, persisted accepted-step metadata is recovered and expired deadlines emit configured timeout outcome instead of stale saga recovery.
+
+In tests, use `SagaTestWorld::accept_step(...)`, `record_accepted_step_progress(...)`, `wait_for_step_accepted(saga_id, step_name, ...)`, `complete_accepted_step(...)`, and `fail_accepted_step(...)` instead of hand-building accepted-step, progress, completion, or failure events.
+
 ## Routing Saga Events
 
 When your actor receives a saga event inside its normal actor command handling, pass it through the ingress helper rather than calling low-level event handlers (for example `handle_saga_event_with_emit(...)`) directly. The ingress helper is the runtime-facing path because it validates emitted transitions and republishes emitted choreography events through the attached bus.
 
 ```rust
 use icanact_saga_choreography::{
-    durability::apply_sync_participant_saga_ingress, SagaChoreographyEvent,
+    apply_sync_participant_saga_ingress, SagaChoreographyEvent,
 };
 
 fn on_saga_event(
@@ -212,8 +222,8 @@ use std::time::Duration;
 
 use icanact_core::local_sync::{self, SyncActor};
 use icanact_saga_choreography::{
-    durability::apply_sync_participant_saga_ingress, DeterministicContextBuilder,
-    SagaChoreographyEvent, SagaTestWorld,
+    apply_sync_participant_saga_ingress, DeterministicContextBuilder, SagaChoreographyEvent,
+    SagaTestWorld,
 };
 
 enum MyCmd {
@@ -288,6 +298,9 @@ On startup or restart, enumerate participant journal state through your durabili
 
 - `overall_timeout`: hard maximum elapsed wall-clock from saga start.
 - `stalled_timeout`: resettable stall watchdog that resets on each participant progress event.
+- accepted-step `idle_timeout`: resettable per-step deadline; publish progress heartbeat to refresh resolver deadline.
+- accepted-step `hard_timeout`: non-resettable per-step deadline from accept time.
+- accepted-step `timeout_outcome`: per-step deadline result, either `FailStep` or `QuarantineSaga`.
 
 ## Notes
 

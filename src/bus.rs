@@ -1,17 +1,19 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use icanact_core::local::{EventBus, EventSubscription, PublishStats};
 use icanact_core::CorrelationRegistry;
+use icanact_core::local::{EventBus, EventSubscription, PublishStats};
+use icanact_core::local_sync::{self, SyncActor};
 
 use crate::reply_registry::{SagaReplyToHandle, SagaReplyToResult};
 use crate::workflow_contract::required_path_steps_from_success_criteria;
 use crate::{
-    required_steps_from_success_criteria, validate_workflow_contract, HasSagaWorkflowParticipants,
-    SagaChoreographyEvent, SagaId, SagaReplyTo, SagaTerminalOutcome, SagaWorkflowContract,
-    SagaWorkflowStepContract, TerminalPolicy, TerminalResolver, TERMINAL_RESOLVER_STEP,
+    HasSagaWorkflowParticipants, SagaChoreographyEvent, SagaId, SagaReplyTo, SagaTerminalOutcome,
+    SagaWorkflowContract, SagaWorkflowStepContract, TERMINAL_RESOLVER_STEP, TerminalPolicy,
+    TerminalResolver, required_steps_from_success_criteria, validate_workflow_contract,
 };
 
 #[derive(Clone, Debug)]
@@ -22,27 +24,419 @@ struct WorkflowContractState {
     required_path_description: Box<str>,
 }
 
-type TerminalReplyMap = Arc<Mutex<HashMap<SagaId, SagaReplyTo>>>;
-type TerminalOutcomeMap = Arc<Mutex<HashMap<SagaId, SagaTerminalOutcome>>>;
-type TerminalOrder = Arc<Mutex<VecDeque<SagaId>>>;
-type TerminalPolicyMap = Arc<Mutex<HashMap<Box<str>, Box<str>>>>;
-type WorkflowContractMap = Arc<Mutex<HashMap<Box<str>, WorkflowContractState>>>;
-type BoundStepMap = Arc<Mutex<HashMap<Box<str>, HashSet<Box<str>>>>>;
+#[derive(Default)]
+struct BusStateActor {
+    terminal_replies: HashMap<SagaId, SagaReplyTo>,
+    terminal_outcomes: HashMap<SagaId, SagaTerminalOutcome>,
+    terminal_order: VecDeque<SagaId>,
+    terminal_policies_by_saga_type: HashMap<Box<str>, Box<str>>,
+    workflow_contracts_by_saga_type: HashMap<Box<str>, WorkflowContractState>,
+    bound_steps_by_saga_type: HashMap<Box<str>, HashSet<Box<str>>>,
+    binding_actor_handles: Vec<local_sync::ActorHandle>,
+}
+
+#[derive(Debug)]
+enum BusStateAsk {
+    RegisterTerminalPolicy {
+        saga_type: Box<str>,
+        policy_id: Box<str>,
+    },
+    RegisterWorkflowContract {
+        saga_type: Box<str>,
+        contract_state: WorkflowContractState,
+    },
+    RegisterBoundWorkflowStep {
+        saga_type: Box<str>,
+        step_name: Box<str>,
+    },
+    HasTerminalPolicy {
+        saga_type: Box<str>,
+    },
+    WorkflowContract {
+        saga_type: Box<str>,
+    },
+    BoundSteps {
+        saga_type: Box<str>,
+    },
+    RequiredPathDescription {
+        saga_type: Box<str>,
+    },
+    RequiredPathExpectedMinDelivery {
+        saga_type: Box<str>,
+        step_name: Box<str>,
+    },
+    SagaStartExpectedMinDelivery {
+        saga_type: Box<str>,
+    },
+    StoreTerminalReply {
+        saga_id: SagaId,
+        reply: SagaReplyTo,
+        retention_limit: usize,
+    },
+    StoreTerminalOutcome {
+        saga_id: SagaId,
+        outcome: SagaTerminalOutcome,
+        retention_limit: usize,
+    },
+    TakeTerminalReply {
+        saga_id: SagaId,
+    },
+    TakeTerminalOutcome {
+        saga_id: SagaId,
+    },
+    ShutdownBindingActors,
+}
+
+enum BusStateTell {
+    RememberBindingActor(local_sync::ActorHandle),
+}
+
+impl icanact_core::TellAskTell for BusStateTell {}
+
+#[derive(Clone, Debug)]
+enum BusStateReply {
+    Unit,
+    Bool(bool),
+    WorkflowContract(Option<WorkflowContractState>),
+    BoundSteps(HashSet<Box<str>>),
+    String(String),
+    OptionalU32(Option<u32>),
+    TerminalReply(Option<SagaReplyTo>),
+    TerminalOutcome(Option<SagaTerminalOutcome>),
+}
+
+impl BusStateActor {
+    fn insert_terminal_outcome(
+        &mut self,
+        saga_id: SagaId,
+        outcome: SagaTerminalOutcome,
+        retention_limit: usize,
+    ) {
+        let inserted_new = self.terminal_outcomes.insert(saga_id, outcome).is_none();
+        if inserted_new {
+            self.terminal_order.push_back(saga_id);
+        }
+        while self.terminal_order.len() > retention_limit {
+            let Some(candidate) = self.terminal_order.pop_front() else {
+                break;
+            };
+            if candidate != saga_id {
+                self.terminal_outcomes.remove(&candidate);
+                self.terminal_replies.remove(&candidate);
+                break;
+            }
+        }
+    }
+}
+
+impl SyncActor for BusStateActor {
+    type Contract = local_sync::contract::TellAsk;
+    type Tell = BusStateTell;
+    type Ask = BusStateAsk;
+    type Reply = BusStateReply;
+    type Channel = ();
+    type PubSub = ();
+    type Broadcast = ();
+
+    fn handle_tell(&mut self, msg: Self::Tell) {
+        match msg {
+            BusStateTell::RememberBindingActor(handle) => {
+                self.binding_actor_handles.push(handle);
+            }
+        }
+    }
+
+    fn handle_ask(&mut self, msg: Self::Ask) -> Self::Reply {
+        match msg {
+            BusStateAsk::RegisterTerminalPolicy {
+                saga_type,
+                policy_id,
+            } => {
+                self.terminal_policies_by_saga_type
+                    .insert(saga_type, policy_id);
+                BusStateReply::Unit
+            }
+            BusStateAsk::RegisterWorkflowContract {
+                saga_type,
+                contract_state,
+            } => {
+                self.workflow_contracts_by_saga_type
+                    .insert(saga_type, contract_state);
+                BusStateReply::Unit
+            }
+            BusStateAsk::RegisterBoundWorkflowStep {
+                saga_type,
+                step_name,
+            } => {
+                self.bound_steps_by_saga_type
+                    .entry(saga_type)
+                    .or_default()
+                    .insert(step_name);
+                BusStateReply::Unit
+            }
+            BusStateAsk::HasTerminalPolicy { saga_type } => BusStateReply::Bool(
+                self.terminal_policies_by_saga_type
+                    .contains_key(saga_type.as_ref()),
+            ),
+            BusStateAsk::WorkflowContract { saga_type } => BusStateReply::WorkflowContract(
+                self.workflow_contracts_by_saga_type
+                    .get(saga_type.as_ref())
+                    .cloned(),
+            ),
+            BusStateAsk::BoundSteps { saga_type } => BusStateReply::BoundSteps(
+                self.bound_steps_by_saga_type
+                    .get(saga_type.as_ref())
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+            BusStateAsk::RequiredPathDescription { saga_type } => {
+                let description = self
+                    .workflow_contracts_by_saga_type
+                    .get(saga_type.as_ref())
+                    .map(|contract| contract.required_path_description.to_string())
+                    .unwrap_or_default();
+                BusStateReply::String(description)
+            }
+            BusStateAsk::RequiredPathExpectedMinDelivery {
+                saga_type,
+                step_name,
+            } => {
+                let expected = self
+                    .workflow_contracts_by_saga_type
+                    .get(saga_type.as_ref())
+                    .and_then(|contract| {
+                        if contract.required_path_steps.contains(step_name.as_ref()) {
+                            Some(saturating_u32_from_usize(
+                                contract.required_path_steps.len().saturating_add(1),
+                            ))
+                        } else {
+                            None
+                        }
+                    });
+                BusStateReply::OptionalU32(expected)
+            }
+            BusStateAsk::SagaStartExpectedMinDelivery { saga_type } => {
+                let expected = self
+                    .workflow_contracts_by_saga_type
+                    .get(saga_type.as_ref())
+                    .map(|contract| {
+                        saturating_u32_from_usize(
+                            contract.required_path_steps.len().saturating_add(1),
+                        )
+                    });
+                BusStateReply::OptionalU32(expected)
+            }
+            BusStateAsk::StoreTerminalReply {
+                saga_id,
+                reply,
+                retention_limit,
+            } => {
+                let outcome = reply.outcome.clone();
+                self.terminal_replies.insert(saga_id, reply);
+                self.insert_terminal_outcome(saga_id, outcome, retention_limit);
+                BusStateReply::Unit
+            }
+            BusStateAsk::StoreTerminalOutcome {
+                saga_id,
+                outcome,
+                retention_limit,
+            } => {
+                self.insert_terminal_outcome(saga_id, outcome, retention_limit);
+                BusStateReply::Unit
+            }
+            BusStateAsk::TakeTerminalReply { saga_id } => {
+                let reply = self.terminal_replies.remove(&saga_id);
+                if reply.is_some() {
+                    self.terminal_outcomes.remove(&saga_id);
+                }
+                BusStateReply::TerminalReply(reply)
+            }
+            BusStateAsk::TakeTerminalOutcome { saga_id } => {
+                let reply = self
+                    .terminal_replies
+                    .remove(&saga_id)
+                    .map(|reply| reply.outcome);
+                let direct = self.terminal_outcomes.remove(&saga_id);
+                BusStateReply::TerminalOutcome(reply.or(direct))
+            }
+            BusStateAsk::ShutdownBindingActors => {
+                for handle in self.binding_actor_handles.drain(..) {
+                    handle.shutdown();
+                }
+                BusStateReply::Unit
+            }
+        }
+    }
+}
+
+struct TerminalResolverRuntime {
+    subscription: EventSubscription,
+    shutdown: Arc<AtomicBool>,
+    handle: local_sync::ActorHandle,
+}
+
+enum TerminalResolverRegistryAsk {
+    Existing(Box<str>),
+    Register {
+        saga_type: Box<str>,
+        runtime: TerminalResolverRuntime,
+    },
+    ShutdownAll,
+}
+
+enum TerminalResolverRegistryReply {
+    Existing(Option<EventSubscription>),
+    Registered(EventSubscription),
+    ShutdownComplete,
+}
+
+#[derive(Default)]
+struct TerminalResolverRegistryActor {
+    runtimes: HashMap<Box<str>, TerminalResolverRuntime>,
+}
+
+impl SyncActor for TerminalResolverRegistryActor {
+    type Contract = local_sync::contract::AskOnly;
+    type Tell = ();
+    type Ask = TerminalResolverRegistryAsk;
+    type Reply = TerminalResolverRegistryReply;
+    type Channel = ();
+    type PubSub = ();
+    type Broadcast = ();
+
+    fn handle_ask(&mut self, msg: Self::Ask) -> Self::Reply {
+        match msg {
+            TerminalResolverRegistryAsk::Existing(saga_type) => {
+                TerminalResolverRegistryReply::Existing(
+                    self.runtimes
+                        .get(saga_type.as_ref())
+                        .map(|runtime| runtime.subscription.clone()),
+                )
+            }
+            TerminalResolverRegistryAsk::Register { saga_type, runtime } => {
+                match self.runtimes.entry(saga_type) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let subscription = runtime.subscription.clone();
+                        entry.insert(runtime);
+                        TerminalResolverRegistryReply::Registered(subscription)
+                    }
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        runtime.shutdown.store(true, Ordering::Release);
+                        runtime.handle.shutdown();
+                        TerminalResolverRegistryReply::Registered(entry.get().subscription.clone())
+                    }
+                }
+            }
+            TerminalResolverRegistryAsk::ShutdownAll => {
+                for (_, runtime) in self.runtimes.drain() {
+                    runtime.shutdown.store(true, Ordering::Release);
+                    runtime.handle.shutdown();
+                }
+                TerminalResolverRegistryReply::ShutdownComplete
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum TerminalResolverTell {
+    Ingest(Box<SagaChoreographyEvent>),
+    PollTimeouts,
+}
+
+impl icanact_core::TellAskTell for TerminalResolverTell {}
+
+struct TerminalResolverActor {
+    resolver: TerminalResolver,
+    bus: SagaChoreographyBus,
+    responder: Arc<str>,
+    saga_type: Box<str>,
+}
+
+impl TerminalResolverActor {
+    fn publish_terminal_events(&mut self, terminal_events: Vec<SagaChoreographyEvent>) {
+        for terminal_event in terminal_events {
+            let _ = self
+                .bus
+                .complete_terminal_reply_from_event(&terminal_event, self.responder.as_ref());
+            if let Err(err) = self.bus.publish_strict(terminal_event) {
+                tracing::error!(
+                    target: "core::saga",
+                    event = "terminal_resolver_publish_failed",
+                    saga_type = self.saga_type.as_ref(),
+                    error = ?err
+                );
+            }
+        }
+    }
+}
+
+impl SyncActor for TerminalResolverActor {
+    type Contract = local_sync::contract::TellOnly;
+    type Tell = TerminalResolverTell;
+    type Ask = ();
+    type Reply = ();
+    type Channel = ();
+    type PubSub = ();
+    type Broadcast = ();
+
+    fn handle_tell(&mut self, msg: Self::Tell) {
+        let terminal_events = match msg {
+            TerminalResolverTell::Ingest(event) => self.resolver.ingest(&event),
+            TerminalResolverTell::PollTimeouts => self.resolver.poll_timeouts(),
+        };
+        self.publish_terminal_events(terminal_events);
+    }
+}
 
 pub struct SagaChoreographyBus {
     bus: EventBus<SagaChoreographyEvent>,
     pending_replies: CorrelationRegistry<SagaId, SagaReplyToResult>,
-    terminal_replies: TerminalReplyMap,
-    terminal_outcomes: TerminalOutcomeMap,
-    terminal_order: TerminalOrder,
-    terminal_policies_by_saga_type: TerminalPolicyMap,
-    workflow_contracts_by_saga_type: WorkflowContractMap,
-    bound_steps_by_saga_type: BoundStepMap,
-    owned: bool,
+    state_ref: local_sync::SyncActorRef<BusStateActor>,
+    terminal_resolver_registry_ref: local_sync::SyncActorRef<TerminalResolverRegistryActor>,
+    _lifecycle: Arc<BusActorLifecycle>,
+}
+
+struct BusActorLifecycle {
+    pending_replies: CorrelationRegistry<SagaId, SagaReplyToResult>,
+    state_ref: local_sync::SyncActorRef<BusStateActor>,
+    state_handle: Option<local_sync::ActorHandle>,
+    terminal_resolver_registry_ref: local_sync::SyncActorRef<TerminalResolverRegistryActor>,
+    terminal_resolver_registry_handle: Option<local_sync::ActorHandle>,
+}
+
+impl Drop for BusActorLifecycle {
+    fn drop(&mut self) {
+        let _ = self
+            .terminal_resolver_registry_ref
+            .ask(TerminalResolverRegistryAsk::ShutdownAll);
+        if let Some(handle) = self.terminal_resolver_registry_handle.take() {
+            handle.shutdown();
+        }
+        let _ = self.state_ref.ask(BusStateAsk::ShutdownBindingActors);
+        if let Some(handle) = self.state_handle.take() {
+            handle.shutdown();
+        }
+
+        for (_, reply) in self.pending_replies.drain() {
+            let _ = reply.reply(Err("saga bus dropped".to_string()));
+        }
+    }
 }
 
 const DEFAULT_TERMINAL_RETENTION_LIMIT: usize = 1024;
 const DEFAULT_TERMINAL_WATCHDOG_TICK_MS: u64 = 100;
+
+pub(crate) fn ensure_saga_sync_pool_capacity() {
+    static CONFIGURED: OnceLock<()> = OnceLock::new();
+    CONFIGURED.get_or_init(|| {
+        let size = std::thread::available_parallelism()
+            .map(|parallelism| parallelism.get())
+            .unwrap_or(1)
+            .max(256);
+        let _ = local_sync::set_default_pool_config(local_sync::PoolConfig::new(size));
+    });
+}
 
 fn saturating_u32_from_usize(value: usize) -> u32 {
     if value > u32::MAX as usize {
@@ -94,16 +488,38 @@ pub enum SagaBusPublishError {
 
 impl SagaChoreographyBus {
     pub fn new() -> Self {
+        ensure_saga_sync_pool_capacity();
+        let (state_ref, state_handle) = local_sync::spawn(BusStateActor::default());
+        let (terminal_resolver_registry_ref, terminal_resolver_registry_handle) =
+            local_sync::spawn(TerminalResolverRegistryActor::default());
+        let pending_replies = CorrelationRegistry::new();
+        let lifecycle = Arc::new(BusActorLifecycle {
+            pending_replies: pending_replies.clone(),
+            state_ref: state_ref.clone(),
+            state_handle: Some(state_handle),
+            terminal_resolver_registry_ref: terminal_resolver_registry_ref.clone(),
+            terminal_resolver_registry_handle: Some(terminal_resolver_registry_handle),
+        });
         Self {
             bus: EventBus::new(),
-            pending_replies: CorrelationRegistry::new(),
-            terminal_replies: Arc::new(Mutex::new(HashMap::new())),
-            terminal_outcomes: Arc::new(Mutex::new(HashMap::new())),
-            terminal_order: Arc::new(Mutex::new(VecDeque::new())),
-            terminal_policies_by_saga_type: Arc::new(Mutex::new(HashMap::new())),
-            workflow_contracts_by_saga_type: Arc::new(Mutex::new(HashMap::new())),
-            bound_steps_by_saga_type: Arc::new(Mutex::new(HashMap::new())),
-            owned: true,
+            pending_replies,
+            state_ref,
+            terminal_resolver_registry_ref,
+            _lifecycle: lifecycle,
+        }
+    }
+
+    fn ask_state(&self, msg: BusStateAsk) -> Option<BusStateReply> {
+        match self.state_ref.ask(msg) {
+            Ok(reply) => Some(reply),
+            Err(err) => {
+                tracing::error!(
+                    target: "core::saga",
+                    event = "saga_bus_state_actor_unavailable",
+                    error = ?err
+                );
+                None
+            }
         }
     }
 
@@ -116,6 +532,11 @@ impl SagaChoreographyBus {
 
     pub fn unsubscribe(&self, sub: EventSubscription) -> bool {
         self.bus.unsubscribe(sub)
+    }
+
+    pub(crate) fn remember_binding_actor_handle(&self, handle: local_sync::ActorHandle) {
+        self.state_ref
+            .tell(BusStateTell::RememberBindingActor(handle));
     }
 
     pub fn publish(&self, event: SagaChoreographyEvent) -> PublishStats {
@@ -172,9 +593,9 @@ impl SagaChoreographyBus {
         let stats = self.bus.publish(event);
         if let (Some(required_min_delivery), Some(context)) =
             (expected_min_delivery, expected_context)
+            && stats.delivered < required_min_delivery
         {
-            if stats.delivered < required_min_delivery {
-                let terminal = SagaChoreographyEvent::SagaFailed {
+            let terminal = SagaChoreographyEvent::SagaFailed {
                     context: context.next_step(TERMINAL_RESOLVER_STEP.into()),
                     reason: format!(
                         "required_path_delivery_shortfall: saga_type={} event_type={} step={} delivered={} attempted={} required_min_delivered={} required_path={}",
@@ -189,11 +610,10 @@ impl SagaChoreographyBus {
                     .into(),
                     failure: None,
                 };
-                if let Some(outcome) = terminal.terminal_outcome() {
-                    self.store_terminal_outcome(terminal.context().saga_id, outcome);
-                }
-                let _ = self.bus.publish(terminal);
+            if let Some(outcome) = terminal.terminal_outcome() {
+                self.store_terminal_outcome(terminal.context().saga_id, outcome);
             }
+            let _ = self.bus.publish(terminal);
         }
         stats
     }
@@ -205,22 +625,21 @@ impl SagaChoreographyBus {
         let stats = self.publish(event.clone());
         if let Some(required_min_delivery) =
             self.required_path_expected_min_delivery_for_event(&event)
+            && stats.delivered < required_min_delivery
         {
-            if stats.delivered < required_min_delivery {
-                let context = event.context();
-                return Err(SagaBusPublishError::RequiredPathDeliveryShortfall {
-                    saga_id: context.saga_id,
-                    saga_type: context.saga_type.clone(),
-                    step_name: context.step_name.clone(),
-                    event_type: event.event_type(),
-                    attempted: stats.attempted,
-                    delivered: stats.delivered,
-                    required_min_delivered: required_min_delivery,
-                    required_path: self
-                        .required_path_description(context.saga_type.as_ref())
-                        .into(),
-                });
-            }
+            let context = event.context();
+            return Err(SagaBusPublishError::RequiredPathDeliveryShortfall {
+                saga_id: context.saga_id,
+                saga_type: context.saga_type.clone(),
+                step_name: context.step_name.clone(),
+                event_type: event.event_type(),
+                attempted: stats.attempted,
+                delivered: stats.delivered,
+                required_min_delivered: required_min_delivery,
+                required_path: self
+                    .required_path_description(context.saga_type.as_ref())
+                    .into(),
+            });
         }
         if stats.attempted == stats.delivered {
             return Ok(stats);
@@ -273,10 +692,10 @@ impl SagaChoreographyBus {
     }
 
     fn register_terminal_policy(&self, policy: &TerminalPolicy) {
-        self.terminal_policies_by_saga_type
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(policy.saga_type.clone(), policy.policy_id.clone());
+        let _ = self.ask_state(BusStateAsk::RegisterTerminalPolicy {
+            saga_type: policy.saga_type.clone(),
+            policy_id: policy.policy_id.clone(),
+        });
     }
 
     pub fn register_workflow_contract_provider<C: SagaWorkflowContract>(
@@ -299,35 +718,32 @@ impl SagaChoreographyBus {
             required_path_description: required_path_description.into(),
         };
 
-        {
-            let bound = self
-                .bound_steps_by_saga_type
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(bound_for_type) = bound.get(C::saga_type()) {
-                let mut unknown_steps: Vec<&str> = bound_for_type
-                    .iter()
-                    .filter(|step| !declared_steps.contains(step.as_ref()))
-                    .map(|step| step.as_ref())
-                    .collect();
-                unknown_steps.sort_unstable();
-                if !unknown_steps.is_empty() {
-                    return Err(format!(
-                        "bound step set contains steps not declared by workflow contract: saga_type={} unknown_steps={}",
-                        C::saga_type(),
-                        unknown_steps.join(",")
-                    ));
-                }
+        let bound_for_type = match self.ask_state(BusStateAsk::BoundSteps {
+            saga_type: C::saga_type().into(),
+        }) {
+            Some(BusStateReply::BoundSteps(steps)) => steps,
+            _ => HashSet::new(),
+        };
+        if !bound_for_type.is_empty() {
+            let mut unknown_steps: Vec<&str> = bound_for_type
+                .iter()
+                .filter(|step| !declared_steps.contains(step.as_ref()))
+                .map(|step| step.as_ref())
+                .collect();
+            unknown_steps.sort_unstable();
+            if !unknown_steps.is_empty() {
+                return Err(format!(
+                    "bound step set contains steps not declared by workflow contract: saga_type={} unknown_steps={}",
+                    C::saga_type(),
+                    unknown_steps.join(",")
+                ));
             }
         }
 
-        {
-            let mut contracts = self
-                .workflow_contracts_by_saga_type
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            contracts.insert(C::saga_type().into(), contract_state);
-        }
+        let _ = self.ask_state(BusStateAsk::RegisterWorkflowContract {
+            saga_type: C::saga_type().into(),
+            contract_state,
+        });
 
         let required = required_steps_from_success_criteria(&policy.success_criteria);
         for step in required {
@@ -351,29 +767,25 @@ impl SagaChoreographyBus {
         if saga_type.is_empty() || step_name.is_empty() {
             return Err("saga_type and step_name must be non-empty".to_string());
         }
+        let contract = match self.ask_state(BusStateAsk::WorkflowContract {
+            saga_type: saga_type.into(),
+        }) {
+            Some(BusStateReply::WorkflowContract(contract)) => contract,
+            _ => None,
+        };
+        if let Some(contract) = contract
+            && !contract.declared_steps.contains(step_name)
         {
-            let contracts = self
-                .workflow_contracts_by_saga_type
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(contract) = contracts.get(saga_type) {
-                if !contract.declared_steps.contains(step_name) {
-                    return Err(format!(
-                        "bound workflow step is not declared by contract: saga_type={} step={}",
-                        saga_type, step_name
-                    ));
-                }
-            }
+            return Err(format!(
+                "bound workflow step is not declared by contract: saga_type={} step={}",
+                saga_type, step_name
+            ));
         }
 
-        let mut bound = self
-            .bound_steps_by_saga_type
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        bound
-            .entry(saga_type.into())
-            .or_default()
-            .insert(step_name.into());
+        let _ = self.ask_state(BusStateAsk::RegisterBoundWorkflowStep {
+            saga_type: saga_type.into(),
+            step_name: step_name.into(),
+        });
         Ok(())
     }
 
@@ -435,43 +847,80 @@ impl SagaChoreographyBus {
         policy: TerminalPolicy,
         responder: &'static str,
     ) -> Result<EventSubscription, String> {
+        let saga_type_topic = policy.saga_type.clone();
+        let existing =
+            match self
+                .terminal_resolver_registry_ref
+                .ask(TerminalResolverRegistryAsk::Existing(
+                    saga_type_topic.clone(),
+                )) {
+                Ok(TerminalResolverRegistryReply::Existing(existing)) => existing,
+                Ok(TerminalResolverRegistryReply::Registered(_)) => {
+                    return Err(format!(
+                        "terminal resolver registry returned register reply saga_type={}",
+                        saga_type_topic
+                    ));
+                }
+                Ok(TerminalResolverRegistryReply::ShutdownComplete) => {
+                    return Err(format!(
+                        "terminal resolver registry returned shutdown reply saga_type={}",
+                        saga_type_topic
+                    ));
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "terminal resolver registry unavailable saga_type={}: {:?}",
+                        saga_type_topic, err
+                    ));
+                }
+            };
+        if let Some(subscription) = existing {
+            return Ok(subscription);
+        }
+
         self.register_terminal_policy(&policy);
-        let resolver = Arc::new(Mutex::new(TerminalResolver::new(policy.clone())));
         let bus = self.clone();
         let responder: Arc<str> = Arc::from(responder);
-        let saga_type_topic = policy.saga_type.clone();
-        spawn_terminal_watchdog_if_needed(
-            &policy,
-            Arc::clone(&resolver),
-            bus.clone(),
-            Arc::clone(&responder),
-        )?;
-        Ok(self
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (resolver_ref, resolver_handle) = local_sync::spawn(TerminalResolverActor {
+            resolver: TerminalResolver::new(policy.clone()),
+            bus: bus.clone(),
+            responder: Arc::clone(&responder),
+            saga_type: saga_type_topic.clone(),
+        });
+        spawn_terminal_watchdog_if_needed(&policy, resolver_ref.clone(), Arc::clone(&shutdown))?;
+        let subscription = self
             .bus
             .subscribe_fn(saga_type_topic.as_ref(), move |event| {
-                let terminal_events = {
-                    let mut resolver = match resolver.lock() {
-                        Ok(guard) => guard,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    resolver.ingest(event)
-                };
-
-                for terminal_event in terminal_events {
-                    let _ =
-                        bus.complete_terminal_reply_from_event(&terminal_event, responder.as_ref());
-                    if let Err(err) = bus.publish_strict(terminal_event) {
-                        tracing::error!(
-                            target: "core::saga",
-                            event = "terminal_resolver_publish_failed",
-                            saga_type = policy.saga_type.as_ref(),
-                            error = ?err
-                        );
-                    }
+                if !resolver_ref.tell(TerminalResolverTell::Ingest(Box::new(event.clone()))) {
+                    tracing::error!(
+                        target: "core::saga",
+                        event = "terminal_resolver_ingest_failed",
+                        saga_type = policy.saga_type.as_ref()
+                    );
                 }
 
                 true
-            }))
+            });
+        match self
+            .terminal_resolver_registry_ref
+            .ask(TerminalResolverRegistryAsk::Register {
+                saga_type: saga_type_topic,
+                runtime: TerminalResolverRuntime {
+                    subscription,
+                    shutdown,
+                    handle: resolver_handle,
+                },
+            }) {
+            Ok(TerminalResolverRegistryReply::Registered(subscription)) => Ok(subscription),
+            Ok(TerminalResolverRegistryReply::Existing(_)) => {
+                Err("terminal resolver registry returned unexpected existing reply".to_string())
+            }
+            Ok(TerminalResolverRegistryReply::ShutdownComplete) => {
+                Err("terminal resolver registry returned shutdown reply".to_string())
+            }
+            Err(err) => Err(format!("terminal resolver registry unavailable: {err:?}")),
+        }
     }
 
     pub fn attach_terminal_resolver_for_contract<C: SagaWorkflowContract>(
@@ -482,28 +931,17 @@ impl SagaChoreographyBus {
     }
 
     pub fn take_terminal_reply(&self, saga_id: SagaId) -> Option<SagaReplyTo> {
-        let reply = self
-            .terminal_replies
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&saga_id);
-        if reply.is_some() {
-            self.terminal_outcomes
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&saga_id);
+        match self.ask_state(BusStateAsk::TakeTerminalReply { saga_id }) {
+            Some(BusStateReply::TerminalReply(reply)) => reply,
+            _ => None,
         }
-        reply
     }
 
     pub fn take_terminal_outcome(&self, saga_id: SagaId) -> Option<crate::SagaTerminalOutcome> {
-        let reply = self.take_terminal_reply(saga_id).map(|reply| reply.outcome);
-        let direct = self
-            .terminal_outcomes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&saga_id);
-        reply.or(direct)
+        match self.ask_state(BusStateAsk::TakeTerminalOutcome { saga_id }) {
+            Some(BusStateReply::TerminalOutcome(outcome)) => outcome,
+            _ => None,
+        }
     }
 
     fn complete_terminal_reply_from_event(
@@ -535,7 +973,8 @@ impl SagaChoreographyBus {
     }
 
     fn terminal_retention_limit(&self) -> usize {
-        match std::env::var("SAGA_TERMINAL_RETENTION_LIMIT") {
+        static LIMIT: OnceLock<usize> = OnceLock::new();
+        *LIMIT.get_or_init(|| match std::env::var("SAGA_TERMINAL_RETENTION_LIMIT") {
             Ok(raw) => match raw.parse::<usize>() {
                 Ok(value) if value > 0 => value,
                 Ok(_value) => DEFAULT_TERMINAL_RETENTION_LIMIT,
@@ -551,24 +990,25 @@ impl SagaChoreographyBus {
                 }
             },
             Err(_) => DEFAULT_TERMINAL_RETENTION_LIMIT,
-        }
+        })
     }
 
     fn has_terminal_policy_for_saga_type(&self, saga_type: &str) -> bool {
-        self.terminal_policies_by_saga_type
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains_key(saga_type)
+        match self.ask_state(BusStateAsk::HasTerminalPolicy {
+            saga_type: saga_type.into(),
+        }) {
+            Some(BusStateReply::Bool(has_policy)) => has_policy,
+            _ => false,
+        }
     }
 
     fn saga_start_contract_violation_reason(&self, context: &crate::SagaContext) -> Option<String> {
         let saga_type = context.saga_type.as_ref();
-        let contract = {
-            let contracts = self
-                .workflow_contracts_by_saga_type
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            contracts.get(saga_type).cloned()
+        let contract = match self.ask_state(BusStateAsk::WorkflowContract {
+            saga_type: saga_type.into(),
+        }) {
+            Some(BusStateReply::WorkflowContract(contract)) => contract,
+            _ => None,
         };
         let Some(contract) = contract else {
             return Some(format!(
@@ -585,15 +1025,11 @@ impl SagaChoreographyBus {
             ));
         }
 
-        let bound_for_type = {
-            let bound = self
-                .bound_steps_by_saga_type
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            match bound.get(saga_type) {
-                Some(steps) => steps.clone(),
-                None => HashSet::new(),
-            }
+        let bound_for_type = match self.ask_state(BusStateAsk::BoundSteps {
+            saga_type: saga_type.into(),
+        }) {
+            Some(BusStateReply::BoundSteps(steps)) => steps,
+            _ => HashSet::new(),
         };
         let mut missing_steps: Vec<&str> = contract
             .declared_steps
@@ -602,37 +1038,33 @@ impl SagaChoreographyBus {
             .map(|step| step.as_ref())
             .collect();
         missing_steps.sort_unstable();
-        if missing_steps.is_empty() {
-            return None;
+        if !missing_steps.is_empty() {
+            return Some(format!(
+                "workflow contract violation: unbound participant steps; saga_type={} missing_steps={}",
+                saga_type,
+                missing_steps.join(",")
+            ));
         }
-        Some(format!(
-            "workflow contract violation: unbound participant steps at saga start; saga_type={} missing_steps={}",
-            saga_type,
-            missing_steps.join(",")
-        ))
+
+        None
     }
 
     fn saga_start_expected_min_delivery(&self, saga_type: &str) -> Option<u32> {
-        let contracts = self
-            .workflow_contracts_by_saga_type
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let contract = contracts.get(saga_type)?;
-        let required_path_steps = contract.required_path_steps.len();
-        Some(saturating_u32_from_usize(
-            required_path_steps.saturating_add(1),
-        ))
+        match self.ask_state(BusStateAsk::SagaStartExpectedMinDelivery {
+            saga_type: saga_type.into(),
+        }) {
+            Some(BusStateReply::OptionalU32(expected)) => expected,
+            _ => None,
+        }
     }
 
     fn required_path_description(&self, saga_type: &str) -> String {
-        let contracts = self
-            .workflow_contracts_by_saga_type
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(contract) = contracts.get(saga_type) else {
-            return String::new();
-        };
-        contract.required_path_description.to_string()
+        match self.ask_state(BusStateAsk::RequiredPathDescription {
+            saga_type: saga_type.into(),
+        }) {
+            Some(BusStateReply::String(description)) => description,
+            _ => String::new(),
+        }
     }
 
     fn required_path_expected_min_delivery_for_event(
@@ -652,80 +1084,37 @@ impl SagaChoreographyBus {
         if !self.has_terminal_policy_for_saga_type(context.saga_type.as_ref()) {
             return None;
         }
-        let contracts = self
-            .workflow_contracts_by_saga_type
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let contract = contracts.get(context.saga_type.as_ref())?;
-        if !contract
-            .required_path_steps
-            .contains(context.step_name.as_ref())
-        {
-            return None;
+        match self.ask_state(BusStateAsk::RequiredPathExpectedMinDelivery {
+            saga_type: context.saga_type.clone(),
+            step_name: context.step_name.clone(),
+        }) {
+            Some(BusStateReply::OptionalU32(expected)) => expected,
+            _ => None,
         }
-        Some(saturating_u32_from_usize(
-            contract.required_path_steps.len().saturating_add(1),
-        ))
     }
 
     fn store_terminal_reply(&self, saga_id: SagaId, reply: SagaReplyTo) {
-        let outcome = reply.outcome.clone();
-        self.terminal_replies
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(saga_id, reply);
-        self.store_terminal_outcome(saga_id, outcome);
+        let retention_limit = self.terminal_retention_limit();
+        let _ = self.ask_state(BusStateAsk::StoreTerminalReply {
+            saga_id,
+            reply,
+            retention_limit,
+        });
     }
 
     fn store_terminal_outcome(&self, saga_id: SagaId, outcome: SagaTerminalOutcome) {
-        let inserted_new = {
-            let mut terminal_outcomes = self
-                .terminal_outcomes
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            terminal_outcomes.insert(saga_id, outcome).is_none()
-        };
-
-        if inserted_new {
-            let limit = self.terminal_retention_limit();
-            let evicted_id = {
-                let mut order = self
-                    .terminal_order
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let mut evicted_id = None;
-                order.push_back(saga_id);
-                while order.len() > limit {
-                    let Some(candidate) = order.pop_front() else {
-                        break;
-                    };
-                    if candidate != saga_id {
-                        evicted_id = Some(candidate);
-                        break;
-                    }
-                }
-                evicted_id
-            };
-            if let Some(evicted_id) = evicted_id {
-                self.remove_terminal_state(evicted_id);
-            }
-        }
-    }
-
-    fn remove_terminal_state(&self, saga_id: SagaId) -> Option<SagaTerminalOutcome> {
-        self.terminal_replies
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&saga_id);
-        self.terminal_outcomes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&saga_id)
+        let retention_limit = self.terminal_retention_limit();
+        let _ = self.ask_state(BusStateAsk::StoreTerminalOutcome {
+            saga_id,
+            outcome,
+            retention_limit,
+        });
     }
 }
 
 fn terminal_watchdog_tick_interval() -> Duration {
-    match std::env::var("SAGA_TERMINAL_WATCHDOG_TICK_MS") {
+    static INTERVAL: OnceLock<Duration> = OnceLock::new();
+    *INTERVAL.get_or_init(|| match std::env::var("SAGA_TERMINAL_WATCHDOG_TICK_MS") {
         Ok(raw) => match raw.parse::<u64>() {
             Ok(value) if value > 0 => Duration::from_millis(value),
             Ok(_value) => Duration::from_millis(DEFAULT_TERMINAL_WATCHDOG_TICK_MS),
@@ -741,40 +1130,32 @@ fn terminal_watchdog_tick_interval() -> Duration {
             }
         },
         Err(_) => Duration::from_millis(DEFAULT_TERMINAL_WATCHDOG_TICK_MS),
-    }
+    })
 }
 
 fn spawn_terminal_watchdog_if_needed(
     policy: &TerminalPolicy,
-    resolver: Arc<Mutex<TerminalResolver>>,
-    bus: SagaChoreographyBus,
-    responder: Arc<str>,
+    resolver_ref: local_sync::SyncActorRef<TerminalResolverActor>,
+    shutdown: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let saga_type = policy.saga_type.clone();
     let watchdog_name = format!("saga-terminal-watchdog:{saga_type}");
-    let spawn_result = thread::Builder::new()
-        .name(watchdog_name)
-        .spawn(move || loop {
+    let spawn_result = thread::Builder::new().name(watchdog_name).spawn(move || {
+        loop {
             thread::sleep(terminal_watchdog_tick_interval());
-            let terminal_events = {
-                let mut guard = match resolver.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                guard.poll_timeouts()
-            };
-            for terminal_event in terminal_events {
-                let _ = bus.complete_terminal_reply_from_event(&terminal_event, responder.as_ref());
-                if let Err(err) = bus.publish_strict(terminal_event) {
-                    tracing::error!(
-                        target: "core::saga",
-                        event = "terminal_watchdog_publish_failed",
-                        saga_type = saga_type.as_ref(),
-                        error = ?err
-                    );
-                }
+            if shutdown.load(Ordering::Acquire) {
+                break;
             }
-        });
+            if !resolver_ref.tell(TerminalResolverTell::PollTimeouts) {
+                tracing::error!(
+                    target: "core::saga",
+                    event = "terminal_watchdog_poll_failed",
+                    saga_type = saga_type.as_ref()
+                );
+                break;
+            }
+        }
+    });
     if let Err(err) = spawn_result {
         return Err(format!(
             "terminal watchdog spawn failed saga_type={}: {}",
@@ -794,25 +1175,9 @@ impl Clone for SagaChoreographyBus {
         Self {
             bus: self.bus.clone(),
             pending_replies: self.pending_replies.clone(),
-            terminal_replies: Arc::clone(&self.terminal_replies),
-            terminal_outcomes: Arc::clone(&self.terminal_outcomes),
-            terminal_order: Arc::clone(&self.terminal_order),
-            terminal_policies_by_saga_type: Arc::clone(&self.terminal_policies_by_saga_type),
-            workflow_contracts_by_saga_type: Arc::clone(&self.workflow_contracts_by_saga_type),
-            bound_steps_by_saga_type: Arc::clone(&self.bound_steps_by_saga_type),
-            owned: false,
-        }
-    }
-}
-
-impl Drop for SagaChoreographyBus {
-    fn drop(&mut self) {
-        if !self.owned {
-            return;
-        }
-
-        for (_, reply) in self.pending_replies.drain() {
-            let _ = reply.reply(Err("saga bus dropped".to_string()));
+            state_ref: self.state_ref.clone(),
+            terminal_resolver_registry_ref: self.terminal_resolver_registry_ref.clone(),
+            _lifecycle: Arc::clone(&self._lifecycle),
         }
     }
 }
@@ -826,8 +1191,8 @@ impl Default for SagaChoreographyBus {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -836,10 +1201,10 @@ mod tests {
     use crate::{
         FailureAuthority, SagaChoreographyEvent, SagaContext, SagaId, SagaReplyToResult,
         SagaTerminalOutcome, SagaWorkflowContract, SagaWorkflowStepContract, SuccessCriteria,
-        TerminalPolicy, WorkflowDependencySpec, TERMINAL_RESOLVER_STEP,
+        TERMINAL_RESOLVER_STEP, TerminalPolicy, WorkflowDependencySpec,
     };
 
-    use super::{SagaChoreographyBus, DEFAULT_TERMINAL_RETENTION_LIMIT};
+    use super::{DEFAULT_TERMINAL_RETENTION_LIMIT, SagaChoreographyBus};
 
     fn context_for(saga_type: &str, step_name: &str, saga_id: u64) -> SagaContext {
         let now = SagaContext::now_millis();
@@ -1005,6 +1370,50 @@ mod tests {
             "terminal outcome should be consumed after the first read"
         );
         probe.shutdown();
+    }
+
+    #[test]
+    fn attaching_terminal_resolver_twice_is_idempotent_for_saga_type() {
+        let bus = SagaChoreographyBus::new();
+        let first = bus
+            .attach_terminal_resolver(
+                TerminalPolicy::order_lifecycle_default(),
+                "terminal-resolver",
+            )
+            .expect("terminal resolver should attach");
+        let second = bus
+            .attach_terminal_resolver(
+                TerminalPolicy::order_lifecycle_default(),
+                "terminal-resolver",
+            )
+            .expect("terminal resolver should return existing attachment");
+        assert_eq!(first, second);
+
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let _capture_sub = bus.subscribe_saga_type_fn("order_lifecycle", {
+            let delivered = Arc::clone(&delivered);
+            move |event: &SagaChoreographyEvent| {
+                if matches!(event, SagaChoreographyEvent::SagaCompleted { .. }) {
+                    delivered.fetch_add(1, Ordering::Relaxed);
+                }
+                true
+            }
+        });
+
+        let step = SagaChoreographyEvent::StepCompleted {
+            context: context_for("order_lifecycle", "create_order", 77),
+            output: Vec::new(),
+            saga_input: Vec::new(),
+            compensation_available: false,
+        };
+        let stats = bus
+            .publish_strict(step)
+            .expect("single completed step should publish");
+        assert_eq!(stats.delivered, stats.attempted);
+        wait_until(Instant::now() + Duration::from_millis(200), || {
+            delivered.load(Ordering::Relaxed) == 1
+        });
+        assert_eq!(delivered.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -1207,6 +1616,48 @@ mod tests {
         }
     }
 
+    struct AnyOfOrderLifecycleContract;
+
+    impl SagaWorkflowContract for AnyOfOrderLifecycleContract {
+        fn saga_type() -> &'static str {
+            "order_lifecycle"
+        }
+
+        fn first_step() -> &'static str {
+            "risk_check"
+        }
+
+        fn steps() -> &'static [SagaWorkflowStepContract] {
+            &[
+                SagaWorkflowStepContract {
+                    step_name: "risk_check",
+                    participant_id: "risk-engine",
+                    depends_on: WorkflowDependencySpec::OnSagaStart,
+                },
+                SagaWorkflowStepContract {
+                    step_name: "manual_review",
+                    participant_id: "risk-human",
+                    depends_on: WorkflowDependencySpec::OnSagaStart,
+                },
+            ]
+        }
+
+        fn terminal_policy() -> TerminalPolicy {
+            let mut possible_success_steps = HashSet::new();
+            possible_success_steps.insert("risk_check".into());
+            possible_success_steps.insert("manual_review".into());
+            TerminalPolicy {
+                saga_type: "order_lifecycle".into(),
+                policy_id: "order_lifecycle/any-of".into(),
+                failure_authority: FailureAuthority::AnyParticipant,
+                success_criteria: SuccessCriteria::AnyOf(possible_success_steps),
+                overall_timeout: Duration::from_secs(30),
+                stalled_timeout: Duration::from_secs(5),
+                workflow_steps: Self::steps(),
+            }
+        }
+    }
+
     struct MismatchedPolicySagaTypeContract;
 
     impl SagaWorkflowContract for MismatchedPolicySagaTypeContract {
@@ -1288,6 +1739,62 @@ mod tests {
         assert!(
             bus.take_terminal_outcome(saga_id).is_none(),
             "contract + resolver + bound step should allow saga start"
+        );
+    }
+
+    #[test]
+    fn cloned_bus_keeps_shared_actors_alive_after_original_drop() {
+        let bus = SagaChoreographyBus::new();
+        bus.register_workflow_contract_provider::<OrderLifecycleContract>()
+            .expect("workflow contract registration should succeed");
+        bus.register_bound_workflow_step("order_lifecycle", "create_order")
+            .expect("bound workflow step registration should succeed");
+        let _resolver = bus
+            .attach_terminal_resolver_for_contract::<OrderLifecycleContract>("test-resolver")
+            .expect("terminal resolver should attach");
+        let _participant_sub = bus.subscribe_saga_type_fn("order_lifecycle", |_event| true);
+        let cloned = bus.clone();
+        drop(bus);
+
+        let saga_id = SagaId::new(90032);
+        let stats = cloned.publish(SagaChoreographyEvent::SagaStarted {
+            context: context("create_order", saga_id.get()),
+            payload: Vec::new(),
+        });
+
+        assert!(stats.delivered >= 1, "clone should still deliver events");
+        assert!(
+            cloned.take_terminal_outcome(saga_id).is_none(),
+            "clone should retain workflow contract, bound steps, and resolver actors"
+        );
+    }
+
+    #[test]
+    fn concurrent_terminal_resolver_attach_is_idempotent() {
+        let bus = Arc::new(SagaChoreographyBus::new());
+        bus.register_workflow_contract_provider::<OrderLifecycleContract>()
+            .expect("workflow contract registration should succeed");
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let bus = Arc::clone(&bus);
+            workers.push(thread::spawn(move || {
+                bus.attach_terminal_resolver_for_contract::<OrderLifecycleContract>("test-resolver")
+                    .expect("resolver attach should succeed")
+            }));
+        }
+        let subscriptions = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("attach worker should not panic"))
+            .collect::<Vec<_>>();
+        let first = subscriptions
+            .first()
+            .expect("at least one subscription should be returned")
+            .clone();
+        assert!(
+            subscriptions
+                .iter()
+                .all(|subscription| *subscription == first),
+            "concurrent attaches must all return the same resolver subscription"
         );
     }
 
@@ -1395,6 +1902,36 @@ mod tests {
         assert!(
             reason.contains("required_path=create_order(order-manager),risk_check(risk-engine)"),
             "expected required path participants in reason, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn any_of_success_does_not_require_every_branch_delivery() {
+        let bus = SagaChoreographyBus::new();
+        bus.register_workflow_contract_provider::<AnyOfOrderLifecycleContract>()
+            .expect("workflow contract registration should succeed");
+        bus.register_bound_workflow_step("order_lifecycle", "risk_check")
+            .expect("risk_check binding should succeed");
+        bus.register_bound_workflow_step("order_lifecycle", "manual_review")
+            .expect("manual_review binding should succeed");
+        let _resolver = bus
+            .attach_terminal_resolver_for_contract::<AnyOfOrderLifecycleContract>("test-resolver")
+            .expect("terminal resolver should attach");
+        let _risk_sub = bus.subscribe_saga_type_fn("order_lifecycle", |_event| true);
+
+        let saga_id = SagaId::new(900_511);
+        let publish = bus.publish_strict(SagaChoreographyEvent::SagaStarted {
+            context: context("risk_check", saga_id.get()),
+            payload: Vec::new(),
+        });
+
+        assert!(
+            publish.is_ok(),
+            "AnyOf success should not require every alternate branch delivery: {publish:?}"
+        );
+        assert!(
+            bus.take_terminal_outcome(saga_id).is_none(),
+            "AnyOf success should not terminally fail when one alternate branch is undelivered"
         );
     }
 

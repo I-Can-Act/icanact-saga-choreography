@@ -1,7 +1,18 @@
 //! Saga context and identity types
 
 /// Unique identifier for a saga execution
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct SagaId(pub u64);
 
 impl SagaId {
@@ -41,7 +52,7 @@ pub struct StepId {
 pub type PeerId = [u8; 32];
 
 /// Correlation context passed with every saga event
-#[derive(Clone)]
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct SagaContext {
     /// Unique saga execution identifier
     pub saga_id: SagaId,
@@ -53,7 +64,7 @@ pub struct SagaContext {
     pub correlation_id: u64,
     /// ID of the event that caused this one
     pub causation_id: u64,
-    /// Distributed tracing ID
+    /// Per-event trace/span ID. `correlation_id` is stable for the saga.
     pub trace_id: u64,
     /// Index of this step in the workflow
     pub step_index: usize,

@@ -44,7 +44,6 @@ mod context;
 pub mod durability;
 mod errors;
 mod events;
-mod idempotency;
 mod state;
 mod support;
 
@@ -64,6 +63,7 @@ mod stats;
 mod helpers;
 mod reply_registry;
 mod resolver;
+#[cfg(any(test, feature = "test-harness"))]
 mod testkit;
 mod workflow_contract;
 
@@ -71,7 +71,7 @@ mod workflow_contract;
 
 // Types
 pub use binding::{
-    bind_async_participant_channel, bind_async_participant_channel_lazy,
+    SagaParticipantChannel, bind_async_participant_channel, bind_async_participant_channel_lazy,
     bind_async_participant_tell, bind_async_workflow_participant_channel,
     bind_async_workflow_participant_channel_lazy,
     bind_async_workflow_participant_channel_lazy_strict,
@@ -81,19 +81,20 @@ pub use binding::{
     bind_sync_workflow_participant_channel_lazy_strict,
     bind_sync_workflow_participant_channel_strict, bind_sync_workflow_participant_tell,
     bind_sync_workflow_participant_tell_strict, checked_workflow_saga_types, workflow_saga_types,
-    SagaParticipantChannel,
 };
-pub use bus::{global_saga_choreography_bus, SagaBusPublishError, SagaChoreographyBus};
+pub use bus::{SagaBusPublishError, SagaChoreographyBus, global_saga_choreography_bus};
 pub use context::{PeerId, SagaContext, SagaId, StepId};
 pub use durability::*;
-pub use idempotency::IdempotencyKey;
 
 // State (typestate)
 pub use state::{
     Compensated, Compensating, Completed, Executing, Failed, Idle, Quarantined,
     SagaParticipantState, SagaStateEntry, TimestampedEvent, Triggered,
 };
-pub use support::{HasSagaParticipantSupport, SagaParticipantSupport, SagaParticipantSupportExt};
+pub use support::{
+    AcceptedWorkflowStep, HasSagaParticipantSupport, SagaParticipantSupport,
+    SagaParticipantSupportExt,
+};
 
 // Events
 pub use events::{
@@ -102,7 +103,11 @@ pub use events::{
 };
 
 // Errors
-pub use errors::{CompensationError, StepError, StepOutput};
+pub use errors::{
+    AcceptedStepCompletion, AcceptedStepError, AcceptedStepFailure, AcceptedStepPolicy,
+    AcceptedStepPolicyError, AcceptedStepTimeoutOutcome, CompensationError, StepError,
+    StepExecutionId, StepOutput,
+};
 
 // Traits
 pub use state_ext::SagaStateExt;
@@ -123,17 +128,18 @@ pub use stats::{ParticipantStats, ParticipantStatsSnapshot};
 pub use helpers::{handle_async_saga_event_with_emit, handle_saga_event_with_emit};
 pub use reply_registry::{SagaReplyToHandle, SagaReplyToResult};
 pub use resolver::{
-    FailureAuthority, SuccessCriteria, TerminalPolicy, TerminalResolver, TERMINAL_RESOLVER_STEP,
+    FailureAuthority, SuccessCriteria, TERMINAL_RESOLVER_STEP, TerminalPolicy, TerminalResolver,
 };
 #[cfg(any(test, feature = "test-harness"))]
 pub use testkit::AsyncSagaParticipantHandle;
+#[cfg(any(test, feature = "test-harness"))]
 pub use testkit::{
-    compensation_requested, drive_scenario, drive_workflow_scenario, saga_started, step_completed,
-    step_failed, DeterministicContextBuilder,
+    DeterministicContextBuilder, compensation_requested, drive_scenario, drive_workflow_scenario,
+    saga_started, step_completed, step_failed,
 };
 #[cfg(any(test, feature = "test-harness"))]
 pub use testkit::{SagaTestWorld, SyncSagaParticipantHandle};
 pub use workflow_contract::{
-    required_steps_from_success_criteria, validate_workflow_contract, SagaWorkflowContract,
-    SagaWorkflowStepContract, WorkflowDependencySpec,
+    SagaWorkflowContract, SagaWorkflowStepContract, WorkflowDependencySpec,
+    required_steps_from_success_criteria, validate_workflow_contract,
 };

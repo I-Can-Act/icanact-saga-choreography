@@ -5,9 +5,21 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use icanact_core::local::PublishStats;
 
 use crate::{
-    ParticipantDedupeStore, ParticipantJournal, ParticipantStats, SagaChoreographyBus,
-    SagaChoreographyEvent, SagaId, SagaStateEntry,
+    AcceptedStepPolicy, ParticipantDedupeStore, ParticipantJournal, ParticipantStats,
+    SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId, SagaStateEntry,
+    StepExecutionId,
 };
+
+#[derive(Clone, Debug)]
+pub struct AcceptedWorkflowStep {
+    pub context: SagaContext,
+    pub participant_id: Box<str>,
+    pub execution_id: StepExecutionId,
+    pub policy: AcceptedStepPolicy,
+    pub accepted_at_millis: u64,
+    pub deadline_at_millis: u64,
+    pub hard_deadline_at_millis: u64,
+}
 
 /// Embedded choreography capability owned by a saga-enabled participant.
 ///
@@ -24,6 +36,8 @@ where
     pub dependency_fired: HashSet<SagaId>,
     pub terminal_sagas: HashSet<SagaId>,
     pub terminal_saga_order: VecDeque<SagaId>,
+    pub accepted_workflow_steps: HashMap<SagaId, AcceptedWorkflowStep>,
+    pub resolved_workflow_steps: HashSet<(SagaId, StepExecutionId)>,
     pub journal: J,
     pub dedupe: D,
     pub stats: ParticipantStats,
@@ -43,6 +57,8 @@ where
             dependency_fired: HashSet::new(),
             terminal_sagas: HashSet::new(),
             terminal_saga_order: VecDeque::new(),
+            accepted_workflow_steps: HashMap::new(),
+            resolved_workflow_steps: HashSet::new(),
             journal,
             dedupe,
             stats: ParticipantStats::new(),
@@ -72,6 +88,27 @@ where
             Err("saga bus is not attached".to_string())
         }
     }
+
+    pub fn has_accepted_workflow_step(&self, saga_id: SagaId) -> bool {
+        self.accepted_workflow_steps.contains_key(&saga_id)
+    }
+
+    pub fn accepted_workflow_step_count(&self) -> usize {
+        self.accepted_workflow_steps.len()
+    }
+
+    pub fn has_resolved_workflow_step(
+        &self,
+        saga_id: SagaId,
+        execution_id: &StepExecutionId,
+    ) -> bool {
+        self.resolved_workflow_steps
+            .contains(&(saga_id, execution_id.clone()))
+    }
+
+    pub fn resolved_workflow_step_count(&self) -> usize {
+        self.resolved_workflow_steps.len()
+    }
 }
 
 impl<J, D> std::fmt::Debug for SagaParticipantSupport<J, D>
@@ -89,6 +126,14 @@ where
             .field("dependency_fired_len", &self.dependency_fired.len())
             .field("terminal_sagas_len", &self.terminal_sagas.len())
             .field("terminal_saga_order_len", &self.terminal_saga_order.len())
+            .field(
+                "accepted_workflow_steps_len",
+                &self.accepted_workflow_steps.len(),
+            )
+            .field(
+                "resolved_workflow_steps_len",
+                &self.resolved_workflow_steps.len(),
+            )
             .field(
                 "startup_recovery_events_len",
                 &self.startup_recovery_events.len(),
@@ -127,8 +172,8 @@ impl<T> SagaParticipantSupportExt for T where T: HasSagaParticipantSupport {}
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::{InMemoryDedupe, InMemoryJournal, PeerId, SagaContext, SagaId};
 

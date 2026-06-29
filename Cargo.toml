@@ -1,7 +1,7 @@
 [package]
 name = "icanact-saga-choreography"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "Choreography-based SAGA pattern for distributed transactions using icanact-core actors"
 license = "MIT"
 authors = ["Greg"]
@@ -12,10 +12,28 @@ diagnostics = []
 test-harness = ["icanact-core/test-support", "dep:tracing-subscriber"]
 test-support = ["test-harness"]
 lmdb = ["dep:heed"]
+# Opt-in exhaustive concurrency model checking for the dedupe/journal atomicity
+# contracts. Run with: cargo test --features loom (slower; explores all interleavings).
+loom = []
+
+[[test]]
+name = "async_workflow_lifecycle_e2e"
+path = "tests/async_workflow_lifecycle_e2e.rs"
+required-features = ["test-harness"]
+
+[[test]]
+name = "durability_lmdb_integration"
+path = "tests/durability_lmdb_integration.rs"
+required-features = ["lmdb"]
+
+[[test]]
+name = "saga_testkit_smoke"
+path = "tests/saga_testkit_smoke.rs"
+required-features = ["test-harness"]
 
 [dependencies]
 # Core dependencies
-icanact-core = { git = "ssh://git@github.com/moofone/actor-framework-core.git", branch = "main", features = ["async-actors"] }
+icanact-core = { git = "ssh://git@github.com/moofone/actor-framework-core.git", rev = "ec5d25e3285c4f306749860bfdd57f1e7264b25a", features = ["async-actors"] }
 rkyv = { version = "0.8", features = ["std", "bytecheck"] }
 thiserror = "1.0"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros", "sync"] }
@@ -26,8 +44,15 @@ heed = { version = "0.20", optional = true }
 tracing-subscriber = { version = "0.3", optional = true }
 
 [dev-dependencies]
-icanact-core = { git = "ssh://git@github.com/moofone/actor-framework-core.git", branch = "main", features = ["async-actors", "test-support"] }
+icanact-core = { git = "ssh://git@github.com/moofone/actor-framework-core.git", rev = "ec5d25e3285c4f306749860bfdd57f1e7264b25a", features = ["async-actors", "test-support"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros", "sync", "test-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Property-based testing for the FSM transition validator and journal replay.
+proptest = "1"
+# Exhaustive concurrency model checking. The crate is always built as a
+# dev-dependency; the `loom` feature only gates the (slow) exhaustive test
+# module so default `cargo test` stays fast.
+loom = "0.7"

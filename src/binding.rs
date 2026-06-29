@@ -1,4 +1,5 @@
 use icanact_core::local::EventSubscription;
+use std::marker::PhantomData;
 
 use crate::{
     AllowsSagaTellIngress, HasSagaWorkflowParticipants, SagaChoreographyBus, SagaChoreographyEvent,
@@ -11,6 +12,227 @@ use crate::{
 pub enum SagaParticipantChannel<C> {
     Saga(SagaChoreographyEvent),
     Business(C),
+}
+
+#[derive(Debug)]
+struct ForwardSagaEvent(SagaChoreographyEvent);
+
+impl icanact_core::TellAskTell for ForwardSagaEvent {}
+
+struct SyncChannelForwarder<A, C>
+where
+    A: icanact_core::local_sync::SyncActor,
+{
+    actor_ref: icanact_core::local_sync::SyncActorRef<A>,
+    channel_name: String,
+    capacity: usize,
+    sender: Option<icanact_core::local_sync::ChannelSender<A::Channel>>,
+    _business: PhantomData<C>,
+}
+
+impl<A, C> SyncChannelForwarder<A, C>
+where
+    A: icanact_core::local_sync::SyncActor + Send + 'static,
+    A::Channel: Send + 'static,
+    A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
+{
+    fn lazy(
+        actor_ref: icanact_core::local_sync::SyncActorRef<A>,
+        channel_name: String,
+        capacity: usize,
+    ) -> Self {
+        Self {
+            actor_ref,
+            channel_name,
+            capacity,
+            sender: None,
+            _business: PhantomData,
+        }
+    }
+
+    fn eager(
+        actor_ref: icanact_core::local_sync::SyncActorRef<A>,
+        channel_name: String,
+        capacity: usize,
+    ) -> Result<Self, String> {
+        let sender = actor_ref
+            .add_channel(channel_name.clone(), capacity)
+            .ok_or_else(|| format!("failed to register saga channel `{channel_name}`"))?;
+        Ok(Self {
+            actor_ref,
+            channel_name,
+            capacity,
+            sender: Some(sender),
+            _business: PhantomData,
+        })
+    }
+
+    fn ensure_sender(&mut self) -> bool {
+        if self.sender.is_some() {
+            return true;
+        }
+        let Some(sender) = self
+            .actor_ref
+            .add_channel(self.channel_name.clone(), self.capacity)
+        else {
+            tracing::error!(
+                target: "core::saga",
+                event = "sync_saga_channel_registration_unavailable",
+                channel_name = %self.channel_name
+            );
+            return false;
+        };
+        self.sender = Some(sender);
+        true
+    }
+}
+
+impl<A, C> SyncChannelForwarder<A, C>
+where
+    A: icanact_core::local_sync::SyncActor + Send + 'static,
+    A::Channel: From<SagaParticipantChannel<C>> + Send + 'static,
+    A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
+    C: Send + 'static,
+{
+    fn forward(&mut self, event: SagaChoreographyEvent) -> bool {
+        if !self.ensure_sender() {
+            return false;
+        }
+        let Some(sender) = self.sender.as_ref() else {
+            return false;
+        };
+        sender
+            .try_send(SagaParticipantChannel::Saga(event).into())
+            .is_ok()
+    }
+}
+
+impl<A, C> icanact_core::local_sync::SyncActor for SyncChannelForwarder<A, C>
+where
+    A: icanact_core::local_sync::SyncActor + Send + 'static,
+    A::Channel: From<SagaParticipantChannel<C>> + Send + 'static,
+    A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
+    C: Send + 'static,
+{
+    type Contract = icanact_core::local_sync::contract::AskOnly;
+    type Tell = ();
+    type Ask = ForwardSagaEvent;
+    type Reply = bool;
+    type Channel = ();
+    type PubSub = ();
+    type Broadcast = ();
+
+    fn handle_ask(&mut self, msg: Self::Ask) -> Self::Reply {
+        self.forward(msg.0)
+    }
+}
+
+struct AsyncChannelForwarder<A, C>
+where
+    A: icanact_core::local_async::AsyncActor,
+{
+    actor_ref: icanact_core::local_async::AsyncActorRef<A>,
+    channel_name: String,
+    capacity: usize,
+    sender: Option<icanact_core::local_async::ChannelSender<A::Channel>>,
+    _business: PhantomData<C>,
+}
+
+impl<A, C> AsyncChannelForwarder<A, C>
+where
+    A: icanact_core::local_async::AsyncActor + Send + 'static,
+    A::Channel: Send + 'static,
+    A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
+{
+    fn lazy(
+        actor_ref: icanact_core::local_async::AsyncActorRef<A>,
+        channel_name: String,
+        capacity: usize,
+    ) -> Self {
+        Self {
+            actor_ref,
+            channel_name,
+            capacity,
+            sender: None,
+            _business: PhantomData,
+        }
+    }
+
+    fn eager(
+        actor_ref: icanact_core::local_async::AsyncActorRef<A>,
+        channel_name: String,
+        capacity: usize,
+    ) -> Result<Self, String> {
+        let sender = actor_ref
+            .add_channel(channel_name.clone(), capacity)
+            .ok_or_else(|| format!("failed to register saga channel `{channel_name}`"))?;
+        Ok(Self {
+            actor_ref,
+            channel_name,
+            capacity,
+            sender: Some(sender),
+            _business: PhantomData,
+        })
+    }
+
+    fn ensure_sender(&mut self) -> bool {
+        if self.sender.is_some() {
+            return true;
+        }
+        let Some(sender) = self
+            .actor_ref
+            .add_channel(self.channel_name.clone(), self.capacity)
+        else {
+            tracing::error!(
+                target: "core::saga",
+                event = "async_saga_channel_registration_unavailable",
+                channel_name = %self.channel_name
+            );
+            return false;
+        };
+        self.sender = Some(sender);
+        true
+    }
+}
+
+impl<A, C> AsyncChannelForwarder<A, C>
+where
+    A: icanact_core::local_async::AsyncActor + Send + 'static,
+    A::Channel: From<SagaParticipantChannel<C>> + Send + 'static,
+    A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
+    C: Send + 'static,
+{
+    fn forward(&mut self, event: SagaChoreographyEvent) -> bool {
+        if !self.ensure_sender() {
+            return false;
+        }
+        let Some(sender) = self.sender.as_ref() else {
+            return false;
+        };
+        sender
+            .try_send(SagaParticipantChannel::Saga(event).into())
+            .is_ok()
+    }
+}
+
+impl<A, C> icanact_core::local_sync::SyncActor for AsyncChannelForwarder<A, C>
+where
+    A: icanact_core::local_async::AsyncActor + Send + 'static,
+    A::Channel: From<SagaParticipantChannel<C>> + Send + 'static,
+    A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
+    C: Send + 'static,
+{
+    type Contract = icanact_core::local_sync::contract::AskOnly;
+    type Tell = ();
+    type Ask = ForwardSagaEvent;
+    type Reply = bool;
+    type Channel = ();
+    type PubSub = ();
+    type Broadcast = ();
+
+    fn handle_ask(&mut self, msg: Self::Ask) -> Self::Reply {
+        self.forward(msg.0)
+    }
 }
 
 impl<C> From<C> for SagaParticipantChannel<C> {
@@ -67,56 +289,24 @@ where
     A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
     C: Send + 'static,
 {
-    let actor_ref = actor_ref.clone();
-    let channel_name: std::sync::Arc<str> = std::sync::Arc::from(channel_name);
-    let sender: std::sync::Arc<
-        std::sync::Mutex<
-            Option<
-                icanact_core::local_sync::ChannelSender<
-                    <A as icanact_core::local_sync::SyncActor>::Channel,
-                >,
-            >,
-        >,
-    > = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let capacity = capacity.max(1);
-
+    let (forwarder_ref, forwarder_handle) =
+        icanact_core::local_sync::spawn(SyncChannelForwarder::<A, C>::lazy(
+            actor_ref.clone(),
+            channel_name.to_string(),
+            capacity.max(1),
+        ));
+    bus.remember_binding_actor_handle(forwarder_handle);
     Ok(saga_types
         .iter()
         .map(|saga_type| {
-            let actor_ref = actor_ref.clone();
-            let channel_name = std::sync::Arc::clone(&channel_name);
-            let sender = std::sync::Arc::clone(&sender);
+            let forwarder_ref = forwarder_ref.clone();
             bus.subscribe_saga_type_fn(saga_type, move |event| {
-                let mut guard = match sender.lock() {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        tracing::error!(
-                            target: "core::saga",
-                            event = "sync_channel_sender_lock_poisoned",
-                            error = %err
-                        );
-                        return false;
-                    }
-                };
-                if guard.is_none() {
-                    let Some(channel_sender) =
-                        actor_ref.add_channel(channel_name.to_string(), capacity)
-                    else {
-                        tracing::error!(
-                            target: "core::saga",
-                            event = "sync_saga_channel_registration_unavailable",
-                            channel_name = %channel_name
-                        );
-                        return false;
-                    };
-                    *guard = Some(channel_sender);
-                }
-                let Some(sender) = guard.as_ref() else {
-                    return false;
-                };
-                sender
-                    .try_send(SagaParticipantChannel::Saga(event.clone()).into())
-                    .is_ok()
+                // Strict publish accounting needs the callback to report whether
+                // the actor channel accepted the event; the forwarder only does
+                // a non-blocking try_send and replies immediately.
+                forwarder_ref
+                    .ask(ForwardSagaEvent(event.clone()))
+                    .unwrap_or(false)
             })
         })
         .collect())
@@ -136,37 +326,24 @@ where
     A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
     C: Send + 'static,
 {
-    let sender: std::sync::Arc<
-        std::sync::Mutex<
-            icanact_core::local_sync::ChannelSender<
-                <A as icanact_core::local_sync::SyncActor>::Channel,
-            >,
-        >,
-    > = std::sync::Arc::new(std::sync::Mutex::new(
-        actor_ref
-            .add_channel(channel_name.to_string(), capacity.max(1))
-            .ok_or_else(|| format!("failed to register saga channel `{channel_name}`"))?,
-    ));
-
+    let (forwarder_ref, forwarder_handle) =
+        icanact_core::local_sync::spawn(SyncChannelForwarder::<A, C>::eager(
+            actor_ref.clone(),
+            channel_name.to_string(),
+            capacity.max(1),
+        )?);
+    bus.remember_binding_actor_handle(forwarder_handle);
     Ok(saga_types
         .iter()
         .map(|saga_type| {
-            let sender = std::sync::Arc::clone(&sender);
+            let forwarder_ref = forwarder_ref.clone();
             bus.subscribe_saga_type_fn(saga_type, move |event| {
-                let guard = match sender.lock() {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        tracing::error!(
-                            target: "core::saga",
-                            event = "sync_channel_sender_lock_poisoned",
-                            error = %err
-                        );
-                        return false;
-                    }
-                };
-                guard
-                    .try_send(SagaParticipantChannel::Saga(event.clone()).into())
-                    .is_ok()
+                // Strict publish accounting needs the callback to report whether
+                // the actor channel accepted the event; the forwarder only does
+                // a non-blocking try_send and replies immediately.
+                forwarder_ref
+                    .ask(ForwardSagaEvent(event.clone()))
+                    .unwrap_or(false)
             })
         })
         .collect())
@@ -323,56 +500,24 @@ where
     A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
     C: Send + 'static,
 {
-    let actor_ref = actor_ref.clone();
-    let channel_name: std::sync::Arc<str> = std::sync::Arc::from(channel_name);
-    let sender: std::sync::Arc<
-        std::sync::Mutex<
-            Option<
-                icanact_core::local_async::ChannelSender<
-                    <A as icanact_core::local_async::AsyncActor>::Channel,
-                >,
-            >,
-        >,
-    > = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let capacity = capacity.max(1);
-
+    let (forwarder_ref, forwarder_handle) =
+        icanact_core::local_sync::spawn(AsyncChannelForwarder::<A, C>::lazy(
+            actor_ref.clone(),
+            channel_name.to_string(),
+            capacity.max(1),
+        ));
+    bus.remember_binding_actor_handle(forwarder_handle);
     Ok(saga_types
         .iter()
         .map(|saga_type| {
-            let actor_ref = actor_ref.clone();
-            let channel_name = std::sync::Arc::clone(&channel_name);
-            let sender = std::sync::Arc::clone(&sender);
+            let forwarder_ref = forwarder_ref.clone();
             bus.subscribe_saga_type_fn(saga_type, move |event| {
-                let mut guard = match sender.lock() {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        tracing::error!(
-                            target: "core::saga",
-                            event = "async_channel_sender_lock_poisoned",
-                            error = %err
-                        );
-                        return false;
-                    }
-                };
-                if guard.is_none() {
-                    let Some(channel_sender) =
-                        actor_ref.add_channel(channel_name.to_string(), capacity)
-                    else {
-                        tracing::error!(
-                            target: "core::saga",
-                            event = "async_saga_channel_registration_unavailable",
-                            channel_name = %channel_name
-                        );
-                        return false;
-                    };
-                    *guard = Some(channel_sender);
-                }
-                let Some(sender) = guard.as_ref() else {
-                    return false;
-                };
-                sender
-                    .try_send(SagaParticipantChannel::Saga(event.clone()).into())
-                    .is_ok()
+                // Strict publish accounting needs the callback to report whether
+                // the actor channel accepted the event; the forwarder only does
+                // a non-blocking try_send and replies immediately.
+                forwarder_ref
+                    .ask(ForwardSagaEvent(event.clone()))
+                    .unwrap_or(false)
             })
         })
         .collect())
@@ -392,37 +537,24 @@ where
     A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
     C: Send + 'static,
 {
-    let sender: std::sync::Arc<
-        std::sync::Mutex<
-            icanact_core::local_async::ChannelSender<
-                <A as icanact_core::local_async::AsyncActor>::Channel,
-            >,
-        >,
-    > = std::sync::Arc::new(std::sync::Mutex::new(
-        actor_ref
-            .add_channel(channel_name.to_string(), capacity.max(1))
-            .ok_or_else(|| format!("failed to register saga channel `{channel_name}`"))?,
-    ));
-
+    let (forwarder_ref, forwarder_handle) =
+        icanact_core::local_sync::spawn(AsyncChannelForwarder::<A, C>::eager(
+            actor_ref.clone(),
+            channel_name.to_string(),
+            capacity.max(1),
+        )?);
+    bus.remember_binding_actor_handle(forwarder_handle);
     Ok(saga_types
         .iter()
         .map(|saga_type| {
-            let sender = std::sync::Arc::clone(&sender);
+            let forwarder_ref = forwarder_ref.clone();
             bus.subscribe_saga_type_fn(saga_type, move |event| {
-                let guard = match sender.lock() {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        tracing::error!(
-                            target: "core::saga",
-                            event = "async_channel_sender_lock_poisoned",
-                            error = %err
-                        );
-                        return false;
-                    }
-                };
-                guard
-                    .try_send(SagaParticipantChannel::Saga(event.clone()).into())
-                    .is_ok()
+                // Strict publish accounting needs the callback to report whether
+                // the actor channel accepted the event; the forwarder only does
+                // a non-blocking try_send and replies immediately.
+                forwarder_ref
+                    .ask(ForwardSagaEvent(event.clone()))
+                    .unwrap_or(false)
             })
         })
         .collect())
@@ -531,15 +663,16 @@ where
 #[cfg(test)]
 mod tests {
     use crate::{
-        define_saga_workflow_contract, CompensationError, HasSagaWorkflowParticipants,
-        SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId, SagaTerminalOutcome,
-        SagaWorkflowParticipant, StepError, StepOutput,
+        CompensationError, HasSagaWorkflowParticipants, SagaChoreographyBus, SagaChoreographyEvent,
+        SagaContext, SagaId, SagaTerminalOutcome, SagaWorkflowParticipant, StepError, StepOutput,
+        define_saga_workflow_contract,
     };
     use icanact_core::local_sync::{self, SyncActor};
 
     use super::{
-        bind_sync_workflow_participant_channel, bind_sync_workflow_participant_channel_lazy_strict,
-        bind_sync_workflow_participant_channel_strict, SagaParticipantChannel,
+        SagaParticipantChannel, bind_sync_workflow_participant_channel,
+        bind_sync_workflow_participant_channel_lazy_strict,
+        bind_sync_workflow_participant_channel_strict,
     };
 
     #[derive(Clone, Debug)]
@@ -817,6 +950,41 @@ mod tests {
 
         assert_eq!(subs.len(), 1);
 
+        for sub in subs {
+            let _ = bus.unsubscribe(sub);
+        }
+    }
+
+    #[test]
+    fn lazy_channel_delivery_failure_is_reported_to_strict_publish() {
+        let bus = SagaChoreographyBus::new();
+        bus.register_workflow_contract_provider::<BindingWorkflowContract>()
+            .expect("workflow contract registration should succeed");
+        let actor_ref = icanact_core::SyncActorRef::<BindingActor>::new_unset();
+        let subs = bind_sync_workflow_participant_channel_lazy_strict::<BindingActor, ()>(
+            &bus, &actor_ref, "saga", 1,
+        )
+        .expect("lazy strict workflow binding should not require channel lane yet");
+
+        let err = bus
+            .publish_strict(SagaChoreographyEvent::SagaStarted {
+                context: context("gate_step", 7004),
+                payload: Vec::new(),
+            })
+            .expect_err("unset lazy channel must not count as delivered");
+
+        assert!(
+            matches!(
+                err,
+                crate::SagaBusPublishError::RequiredPathDeliveryShortfall { delivered: 0, .. }
+                    | crate::SagaBusPublishError::PartialDelivery { delivered: 0, .. }
+                    | crate::SagaBusPublishError::TerminalEscalationPartialDelivery {
+                        delivered: 0,
+                        ..
+                    }
+            ),
+            "unexpected strict publish error: {err:?}"
+        );
         for sub in subs {
             let _ = bus.unsubscribe(sub);
         }

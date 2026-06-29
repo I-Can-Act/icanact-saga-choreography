@@ -82,6 +82,19 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
         &mut self.saga_support_mut().dependency_fired
     }
 
+    /// Clears per-run in-memory tracking for a saga id before a new run or prune.
+    fn clear_in_memory_saga_run_tracking(&mut self, saga_id: SagaId) {
+        self.saga_states().remove(&saga_id);
+        self.dependency_completions().remove(&saga_id);
+        self.dependency_fired().remove(&saga_id);
+        self.saga_support_mut()
+            .accepted_workflow_steps
+            .remove(&saga_id);
+        self.saga_support_mut()
+            .resolved_workflow_steps
+            .retain(|(resolved_saga_id, _)| *resolved_saga_id != saga_id);
+    }
+
     /// Returns mutable access to terminal saga latches.
     fn terminal_sagas(&mut self) -> &mut HashSet<SagaId> {
         &mut self.saga_support_mut().terminal_sagas
@@ -98,13 +111,16 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
     }
 
     fn terminal_latch_retention_limit(&self) -> usize {
-        match std::env::var("SAGA_PARTICIPANT_TERMINAL_LATCH_RETENTION") {
-            Ok(raw) => match raw.parse::<usize>() {
-                Ok(parsed) if parsed > 0 => parsed,
-                _ => 4096,
+        static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *LIMIT.get_or_init(
+            || match std::env::var("SAGA_PARTICIPANT_TERMINAL_LATCH_RETENTION") {
+                Ok(raw) => match raw.parse::<usize>() {
+                    Ok(parsed) if parsed > 0 => parsed,
+                    _ => 4096,
+                },
+                Err(_) => 4096,
             },
-            Err(_) => 4096,
-        }
+        )
     }
 
     fn latch_terminal_saga(&mut self, saga_id: SagaId) {
@@ -241,9 +257,7 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
     ///
     /// * `saga_id` - The unique identifier of the saga to prune
     fn prune_saga_strict(&mut self, saga_id: SagaId) -> Result<(), SagaStateStoreError> {
-        self.saga_states().remove(&saga_id);
-        self.dependency_completions().remove(&saga_id);
-        self.dependency_fired().remove(&saga_id);
+        self.clear_in_memory_saga_run_tracking(saga_id);
         self.saga_journal()
             .prune(saga_id)
             .map_err(SagaStateStoreError::Journal)?;

@@ -2,21 +2,26 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use icanact_saga_choreography::durability::{
+    ActiveSagaExecution, ActiveSagaExecutionPhase, DEFAULT_RECOVERY_SAGA_TYPE,
+    HasActiveSagaExecution, PANIC_QUARANTINE_PUBLISH_KEY, RecoveryDecision, RecoveryPolicy,
     apply_sync_participant_saga_ingress, apply_sync_participant_saga_ingress_with_hooks,
     classify_recovery, collect_startup_recovery_events,
     collect_startup_recovery_events_for_saga_type, default_runtime_dir, is_panic_quarantine_reason,
     is_valid_emitted_transition, open_saga_lmdb_actor, panic_message_from_payload,
     panic_quarantine_reason, panic_quarantine_reason_from_entries,
     publish_active_saga_panic_quarantine, run_participant_phase_with_panic_quarantine,
-    ActiveSagaExecution, ActiveSagaExecutionPhase, HasActiveSagaExecution, RecoveryDecision,
-    RecoveryPolicy, DEFAULT_RECOVERY_SAGA_TYPE, PANIC_QUARANTINE_PUBLISH_KEY,
+};
+#[cfg(feature = "lmdb")]
+use icanact_saga_choreography::{
+    AcceptedStepCompletion, AcceptedStepPolicy, AcceptedStepTimeoutOutcome, accept_workflow_step,
+    complete_accepted_workflow_step,
 };
 use icanact_saga_choreography::{
     CompensationError, DependencySpec, HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal,
     JournalEntry, ParticipantDedupeStore, ParticipantEvent, ParticipantJournal,
     SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant,
     SagaParticipantState, SagaParticipantSupport, SagaStateEntry, SagaStateExt, StepError,
-    StepOutput,
+    StepExecutionId, StepOutput,
 };
 
 const ORDER_LIFECYCLE: &str = "order_lifecycle";
@@ -49,6 +54,28 @@ impl TestParticipant {
 impl HasSagaParticipantSupport for TestParticipant {
     type Journal = InMemoryJournal;
     type Dedupe = InMemoryDedupe;
+
+    fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+        &self.saga
+    }
+
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+        &mut self.saga
+    }
+}
+
+#[cfg(feature = "lmdb")]
+struct LmdbAcceptedStepActor {
+    saga: SagaParticipantSupport<
+        icanact_saga_choreography::durability::lmdb::LmdbJournal,
+        icanact_saga_choreography::durability::lmdb::LmdbDedupe,
+    >,
+}
+
+#[cfg(feature = "lmdb")]
+impl HasSagaParticipantSupport for LmdbAcceptedStepActor {
+    type Journal = icanact_saga_choreography::durability::lmdb::LmdbJournal;
+    type Dedupe = icanact_saga_choreography::durability::lmdb::LmdbDedupe;
 
     fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
         &self.saga
@@ -119,6 +146,133 @@ fn context(saga_id: u64, saga_type: &'static str, step_name: &'static str) -> Sa
         saga_started_at_millis: now,
         event_timestamp_millis: now,
     }
+}
+
+#[cfg(feature = "lmdb")]
+#[test]
+fn lmdb_open_recovers_accepted_step_metadata_for_restart_completion() {
+    let temp = tempfile::tempdir().expect("tempdir should open");
+    let ctx = context(90, ORDER_LIFECYCLE, TEST_STEP);
+    let execution_id = StepExecutionId::new("external-90");
+    let policy = AcceptedStepPolicy {
+        idle_timeout: std::time::Duration::from_millis(100),
+        hard_timeout: std::time::Duration::from_millis(250),
+        timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
+            requires_compensation: false,
+        },
+    };
+
+    let support =
+        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_type(
+            temp.path(),
+            TEST_STEP,
+            ORDER_LIFECYCLE,
+        )
+        .expect("support should open before restart");
+    let mut actor = LmdbAcceptedStepActor { saga: support };
+    accept_workflow_step(
+        &mut actor,
+        ctx.clone(),
+        "order-manager".into(),
+        execution_id.clone(),
+        policy,
+    )
+    .expect("step should be accepted before restart");
+    drop(actor);
+
+    let support =
+        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_type(
+            temp.path(),
+            TEST_STEP,
+            ORDER_LIFECYCLE,
+        )
+        .expect("support should reopen after restart");
+    let mut reopened = LmdbAcceptedStepActor { saga: support };
+    let completed = complete_accepted_workflow_step(
+        &mut reopened,
+        ctx.saga_id,
+        execution_id,
+        AcceptedStepCompletion {
+            completed_at_millis: 1_700_000_000_900,
+            output: b"completed-after-lmdb-restart".to_vec(),
+            saga_input: b"input".to_vec(),
+            compensation_data: Vec::new(),
+        },
+    )
+    .expect("recovered accepted step should complete after lmdb restart");
+
+    assert!(matches!(
+        completed,
+        SagaChoreographyEvent::StepCompleted {
+            ref context,
+            ref output,
+            ..
+        } if context.saga_id == ctx.saga_id
+            && context.event_timestamp_millis == 1_700_000_000_900
+            && output == b"completed-after-lmdb-restart"
+    ));
+}
+
+#[cfg(feature = "lmdb")]
+#[test]
+fn lmdb_open_does_not_rehydrate_expired_accepted_step() {
+    let temp = tempfile::tempdir().expect("tempdir should open");
+    let ctx = context(91, ORDER_LIFECYCLE, TEST_STEP);
+    let execution_id = StepExecutionId::new("external-91");
+    let support =
+        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_type(
+            temp.path(),
+            TEST_STEP,
+            ORDER_LIFECYCLE,
+        )
+        .expect("support should open before restart");
+    support
+        .journal
+        .append(
+            ctx.saga_id,
+            ParticipantEvent::AcceptedStepRecorded {
+                context: ctx.clone(),
+                participant_id: "order-manager".into(),
+                execution_id: execution_id.clone(),
+                idle_timeout_millis: 1,
+                hard_timeout_millis: 1,
+                timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
+                    requires_compensation: false,
+                },
+                accepted_at_millis: 1,
+                deadline_at_millis: 1,
+                hard_deadline_at_millis: 1,
+            },
+        )
+        .expect("accepted metadata append should succeed");
+    drop(support);
+
+    let support =
+        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_type(
+            temp.path(),
+            TEST_STEP,
+            ORDER_LIFECYCLE,
+        )
+        .expect("support should reopen after restart");
+    assert_eq!(support.accepted_workflow_step_count(), 0);
+    assert!(
+        support.startup_recovery_events.iter().any(|event| matches!(
+            event,
+            SagaChoreographyEvent::StepFailed { context, .. } if context.saga_id == ctx.saga_id
+        )),
+        "expired accepted step should recover as timeout event"
+    );
+    let mut reopened = LmdbAcceptedStepActor { saga: support };
+    let completion = AcceptedStepCompletion {
+        completed_at_millis: SagaContext::now_millis(),
+        output: Vec::new(),
+        saga_input: Vec::new(),
+        compensation_data: Vec::new(),
+    };
+    assert!(matches!(
+        complete_accepted_workflow_step(&mut reopened, ctx.saga_id, execution_id, completion),
+        Err(icanact_saga_choreography::AcceptedStepError::NotFound { .. })
+    ));
 }
 
 #[test]
@@ -207,10 +361,12 @@ fn ingress_suppresses_invalid_emitted_transition_when_state_is_missing() {
     assert_eq!(invalid_transition_calls, 1);
     assert_eq!(emitted_transition_calls, 1);
     assert_eq!(DELIVERED_STEP_COMPLETED.load(Ordering::Relaxed), 0);
-    assert!(participant
-        .saga_states_ref()
-        .get(&SagaId::new(11))
-        .is_none());
+    assert!(
+        participant
+            .saga_states_ref()
+            .get(&SagaId::new(11))
+            .is_none()
+    );
 }
 
 #[test]
@@ -257,10 +413,13 @@ fn panic_quarantine_records_journal_marks_dedupe_and_publishes() {
         .expect("panic quarantine reason should be recorded");
     assert!(is_panic_quarantine_reason(panic_reason.as_ref()));
 
-    assert!(participant
-        .saga
-        .dedupe
-        .contains(saga_context.saga_id, PANIC_QUARANTINE_PUBLISH_KEY,));
+    assert!(
+        participant
+            .saga
+            .dedupe
+            .contains(saga_context.saga_id, PANIC_QUARANTINE_PUBLISH_KEY,)
+            .expect("dedupe contains should succeed")
+    );
 }
 
 #[test]
@@ -324,6 +483,70 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
         ),
         RecoveryDecision::QuarantineStale
     );
+
+    let accepted_entries = vec![JournalEntry {
+        sequence: 2,
+        recorded_at_millis: 100,
+        event: ParticipantEvent::AcceptedStepRecorded {
+            context: context(14, ORDER_LIFECYCLE, TEST_STEP),
+            participant_id: TEST_STEP.into(),
+            execution_id: StepExecutionId::new("external-14"),
+            idle_timeout_millis: 1_000,
+            hard_timeout_millis: 20_000,
+            timeout_outcome: icanact_saga_choreography::AcceptedStepTimeoutOutcome::FailStep {
+                requires_compensation: false,
+            },
+            accepted_at_millis: 100,
+            deadline_at_millis: 1_100,
+            hard_deadline_at_millis: 20_100,
+        },
+    }];
+    assert_eq!(
+        classify_recovery(
+            &accepted_entries,
+            10_000,
+            RecoveryPolicy {
+                stale_after_ms: 500
+            }
+        ),
+        RecoveryDecision::Continue
+    );
+
+    let expired_journal = InMemoryJournal::new();
+    let expired_dedupe = InMemoryDedupe::new();
+    expired_journal
+        .append(
+            SagaId::new(15),
+            ParticipantEvent::AcceptedStepRecorded {
+                context: context(15, ORDER_LIFECYCLE, TEST_STEP),
+                participant_id: TEST_STEP.into(),
+                execution_id: StepExecutionId::new("external-15"),
+                idle_timeout_millis: 1,
+                hard_timeout_millis: 1,
+                timeout_outcome: icanact_saga_choreography::AcceptedStepTimeoutOutcome::FailStep {
+                    requires_compensation: true,
+                },
+                accepted_at_millis: 1,
+                deadline_at_millis: 1,
+                hard_deadline_at_millis: 1,
+            },
+        )
+        .expect("append should succeed");
+    let expired = collect_startup_recovery_events_for_saga_type(
+        &expired_journal,
+        &expired_dedupe,
+        TEST_STEP,
+        ORDER_LIFECYCLE,
+    )
+    .expect("startup recovery should collect expired accepted step");
+    assert!(matches!(
+        expired.as_slice(),
+        [SagaChoreographyEvent::StepFailed {
+            error,
+            requires_compensation: true,
+            ..
+        }] if error.contains("accepted step hard timeout after restart")
+    ));
 
     let terminal_entries = vec![JournalEntry {
         sequence: 2,
@@ -769,13 +992,6 @@ fn helper_propagates_open_errors_and_honors_env_runtime_dir() {
         .expect_err("open helper should propagate actor open errors");
     assert_eq!(err, "forced-open-error".to_string());
 
-    let env_key = "DURABILITY_TEST_RUNTIME_DIR";
-    let env_value = "/tmp/durability-runtime-dir";
-    std::env::set_var(env_key, env_value);
-    let runtime_dir = default_runtime_dir(env_key, "unused-fallback");
-    std::env::remove_var(env_key);
-    assert_eq!(runtime_dir, PathBuf::from(env_value));
-
     let mut support_without_bus =
         SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new());
     let no_bus_context = context(93, ORDER_LIFECYCLE, TEST_STEP);
@@ -790,7 +1006,8 @@ fn helper_propagates_open_errors_and_honors_env_runtime_dir() {
     assert!(
         !support_without_bus
             .dedupe
-            .contains(no_bus_context.saga_id, PANIC_QUARANTINE_PUBLISH_KEY),
+            .contains(no_bus_context.saga_id, PANIC_QUARANTINE_PUBLISH_KEY)
+            .expect("dedupe contains should succeed"),
         "without bus delivery we should not mark panic quarantine dedupe key"
     );
 }

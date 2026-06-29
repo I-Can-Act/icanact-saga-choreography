@@ -34,18 +34,19 @@ use super::SagaId;
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use icanact_saga_choreography::{
+///     InMemoryDedupe, ParticipantDedupeStore, SagaId,
+/// };
+///
 /// let dedupe = InMemoryDedupe::new();
 /// let saga_id = SagaId::new(1);
 /// let operation_key = "reserve_inventory";
 ///
-/// // Check and mark atomically - returns true if this is a new operation
-/// if dedupe.check_and_mark(saga_id, operation_key)? {
-///     // First time processing - execute the operation
-///     execute_operation()?;
-/// } else {
-///     // Already processed - skip or return cached result
-/// }
+/// assert!(dedupe.check_and_mark(saga_id, operation_key)?);
+/// assert!(!dedupe.check_and_mark(saga_id, operation_key)?);
+/// assert!(dedupe.contains(saga_id, operation_key)?);
+/// # Ok::<(), icanact_saga_choreography::DedupeError>(())
 /// ```
 pub trait ParticipantDedupeStore: Send + Sync + 'static {
     /// Atomically checks if an operation has been processed and marks it if not.
@@ -83,8 +84,12 @@ pub trait ParticipantDedupeStore: Send + Sync + 'static {
     ///
     /// # Returns
     ///
-    /// `true` if the operation has been marked as processed, `false` otherwise.
-    fn contains(&self, saga_id: SagaId, key: &str) -> bool;
+    /// `Ok(true)` if operation marked processed, `Ok(false)` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DedupeError::Storage`] when backing storage cannot answer query.
+    fn contains(&self, saga_id: SagaId, key: &str) -> Result<bool, DedupeError>;
 
     /// Marks an operation as processed without checking first.
     ///
@@ -140,63 +145,143 @@ pub enum DedupeError {
 /// state is lost when the process terminates, which could lead to duplicate
 /// processing of redelivered messages after a crash.
 ///
-/// # Thread Safety
+/// The backing set is owned by a local actor so test storage follows the same
+/// single-owner state model as saga participants.
+enum InMemoryDedupeMsg {
+    CheckAndMark {
+        saga_id: SagaId,
+        key: Box<str>,
+        reply: icanact_core::local_sync::ReplyTo<bool>,
+    },
+    Contains {
+        saga_id: SagaId,
+        key: Box<str>,
+        reply: icanact_core::local_sync::ReplyTo<bool>,
+    },
+    MarkProcessed {
+        saga_id: SagaId,
+        key: Box<str>,
+        reply: icanact_core::local_sync::ReplyTo<()>,
+    },
+    Prune {
+        saga_id: SagaId,
+        reply: icanact_core::local_sync::ReplyTo<()>,
+    },
+}
+
+/// An in-memory implementation [`ParticipantDedupeStore`].
 ///
-/// Uses `RwLock` internally to provide thread-safe access to the store.
+/// This implementation stores deduplication records in actor-owned memory and
+/// is suitable for testing and development. Records are not persisted across
+/// restarts.
+///
+/// # Warning
+///
+/// This implementation should NOT be used in production as all deduplication
+/// state is lost when the process terminates, which could lead to duplicate
+/// processing of redelivered messages after a crash.
+///
+/// The backing set is owned by a dedicated mailbox actor so test storage follows
+/// the same single-owner state model as saga participants without consuming the
+/// pooled sync actor scheduler.
 pub struct InMemoryDedupe {
-    /// The backing store containing tuples of (SAGA ID, operation key).
-    data: std::sync::RwLock<std::collections::HashSet<(u64, Box<str>)>>,
+    actor_ref: icanact_core::local_sync::mpsc::MailboxAddr<InMemoryDedupeMsg>,
+    actor_handle: Option<icanact_core::local_sync::mpsc::ActorHandle>,
 }
 
 impl InMemoryDedupe {
     /// Creates a new empty in-memory deduplication store.
     pub fn new() -> Self {
+        let mut data: std::collections::HashSet<(u64, Box<str>)> = std::collections::HashSet::new();
+        let (actor_ref, actor_handle) =
+            icanact_core::local_sync::mpsc::spawn(1024, move |msg: InMemoryDedupeMsg| match msg {
+                InMemoryDedupeMsg::CheckAndMark {
+                    saga_id,
+                    key,
+                    reply,
+                } => {
+                    let inserted = data.insert((saga_id.0, key));
+                    let _ = reply.reply(inserted);
+                }
+                InMemoryDedupeMsg::Contains {
+                    saga_id,
+                    key,
+                    reply,
+                } => {
+                    let contains = data.contains(&(saga_id.0, key));
+                    let _ = reply.reply(contains);
+                }
+                InMemoryDedupeMsg::MarkProcessed {
+                    saga_id,
+                    key,
+                    reply,
+                } => {
+                    data.insert((saga_id.0, key));
+                    let _ = reply.reply(());
+                }
+                InMemoryDedupeMsg::Prune { saga_id, reply } => {
+                    data.retain(|(id, _)| *id != saga_id.0);
+                    let _ = reply.reply(());
+                }
+            });
         Self {
-            data: std::sync::RwLock::new(std::collections::HashSet::new()),
+            actor_ref,
+            actor_handle: Some(actor_handle),
+        }
+    }
+}
+
+impl Drop for InMemoryDedupe {
+    fn drop(&mut self) {
+        if let Some(handle) = self.actor_handle.take() {
+            handle.shutdown();
         }
     }
 }
 
 impl ParticipantDedupeStore for InMemoryDedupe {
     fn check_and_mark(&self, saga_id: SagaId, key: &str) -> Result<bool, DedupeError> {
-        let entry = (saga_id.0, key.into());
-        let mut data = self
-            .data
-            .write()
-            .map_err(|e| DedupeError::Storage(e.to_string().into()))?;
-        Ok(data.insert(entry))
+        self.actor_ref
+            .ask(|reply| InMemoryDedupeMsg::CheckAndMark {
+                saga_id,
+                key: key.into(),
+                reply,
+            })
+            .map_err(|err| {
+                DedupeError::Storage(format!("in-memory dedupe actor unavailable: {err:?}").into())
+            })
     }
 
-    fn contains(&self, saga_id: SagaId, key: &str) -> bool {
-        match self.data.read() {
-            Ok(data) => data.contains(&(saga_id.0, key.into())),
-            Err(err) => {
-                tracing::error!(
-                    target: "core::saga",
-                    event = "in_memory_dedupe_read_lock_failed",
-                    error = %err
-                );
-                false
-            }
-        }
+    fn contains(&self, saga_id: SagaId, key: &str) -> Result<bool, DedupeError> {
+        self.actor_ref
+            .ask(|reply| InMemoryDedupeMsg::Contains {
+                saga_id,
+                key: key.into(),
+                reply,
+            })
+            .map_err(|err| {
+                DedupeError::Storage(format!("in-memory dedupe actor unavailable: {err:?}").into())
+            })
     }
 
     fn mark_processed(&self, saga_id: SagaId, key: &str) -> Result<(), DedupeError> {
-        let mut data = self
-            .data
-            .write()
-            .map_err(|e| DedupeError::Storage(e.to_string().into()))?;
-        data.insert((saga_id.0, key.into()));
-        Ok(())
+        self.actor_ref
+            .ask(|reply| InMemoryDedupeMsg::MarkProcessed {
+                saga_id,
+                key: key.into(),
+                reply,
+            })
+            .map_err(|err| {
+                DedupeError::Storage(format!("in-memory dedupe actor unavailable: {err:?}").into())
+            })
     }
 
     fn prune(&self, saga_id: SagaId) -> Result<(), DedupeError> {
-        let mut data = self
-            .data
-            .write()
-            .map_err(|e| DedupeError::Storage(e.to_string().into()))?;
-        data.retain(|(id, _)| *id != saga_id.0);
-        Ok(())
+        self.actor_ref
+            .ask(|reply| InMemoryDedupeMsg::Prune { saga_id, reply })
+            .map_err(|err| {
+                DedupeError::Storage(format!("in-memory dedupe actor unavailable: {err:?}").into())
+            })
     }
 }
 
@@ -214,7 +299,7 @@ where
         (**self).check_and_mark(saga_id, key)
     }
 
-    fn contains(&self, saga_id: SagaId, key: &str) -> bool {
+    fn contains(&self, saga_id: SagaId, key: &str) -> Result<bool, DedupeError> {
         (**self).contains(saga_id, key)
     }
 

@@ -36,6 +36,18 @@ pub trait SagaWorkflowContract {
 
 pub fn required_steps_from_success_criteria(criteria: &SuccessCriteria) -> HashSet<Box<str>> {
     match criteria {
+        SuccessCriteria::AllOf(steps) => steps.clone(),
+        SuccessCriteria::AnyOf(steps) if steps.len() == 1 => steps.clone(),
+        SuccessCriteria::Quorum {
+            group_steps,
+            required_count,
+        } if *required_count >= group_steps.len() => group_steps.clone(),
+        SuccessCriteria::AnyOf(_) | SuccessCriteria::Quorum { .. } => HashSet::new(),
+    }
+}
+
+fn referenced_steps_from_success_criteria(criteria: &SuccessCriteria) -> HashSet<Box<str>> {
+    match criteria {
         SuccessCriteria::AllOf(steps) | SuccessCriteria::AnyOf(steps) => steps.clone(),
         SuccessCriteria::Quorum { group_steps, .. } => group_steps.clone(),
     }
@@ -103,8 +115,8 @@ pub fn validate_workflow_contract(
         }
     }
 
-    let required = required_steps_from_success_criteria(&policy.success_criteria);
-    for required_step in required {
+    let terminal_steps = referenced_steps_from_success_criteria(&policy.success_criteria);
+    for required_step in terminal_steps {
         if !by_step.contains_key(required_step.as_ref()) {
             return Err(format!(
                 "workflow contract terminal required step is not declared: saga_type={} required_step={}",
@@ -363,8 +375,8 @@ mod tests {
     use crate::{FailureAuthority, SuccessCriteria};
 
     use super::{
-        required_steps_from_success_criteria, validate_workflow_contract, SagaWorkflowStepContract,
-        WorkflowDependencySpec,
+        SagaWorkflowStepContract, WorkflowDependencySpec, required_steps_from_success_criteria,
+        validate_workflow_contract,
     };
 
     fn policy_all_of(saga_type: &str, required_steps: &[&str]) -> crate::TerminalPolicy {
@@ -558,7 +570,6 @@ mod tests {
             "unexpected error: {err}"
         );
     }
-
     #[test]
     fn required_steps_from_success_criteria_handles_all_variants() {
         let mut all_of = HashSet::new();
@@ -570,17 +581,36 @@ mod tests {
 
         let mut any_of = HashSet::new();
         any_of.insert("x".into());
+        any_of.insert("y".into());
         let any_required = required_steps_from_success_criteria(&SuccessCriteria::AnyOf(any_of));
-        assert!(any_required.contains("x"));
+        assert!(
+            any_required.is_empty(),
+            "multi-branch AnyOf has no single required participant"
+        );
+
+        let mut singleton_any = HashSet::new();
+        singleton_any.insert("only".into());
+        let singleton_required =
+            required_steps_from_success_criteria(&SuccessCriteria::AnyOf(singleton_any));
+        assert!(singleton_required.contains("only"));
 
         let mut quorum_steps = HashSet::new();
         quorum_steps.insert("q1".into());
         quorum_steps.insert("q2".into());
         let quorum_required = required_steps_from_success_criteria(&SuccessCriteria::Quorum {
-            group_steps: quorum_steps,
+            group_steps: quorum_steps.clone(),
             required_count: 1,
         });
-        assert!(quorum_required.contains("q1"));
-        assert!(quorum_required.contains("q2"));
+        assert!(
+            quorum_required.is_empty(),
+            "partial quorum has no single required participant"
+        );
+
+        let full_quorum_required = required_steps_from_success_criteria(&SuccessCriteria::Quorum {
+            group_steps: quorum_steps,
+            required_count: 2,
+        });
+        assert!(full_quorum_required.contains("q1"));
+        assert!(full_quorum_required.contains("q2"));
     }
 }

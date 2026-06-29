@@ -1,6 +1,6 @@
 //! Saga events
 
-use super::SagaContext;
+use super::{AcceptedStepTimeoutOutcome, SagaContext, StepExecutionId};
 use icanact_core::ActorId;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,6 +41,22 @@ pub enum SagaChoreographyEvent {
     StepStarted {
         /// The saga context containing identifiers and metadata.
         context: SagaContext,
+    },
+    /// Emitted when a participant accepts async responsibility for a step.
+    #[non_exhaustive]
+    StepAccepted {
+        /// The saga context containing identifiers and metadata.
+        context: SagaContext,
+        /// Participant that accepted responsibility for this step.
+        participant_id: Box<str>,
+        /// External or participant-local execution identifier.
+        execution_id: StepExecutionId,
+        /// Resettable idle deadline in epoch milliseconds.
+        deadline_at_millis: u64,
+        /// Non-resettable hard deadline in epoch milliseconds.
+        hard_deadline_at_millis: u64,
+        /// Terminal outcome to apply when accepted step deadline expires.
+        timeout_outcome: AcceptedStepTimeoutOutcome,
     },
     /// Emitted when a step completes successfully.
     StepCompleted {
@@ -116,7 +132,7 @@ pub enum SagaChoreographyEvent {
         /// The saga context containing identifiers and metadata.
         context: SagaContext,
         /// The identifier of the participant sending the acknowledgment.
-        participant_id: super::PeerId,
+        participant_id: Box<str>,
         /// The status of the acknowledgment.
         status: AckStatus,
     },
@@ -211,6 +227,7 @@ impl SagaChoreographyEvent {
             Self::SagaCompleted { context } => context,
             Self::SagaFailed { context, .. } => context,
             Self::StepStarted { context } => context,
+            Self::StepAccepted { context, .. } => context,
             Self::StepCompleted { context, .. } => context,
             Self::StepFailed { context, .. } => context,
             Self::CompensationRequested { context, .. } => context,
@@ -231,6 +248,7 @@ impl SagaChoreographyEvent {
             Self::SagaCompleted { .. } => "saga_completed",
             Self::SagaFailed { .. } => "saga_failed",
             Self::StepStarted { .. } => "step_started",
+            Self::StepAccepted { .. } => "step_accepted",
             Self::StepCompleted { .. } => "step_completed",
             Self::StepFailed { .. } => "step_failed",
             Self::CompensationRequested { .. } => "compensation_requested",
@@ -364,5 +382,26 @@ pub enum ParticipantEvent {
         reason: Box<str>,
         /// The timestamp (in milliseconds since epoch) when quarantine occurred.
         quarantined_at_millis: u64,
+    },
+    /// Emitted when an async step is accepted and must survive participant restart.
+    AcceptedStepRecorded {
+        /// Saga context stamped at acceptance time.
+        context: SagaContext,
+        /// Participant that accepted responsibility for the step.
+        participant_id: Box<str>,
+        /// External or participant-local execution identifier.
+        execution_id: StepExecutionId,
+        /// Resettable idle timeout duration in milliseconds.
+        idle_timeout_millis: u64,
+        /// Non-resettable hard timeout duration in milliseconds.
+        hard_timeout_millis: u64,
+        /// Terminal outcome used when the accepted step times out.
+        timeout_outcome: AcceptedStepTimeoutOutcome,
+        /// Timestamp when the participant accepted the step.
+        accepted_at_millis: u64,
+        /// Current resettable idle deadline in epoch milliseconds.
+        deadline_at_millis: u64,
+        /// Non-resettable hard deadline in epoch milliseconds.
+        hard_deadline_at_millis: u64,
     },
 }
