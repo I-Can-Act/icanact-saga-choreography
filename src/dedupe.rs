@@ -13,6 +13,11 @@
 //! semantics despite the possibility of duplicate message delivery.
 
 use super::SagaId;
+use std::collections::HashSet;
+use std::sync::Mutex;
+
+type DedupeKey = (u64, Box<str>);
+type DedupeSet = HashSet<DedupeKey>;
 
 /// A trait for participant deduplication storage implementations.
 ///
@@ -145,33 +150,9 @@ pub enum DedupeError {
 /// state is lost when the process terminates, which could lead to duplicate
 /// processing of redelivered messages after a crash.
 ///
-/// The backing set is owned by a local actor so test storage follows the same
-/// single-owner state model as saga participants.
-enum InMemoryDedupeMsg {
-    CheckAndMark {
-        saga_id: SagaId,
-        key: Box<str>,
-        reply: icanact_core::local_sync::ReplyTo<bool>,
-    },
-    Contains {
-        saga_id: SagaId,
-        key: Box<str>,
-        reply: icanact_core::local_sync::ReplyTo<bool>,
-    },
-    MarkProcessed {
-        saga_id: SagaId,
-        key: Box<str>,
-        reply: icanact_core::local_sync::ReplyTo<()>,
-    },
-    Prune {
-        saga_id: SagaId,
-        reply: icanact_core::local_sync::ReplyTo<()>,
-    },
-}
-
 /// An in-memory implementation [`ParticipantDedupeStore`].
 ///
-/// This implementation stores deduplication records in actor-owned memory and
+/// This implementation stores deduplication records in process-local memory and
 /// is suitable for testing and development. Records are not persisted across
 /// restarts.
 ///
@@ -181,107 +162,48 @@ enum InMemoryDedupeMsg {
 /// state is lost when the process terminates, which could lead to duplicate
 /// processing of redelivered messages after a crash.
 ///
-/// The backing set is owned by a dedicated mailbox actor so test storage follows
-/// the same single-owner state model as saga participants without consuming the
-/// pooled sync actor scheduler.
+/// The backing set uses a short critical section. It does not start a worker
+/// thread or perform a blocking actor ask, so it is safe to call from either
+/// sync scheduler workers or async participants.
 pub struct InMemoryDedupe {
-    actor_ref: icanact_core::local_sync::mpsc::MailboxAddr<InMemoryDedupeMsg>,
-    actor_handle: Option<icanact_core::local_sync::mpsc::ActorHandle>,
+    seen: Mutex<DedupeSet>,
 }
 
 impl InMemoryDedupe {
     /// Creates a new empty in-memory deduplication store.
     pub fn new() -> Self {
-        let mut data: std::collections::HashSet<(u64, Box<str>)> = std::collections::HashSet::new();
-        let (actor_ref, actor_handle) =
-            icanact_core::local_sync::mpsc::spawn(1024, move |msg: InMemoryDedupeMsg| match msg {
-                InMemoryDedupeMsg::CheckAndMark {
-                    saga_id,
-                    key,
-                    reply,
-                } => {
-                    let inserted = data.insert((saga_id.0, key));
-                    let _ = reply.reply(inserted);
-                }
-                InMemoryDedupeMsg::Contains {
-                    saga_id,
-                    key,
-                    reply,
-                } => {
-                    let contains = data.contains(&(saga_id.0, key));
-                    let _ = reply.reply(contains);
-                }
-                InMemoryDedupeMsg::MarkProcessed {
-                    saga_id,
-                    key,
-                    reply,
-                } => {
-                    data.insert((saga_id.0, key));
-                    let _ = reply.reply(());
-                }
-                InMemoryDedupeMsg::Prune { saga_id, reply } => {
-                    data.retain(|(id, _)| *id != saga_id.0);
-                    let _ = reply.reply(());
-                }
-            });
         Self {
-            actor_ref,
-            actor_handle: Some(actor_handle),
+            seen: Mutex::new(HashSet::new()),
         }
     }
-}
 
-impl Drop for InMemoryDedupe {
-    fn drop(&mut self) {
-        if let Some(handle) = self.actor_handle.take() {
-            handle.shutdown();
-        }
+    fn seen(&self) -> Result<std::sync::MutexGuard<'_, DedupeSet>, DedupeError> {
+        self.seen
+            .lock()
+            .map_err(|_| DedupeError::Storage("in-memory dedupe lock poisoned".into()))
     }
 }
 
 impl ParticipantDedupeStore for InMemoryDedupe {
     fn check_and_mark(&self, saga_id: SagaId, key: &str) -> Result<bool, DedupeError> {
-        self.actor_ref
-            .ask(|reply| InMemoryDedupeMsg::CheckAndMark {
-                saga_id,
-                key: key.into(),
-                reply,
-            })
-            .map_err(|err| {
-                DedupeError::Storage(format!("in-memory dedupe actor unavailable: {err:?}").into())
-            })
+        Ok(self.seen()?.insert((saga_id.0, key.into())))
     }
 
     fn contains(&self, saga_id: SagaId, key: &str) -> Result<bool, DedupeError> {
-        self.actor_ref
-            .ask(|reply| InMemoryDedupeMsg::Contains {
-                saga_id,
-                key: key.into(),
-                reply,
-            })
-            .map_err(|err| {
-                DedupeError::Storage(format!("in-memory dedupe actor unavailable: {err:?}").into())
-            })
+        Ok(self
+            .seen()?
+            .iter()
+            .any(|(id, stored_key)| *id == saga_id.0 && stored_key.as_ref() == key))
     }
 
     fn mark_processed(&self, saga_id: SagaId, key: &str) -> Result<(), DedupeError> {
-        self.actor_ref
-            .ask(|reply| InMemoryDedupeMsg::MarkProcessed {
-                saga_id,
-                key: key.into(),
-                reply,
-            })
-            .map_err(|err| {
-                DedupeError::Storage(format!("in-memory dedupe actor unavailable: {err:?}").into())
-            })
+        self.seen()?.insert((saga_id.0, key.into()));
+        Ok(())
     }
 
     fn prune(&self, saga_id: SagaId) -> Result<(), DedupeError> {
-        self.actor_ref
-            .ask(|reply| InMemoryDedupeMsg::Prune { saga_id, reply })
-            .map_err(|err| {
-                DedupeError::Storage(format!("in-memory dedupe actor unavailable: {err:?}").into())
-            })
+        self.seen()?.retain(|(id, _)| *id != saga_id.0);
+        Ok(())
     }
 }
 
@@ -309,5 +231,34 @@ where
 
     fn prune(&self, saga_id: SagaId) -> Result<(), DedupeError> {
         (**self).prune(saga_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn concurrent_check_and_mark_has_exactly_one_winner() {
+        let store = Arc::new(InMemoryDedupe::new());
+        let saga_id = SagaId::new(7);
+        let workers = (0..16)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || store.check_and_mark(saga_id, "reserve").unwrap())
+            })
+            .collect::<Vec<_>>();
+
+        let winners = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|won| *won)
+            .count();
+
+        assert_eq!(winners, 1);
+        assert!(store.contains(saga_id, "reserve").unwrap());
+        store.prune(saga_id).unwrap();
+        assert!(!store.contains(saga_id, "reserve").unwrap());
     }
 }

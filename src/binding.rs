@@ -1,10 +1,17 @@
-use icanact_core::local::EventSubscription;
+use icanact_core::local::FirehoseSubscription;
 use std::marker::PhantomData;
+use std::sync::{Arc, Mutex};
 
 use crate::{
     AllowsSagaTellIngress, HasSagaWorkflowParticipants, SagaChoreographyBus, SagaChoreographyEvent,
     SagaWorkflowParticipant,
 };
+
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 #[derive(Clone, Debug)]
 // Keep the public channel shape direct so actor channel conversions stay simple.
@@ -13,11 +20,6 @@ pub enum SagaParticipantChannel<C> {
     Saga(SagaChoreographyEvent),
     Business(C),
 }
-
-#[derive(Debug)]
-struct ForwardSagaEvent(SagaChoreographyEvent);
-
-impl icanact_core::TellAskTell for ForwardSagaEvent {}
 
 struct SyncChannelForwarder<A, C>
 where
@@ -104,26 +106,6 @@ where
         sender
             .try_send(SagaParticipantChannel::Saga(event).into())
             .is_ok()
-    }
-}
-
-impl<A, C> icanact_core::local_sync::SyncActor for SyncChannelForwarder<A, C>
-where
-    A: icanact_core::local_sync::SyncActor + Send + 'static,
-    A::Channel: From<SagaParticipantChannel<C>> + Send + 'static,
-    A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
-    C: Send + 'static,
-{
-    type Contract = icanact_core::local_sync::contract::AskOnly;
-    type Tell = ();
-    type Ask = ForwardSagaEvent;
-    type Reply = bool;
-    type Channel = ();
-    type PubSub = ();
-    type Broadcast = ();
-
-    fn handle_ask(&mut self, msg: Self::Ask) -> Self::Reply {
-        self.forward(msg.0)
     }
 }
 
@@ -215,26 +197,6 @@ where
     }
 }
 
-impl<A, C> icanact_core::local_sync::SyncActor for AsyncChannelForwarder<A, C>
-where
-    A: icanact_core::local_async::AsyncActor + Send + 'static,
-    A::Channel: From<SagaParticipantChannel<C>> + Send + 'static,
-    A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
-    C: Send + 'static,
-{
-    type Contract = icanact_core::local_sync::contract::AskOnly;
-    type Tell = ();
-    type Ask = ForwardSagaEvent;
-    type Reply = bool;
-    type Channel = ();
-    type PubSub = ();
-    type Broadcast = ();
-
-    fn handle_ask(&mut self, msg: Self::Ask) -> Self::Reply {
-        self.forward(msg.0)
-    }
-}
-
 impl<C> From<C> for SagaParticipantChannel<C> {
     fn from(value: C) -> Self {
         Self::Business(value)
@@ -281,7 +243,7 @@ pub fn bind_sync_participant_channel_lazy<A, C>(
     saga_types: &[&'static str],
     channel_name: &str,
     capacity: usize,
-) -> Result<Vec<EventSubscription>, String>
+) -> Result<Vec<FirehoseSubscription>, String>
 where
     A: icanact_core::local_sync::SyncActor + Send + 'static,
     <A as icanact_core::local_sync::SyncActor>::Channel: Send + 'static,
@@ -289,24 +251,17 @@ where
     A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
     C: Send + 'static,
 {
-    let (forwarder_ref, forwarder_handle) =
-        icanact_core::local_sync::spawn(SyncChannelForwarder::<A, C>::lazy(
-            actor_ref.clone(),
-            channel_name.to_string(),
-            capacity.max(1),
-        ));
-    bus.remember_binding_actor_handle(forwarder_handle);
+    let forwarder = Arc::new(Mutex::new(SyncChannelForwarder::<A, C>::lazy(
+        actor_ref.clone(),
+        channel_name.to_string(),
+        capacity.max(1),
+    )));
     Ok(saga_types
         .iter()
         .map(|saga_type| {
-            let forwarder_ref = forwarder_ref.clone();
+            let forwarder = Arc::clone(&forwarder);
             bus.subscribe_saga_type_fn(saga_type, move |event| {
-                // Strict publish accounting needs the callback to report whether
-                // the actor channel accepted the event; the forwarder only does
-                // a non-blocking try_send and replies immediately.
-                forwarder_ref
-                    .ask(ForwardSagaEvent(event.clone()))
-                    .unwrap_or(false)
+                lock_or_recover(&forwarder).forward(event.clone())
             })
         })
         .collect())
@@ -318,7 +273,7 @@ pub fn bind_sync_participant_channel<A, C>(
     saga_types: &[&'static str],
     channel_name: &str,
     capacity: usize,
-) -> Result<Vec<EventSubscription>, String>
+) -> Result<Vec<FirehoseSubscription>, String>
 where
     A: icanact_core::local_sync::SyncActor + Send + 'static,
     <A as icanact_core::local_sync::SyncActor>::Channel: Send + 'static,
@@ -326,24 +281,17 @@ where
     A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
     C: Send + 'static,
 {
-    let (forwarder_ref, forwarder_handle) =
-        icanact_core::local_sync::spawn(SyncChannelForwarder::<A, C>::eager(
-            actor_ref.clone(),
-            channel_name.to_string(),
-            capacity.max(1),
-        )?);
-    bus.remember_binding_actor_handle(forwarder_handle);
+    let forwarder = Arc::new(Mutex::new(SyncChannelForwarder::<A, C>::eager(
+        actor_ref.clone(),
+        channel_name.to_string(),
+        capacity.max(1),
+    )?));
     Ok(saga_types
         .iter()
         .map(|saga_type| {
-            let forwarder_ref = forwarder_ref.clone();
+            let forwarder = Arc::clone(&forwarder);
             bus.subscribe_saga_type_fn(saga_type, move |event| {
-                // Strict publish accounting needs the callback to report whether
-                // the actor channel accepted the event; the forwarder only does
-                // a non-blocking try_send and replies immediately.
-                forwarder_ref
-                    .ask(ForwardSagaEvent(event.clone()))
-                    .unwrap_or(false)
+                lock_or_recover(&forwarder).forward(event.clone())
             })
         })
         .collect())
@@ -354,7 +302,7 @@ pub fn bind_sync_workflow_participant_channel<A, C>(
     actor_ref: &icanact_core::local_sync::SyncActorRef<A>,
     channel_name: &str,
     capacity: usize,
-) -> Result<Vec<EventSubscription>, String>
+) -> Result<Vec<FirehoseSubscription>, String>
 where
     A: icanact_core::local_sync::SyncActor + HasSagaWorkflowParticipants + Send + 'static,
     <A as icanact_core::local_sync::SyncActor>::Channel: Send + 'static,
@@ -371,7 +319,7 @@ pub fn bind_sync_workflow_participant_channel_strict<A, C>(
     actor_ref: &icanact_core::local_sync::SyncActorRef<A>,
     channel_name: &str,
     capacity: usize,
-) -> Result<Vec<EventSubscription>, String>
+) -> Result<Vec<FirehoseSubscription>, String>
 where
     A: icanact_core::local_sync::SyncActor + HasSagaWorkflowParticipants + Send + 'static,
     <A as icanact_core::local_sync::SyncActor>::Channel: Send + 'static,
@@ -390,7 +338,7 @@ pub fn bind_sync_workflow_participant_channel_lazy<A, C>(
     actor_ref: &icanact_core::local_sync::SyncActorRef<A>,
     channel_name: &str,
     capacity: usize,
-) -> Result<Vec<EventSubscription>, String>
+) -> Result<Vec<FirehoseSubscription>, String>
 where
     A: icanact_core::local_sync::SyncActor + HasSagaWorkflowParticipants + Send + 'static,
     <A as icanact_core::local_sync::SyncActor>::Channel: Send + 'static,
@@ -407,7 +355,7 @@ pub fn bind_sync_workflow_participant_channel_lazy_strict<A, C>(
     actor_ref: &icanact_core::local_sync::SyncActorRef<A>,
     channel_name: &str,
     capacity: usize,
-) -> Result<Vec<EventSubscription>, String>
+) -> Result<Vec<FirehoseSubscription>, String>
 where
     A: icanact_core::local_sync::SyncActor + HasSagaWorkflowParticipants + Send + 'static,
     <A as icanact_core::local_sync::SyncActor>::Channel: Send + 'static,
@@ -430,7 +378,7 @@ pub fn bind_sync_participant_tell<A, F>(
     actor_ref: &icanact_core::local_sync::SyncActorRef<A>,
     saga_types: &[&'static str],
     map_event: F,
-) -> Result<Vec<EventSubscription>, String>
+) -> Result<Vec<FirehoseSubscription>, String>
 where
     A: icanact_core::local_sync::SyncActor + AllowsSagaTellIngress + Send + 'static,
     A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
@@ -453,7 +401,7 @@ pub fn bind_sync_workflow_participant_tell<A, F>(
     bus: &SagaChoreographyBus,
     actor_ref: &icanact_core::local_sync::SyncActorRef<A>,
     map_event: F,
-) -> Result<Vec<EventSubscription>, String>
+) -> Result<Vec<FirehoseSubscription>, String>
 where
     A: icanact_core::local_sync::SyncActor
         + HasSagaWorkflowParticipants
@@ -471,7 +419,7 @@ pub fn bind_sync_workflow_participant_tell_strict<A, F>(
     bus: &SagaChoreographyBus,
     actor_ref: &icanact_core::local_sync::SyncActorRef<A>,
     map_event: F,
-) -> Result<Vec<EventSubscription>, String>
+) -> Result<Vec<FirehoseSubscription>, String>
 where
     A: icanact_core::local_sync::SyncActor
         + HasSagaWorkflowParticipants
@@ -492,7 +440,7 @@ pub fn bind_async_participant_channel_lazy<A, C>(
     saga_types: &[&'static str],
     channel_name: &str,
     capacity: usize,
-) -> Result<Vec<EventSubscription>, String>
+) -> Result<Vec<FirehoseSubscription>, String>
 where
     A: icanact_core::local_async::AsyncActor + Send + 'static,
     <A as icanact_core::local_async::AsyncActor>::Channel: Send + 'static,
@@ -500,24 +448,17 @@ where
     A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
     C: Send + 'static,
 {
-    let (forwarder_ref, forwarder_handle) =
-        icanact_core::local_sync::spawn(AsyncChannelForwarder::<A, C>::lazy(
-            actor_ref.clone(),
-            channel_name.to_string(),
-            capacity.max(1),
-        ));
-    bus.remember_binding_actor_handle(forwarder_handle);
+    let forwarder = Arc::new(Mutex::new(AsyncChannelForwarder::<A, C>::lazy(
+        actor_ref.clone(),
+        channel_name.to_string(),
+        capacity.max(1),
+    )));
     Ok(saga_types
         .iter()
         .map(|saga_type| {
-            let forwarder_ref = forwarder_ref.clone();
+            let forwarder = Arc::clone(&forwarder);
             bus.subscribe_saga_type_fn(saga_type, move |event| {
-                // Strict publish accounting needs the callback to report whether
-                // the actor channel accepted the event; the forwarder only does
-                // a non-blocking try_send and replies immediately.
-                forwarder_ref
-                    .ask(ForwardSagaEvent(event.clone()))
-                    .unwrap_or(false)
+                lock_or_recover(&forwarder).forward(event.clone())
             })
         })
         .collect())
@@ -529,7 +470,7 @@ pub fn bind_async_participant_channel<A, C>(
     saga_types: &[&'static str],
     channel_name: &str,
     capacity: usize,
-) -> Result<Vec<EventSubscription>, String>
+) -> Result<Vec<FirehoseSubscription>, String>
 where
     A: icanact_core::local_async::AsyncActor + Send + 'static,
     <A as icanact_core::local_async::AsyncActor>::Channel: Send + 'static,
@@ -537,24 +478,17 @@ where
     A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
     C: Send + 'static,
 {
-    let (forwarder_ref, forwarder_handle) =
-        icanact_core::local_sync::spawn(AsyncChannelForwarder::<A, C>::eager(
-            actor_ref.clone(),
-            channel_name.to_string(),
-            capacity.max(1),
-        )?);
-    bus.remember_binding_actor_handle(forwarder_handle);
+    let forwarder = Arc::new(Mutex::new(AsyncChannelForwarder::<A, C>::eager(
+        actor_ref.clone(),
+        channel_name.to_string(),
+        capacity.max(1),
+    )?));
     Ok(saga_types
         .iter()
         .map(|saga_type| {
-            let forwarder_ref = forwarder_ref.clone();
+            let forwarder = Arc::clone(&forwarder);
             bus.subscribe_saga_type_fn(saga_type, move |event| {
-                // Strict publish accounting needs the callback to report whether
-                // the actor channel accepted the event; the forwarder only does
-                // a non-blocking try_send and replies immediately.
-                forwarder_ref
-                    .ask(ForwardSagaEvent(event.clone()))
-                    .unwrap_or(false)
+                lock_or_recover(&forwarder).forward(event.clone())
             })
         })
         .collect())
@@ -565,7 +499,7 @@ pub fn bind_async_workflow_participant_channel<A, C>(
     actor_ref: &icanact_core::local_async::AsyncActorRef<A>,
     channel_name: &str,
     capacity: usize,
-) -> Result<Vec<EventSubscription>, String>
+) -> Result<Vec<FirehoseSubscription>, String>
 where
     A: icanact_core::local_async::AsyncActor + HasSagaWorkflowParticipants + Send + 'static,
     <A as icanact_core::local_async::AsyncActor>::Channel: Send + 'static,
@@ -582,7 +516,7 @@ pub fn bind_async_workflow_participant_channel_strict<A, C>(
     actor_ref: &icanact_core::local_async::AsyncActorRef<A>,
     channel_name: &str,
     capacity: usize,
-) -> Result<Vec<EventSubscription>, String>
+) -> Result<Vec<FirehoseSubscription>, String>
 where
     A: icanact_core::local_async::AsyncActor + HasSagaWorkflowParticipants + Send + 'static,
     <A as icanact_core::local_async::AsyncActor>::Channel: Send + 'static,
@@ -601,7 +535,7 @@ pub fn bind_async_workflow_participant_channel_lazy<A, C>(
     actor_ref: &icanact_core::local_async::AsyncActorRef<A>,
     channel_name: &str,
     capacity: usize,
-) -> Result<Vec<EventSubscription>, String>
+) -> Result<Vec<FirehoseSubscription>, String>
 where
     A: icanact_core::local_async::AsyncActor + HasSagaWorkflowParticipants + Send + 'static,
     <A as icanact_core::local_async::AsyncActor>::Channel: Send + 'static,
@@ -618,7 +552,7 @@ pub fn bind_async_workflow_participant_channel_lazy_strict<A, C>(
     actor_ref: &icanact_core::local_async::AsyncActorRef<A>,
     channel_name: &str,
     capacity: usize,
-) -> Result<Vec<EventSubscription>, String>
+) -> Result<Vec<FirehoseSubscription>, String>
 where
     A: icanact_core::local_async::AsyncActor + HasSagaWorkflowParticipants + Send + 'static,
     <A as icanact_core::local_async::AsyncActor>::Channel: Send + 'static,
@@ -641,7 +575,7 @@ pub fn bind_async_participant_tell<A, F>(
     actor_ref: &icanact_core::local_async::AsyncActorRef<A>,
     saga_types: &[&'static str],
     map_event: F,
-) -> Result<Vec<EventSubscription>, String>
+) -> Result<Vec<FirehoseSubscription>, String>
 where
     A: icanact_core::local_async::AsyncActor + AllowsSagaTellIngress + Send + 'static,
     A::Contract: icanact_core::local_async::contract::SupportsTell<A>,

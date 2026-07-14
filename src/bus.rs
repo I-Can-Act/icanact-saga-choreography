@@ -5,7 +5,7 @@ use std::thread;
 use std::time::Duration;
 
 use icanact_core::CorrelationRegistry;
-use icanact_core::local::{EventBus, EventSubscription, PublishStats};
+use icanact_core::local::{FirehosePubSub, FirehoseSubscription, PublishStats};
 use icanact_core::local_sync::{self, SyncActor};
 
 use crate::reply_registry::{SagaReplyToHandle, SagaReplyToResult};
@@ -32,7 +32,6 @@ struct BusStateActor {
     terminal_policies_by_saga_type: HashMap<Box<str>, Box<str>>,
     workflow_contracts_by_saga_type: HashMap<Box<str>, WorkflowContractState>,
     bound_steps_by_saga_type: HashMap<Box<str>, HashSet<Box<str>>>,
-    binding_actor_handles: Vec<local_sync::ActorHandle>,
 }
 
 #[derive(Debug)]
@@ -84,14 +83,7 @@ enum BusStateAsk {
     TakeTerminalOutcome {
         saga_id: SagaId,
     },
-    ShutdownBindingActors,
 }
-
-enum BusStateTell {
-    RememberBindingActor(local_sync::ActorHandle),
-}
-
-impl icanact_core::TellAskTell for BusStateTell {}
 
 #[derive(Clone, Debug)]
 enum BusStateReply {
@@ -130,21 +122,13 @@ impl BusStateActor {
 }
 
 impl SyncActor for BusStateActor {
-    type Contract = local_sync::contract::TellAsk;
-    type Tell = BusStateTell;
+    type Contract = local_sync::contract::AskOnly;
+    type Tell = ();
     type Ask = BusStateAsk;
     type Reply = BusStateReply;
     type Channel = ();
     type PubSub = ();
     type Broadcast = ();
-
-    fn handle_tell(&mut self, msg: Self::Tell) {
-        match msg {
-            BusStateTell::RememberBindingActor(handle) => {
-                self.binding_actor_handles.push(handle);
-            }
-        }
-    }
 
     fn handle_ask(&mut self, msg: Self::Ask) -> Self::Reply {
         match msg {
@@ -259,18 +243,12 @@ impl SyncActor for BusStateActor {
                 let direct = self.terminal_outcomes.remove(&saga_id);
                 BusStateReply::TerminalOutcome(reply.or(direct))
             }
-            BusStateAsk::ShutdownBindingActors => {
-                for handle in self.binding_actor_handles.drain(..) {
-                    handle.shutdown();
-                }
-                BusStateReply::Unit
-            }
         }
     }
 }
 
 struct TerminalResolverRuntime {
-    subscription: EventSubscription,
+    subscription: FirehoseSubscription,
     shutdown: Arc<AtomicBool>,
     handle: local_sync::ActorHandle,
 }
@@ -285,8 +263,8 @@ enum TerminalResolverRegistryAsk {
 }
 
 enum TerminalResolverRegistryReply {
-    Existing(Option<EventSubscription>),
-    Registered(EventSubscription),
+    Existing(Option<FirehoseSubscription>),
+    Registered(FirehoseSubscription),
     ShutdownComplete,
 }
 
@@ -390,7 +368,7 @@ impl SyncActor for TerminalResolverActor {
 }
 
 pub struct SagaChoreographyBus {
-    bus: EventBus<SagaChoreographyEvent>,
+    bus: FirehosePubSub<SagaChoreographyEvent>,
     pending_replies: CorrelationRegistry<SagaId, SagaReplyToResult>,
     state_ref: local_sync::SyncActorRef<BusStateActor>,
     terminal_resolver_registry_ref: local_sync::SyncActorRef<TerminalResolverRegistryActor>,
@@ -399,7 +377,6 @@ pub struct SagaChoreographyBus {
 
 struct BusActorLifecycle {
     pending_replies: CorrelationRegistry<SagaId, SagaReplyToResult>,
-    state_ref: local_sync::SyncActorRef<BusStateActor>,
     state_handle: Option<local_sync::ActorHandle>,
     terminal_resolver_registry_ref: local_sync::SyncActorRef<TerminalResolverRegistryActor>,
     terminal_resolver_registry_handle: Option<local_sync::ActorHandle>,
@@ -413,7 +390,6 @@ impl Drop for BusActorLifecycle {
         if let Some(handle) = self.terminal_resolver_registry_handle.take() {
             handle.shutdown();
         }
-        let _ = self.state_ref.ask(BusStateAsk::ShutdownBindingActors);
         if let Some(handle) = self.state_handle.take() {
             handle.shutdown();
         }
@@ -495,13 +471,12 @@ impl SagaChoreographyBus {
         let pending_replies = CorrelationRegistry::new();
         let lifecycle = Arc::new(BusActorLifecycle {
             pending_replies: pending_replies.clone(),
-            state_ref: state_ref.clone(),
             state_handle: Some(state_handle),
             terminal_resolver_registry_ref: terminal_resolver_registry_ref.clone(),
             terminal_resolver_registry_handle: Some(terminal_resolver_registry_handle),
         });
         Self {
-            bus: EventBus::new(),
+            bus: FirehosePubSub::new(),
             pending_replies,
             state_ref,
             terminal_resolver_registry_ref,
@@ -523,20 +498,22 @@ impl SagaChoreographyBus {
         }
     }
 
-    pub fn subscribe_fn<F>(&self, topic: &str, f: F) -> EventSubscription
+    pub fn subscribe_fn<F>(&self, topic: &str, f: F) -> FirehoseSubscription
     where
         F: Fn(&SagaChoreographyEvent) -> bool + Send + Sync + 'static,
     {
-        self.bus.subscribe_fn(topic, f)
+        self.bus
+            .subscribe_checked_fn(topic, f)
+            .unwrap_or_else(|err| panic!("invalid saga topic '{topic}': {err}"))
     }
 
-    pub fn unsubscribe(&self, sub: EventSubscription) -> bool {
+    pub fn unsubscribe(&self, sub: FirehoseSubscription) -> bool {
         self.bus.unsubscribe(sub)
     }
 
-    pub(crate) fn remember_binding_actor_handle(&self, handle: local_sync::ActorHandle) {
-        self.state_ref
-            .tell(BusStateTell::RememberBindingActor(handle));
+    fn publish_event(&self, event: SagaChoreographyEvent) -> PublishStats {
+        let saga_type = event.context().saga_type.clone();
+        self.publish_to_saga_type(saga_type.as_ref(), event)
     }
 
     pub fn publish(&self, event: SagaChoreographyEvent) -> PublishStats {
@@ -559,7 +536,7 @@ impl SagaChoreographyBus {
                 if let Some(outcome) = terminal.terminal_outcome() {
                     self.store_terminal_outcome(terminal.context().saga_id, outcome);
                 }
-                return self.bus.publish(terminal);
+                return self.publish_event(terminal);
             }
             if let Some(reason) = self.saga_start_contract_violation_reason(context) {
                 let terminal = SagaChoreographyEvent::SagaFailed {
@@ -570,7 +547,7 @@ impl SagaChoreographyBus {
                 if let Some(outcome) = terminal.terminal_outcome() {
                     self.store_terminal_outcome(terminal.context().saga_id, outcome);
                 }
-                return self.bus.publish(terminal);
+                return self.publish_event(terminal);
             }
             expected_min_delivery =
                 self.saga_start_expected_min_delivery(context.saga_type.as_ref());
@@ -590,7 +567,7 @@ impl SagaChoreographyBus {
         if let Some(outcome) = event.terminal_outcome() {
             self.store_terminal_outcome(event.context().saga_id, outcome);
         }
-        let stats = self.bus.publish(event);
+        let stats = self.publish_event(event);
         if let (Some(required_min_delivery), Some(context)) =
             (expected_min_delivery, expected_context)
             && stats.delivered < required_min_delivery
@@ -613,7 +590,7 @@ impl SagaChoreographyBus {
             if let Some(outcome) = terminal.terminal_outcome() {
                 self.store_terminal_outcome(terminal.context().saga_id, outcome);
             }
-            let _ = self.bus.publish(terminal);
+            let _ = self.publish_event(terminal);
         }
         stats
     }
@@ -806,10 +783,12 @@ impl SagaChoreographyBus {
         saga_type: &str,
         event: SagaChoreographyEvent,
     ) -> PublishStats {
-        self.bus.publish_to(saga_type, event)
+        self.bus
+            .publish_checked(saga_type, &event)
+            .unwrap_or_else(|err| panic!("invalid saga topic '{saga_type}': {err}"))
     }
 
-    pub fn subscribe_saga_type_fn<F>(&self, saga_type: &str, f: F) -> EventSubscription
+    pub fn subscribe_saga_type_fn<F>(&self, saga_type: &str, f: F) -> FirehoseSubscription
     where
         F: Fn(&SagaChoreographyEvent) -> bool + Send + Sync + 'static,
     {
@@ -846,7 +825,7 @@ impl SagaChoreographyBus {
         &self,
         policy: TerminalPolicy,
         responder: &'static str,
-    ) -> Result<EventSubscription, String> {
+    ) -> Result<FirehoseSubscription, String> {
         let saga_type_topic = policy.saga_type.clone();
         let existing =
             match self
@@ -889,19 +868,16 @@ impl SagaChoreographyBus {
             saga_type: saga_type_topic.clone(),
         });
         spawn_terminal_watchdog_if_needed(&policy, resolver_ref.clone(), Arc::clone(&shutdown))?;
-        let subscription = self
-            .bus
-            .subscribe_fn(saga_type_topic.as_ref(), move |event| {
-                if !resolver_ref.tell(TerminalResolverTell::Ingest(Box::new(event.clone()))) {
-                    tracing::error!(
-                        target: "core::saga",
-                        event = "terminal_resolver_ingest_failed",
-                        saga_type = policy.saga_type.as_ref()
-                    );
-                }
-
-                true
-            });
+        let subscription = self.subscribe_fn(saga_type_topic.as_ref(), move |event| {
+            if !resolver_ref.tell(TerminalResolverTell::Ingest(Box::new(event.clone()))) {
+                tracing::error!(
+                    target: "core::saga",
+                    event = "terminal_resolver_ingest_failed",
+                    saga_type = policy.saga_type.as_ref()
+                );
+            }
+            true
+        });
         match self
             .terminal_resolver_registry_ref
             .ask(TerminalResolverRegistryAsk::Register {
@@ -926,7 +902,7 @@ impl SagaChoreographyBus {
     pub fn attach_terminal_resolver_for_contract<C: SagaWorkflowContract>(
         &self,
         responder: &'static str,
-    ) -> Result<EventSubscription, String> {
+    ) -> Result<FirehoseSubscription, String> {
         self.attach_terminal_resolver(C::terminal_policy(), responder)
     }
 
