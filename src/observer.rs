@@ -175,9 +175,11 @@ mod tests {
     /// Capturing `tracing` layer: records each event's level, message, and
     /// field values. Scoped under `with_default` so it never pollutes the
     /// global subscriber or other tests.
+    type CapturedEvent = (tracing::Level, String, Vec<(String, String)>);
+
     #[derive(Default)]
     struct Captured {
-        events: Vec<(tracing::Level, String, Vec<(String, String)>)>,
+        events: Vec<CapturedEvent>,
     }
 
     struct CaptureLayer {

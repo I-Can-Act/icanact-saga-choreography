@@ -290,12 +290,6 @@ impl SagaChoreographyEvent {
     }
 }
 
-impl icanact_core::local::EventTopic for SagaChoreographyEvent {
-    fn event_topic(&self) -> &str {
-        self.context().saga_type.as_ref()
-    }
-}
-
 /// Acknowledgment status for step processing responses.
 #[derive(Clone, Debug)]
 pub enum AckStatus {

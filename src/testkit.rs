@@ -166,7 +166,7 @@ use crate::{
     bind_sync_workflow_participant_channel_strict, checked_workflow_saga_types,
 };
 #[cfg(any(test, feature = "test-harness"))]
-use icanact_core::local::{EventSubscription, PublishStats};
+use icanact_core::local::{FirehoseSubscription, PublishStats};
 
 #[cfg(any(test, feature = "test-harness"))]
 #[derive(Clone, Debug)]
@@ -272,7 +272,7 @@ impl SagaTestWorld {
         &self,
         policy: TerminalPolicy,
         responder: &'static str,
-    ) -> Result<EventSubscription, String> {
+    ) -> Result<FirehoseSubscription, String> {
         self.ensure_capture_saga_type(policy.saga_type.as_ref());
         self.bus.attach_terminal_resolver(policy, responder)
     }

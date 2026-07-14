@@ -12,6 +12,8 @@
 //! journal of events, allowing for independent recovery and replay.
 
 use super::{ParticipantEvent, SagaId};
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 /// A trait for participant journal storage implementations.
 ///
@@ -168,30 +170,9 @@ pub enum JournalError {
 /// This implementation should NOT be used in production as all data
 /// is lost when the process terminates.
 ///
-/// The backing map is owned by a local actor so test storage follows the same
-/// single-owner state model as saga participants.
-enum InMemoryJournalMsg {
-    Append {
-        saga_id: SagaId,
-        entry: Box<JournalEntry>,
-        reply: icanact_core::local_sync::ReplyTo<()>,
-    },
-    Read {
-        saga_id: SagaId,
-        reply: icanact_core::local_sync::ReplyTo<Vec<JournalEntry>>,
-    },
-    ListSagas {
-        reply: icanact_core::local_sync::ReplyTo<Vec<SagaId>>,
-    },
-    Prune {
-        saga_id: SagaId,
-        reply: icanact_core::local_sync::ReplyTo<()>,
-    },
-}
-
 /// An in-memory implementation [`ParticipantJournal`].
 ///
-/// This implementation stores journal entries in memory using actor-owned state
+/// This implementation stores journal entries in process-local memory
 /// and is suitable for testing and development. Data is not persisted across
 /// restarts.
 ///
@@ -200,64 +181,38 @@ enum InMemoryJournalMsg {
 /// This implementation should NOT be used in production as all data is lost
 /// when the process terminates.
 ///
-/// The backing map is owned by a dedicated mailbox actor so test storage follows
-/// the same single-owner state model as saga participants without consuming the
-/// pooled sync actor scheduler.
+/// The backing map uses a short critical section. It does not start a worker
+/// thread or perform a blocking actor ask, so it is safe to call from either
+/// sync scheduler workers or async participants.
 pub struct InMemoryJournal {
-    actor_ref: icanact_core::local_sync::mpsc::MailboxAddr<InMemoryJournalMsg>,
-    actor_handle: Option<icanact_core::local_sync::mpsc::ActorHandle>,
-    counter: std::sync::atomic::AtomicU64,
+    state: Mutex<InMemoryJournalState>,
+}
+
+struct InMemoryJournalState {
+    entries: HashMap<u64, Vec<JournalEntry>>,
+    next_sequence: u64,
 }
 
 impl InMemoryJournal {
     /// Creates a new empty in-memory journal.
     pub fn new() -> Self {
-        let mut data: std::collections::HashMap<u64, Vec<JournalEntry>> =
-            std::collections::HashMap::new();
-        let (actor_ref, actor_handle) =
-            icanact_core::local_sync::mpsc::spawn(1024, move |msg: InMemoryJournalMsg| match msg {
-                InMemoryJournalMsg::Append {
-                    saga_id,
-                    entry,
-                    reply,
-                } => {
-                    data.entry(saga_id.0).or_default().push(*entry);
-                    let _ = reply.reply(());
-                }
-                InMemoryJournalMsg::Read { saga_id, reply } => {
-                    let entries = data.get(&saga_id.0).cloned().unwrap_or_default();
-                    let _ = reply.reply(entries);
-                }
-                InMemoryJournalMsg::ListSagas { reply } => {
-                    let saga_ids = data.keys().map(|&id| SagaId::new(id)).collect();
-                    let _ = reply.reply(saga_ids);
-                }
-                InMemoryJournalMsg::Prune { saga_id, reply } => {
-                    data.remove(&saga_id.0);
-                    let _ = reply.reply(());
-                }
-            });
         Self {
-            actor_ref,
-            actor_handle: Some(actor_handle),
-            counter: std::sync::atomic::AtomicU64::new(1),
+            state: Mutex::new(InMemoryJournalState {
+                entries: HashMap::new(),
+                next_sequence: 1,
+            }),
         }
     }
-}
 
-impl Drop for InMemoryJournal {
-    fn drop(&mut self) {
-        if let Some(handle) = self.actor_handle.take() {
-            handle.shutdown();
-        }
+    fn state(&self) -> Result<std::sync::MutexGuard<'_, InMemoryJournalState>, JournalError> {
+        self.state
+            .lock()
+            .map_err(|_| JournalError::Storage("in-memory journal lock poisoned".into()))
     }
 }
 
 impl ParticipantJournal for InMemoryJournal {
     fn append(&self, saga_id: SagaId, event: ParticipantEvent) -> Result<u64, JournalError> {
-        let seq = self
-            .counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let recorded_at_millis =
             match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
                 Ok(duration) => duration.as_millis() as u64,
@@ -270,53 +225,43 @@ impl ParticipantJournal for InMemoryJournal {
                     0
                 }
             };
-        let entry = JournalEntry {
-            sequence: seq,
-            recorded_at_millis,
-            event,
-        };
-        self.actor_ref
-            .ask(|reply| InMemoryJournalMsg::Append {
-                saga_id,
-                entry: Box::new(entry),
-                reply,
-            })
-            .map_err(|err| {
-                JournalError::Storage(
-                    format!("in-memory journal actor unavailable: {err:?}").into(),
-                )
-            })?;
-        Ok(seq)
+        let mut state = self.state()?;
+        let sequence = state.next_sequence;
+        state.next_sequence = state.next_sequence.saturating_add(1);
+        state
+            .entries
+            .entry(saga_id.0)
+            .or_default()
+            .push(JournalEntry {
+                sequence,
+                recorded_at_millis,
+                event,
+            });
+        Ok(sequence)
     }
 
     fn read(&self, saga_id: SagaId) -> Result<Vec<JournalEntry>, JournalError> {
-        self.actor_ref
-            .ask(|reply| InMemoryJournalMsg::Read { saga_id, reply })
-            .map_err(|err| {
-                JournalError::Storage(
-                    format!("in-memory journal actor unavailable: {err:?}").into(),
-                )
-            })
+        Ok(self
+            .state()?
+            .entries
+            .get(&saga_id.0)
+            .cloned()
+            .unwrap_or_default())
     }
 
     fn list_sagas(&self) -> Result<Vec<SagaId>, JournalError> {
-        self.actor_ref
-            .ask(|reply| InMemoryJournalMsg::ListSagas { reply })
-            .map_err(|err| {
-                JournalError::Storage(
-                    format!("in-memory journal actor unavailable: {err:?}").into(),
-                )
-            })
+        Ok(self
+            .state()?
+            .entries
+            .keys()
+            .copied()
+            .map(SagaId::new)
+            .collect())
     }
 
     fn prune(&self, saga_id: SagaId) -> Result<(), JournalError> {
-        self.actor_ref
-            .ask(|reply| InMemoryJournalMsg::Prune { saga_id, reply })
-            .map_err(|err| {
-                JournalError::Storage(
-                    format!("in-memory journal actor unavailable: {err:?}").into(),
-                )
-            })
+        self.state()?.entries.remove(&saga_id.0);
+        Ok(())
     }
 }
 

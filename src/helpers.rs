@@ -28,6 +28,12 @@ pub fn handle_saga_event_with_emit<P, F>(
     }
 
     let is_saga_started = matches!(event, SagaChoreographyEvent::SagaStarted { .. });
+    if is_saga_started
+        && participant
+            .is_terminal_saga_start_replay(context.saga_id, context.saga_started_at_millis)
+    {
+        return;
+    }
     if !is_saga_started && participant.is_terminal_saga_latched(context.saga_id) {
         return;
     }
@@ -46,6 +52,7 @@ pub fn handle_saga_event_with_emit<P, F>(
         SagaChoreographyEvent::SagaStarted { payload, .. }
             if participant.depends_on().is_on_saga_start() =>
         {
+            participant.record_saga_run_start(context.saga_id, context.saga_started_at_millis);
             // A new saga run may legitimately reuse a saga_id after process restart.
             // Reset per-saga in-memory dependency/state tracking so old runs cannot
             // satisfy dependencies for the new run.
@@ -55,6 +62,7 @@ pub fn handle_saga_event_with_emit<P, F>(
         }
 
         SagaChoreographyEvent::SagaStarted { .. } => {
+            participant.record_saga_run_start(context.saga_id, context.saga_started_at_millis);
             // Even when this participant does not execute on saga start, clear stale
             // dependency/state entries for this saga id so downstream dependency checks
             // are scoped to the current run.
@@ -137,6 +145,12 @@ pub async fn handle_async_saga_event_with_emit<P, F>(
     }
 
     let is_saga_started = matches!(event, SagaChoreographyEvent::SagaStarted { .. });
+    if is_saga_started
+        && participant
+            .is_terminal_saga_start_replay(context.saga_id, context.saga_started_at_millis)
+    {
+        return;
+    }
     if !is_saga_started && participant.is_terminal_saga_latched(context.saga_id) {
         return;
     }
@@ -150,6 +164,7 @@ pub async fn handle_async_saga_event_with_emit<P, F>(
         SagaChoreographyEvent::SagaStarted { payload, .. }
             if participant.depends_on().is_on_saga_start() =>
         {
+            participant.record_saga_run_start(context.saga_id, context.saga_started_at_millis);
             participant.unlatch_terminal_saga(context.saga_id);
             participant.clear_in_memory_saga_run_tracking(context.saga_id);
             execute_step_wrapper_with_emit_async(
@@ -162,6 +177,7 @@ pub async fn handle_async_saga_event_with_emit<P, F>(
             .await;
         }
         SagaChoreographyEvent::SagaStarted { .. } => {
+            participant.record_saga_run_start(context.saga_id, context.saga_started_at_millis);
             participant.unlatch_terminal_saga(context.saga_id);
             participant.clear_in_memory_saga_run_tracking(context.saga_id);
         }

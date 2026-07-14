@@ -123,6 +123,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "crossbeam-epoch"
+version = "0.9.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-queue"
 version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -396,9 +405,10 @@ dependencies = [
 [[package]]
 name = "icanact-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/moofone/actor-framework-core.git?rev=ec5d25e3285c4f306749860bfdd57f1e7264b25a#ec5d25e3285c4f306749860bfdd57f1e7264b25a"
+source = "git+ssh://git@github.com/moofone/actor-framework-core.git?rev=ed7a7892709c6e003598b796025fe17d08537fe6#ed7a7892709c6e003598b796025fe17d08537fe6"
 dependencies = [
  "arc-swap",
+ "crossbeam-epoch",
  "futures",
  "icanact-core-derive",
  "libc",
@@ -411,7 +421,7 @@ dependencies = [
 [[package]]
 name = "icanact-core-derive"
 version = "0.1.0"
-source = "git+ssh://git@github.com/moofone/actor-framework-core.git?rev=ec5d25e3285c4f306749860bfdd57f1e7264b25a#ec5d25e3285c4f306749860bfdd57f1e7264b25a"
+source = "git+ssh://git@github.com/moofone/actor-framework-core.git?rev=ed7a7892709c6e003598b796025fe17d08537fe6#ed7a7892709c6e003598b796025fe17d08537fe6"
 dependencies = [
  "proc-macro2",
  "quote",

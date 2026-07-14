@@ -36,6 +36,7 @@ where
     pub dependency_fired: HashSet<SagaId>,
     pub terminal_sagas: HashSet<SagaId>,
     pub terminal_saga_order: VecDeque<SagaId>,
+    pub saga_run_started_at: HashMap<SagaId, u64>,
     pub accepted_workflow_steps: HashMap<SagaId, AcceptedWorkflowStep>,
     pub resolved_workflow_steps: HashSet<(SagaId, StepExecutionId)>,
     pub journal: J,
@@ -57,6 +58,7 @@ where
             dependency_fired: HashSet::new(),
             terminal_sagas: HashSet::new(),
             terminal_saga_order: VecDeque::new(),
+            saga_run_started_at: HashMap::new(),
             accepted_workflow_steps: HashMap::new(),
             resolved_workflow_steps: HashSet::new(),
             journal,
@@ -126,6 +128,7 @@ where
             .field("dependency_fired_len", &self.dependency_fired.len())
             .field("terminal_sagas_len", &self.terminal_sagas.len())
             .field("terminal_saga_order_len", &self.terminal_saga_order.len())
+            .field("saga_run_started_at_len", &self.saga_run_started_at.len())
             .field(
                 "accepted_workflow_steps_len",
                 &self.accepted_workflow_steps.len(),

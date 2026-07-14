@@ -110,6 +110,21 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
         self.saga_support().terminal_sagas.contains(&saga_id)
     }
 
+    fn is_terminal_saga_start_replay(&self, saga_id: SagaId, started_at_millis: u64) -> bool {
+        self.is_terminal_saga_latched(saga_id)
+            && self
+                .saga_support()
+                .saga_run_started_at
+                .get(&saga_id)
+                .is_some_and(|started_at| *started_at == started_at_millis)
+    }
+
+    fn record_saga_run_start(&mut self, saga_id: SagaId, started_at_millis: u64) {
+        self.saga_support_mut()
+            .saga_run_started_at
+            .insert(saga_id, started_at_millis);
+    }
+
     fn terminal_latch_retention_limit(&self) -> usize {
         static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *LIMIT.get_or_init(
@@ -135,6 +150,7 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
                 break;
             };
             self.terminal_sagas().remove(&evicted);
+            self.saga_support_mut().saga_run_started_at.remove(&evicted);
         }
     }
 

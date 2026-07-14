@@ -82,7 +82,7 @@ impl TerminalProbe {
 
 struct SpawnedParticipant {
     bus: SagaChoreographyBus,
-    subscriptions: Vec<icanact_core::local::EventSubscription>,
+    subscriptions: Vec<icanact_core::local::FirehoseSubscription>,
     handle: Option<local_sync::ActorHandle>,
 }
 
@@ -109,7 +109,7 @@ impl Drop for SpawnedParticipant {
 
 struct SpawnedTerminalProbe {
     bus: SagaChoreographyBus,
-    subscription: Option<icanact_core::local::EventSubscription>,
+    subscription: Option<icanact_core::local::FirehoseSubscription>,
     handle: Option<local_sync::ActorHandle>,
 }
 
@@ -508,12 +508,20 @@ fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) {
     panic!("wait_until timed out after {timeout:?}");
 }
 
+fn serial_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 // ===========================================================================
 // Test 1: Happy Path
 // ===========================================================================
 
 #[test]
 fn all_succeed_saga_completed() {
+    let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
 
@@ -592,6 +600,7 @@ fn all_succeed_saga_completed() {
 
 #[test]
 fn position_fails_terminal_no_compensation() {
+    let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus
@@ -668,6 +677,7 @@ fn position_fails_terminal_no_compensation() {
 
 #[test]
 fn balance_fails_terminal_after_position_succeeds() {
+    let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus
@@ -736,6 +746,7 @@ fn balance_fails_terminal_after_position_succeeds() {
 
 #[test]
 fn order_fails_terminal_after_both_succeed() {
+    let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus
@@ -804,6 +815,7 @@ fn order_fails_terminal_after_both_succeed() {
 
 #[test]
 fn order_fails_require_compensation_triggers_full_compensation() {
+    let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus
@@ -864,6 +876,7 @@ fn order_fails_require_compensation_triggers_full_compensation() {
 
 #[test]
 fn position_compensation_fails_terminal_causes_saga_failed() {
+    let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus
@@ -924,6 +937,7 @@ fn position_compensation_fails_terminal_causes_saga_failed() {
 
 #[test]
 fn balance_compensation_fails_ambiguous_causes_quarantine() {
+    let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus
@@ -975,6 +989,7 @@ fn balance_compensation_fails_ambiguous_causes_quarantine() {
 
 #[test]
 fn balance_compensation_fails_safe_to_retry_causes_failed() {
+    let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus
@@ -1032,6 +1047,7 @@ fn balance_compensation_fails_safe_to_retry_causes_failed() {
 
 #[test]
 fn position_panics_emits_quarantined() {
+    let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus
@@ -1086,6 +1102,7 @@ fn position_panics_emits_quarantined() {
 
 #[test]
 fn balance_panics_after_position_succeeds() {
+    let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus
@@ -1147,6 +1164,7 @@ fn balance_panics_after_position_succeeds() {
 
 #[test]
 fn order_panics_after_both_succeed() {
+    let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus
@@ -1221,6 +1239,7 @@ fn order_panics_after_both_succeed() {
 
 #[test]
 fn duplicate_saga_started_is_deduped() {
+    let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus
@@ -1274,6 +1293,7 @@ fn duplicate_saga_started_is_deduped() {
 
 #[test]
 fn order_does_not_fire_on_partial_dependency() {
+    let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
 
@@ -1326,6 +1346,7 @@ fn order_does_not_fire_on_partial_dependency() {
 
 #[test]
 fn terminal_latch_prevents_duplicate_events() {
+    let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus
@@ -1389,6 +1410,7 @@ fn terminal_latch_prevents_duplicate_events() {
 
 #[test]
 fn duplicate_dependency_completion_after_order_executes_is_deduped() {
+    let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus
@@ -1452,6 +1474,7 @@ fn duplicate_dependency_completion_after_order_executes_is_deduped() {
 
 #[test]
 fn duplicate_compensation_request_is_deduped() {
+    let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus
@@ -1500,6 +1523,7 @@ fn duplicate_compensation_request_is_deduped() {
 
 #[test]
 fn duplicate_position_approval_before_balance_keeps_order_exactly_once() {
+    let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
 
@@ -1571,6 +1595,7 @@ fn duplicate_position_approval_before_balance_keeps_order_exactly_once() {
 
 #[test]
 fn duplicate_balance_approval_before_position_keeps_order_exactly_once() {
+    let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
 
@@ -1642,6 +1667,7 @@ fn duplicate_balance_approval_before_position_keeps_order_exactly_once() {
 
 #[test]
 fn duplicate_both_approvals_still_produce_single_order_execution() {
+    let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
     let _resolver = bus

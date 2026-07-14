@@ -951,6 +951,11 @@ fn handle_workflow_saga_event_with_emit<A, F>(
     }
 
     let is_saga_started = matches!(event, SagaChoreographyEvent::SagaStarted { .. });
+    if is_saga_started
+        && actor.is_terminal_saga_start_replay(context.saga_id, context.saga_started_at_millis)
+    {
+        return;
+    }
     if !is_saga_started && actor.is_terminal_saga_latched(context.saga_id) {
         return;
     }
@@ -980,6 +985,7 @@ fn handle_workflow_saga_event_with_emit<A, F>(
         SagaChoreographyEvent::SagaStarted { payload, .. }
             if workflow.depends_on().is_on_saga_start() =>
         {
+            actor.record_saga_run_start(context.saga_id, context.saga_started_at_millis);
             actor.unlatch_terminal_saga(context.saga_id);
             actor.clear_in_memory_saga_run_tracking(context.saga_id);
             execute_workflow_step_with_emit(
@@ -992,6 +998,7 @@ fn handle_workflow_saga_event_with_emit<A, F>(
             );
         }
         SagaChoreographyEvent::SagaStarted { .. } => {
+            actor.record_saga_run_start(context.saga_id, context.saga_started_at_millis);
             actor.unlatch_terminal_saga(context.saga_id);
             actor.clear_in_memory_saga_run_tracking(context.saga_id);
         }
@@ -2845,9 +2852,9 @@ mod property_tests {
         let mut some = false;
         for &idx in seq {
             match idx {
-                9 => some = true,                      // AcceptedStepRecorded
-                3 | 4 | 5 | 6 | 7 | 8 => some = false, // terminal/clearing events
-                _ => {}                                // registration/trigger/start: unchanged
+                9 => some = true,      // AcceptedStepRecorded
+                3..=8 => some = false, // terminal/clearing events
+                _ => {}                // registration/trigger/start: unchanged
             }
         }
         some
@@ -2910,9 +2917,9 @@ mod property_tests {
 /// Every `ParticipantDedupeStore` backend MUST make check-and-mark atomic:
 /// across all thread interleavings, exactly one concurrent first-mark for a
 /// given (saga_id, key) wins, and every duplicate observes a miss. The in-tree
-/// `InMemoryDedupe` satisfies this structurally via a single-owner mailbox
-/// actor, so it needs no loom model. Real backends (LMDB/heed, SQL, KV stores)
-/// use shared mutable state and SHOULD be exercised here.
+/// `InMemoryDedupe` uses the same canonical mutex-protected check-and-mark
+/// operation modeled below. Real backends (LMDB/heed, SQL, KV stores) use
+/// shared mutable state and SHOULD be exercised here.
 ///
 /// This module models the canonical shared-state algorithm a backend would
 /// write and proves it race-free under loom's exhaustive scheduler. Extend it
