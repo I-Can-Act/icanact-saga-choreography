@@ -2852,6 +2852,7 @@ fn collect_startup_recovery_events_for_saga_type_inner<
             if let Some((error, failed_at_millis)) =
                 accepted_step_failure_requiring_compensation(&entries)
             {
+                out.push(startup_accepted_step_failure_hydration_event(&accepted));
                 out.push(startup_accepted_step_failure_event(
                     &accepted,
                     None,
@@ -2870,6 +2871,7 @@ fn collect_startup_recovery_events_for_saga_type_inner<
                     ..
                 } = timeout_event
                 {
+                    out.push(startup_accepted_step_failure_hydration_event(&accepted));
                     out.push(startup_accepted_step_failure_event(
                         &accepted,
                         error_code,
@@ -2938,6 +2940,24 @@ fn startup_accepted_step_replay_event(accepted: &AcceptedWorkflowStep) -> SagaCh
         execution_id: accepted.execution_id.clone(),
         deadline_at_millis: accepted.deadline_at_millis,
         hard_deadline_at_millis: accepted.hard_deadline_at_millis,
+        timeout_outcome: accepted.policy.timeout_outcome.clone(),
+        compensation_available: !accepted.compensation_data.is_empty(),
+    }
+}
+
+fn startup_accepted_step_failure_hydration_event(
+    accepted: &AcceptedWorkflowStep,
+) -> SagaChoreographyEvent {
+    SagaChoreographyEvent::StepAccepted {
+        context: accepted.context.clone(),
+        participant_id: accepted.participant_id.clone(),
+        execution_id: accepted.execution_id.clone(),
+        // The immediately following durable StepFailed is authoritative. These
+        // recovery-only deadlines prevent the resolver from racing that failure
+        // with a stale timeout while still rebuilding compensation ownership for
+        // an in-memory resolver.
+        deadline_at_millis: u64::MAX,
+        hard_deadline_at_millis: u64::MAX,
         timeout_outcome: accepted.policy.timeout_outcome.clone(),
         compensation_available: !accepted.compensation_data.is_empty(),
     }

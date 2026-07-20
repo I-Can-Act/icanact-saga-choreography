@@ -990,7 +990,7 @@ fn compensating_failure_restart_keeps_forward_execution_tombstoned() {
     let mut actor = RestartedHarnessActor::new(journal.clone());
     let ctx = context("create_order", 39);
     let execution_id = StepExecutionId::new("effect-39");
-    let accepted_event = accept_workflow_step_with_state(
+    accept_workflow_step_with_state(
         &mut actor,
         ctx.clone(),
         "order-manager".into(),
@@ -1019,7 +1019,11 @@ fn compensating_failure_restart_keeps_forward_execution_tombstoned() {
     .expect("durable failure recovery events should be collected");
     assert!(matches!(
         recovery_events.as_slice(),
-        [SagaChoreographyEvent::StepFailed {
+        [SagaChoreographyEvent::StepAccepted {
+            deadline_at_millis: u64::MAX,
+            hard_deadline_at_millis: u64::MAX,
+            ..
+        }, SagaChoreographyEvent::StepFailed {
             context,
             error,
             requires_compensation: true,
@@ -1028,7 +1032,6 @@ fn compensating_failure_restart_keeps_forward_execution_tombstoned() {
             && error.as_ref() == "authoritative create failure"
     ));
     let mut restarted_resolver = TerminalResolver::new(terminal_policy());
-    let _ = restarted_resolver.ingest(&accepted_event);
     let mut resolver_events = Vec::new();
     for event in &recovery_events {
         resolver_events.extend(restarted_resolver.ingest(event));

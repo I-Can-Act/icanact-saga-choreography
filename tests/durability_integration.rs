@@ -758,7 +758,11 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
     .expect("startup recovery should collect expired accepted step");
     assert!(matches!(
         expired.as_slice(),
-        [SagaChoreographyEvent::StepFailed {
+        [SagaChoreographyEvent::StepAccepted {
+            deadline_at_millis: u64::MAX,
+            hard_deadline_at_millis: u64::MAX,
+            ..
+        }, SagaChoreographyEvent::StepFailed {
             error,
             requires_compensation: true,
             ..
@@ -805,7 +809,11 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
     .expect("startup recovery should replay the durable accepted-step failure");
     assert!(matches!(
         failed.as_slice(),
-        [SagaChoreographyEvent::StepFailed {
+        [SagaChoreographyEvent::StepAccepted {
+            deadline_at_millis: u64::MAX,
+            hard_deadline_at_millis: u64::MAX,
+            ..
+        }, SagaChoreographyEvent::StepFailed {
             context,
             participant_id,
             error,
