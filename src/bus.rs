@@ -375,15 +375,15 @@ impl SyncActor for TerminalResolverActor {
                     );
                     if !matches!(*event, SagaChoreographyEvent::SagaQuarantined { .. }) {
                         let context = event.context().next_step(TERMINAL_RESOLVER_STEP.into());
-                        let _ = self
-                            .bus
-                            .publish_strict(SagaChoreographyEvent::SagaQuarantined {
+                        self.publish_terminal_events(vec![
+                            SagaChoreographyEvent::SagaQuarantined {
                                 context,
                                 reason: format!("terminal resolver durability failed: {error}")
                                     .into(),
                                 step: TERMINAL_RESOLVER_STEP.into(),
                                 participant_id: self.responder.as_ref().into(),
-                            });
+                            },
+                        ]);
                     }
                     return;
                 }
@@ -1275,7 +1275,8 @@ mod tests {
         AcceptedStepTimeoutOutcome, FailureAuthority, InMemoryTerminalResolverJournal,
         SagaChoreographyEvent, SagaContext, SagaId, SagaReplyToResult, SagaTerminalOutcome,
         SagaWorkflowContract, SagaWorkflowStepContract, StepExecutionId, SuccessCriteria,
-        TERMINAL_RESOLVER_STEP, TerminalPolicy, TerminalResolverJournal, WorkflowDependencySpec,
+        TERMINAL_RESOLVER_STEP, TerminalPolicy, TerminalResolverJournal,
+        TerminalResolverJournalEntry, TerminalResolverJournalError, WorkflowDependencySpec,
     };
 
     use super::{DEFAULT_TERMINAL_RETENTION_LIMIT, SagaChoreographyBus};
@@ -1346,6 +1347,25 @@ mod tests {
         (pending, probe_handle)
     }
 
+    struct RejectingTerminalResolverJournal;
+
+    impl TerminalResolverJournal for RejectingTerminalResolverJournal {
+        fn append(
+            &self,
+            _event: SagaChoreographyEvent,
+        ) -> Result<u64, TerminalResolverJournalError> {
+            Err(TerminalResolverJournalError::Storage(
+                "injected resolver journal failure".into(),
+            ))
+        }
+
+        fn read_all(
+            &self,
+        ) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError> {
+            Ok(Vec::new())
+        }
+    }
+
     #[test]
     fn attached_resolver_emits_single_terminal_completion() {
         let bus = SagaChoreographyBus::new();
@@ -1384,6 +1404,36 @@ mod tests {
         wait_until(Instant::now() + Duration::from_secs(1), || {
             delivered.load(Ordering::Relaxed) == 1
         });
+    }
+
+    #[test]
+    fn durable_journal_failure_resolves_pending_reply_as_quarantined() {
+        let bus = SagaChoreographyBus::new();
+        let _resolver = bus
+            .attach_durable_terminal_resolver(
+                TerminalPolicy::order_lifecycle_default(),
+                "terminal-resolver",
+                Arc::new(RejectingTerminalResolverJournal),
+            )
+            .expect("durable resolver should attach");
+        let saga_id = SagaId::new(811);
+        let (pending, probe) = register_pending_reply(bus.clone(), saga_id);
+        thread::sleep(Duration::from_millis(20));
+
+        bus.publish_strict(SagaChoreographyEvent::StepStarted {
+            context: context("create_order", saga_id.get()),
+        })
+        .expect("step start should reach the resolver");
+
+        let reply = pending
+            .wait()
+            .expect("journal failure should resolve the pending reply")
+            .expect("quarantine is a terminal saga reply");
+        assert!(matches!(
+            reply.outcome,
+            SagaTerminalOutcome::Quarantined { .. }
+        ));
+        probe.shutdown();
     }
 
     #[test]
