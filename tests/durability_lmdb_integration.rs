@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use heed::EnvOpenOptions;
+use heed::types::{Bytes, Str};
 use icanact_saga_choreography::durability::lmdb::{
     LmdbDedupe, LmdbJournal, open_lmdb_participant_support,
     open_lmdb_participant_support_for_saga_type,
@@ -248,5 +250,42 @@ fn lmdb_open_fails_for_file_paths() {
     assert!(
         !dedupe_err.to_string().is_empty(),
         "dedupe open error should include a storage message"
+    );
+}
+
+#[test]
+fn lmdb_journal_rejects_unversioned_persisted_rows() {
+    let temp = tempfile::tempdir().expect("tempdir should open");
+    let journal_path = temp.path().join("legacy-journal");
+    std::fs::create_dir_all(&journal_path).expect("legacy journal directory should exist");
+    {
+        let env = unsafe {
+            EnvOpenOptions::new()
+                .max_dbs(16)
+                .map_size(1024 * 1024 * 1024)
+                .open(&journal_path)
+        }
+        .expect("legacy environment should open");
+        let mut wtxn = env
+            .write_txn()
+            .expect("legacy write transaction should open");
+        let rows = env
+            .create_database::<Str, Bytes>(&mut wtxn, Some("journal_rows"))
+            .expect("legacy rows database should open");
+        rows.put(
+            &mut wtxn,
+            "00000000000000000001:00000000000000000001",
+            b"legacy",
+        )
+        .expect("legacy row should be persisted");
+        wtxn.commit().expect("legacy row should commit");
+    }
+
+    let err = LmdbJournal::open(&journal_path)
+        .expect_err("unversioned persisted rows must fail closed before decoding");
+    assert!(
+        err.to_string()
+            .contains("unversioned saga journal contains rows incompatible"),
+        "unexpected schema error: {err}"
     );
 }

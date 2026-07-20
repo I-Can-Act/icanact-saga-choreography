@@ -2498,6 +2498,8 @@ pub mod lmdb {
 
     const DEFAULT_LMDB_MAP_SIZE_BYTES: usize = 1024 * 1024 * 1024;
     const SAGA_LMDB_MAP_SIZE_ENV: &str = "SAGA_LMDB_MAP_SIZE_BYTES";
+    const JOURNAL_SCHEMA_KEY: &str = "journal_schema_version";
+    const JOURNAL_SCHEMA_VERSION: &str = "2";
 
     fn lmdb_map_size_bytes() -> Result<usize, Box<str>> {
         match std::env::var(SAGA_LMDB_MAP_SIZE_ENV) {
@@ -2562,6 +2564,44 @@ pub mod lmdb {
             let meta = env
                 .create_database::<Str, Str>(&mut wtxn, Some("journal_meta"))
                 .map_err(|err| JournalError::Storage(err.to_string().into()))?;
+            let stored_schema = meta
+                .get(&wtxn, JOURNAL_SCHEMA_KEY)
+                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
+            match stored_schema {
+                Some(version) if version == JOURNAL_SCHEMA_VERSION => {}
+                Some(version) => {
+                    return Err(JournalError::Storage(
+                        format!(
+                            "incompatible saga journal schema version: stored={version} required={JOURNAL_SCHEMA_VERSION}"
+                        )
+                        .into(),
+                    ));
+                }
+                None => {
+                    let has_unversioned_rows = {
+                        let mut iter = rows
+                            .iter(&wtxn)
+                            .map_err(|err| JournalError::Storage(err.to_string().into()))?;
+                        match iter.next() {
+                            Some(row) => {
+                                row.map_err(|err| JournalError::Storage(err.to_string().into()))?;
+                                true
+                            }
+                            None => false,
+                        }
+                    };
+                    if has_unversioned_rows {
+                        return Err(JournalError::Storage(
+                            format!(
+                                "unversioned saga journal contains rows incompatible with required schema version {JOURNAL_SCHEMA_VERSION}"
+                            )
+                            .into(),
+                        ));
+                    }
+                    meta.put(&mut wtxn, JOURNAL_SCHEMA_KEY, JOURNAL_SCHEMA_VERSION)
+                        .map_err(|err| JournalError::Storage(err.to_string().into()))?;
+                }
+            }
             wtxn.commit()
                 .map_err(|err| JournalError::Storage(err.to_string().into()))?;
             Ok(Self {
