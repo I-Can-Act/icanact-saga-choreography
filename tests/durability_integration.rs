@@ -281,6 +281,74 @@ fn lmdb_open_recovers_accepted_steps_for_each_declared_saga_type() {
 
 #[cfg(feature = "lmdb")]
 #[test]
+fn lmdb_multi_saga_open_only_replays_stale_journal_with_exact_type_evidence() {
+    const OPEN_POSITION: &str = "open_position";
+    const CLOSE_POSITION: &str = "close_position";
+
+    let temp = tempfile::tempdir().expect("tempdir should open");
+    let support =
+        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_types(
+            temp.path(),
+            TEST_STEP,
+            &[OPEN_POSITION, CLOSE_POSITION],
+        )
+        .expect("multi-workflow support should open");
+    support
+        .journal
+        .append(
+            SagaId::new(192),
+            ParticipantEvent::Quarantined {
+                reason: panic_quarantine_reason(
+                    ActiveSagaExecutionPhase::StepExecution,
+                    "untyped panic",
+                ),
+                quarantined_at_millis: SagaContext::now_millis(),
+            },
+        )
+        .expect("untyped legacy event should persist");
+    support
+        .journal
+        .append(
+            SagaId::new(193),
+            ParticipantEvent::SagaRegistered {
+                saga_type: OPEN_POSITION.into(),
+                step_name: TEST_STEP.into(),
+                registered_at_millis: 0,
+            },
+        )
+        .expect("typed registration should persist");
+    support
+        .journal
+        .append(
+            SagaId::new(193),
+            ParticipantEvent::Quarantined {
+                reason: panic_quarantine_reason(
+                    ActiveSagaExecutionPhase::StepExecution,
+                    "typed panic",
+                ),
+                quarantined_at_millis: SagaContext::now_millis(),
+            },
+        )
+        .expect("typed stale execution should persist");
+    drop(support);
+
+    let support =
+        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_types(
+            temp.path(),
+            TEST_STEP,
+            &[OPEN_POSITION, CLOSE_POSITION],
+        )
+        .expect("multi-workflow support should reopen");
+    assert!(matches!(
+        support.startup_recovery_events.as_slice(),
+        [SagaChoreographyEvent::SagaQuarantined { context, .. }]
+            if context.saga_id == SagaId::new(193)
+                && context.saga_type.as_ref() == OPEN_POSITION
+    ));
+}
+
+#[cfg(feature = "lmdb")]
+#[test]
 fn lmdb_open_does_not_rehydrate_expired_accepted_step() {
     let temp = tempfile::tempdir().expect("tempdir should open");
     let ctx = context(91, ORDER_LIFECYCLE, TEST_STEP);

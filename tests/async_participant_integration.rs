@@ -1,9 +1,13 @@
+use std::time::Duration;
+
 use icanact_saga_choreography::durability::apply_async_participant_saga_ingress_with_hooks;
 use icanact_saga_choreography::{
+    AcceptedStepCompletion, AcceptedStepError, AcceptedStepPolicy, AcceptedStepTimeoutOutcome,
     AsyncSagaParticipant, CompensationError, CompensationOutput, DependencySpec,
     HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal, ParticipantEvent,
     ParticipantJournal, PeerId, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipantSupport,
-    SagaStateEntry, SagaStateExt, StepError, StepOutput,
+    SagaStateEntry, SagaStateExt, StepError, StepExecutionId, StepOutput,
+    complete_accepted_workflow_step,
 };
 
 struct AsyncTestParticipant {
@@ -250,5 +254,68 @@ async fn async_ingress_non_ambiguous_compensation_failure_keeps_local_failed_sta
             },
             ..
         }) if error.as_ref() == "undo failed"
+    ));
+}
+
+#[tokio::test]
+async fn async_ingress_tombstones_an_accepted_step_after_terminal_timeout() {
+    let execution_id = StepExecutionId::new("async-timeout-2");
+    let mut participant = AsyncTestParticipant {
+        execute_output: Ok(StepOutput::Accepted {
+            execution_id: execution_id.clone(),
+            policy: AcceptedStepPolicy {
+                idle_timeout: Duration::from_secs(5),
+                hard_timeout: Duration::from_secs(10),
+                timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
+                    requires_compensation: false,
+                },
+            },
+            compensation_data: Vec::new(),
+        }),
+        ..AsyncTestParticipant::default()
+    };
+
+    apply_async_participant_saga_ingress_with_hooks(
+        &mut participant,
+        SagaChoreographyEvent::SagaStarted {
+            context: test_context(2),
+            payload: b"order".to_vec(),
+        },
+        |_actor, _incoming| {},
+        |_invalid| {},
+        |_actor, _event| {},
+    )
+    .await;
+    assert_eq!(participant.saga.accepted_workflow_steps.len(), 1);
+
+    apply_async_participant_saga_ingress_with_hooks(
+        &mut participant,
+        SagaChoreographyEvent::StepFailed {
+            context: test_context(2).next_step("async_step".into()),
+            participant_id: "async-participant".into(),
+            error_code: Some("idle".into()),
+            error: "accepted step idle timeout execution_id=async-timeout-2".into(),
+            requires_compensation: false,
+        },
+        |_actor, _incoming| {},
+        |_invalid| {},
+        |_actor, _event| {},
+    )
+    .await;
+
+    assert!(participant.saga.accepted_workflow_steps.is_empty());
+    let late = complete_accepted_workflow_step(
+        &mut participant,
+        SagaId::new(2),
+        execution_id,
+        AcceptedStepCompletion {
+            completed_at_millis: SagaContext::now_millis(),
+            output: b"late".to_vec(),
+            compensation_data: Vec::new(),
+        },
+    );
+    assert!(matches!(
+        late,
+        Err(AcceptedStepError::AlreadyResolved { .. })
     ));
 }

@@ -2113,6 +2113,7 @@ pub async fn apply_async_participant_saga_ingress_with_hooks<
     FOnEmitted: FnMut(&mut P, &SagaChoreographyEvent),
 {
     apply_terminal_side_effects(participant, &event);
+    mark_matching_accepted_step_failed(participant, &event);
 
     let mut emitted = Vec::new();
     handle_async_saga_event_with_emit(participant, event, |next_event| emitted.push(next_event))
@@ -2389,6 +2390,38 @@ pub fn collect_startup_recovery_events_for_saga_type<
     step_name: &'static str,
     saga_type: &'static str,
 ) -> Result<Vec<SagaChoreographyEvent>, RecoveryCollectionError> {
+    collect_startup_recovery_events_for_saga_type_inner(journal, saga_type, dedupe, step_name, true)
+}
+
+fn recorded_saga_type(entries: &[JournalEntry]) -> Option<&str> {
+    entries.iter().rev().find_map(|entry| match &entry.event {
+        ParticipantEvent::SagaRegistered { saga_type, .. } => Some(saga_type.as_ref()),
+        ParticipantEvent::CompensationRequestRecorded { context, .. }
+        | ParticipantEvent::AcceptedStepRecorded { context, .. }
+        | ParticipantEvent::AcceptedCompensationRecorded { context, .. } => {
+            Some(context.saga_type.as_ref())
+        }
+        ParticipantEvent::StepTriggered { .. }
+        | ParticipantEvent::StepExecutionStarted { .. }
+        | ParticipantEvent::StepExecutionCompleted { .. }
+        | ParticipantEvent::StepExecutionFailed { .. }
+        | ParticipantEvent::CompensationStarted { .. }
+        | ParticipantEvent::CompensationCompleted { .. }
+        | ParticipantEvent::CompensationFailed { .. }
+        | ParticipantEvent::Quarantined { .. } => None,
+    })
+}
+
+fn collect_startup_recovery_events_for_saga_type_inner<
+    J: ParticipantJournal,
+    D: ParticipantDedupeStore,
+>(
+    journal: &J,
+    saga_type: &'static str,
+    dedupe: &D,
+    step_name: &'static str,
+    allow_untyped_recovery: bool,
+) -> Result<Vec<SagaChoreographyEvent>, RecoveryCollectionError> {
     let mut out = Vec::new();
     let policy = RecoveryPolicy::default();
     let now = SagaContext::now_millis();
@@ -2408,6 +2441,11 @@ pub fn collect_startup_recovery_events_for_saga_type<
         };
         if entries.is_empty() {
             continue;
+        }
+        match recorded_saga_type(&entries) {
+            Some(recorded) if recorded != saga_type => continue,
+            None if !allow_untyped_recovery => continue,
+            Some(_) | None => {}
         }
         // Recovery only acts on durable journal evidence. If a persistent
         // dedupe store marked an upstream event but the participant crashed
@@ -2667,7 +2705,7 @@ pub mod lmdb {
     use heed::{Database, Env, EnvOpenOptions};
 
     use super::{
-        DEFAULT_RECOVERY_SAGA_TYPE, collect_startup_recovery_events_for_saga_type,
+        DEFAULT_RECOVERY_SAGA_TYPE, collect_startup_recovery_events_for_saga_type_inner,
         recover_accepted_workflow_steps_for_saga_type,
     };
     use crate::{
@@ -3032,8 +3070,12 @@ pub mod lmdb {
         let dedupe = LmdbDedupe::open(&base.join("dedupe")).map_err(|err| err.to_string())?;
         let mut startup_recovery_events = Vec::new();
         for saga_type in saga_types {
-            let mut events = collect_startup_recovery_events_for_saga_type(
-                &journal, &dedupe, step_name, saga_type,
+            let mut events = collect_startup_recovery_events_for_saga_type_inner(
+                &journal,
+                saga_type,
+                &dedupe,
+                step_name,
+                saga_types.len() == 1,
             )
             .map_err(|err| {
                 format!("startup recovery collection failed for saga_type={saga_type}: {err:?}")

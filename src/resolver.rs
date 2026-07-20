@@ -152,6 +152,7 @@ struct SagaResolutionState {
     compensable_steps: Vec<Box<str>>,
     compensation_requested: bool,
     pending_compensation_steps: HashSet<Box<str>>,
+    completed_compensation_steps: HashSet<Box<str>>,
     pending_failure: Option<SagaFailureDetails>,
     accepted_steps: HashMap<Box<str>, AcceptedStepResolverState>,
     accepted_compensations: HashMap<Box<str>, AcceptedCompensationResolverState>,
@@ -190,6 +191,7 @@ impl SagaResolutionState {
             compensable_steps: Vec::new(),
             compensation_requested: false,
             pending_compensation_steps: HashSet::new(),
+            completed_compensation_steps: HashSet::new(),
             pending_failure: None,
             accepted_steps: HashMap::new(),
             accepted_compensations: HashMap::new(),
@@ -387,6 +389,9 @@ impl TerminalResolver {
                 state
                     .accepted_compensations
                     .remove(context.step_name.as_ref());
+                state
+                    .completed_compensation_steps
+                    .insert(context.step_name.clone());
                 if state.compensation_requested {
                     state
                         .pending_compensation_steps
@@ -443,7 +448,11 @@ impl TerminalResolver {
                 steps_to_compensate,
                 ..
             } => {
-                state.pending_compensation_steps = steps_to_compensate.iter().cloned().collect();
+                state.pending_compensation_steps = steps_to_compensate
+                    .iter()
+                    .filter(|step| !state.completed_compensation_steps.contains(*step))
+                    .cloned()
+                    .collect();
                 state.compensation_requested = true;
                 state.pending_failure = Some(failure.clone());
             }
@@ -1416,6 +1425,50 @@ mod tests {
             !resolver.states.contains_key(&SagaId::new(21)),
             "late event must not resurrect evicted terminal saga state"
         );
+    }
+
+    #[test]
+    fn duplicate_compensation_request_does_not_reopen_a_completed_step() {
+        let mut resolver = TerminalResolver::new(TerminalPolicy::order_lifecycle_default());
+        let context = ctx_at("create_order", 23, 1_000, 1_000);
+        let failure = crate::SagaFailureDetails {
+            step_name: "create_order".into(),
+            participant_id: "order-manager".into(),
+            error_code: Some("exchange_rejected".into()),
+            error_message: "create failed".into(),
+            at_millis: 1_010,
+        };
+        let request = SagaChoreographyEvent::CompensationRequested {
+            context: context.clone(),
+            failed_step: "create_order".into(),
+            reason: "create failed".into(),
+            failure,
+            steps_to_compensate: vec!["reserve".into(), "create_order".into()],
+        };
+
+        assert!(resolver.ingest_at(&request, 1_010).is_empty());
+        assert!(
+            resolver
+                .ingest_at(
+                    &SagaChoreographyEvent::CompensationCompleted {
+                        context: context.next_step("reserve".into()),
+                    },
+                    1_020,
+                )
+                .is_empty()
+        );
+        assert!(resolver.ingest_at(&request, 1_030).is_empty());
+        assert!(matches!(
+            resolver
+                .ingest_at(
+                    &SagaChoreographyEvent::CompensationCompleted {
+                        context: context.next_step("create_order".into()),
+                    },
+                    1_040,
+                )
+                .as_slice(),
+            [SagaChoreographyEvent::SagaFailed { .. }]
+        ));
     }
 
     #[test]
