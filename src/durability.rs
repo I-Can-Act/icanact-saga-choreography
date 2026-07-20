@@ -569,15 +569,20 @@ where
     A: SagaStateExt,
 {
     let accepted = accepted_compensation_for_resolution(actor, saga_id, &execution_id)?;
+    let durable_failure = if failure.is_ambiguous {
+        ParticipantEvent::Quarantined {
+            reason: failure.reason.clone(),
+            quarantined_at_millis: failure.failed_at_millis,
+        }
+    } else {
+        ParticipantEvent::CompensationFailed {
+            error: failure.reason.clone(),
+            is_ambiguous: false,
+            failed_at_millis: failure.failed_at_millis,
+        }
+    };
     actor
-        .record_event_strict(
-            saga_id,
-            ParticipantEvent::CompensationFailed {
-                error: failure.reason.clone(),
-                is_ambiguous: failure.is_ambiguous,
-                failed_at_millis: failure.failed_at_millis,
-            },
-        )
+        .record_event_strict(saga_id, durable_failure)
         .map_err(|source| AcceptedStepError::Durability {
             saga_id,
             execution_id: execution_id.clone(),
@@ -843,8 +848,8 @@ where
                 continue;
             }
             let execution_id = accepted.execution_id.clone();
-            let forward_execution_resolved =
-                retain_expired_for_compensation || accepted_step_failed_with_compensation(&entries);
+            let forward_execution_resolved = retain_expired_for_compensation
+                || accepted_step_failure_requiring_compensation(&entries).is_some();
             let state = crate::SagaParticipantState::new(
                 saga_id,
                 accepted.context.saga_type.clone(),
@@ -968,18 +973,21 @@ fn recover_accepted_workflow_step_from_entries(
     accepted
 }
 
-fn accepted_step_failed_with_compensation(entries: &[JournalEntry]) -> bool {
-    let mut failed_with_compensation = false;
+fn accepted_step_failure_requiring_compensation(
+    entries: &[JournalEntry],
+) -> Option<(Box<str>, u64)> {
+    let mut failure = None;
     for entry in entries {
         match &entry.event {
             ParticipantEvent::AcceptedStepRecorded { .. } => {
-                failed_with_compensation = false;
+                failure = None;
             }
             ParticipantEvent::StepExecutionFailed {
+                error,
                 requires_compensation: true,
-                ..
+                failed_at_millis,
             } => {
-                failed_with_compensation = true;
+                failure = Some((error.clone(), *failed_at_millis));
             }
             ParticipantEvent::StepExecutionCompleted { .. }
             | ParticipantEvent::StepExecutionFailed {
@@ -990,7 +998,7 @@ fn accepted_step_failed_with_compensation(entries: &[JournalEntry]) -> bool {
             | ParticipantEvent::CompensationStarted { .. }
             | ParticipantEvent::CompensationCompleted { .. }
             | ParticipantEvent::CompensationFailed { .. } => {
-                failed_with_compensation = false;
+                failure = None;
             }
             ParticipantEvent::SagaRegistered { .. }
             | ParticipantEvent::StepTriggered { .. }
@@ -998,7 +1006,7 @@ fn accepted_step_failed_with_compensation(entries: &[JournalEntry]) -> bool {
             | ParticipantEvent::AcceptedCompensationRecorded { .. } => {}
         }
     }
-    failed_with_compensation
+    failure
 }
 
 fn resolve_accepted_timeout<A>(
@@ -2287,10 +2295,25 @@ pub fn collect_startup_recovery_events_for_saga_type<
         if let Some(accepted) = recover_accepted_workflow_step_from_entries(&entries)
             && accepted.context.saga_type.as_ref() == saga_type
             && accepted.context.step_name.as_ref() == step_name
-            && let Some(timeout_event) = startup_accepted_step_timeout_event(accepted, now)
         {
-            out.push(timeout_event);
-            continue;
+            if let Some((error, failed_at_millis)) =
+                accepted_step_failure_requiring_compensation(&entries)
+            {
+                let mut context = accepted.context;
+                context.event_timestamp_millis = failed_at_millis;
+                out.push(SagaChoreographyEvent::StepFailed {
+                    context,
+                    participant_id: accepted.participant_id,
+                    error_code: None,
+                    error,
+                    requires_compensation: true,
+                });
+                continue;
+            }
+            if let Some(timeout_event) = startup_accepted_step_timeout_event(accepted, now) {
+                out.push(timeout_event);
+                continue;
+            }
         }
         match classify_recovery(&entries, now, policy) {
             RecoveryDecision::QuarantineStale => {

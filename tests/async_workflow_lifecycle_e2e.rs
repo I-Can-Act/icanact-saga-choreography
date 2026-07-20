@@ -1084,6 +1084,27 @@ fn accepted_compensation_failure_leaves_no_compensating_state() {
                 Some(SagaStateEntry::Failed(_))
             ));
         }
+        let journal = actor
+            .saga
+            .journal
+            .read(ctx.saga_id)
+            .expect("compensation failure should be durable");
+        if is_ambiguous {
+            assert!(matches!(
+                journal.last().map(|entry| &entry.event),
+                Some(ParticipantEvent::Quarantined { reason, .. })
+                    if reason.as_ref() == "authoritative cancel failure"
+            ));
+        } else {
+            assert!(matches!(
+                journal.last().map(|entry| &entry.event),
+                Some(ParticipantEvent::CompensationFailed {
+                    error,
+                    is_ambiguous: false,
+                    ..
+                }) if error.as_ref() == "authoritative cancel failure"
+            ));
+        }
         assert_eq!(actor.saga.accepted_workflow_compensation_count(), 0);
     }
 }

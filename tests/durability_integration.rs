@@ -691,6 +691,59 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
         }] if error.contains("accepted step hard timeout after restart")
     ));
 
+    let failed_journal = InMemoryJournal::new();
+    let failed_dedupe = InMemoryDedupe::new();
+    failed_journal
+        .append(
+            SagaId::new(16),
+            ParticipantEvent::AcceptedStepRecorded {
+                context: context(16, ORDER_LIFECYCLE, TEST_STEP),
+                participant_id: TEST_STEP.into(),
+                execution_id: StepExecutionId::new("external-16"),
+                saga_input: b"input".to_vec(),
+                compensation_data: b"release-external-16".to_vec(),
+                idle_timeout_millis: 1_000,
+                hard_timeout_millis: 20_000,
+                timeout_outcome: icanact_saga_choreography::AcceptedStepTimeoutOutcome::FailStep {
+                    requires_compensation: true,
+                },
+                accepted_at_millis: 100,
+                deadline_at_millis: u64::MAX,
+                hard_deadline_at_millis: u64::MAX,
+            },
+        )
+        .expect("accepted step should be durable");
+    failed_journal
+        .append(
+            SagaId::new(16),
+            ParticipantEvent::StepExecutionFailed {
+                error: "authoritative order rejection".into(),
+                requires_compensation: true,
+                failed_at_millis: 200,
+            },
+        )
+        .expect("accepted-step failure should be durable");
+    let failed = collect_startup_recovery_events_for_saga_type(
+        &failed_journal,
+        &failed_dedupe,
+        TEST_STEP,
+        ORDER_LIFECYCLE,
+    )
+    .expect("startup recovery should replay the durable accepted-step failure");
+    assert!(matches!(
+        failed.as_slice(),
+        [SagaChoreographyEvent::StepFailed {
+            context,
+            participant_id,
+            error,
+            requires_compensation: true,
+            ..
+        }] if context.saga_id == SagaId::new(16)
+            && context.event_timestamp_millis == 200
+            && participant_id.as_ref() == TEST_STEP
+            && error.as_ref() == "authoritative order rejection"
+    ));
+
     let terminal_entries = vec![JournalEntry {
         sequence: 2,
         recorded_at_millis: 100,
