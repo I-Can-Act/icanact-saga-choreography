@@ -14,13 +14,14 @@ use icanact_saga_choreography::{
     AcceptedStepError, AcceptedStepFailure, AcceptedStepPolicy, AcceptedStepTimeoutOutcome,
     AcceptedWorkflowCompensation, CompensationError, CompensationOutput, DependencySpec,
     FailureAuthority, HasSagaParticipantSupport, HasSagaWorkflowParticipants, InMemoryDedupe,
-    InMemoryJournal, ParticipantEvent, ParticipantJournal, SagaChoreographyEvent, SagaContext,
-    SagaId, SagaParticipant, SagaParticipantState, SagaParticipantSupport, SagaStateEntry,
-    SagaStateExt, SagaTerminalOutcome, SagaTestWorld, SagaWorkflowParticipant, StepError,
-    StepExecutionId, StepOutput, SuccessCriteria, TerminalPolicy, TerminalResolver,
-    accept_workflow_step as accept_workflow_step_with_state, complete_accepted_workflow_step,
-    fail_accepted_workflow_step, handle_saga_event_with_emit, poll_accepted_workflow_step_timeouts,
-    record_accepted_workflow_step_progress, recover_accepted_workflow_steps_for_saga_type,
+    InMemoryJournal, ParticipantDedupeStore, ParticipantEvent, ParticipantJournal,
+    SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant, SagaParticipantState,
+    SagaParticipantSupport, SagaStateEntry, SagaStateExt, SagaTerminalOutcome, SagaTestWorld,
+    SagaWorkflowParticipant, StepError, StepExecutionId, StepOutput, SuccessCriteria,
+    TerminalPolicy, TerminalResolver, accept_workflow_step as accept_workflow_step_with_state,
+    complete_accepted_workflow_step, fail_accepted_workflow_step, handle_saga_event_with_emit,
+    poll_accepted_workflow_step_timeouts, record_accepted_workflow_step_progress,
+    recover_accepted_workflow_steps_for_saga_type,
 };
 
 struct HarnessActor {
@@ -1347,6 +1348,82 @@ fn accepted_compensation_can_complete_after_participant_restart() {
             && failure.error_message.as_ref() == "authoritative create failure"
             && failure.at_millis == accepted_at_millis
     ));
+}
+
+#[test]
+fn unstarted_compensation_request_replays_and_rearms_its_dedupe_key() {
+    let journal = InMemoryJournal::new();
+    let dedupe = InMemoryDedupe::new();
+    let ctx = context("create_order", 43);
+    let request = ParticipantEvent::CompensationRequestRecorded {
+        context: ctx.clone(),
+        failed_step: "create_order".into(),
+        reason: "authoritative create failure".into(),
+        failure: icanact_saga_choreography::SagaFailureDetails {
+            step_name: "create_order".into(),
+            participant_id: "order-manager".into(),
+            error_code: Some("exchange_rejected".into()),
+            error_message: "authoritative create failure".into(),
+            at_millis: 1_700_000_000_100,
+        },
+        steps_to_compensate: vec!["create_order".into()],
+        requested_at_millis: 1_700_000_000_100,
+    };
+    journal
+        .append(ctx.saga_id, request)
+        .expect("compensation request should persist");
+    let dedupe_key = format!(
+        "{}:{}:compensation_requested:{}:{}",
+        ctx.trace_id, ctx.saga_started_at_millis, ctx.step_name, "create_order"
+    );
+    dedupe
+        .mark_processed(ctx.saga_id, &dedupe_key)
+        .expect("original ingress should be marked");
+
+    let recovery_events = collect_startup_recovery_events_for_saga_type(
+        &journal,
+        &dedupe,
+        "create_order",
+        "order_lifecycle",
+    )
+    .expect("unstarted compensation request should recover");
+    assert!(matches!(
+        recovery_events.as_slice(),
+        [SagaChoreographyEvent::CompensationRequested { context, .. }]
+            if context.saga_id == ctx.saga_id
+    ));
+    assert!(
+        !dedupe
+            .contains(ctx.saga_id, &dedupe_key)
+            .expect("rearmed dedupe key should be readable"),
+        "startup replay must be allowed through normal participant ingress exactly once"
+    );
+
+    journal
+        .append(
+            ctx.saga_id,
+            ParticipantEvent::CompensationStarted {
+                attempt: 1,
+                started_at_millis: 1_700_000_000_110,
+            },
+        )
+        .expect("compensation start should persist");
+    dedupe
+        .mark_processed(ctx.saga_id, &dedupe_key)
+        .expect("started request should remain deduped");
+    let after_start = collect_startup_recovery_events_for_saga_type(
+        &journal,
+        &dedupe,
+        "create_order",
+        "order_lifecycle",
+    )
+    .expect("started compensation recovery should classify");
+    assert!(after_start.is_empty());
+    assert!(
+        dedupe
+            .contains(ctx.saga_id, &dedupe_key)
+            .expect("started dedupe key should remain readable")
+    );
 }
 
 #[test]

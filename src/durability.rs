@@ -28,6 +28,10 @@ pub enum RecoveryCollectionError {
         saga_id: SagaId,
         source: DedupeError,
     },
+    ResetDedupe {
+        saga_id: SagaId,
+        source: DedupeError,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -979,6 +983,46 @@ fn recover_compensation_request_from_entries(
             | ParticipantEvent::CompensationFailed { .. }
             | ParticipantEvent::Quarantined { .. } => request = None,
             _ => {}
+        }
+    }
+    request
+}
+
+fn recover_unstarted_compensation_request_from_entries(
+    entries: &[JournalEntry],
+) -> Option<SagaChoreographyEvent> {
+    let mut request = None;
+    for entry in entries {
+        match &entry.event {
+            ParticipantEvent::CompensationRequestRecorded {
+                context,
+                failed_step,
+                reason,
+                failure,
+                steps_to_compensate,
+                requested_at_millis,
+            } => {
+                let mut context = context.clone();
+                context.event_timestamp_millis = *requested_at_millis;
+                request = Some(SagaChoreographyEvent::CompensationRequested {
+                    context,
+                    failed_step: failed_step.clone(),
+                    reason: reason.clone(),
+                    failure: failure.clone(),
+                    steps_to_compensate: steps_to_compensate.clone(),
+                });
+            }
+            ParticipantEvent::CompensationStarted { .. }
+            | ParticipantEvent::AcceptedCompensationRecorded { .. }
+            | ParticipantEvent::CompensationCompleted { .. }
+            | ParticipantEvent::CompensationFailed { .. }
+            | ParticipantEvent::Quarantined { .. } => request = None,
+            ParticipantEvent::SagaRegistered { .. }
+            | ParticipantEvent::StepTriggered { .. }
+            | ParticipantEvent::StepExecutionStarted { .. }
+            | ParticipantEvent::StepExecutionCompleted { .. }
+            | ParticipantEvent::StepExecutionFailed { .. }
+            | ParticipantEvent::AcceptedStepRecorded { .. } => {}
         }
     }
     request
@@ -2532,6 +2576,17 @@ fn collect_startup_recovery_events_for_saga_type_inner<
             }
             continue;
         }
+        if let Some(request) = recover_unstarted_compensation_request_from_entries(&entries)
+            && request.context().saga_type.as_ref() == saga_type
+            && request.context().step_name.as_ref() == step_name
+        {
+            let dedupe_key = workflow_dedupe_key_for_event(&request);
+            dedupe
+                .remove_processed(saga_id, &dedupe_key)
+                .map_err(|source| RecoveryCollectionError::ResetDedupe { saga_id, source })?;
+            out.push(request);
+            continue;
+        }
         if let Some(accepted) = recover_accepted_workflow_step_from_entries(&entries)
             && accepted.context.saga_type.as_ref() == saga_type
             && accepted.context.step_name.as_ref() == step_name
@@ -3076,6 +3131,19 @@ pub mod lmdb {
                 .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
             self.entries
                 .put(&mut wtxn, &Self::key(saga_id, key), "1")
+                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
+            wtxn.commit()
+                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
+            Ok(())
+        }
+
+        fn remove_processed(&self, saga_id: SagaId, key: &str) -> Result<(), DedupeError> {
+            let mut wtxn = self
+                .env
+                .write_txn()
+                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
+            self.entries
+                .delete(&mut wtxn, &Self::key(saga_id, key))
                 .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
             wtxn.commit()
                 .map_err(|err| DedupeError::Storage(err.to_string().into()))?;

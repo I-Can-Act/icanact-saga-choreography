@@ -111,6 +111,10 @@ pub trait ParticipantDedupeStore: Send + Sync + 'static {
     /// Returns [`DedupeError::Storage`] if the underlying storage fails.
     fn mark_processed(&self, saga_id: SagaId, key: &str) -> Result<(), DedupeError>;
 
+    /// Removes one processed marker when durable journal evidence proves that
+    /// the corresponding operation was recorded but never started.
+    fn remove_processed(&self, saga_id: SagaId, key: &str) -> Result<(), DedupeError>;
+
     /// Removes all deduplication records for a completed SAGA.
     ///
     /// Call this when a SAGA has completed (successfully or with compensation)
@@ -201,6 +205,12 @@ impl ParticipantDedupeStore for InMemoryDedupe {
         Ok(())
     }
 
+    fn remove_processed(&self, saga_id: SagaId, key: &str) -> Result<(), DedupeError> {
+        self.seen()?
+            .retain(|(id, stored_key)| *id != saga_id.0 || stored_key.as_ref() != key);
+        Ok(())
+    }
+
     fn prune(&self, saga_id: SagaId) -> Result<(), DedupeError> {
         self.seen()?.retain(|(id, _)| *id != saga_id.0);
         Ok(())
@@ -227,6 +237,10 @@ where
 
     fn mark_processed(&self, saga_id: SagaId, key: &str) -> Result<(), DedupeError> {
         (**self).mark_processed(saga_id, key)
+    }
+
+    fn remove_processed(&self, saga_id: SagaId, key: &str) -> Result<(), DedupeError> {
+        (**self).remove_processed(saga_id, key)
     }
 
     fn prune(&self, saga_id: SagaId) -> Result<(), DedupeError> {
