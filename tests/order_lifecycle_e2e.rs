@@ -1504,6 +1504,13 @@ fn duplicate_compensation_request_is_deduped() {
         context: ctx.next_step(STEP_ORDER.into()),
         failed_step: STEP_ORDER.into(),
         reason: "order failed after partial side effects".into(),
+        failure: icanact_saga_choreography::SagaFailureDetails {
+            step_name: STEP_ORDER.into(),
+            participant_id: "order-participant".into(),
+            error_code: None,
+            error_message: "order failed after partial side effects".into(),
+            at_millis: 1,
+        },
         steps_to_compensate: vec![STEP_POSITION.into()],
     };
     let _ = bus.publish(compensation.clone());

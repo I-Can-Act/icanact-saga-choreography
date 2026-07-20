@@ -1165,6 +1165,13 @@ fn accepted_compensation_can_complete_after_participant_restart() {
                 context: ctx.clone(),
                 failed_step: "create_order".into(),
                 reason: "authoritative create failure".into(),
+                failure: icanact_saga_choreography::SagaFailureDetails {
+                    step_name: "create_order".into(),
+                    participant_id: "order-manager".into(),
+                    error_code: Some("exchange_rejected".into()),
+                    error_message: "authoritative create failure".into(),
+                    at_millis: accepted_at_millis,
+                },
                 steps_to_compensate: vec!["create_order".into()],
                 requested_at_millis: accepted_at_millis,
             },
@@ -1228,7 +1235,14 @@ fn accepted_compensation_can_complete_after_participant_restart() {
     ));
     assert!(matches!(
         restarted_resolver.ingest(&completed).as_slice(),
-        [SagaChoreographyEvent::SagaFailed { .. }]
+        [SagaChoreographyEvent::SagaFailed {
+            failure: Some(failure),
+            ..
+        }] if failure.step_name.as_ref() == "create_order"
+            && failure.participant_id.as_ref() == "order-manager"
+            && failure.error_code.as_deref() == Some("exchange_rejected")
+            && failure.error_message.as_ref() == "authoritative create failure"
+            && failure.at_millis == accepted_at_millis
     ));
 }
 

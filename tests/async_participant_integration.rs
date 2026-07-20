@@ -207,6 +207,13 @@ async fn async_ingress_non_ambiguous_compensation_failure_keeps_local_failed_sta
             context,
             failed_step: "upstream".into(),
             reason: "undo failed".into(),
+            failure: icanact_saga_choreography::SagaFailureDetails {
+                step_name: "upstream".into(),
+                participant_id: "upstream-participant".into(),
+                error_code: None,
+                error_message: "undo failed".into(),
+                at_millis: 1,
+            },
             steps_to_compensate: vec!["async_step".into()],
         },
         |_actor, _incoming| {},

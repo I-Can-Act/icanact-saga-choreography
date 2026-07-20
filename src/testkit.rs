@@ -109,10 +109,19 @@ pub fn compensation_requested(
     reason: impl Into<String>,
     steps_to_compensate: Vec<String>,
 ) -> SagaChoreographyEvent {
+    let failed_step = failed_step.into().into_boxed_str();
+    let reason = reason.into().into_boxed_str();
     SagaChoreographyEvent::CompensationRequested {
         context,
-        failed_step: failed_step.into().into_boxed_str(),
-        reason: reason.into().into_boxed_str(),
+        failed_step: failed_step.clone(),
+        reason: reason.clone(),
+        failure: crate::SagaFailureDetails {
+            step_name: failed_step,
+            participant_id: "testkit".into(),
+            error_code: None,
+            error_message: reason,
+            at_millis: 0,
+        },
         steps_to_compensate: steps_to_compensate
             .into_iter()
             .map(|step| step.into_boxed_str())

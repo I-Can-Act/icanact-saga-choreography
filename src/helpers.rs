@@ -97,6 +97,7 @@ pub fn handle_saga_event_with_emit<P, F>(
         SagaChoreographyEvent::CompensationRequested {
             failed_step,
             reason,
+            failure,
             steps_to_compensate,
             ..
         } => {
@@ -106,6 +107,7 @@ pub fn handle_saga_event_with_emit<P, F>(
                     &context,
                     failed_step,
                     reason,
+                    failure,
                     steps_to_compensate,
                     now,
                     &mut emit,
@@ -224,6 +226,7 @@ pub async fn handle_async_saga_event_with_emit<P, F>(
         SagaChoreographyEvent::CompensationRequested {
             failed_step,
             reason,
+            failure,
             steps_to_compensate,
             ..
         } => {
@@ -233,6 +236,7 @@ pub async fn handle_async_saga_event_with_emit<P, F>(
                     &context,
                     failed_step,
                     reason,
+                    failure,
                     steps_to_compensate,
                     now,
                     &mut emit,
@@ -837,6 +841,7 @@ fn compensate_wrapper_with_emit<P, F>(
     context: &SagaContext,
     failed_step: Box<str>,
     request_reason: Box<str>,
+    failure: crate::SagaFailureDetails,
     steps_to_compensate: Vec<Box<str>>,
     now: u64,
     emit: &mut F,
@@ -851,6 +856,7 @@ fn compensate_wrapper_with_emit<P, F>(
             context: context.clone(),
             failed_step,
             reason: request_reason,
+            failure,
             steps_to_compensate,
             requested_at_millis: now,
         },
@@ -954,6 +960,7 @@ async fn compensate_wrapper_with_emit_async<P, F>(
     context: &SagaContext,
     failed_step: Box<str>,
     request_reason: Box<str>,
+    failure: crate::SagaFailureDetails,
     steps_to_compensate: Vec<Box<str>>,
     now: u64,
     emit: &mut F,
@@ -968,6 +975,7 @@ async fn compensate_wrapper_with_emit_async<P, F>(
             context: context.clone(),
             failed_step,
             reason: request_reason,
+            failure,
             steps_to_compensate,
             requested_at_millis: now,
         },
@@ -1607,6 +1615,13 @@ mod tests {
                 context,
                 failed_step: "risk_check".into(),
                 reason: "failed downstream".into(),
+                failure: crate::SagaFailureDetails {
+                    step_name: "risk_check".into(),
+                    participant_id: "risk".into(),
+                    error_code: None,
+                    error_message: "failed downstream".into(),
+                    at_millis: 1,
+                },
                 steps_to_compensate: vec!["risk_check".into()],
             },
             |event| emitted.push(event),
@@ -1658,6 +1673,13 @@ mod tests {
                 context,
                 failed_step: "risk_check".into(),
                 reason: "failed downstream".into(),
+                failure: crate::SagaFailureDetails {
+                    step_name: "risk_check".into(),
+                    participant_id: "risk".into(),
+                    error_code: None,
+                    error_message: "failed downstream".into(),
+                    at_millis: 1,
+                },
                 steps_to_compensate: vec!["risk_check".into()],
             },
             |event| emitted.push(event),

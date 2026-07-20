@@ -903,6 +903,7 @@ fn recover_compensation_request_from_entries(
                 context,
                 failed_step,
                 reason,
+                failure,
                 steps_to_compensate,
                 requested_at_millis,
             } => {
@@ -912,6 +913,7 @@ fn recover_compensation_request_from_entries(
                     context,
                     failed_step: failed_step.clone(),
                     reason: reason.clone(),
+                    failure: failure.clone(),
                     steps_to_compensate: steps_to_compensate.clone(),
                 });
             }
@@ -1511,6 +1513,7 @@ fn handle_workflow_saga_event_with_emit<A, F>(
         SagaChoreographyEvent::CompensationRequested {
             failed_step,
             reason,
+            failure,
             steps_to_compensate,
             ..
         } => {
@@ -1521,6 +1524,7 @@ fn handle_workflow_saga_event_with_emit<A, F>(
                     &context,
                     failed_step,
                     reason,
+                    failure,
                     steps_to_compensate,
                     now,
                     &mut emit,
@@ -1863,6 +1867,7 @@ fn compensate_workflow_with_emit<A, F>(
     context: &SagaContext,
     failed_step: Box<str>,
     request_reason: Box<str>,
+    failure: crate::SagaFailureDetails,
     steps_to_compensate: Vec<Box<str>>,
     now: u64,
     emit: &mut F,
@@ -1877,6 +1882,7 @@ fn compensate_workflow_with_emit<A, F>(
             context: context.clone(),
             failed_step,
             reason: request_reason,
+            failure,
             steps_to_compensate,
             requested_at_millis: now,
         },

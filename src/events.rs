@@ -3,7 +3,7 @@
 use super::{AcceptedStepTimeoutOutcome, SagaContext, StepExecutionId};
 use icanact_core::ActorId;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct SagaFailureDetails {
     pub step_name: Box<str>,
     pub participant_id: Box<str>,
@@ -93,6 +93,8 @@ pub enum SagaChoreographyEvent {
         failed_step: Box<str>,
         /// The reason compensation was requested.
         reason: Box<str>,
+        /// Exact failure evidence that triggered compensation.
+        failure: SagaFailureDetails,
         /// The list of step names that need to be compensated, in reverse execution order.
         steps_to_compensate: Vec<Box<str>>,
     },
@@ -388,6 +390,7 @@ pub enum ParticipantEvent {
         context: SagaContext,
         failed_step: Box<str>,
         reason: Box<str>,
+        failure: SagaFailureDetails,
         steps_to_compensate: Vec<Box<str>>,
         requested_at_millis: u64,
     },

@@ -439,11 +439,13 @@ impl TerminalResolver {
                 state.terminal_latched = true;
             }
             SagaChoreographyEvent::CompensationRequested {
+                failure,
                 steps_to_compensate,
                 ..
             } => {
                 state.pending_compensation_steps = steps_to_compensate.iter().cloned().collect();
                 state.compensation_requested = true;
+                state.pending_failure = Some(failure.clone());
             }
             SagaChoreographyEvent::SagaCompleted { .. }
             | SagaChoreographyEvent::SagaFailed { .. }
@@ -697,6 +699,7 @@ fn apply_step_failure(
                 context: terminal_context(context),
                 failed_step: context.step_name.clone(),
                 reason: error.clone(),
+                failure: failure.clone(),
                 steps_to_compensate,
             });
         }
