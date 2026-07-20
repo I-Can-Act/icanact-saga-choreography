@@ -1019,31 +1019,21 @@ fn compensating_failure_restart_keeps_forward_execution_tombstoned() {
     .expect("durable failure recovery events should be collected");
     assert!(matches!(
         recovery_events.as_slice(),
-        [
-            SagaChoreographyEvent::StepAccepted {
-                compensation_available: true,
-                ..
-            },
-            SagaChoreographyEvent::StepFailed {
-                requires_compensation: true,
-                ..
-            }
-        ]
+        [SagaChoreographyEvent::CompensationRequested {
+            failed_step,
+            steps_to_compensate,
+            failure,
+            ..
+        }] if failed_step.as_ref() == "create_order"
+            && steps_to_compensate.as_slice() == [Box::<str>::from("create_order")]
+            && failure.error_message.as_ref() == "authoritative create failure"
     ));
     let mut restarted_resolver = TerminalResolver::new(terminal_policy());
     let mut resolver_events = Vec::new();
     for event in &recovery_events {
         resolver_events.extend(restarted_resolver.ingest(event));
     }
-    assert!(matches!(
-        resolver_events.as_slice(),
-        [SagaChoreographyEvent::CompensationRequested {
-            failed_step,
-            steps_to_compensate,
-            ..
-        }] if failed_step.as_ref() == "create_order"
-            && steps_to_compensate.as_slice() == [Box::<str>::from("create_order")]
-    ));
+    assert!(resolver_events.is_empty());
     drop(actor);
 
     let mut reopened = RestartedHarnessActor::new(journal);

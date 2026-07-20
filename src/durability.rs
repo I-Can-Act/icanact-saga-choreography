@@ -2759,30 +2759,33 @@ fn collect_startup_recovery_events_for_saga_type_inner<
             if let Some((error, failed_at_millis)) =
                 accepted_step_failure_requiring_compensation(&entries)
             {
-                out.push(startup_accepted_step_replay_event(&accepted));
-                let mut context = accepted.context;
-                context.event_timestamp_millis = failed_at_millis;
-                out.push(SagaChoreographyEvent::StepFailed {
-                    context,
-                    participant_id: accepted.participant_id,
-                    error_code: None,
+                out.push(startup_accepted_step_compensation_event(
+                    &accepted,
+                    None,
                     error,
-                    requires_compensation: true,
-                });
+                    failed_at_millis,
+                ));
                 continue;
             }
             if let Some(timeout_event) = startup_accepted_step_timeout_event(accepted.clone(), now)
             {
-                if matches!(
-                    &timeout_event,
-                    SagaChoreographyEvent::StepFailed {
-                        requires_compensation: true,
-                        ..
-                    }
-                ) {
-                    out.push(startup_accepted_step_replay_event(&accepted));
+                if let SagaChoreographyEvent::StepFailed {
+                    context,
+                    error_code,
+                    error,
+                    requires_compensation: true,
+                    ..
+                } = timeout_event
+                {
+                    out.push(startup_accepted_step_compensation_event(
+                        &accepted,
+                        error_code,
+                        error,
+                        context.event_timestamp_millis,
+                    ));
+                } else {
+                    out.push(timeout_event);
                 }
-                out.push(timeout_event);
                 continue;
             }
             out.push(startup_accepted_step_replay_event(&accepted));
@@ -2844,6 +2847,39 @@ fn startup_accepted_step_replay_event(accepted: &AcceptedWorkflowStep) -> SagaCh
         hard_deadline_at_millis: accepted.hard_deadline_at_millis,
         timeout_outcome: accepted.policy.timeout_outcome.clone(),
         compensation_available: !accepted.compensation_data.is_empty(),
+    }
+}
+
+fn startup_accepted_step_compensation_event(
+    accepted: &AcceptedWorkflowStep,
+    error_code: Option<Box<str>>,
+    error: Box<str>,
+    failed_at_millis: u64,
+) -> SagaChoreographyEvent {
+    let failure = crate::SagaFailureDetails {
+        step_name: accepted.context.step_name.clone(),
+        participant_id: accepted.participant_id.clone(),
+        error_code,
+        error_message: error.clone(),
+        at_millis: failed_at_millis,
+    };
+    let mut context = accepted
+        .context
+        .next_step(crate::TERMINAL_RESOLVER_STEP.into());
+    context.event_timestamp_millis = failed_at_millis;
+    if accepted.compensation_data.is_empty() {
+        return SagaChoreographyEvent::SagaFailed {
+            context,
+            reason: "accepted step failed without durable compensation data".into(),
+            failure: Some(failure),
+        };
+    }
+    SagaChoreographyEvent::CompensationRequested {
+        context,
+        failed_step: accepted.context.step_name.clone(),
+        reason: error,
+        failure,
+        steps_to_compensate: vec![accepted.context.step_name.clone()],
     }
 }
 

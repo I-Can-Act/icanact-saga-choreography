@@ -465,11 +465,12 @@ fn lmdb_open_rehydrates_expired_compensable_step_with_forward_tombstone() {
     );
     assert!(support.startup_recovery_events.iter().any(|event| matches!(
         event,
-        SagaChoreographyEvent::StepFailed {
+        SagaChoreographyEvent::CompensationRequested {
             context,
-            requires_compensation: true,
+            steps_to_compensate,
             ..
         } if context.saga_id == ctx.saga_id
+            && steps_to_compensate.as_slice() == [Box::<str>::from(TEST_STEP)]
     )));
 
     let mut reopened = LmdbAcceptedStepActor { saga: support };
@@ -758,14 +759,12 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
     .expect("startup recovery should collect expired accepted step");
     assert!(matches!(
         expired.as_slice(),
-        [SagaChoreographyEvent::StepAccepted {
-            compensation_available: true,
+        [SagaChoreographyEvent::CompensationRequested {
+            reason,
+            steps_to_compensate,
             ..
-        }, SagaChoreographyEvent::StepFailed {
-                error,
-                requires_compensation: true,
-                ..
-            }] if error.contains("accepted step hard timeout after restart")
+        }] if reason.contains("accepted step hard timeout after restart")
+            && steps_to_compensate.as_slice() == [Box::<str>::from(TEST_STEP)]
     ));
 
     let failed_journal = InMemoryJournal::new();
@@ -781,12 +780,11 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
                 compensation_data: b"release-external-16".to_vec(),
                 idle_timeout_millis: 1_000,
                 hard_timeout_millis: 20_000,
-                timeout_outcome: icanact_saga_choreography::AcceptedStepTimeoutOutcome::FailStep {
-                    requires_compensation: true,
-                },
+                timeout_outcome:
+                    icanact_saga_choreography::AcceptedStepTimeoutOutcome::QuarantineSaga,
                 accepted_at_millis: 100,
-                deadline_at_millis: u64::MAX,
-                hard_deadline_at_millis: u64::MAX,
+                deadline_at_millis: 101,
+                hard_deadline_at_millis: 102,
             },
         )
         .expect("accepted step should be durable");
@@ -809,19 +807,16 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
     .expect("startup recovery should replay the durable accepted-step failure");
     assert!(matches!(
         failed.as_slice(),
-        [SagaChoreographyEvent::StepAccepted {
-            compensation_available: true,
+        [SagaChoreographyEvent::CompensationRequested {
+            context,
+            failure,
+            steps_to_compensate,
             ..
-        }, SagaChoreographyEvent::StepFailed {
-                context,
-                participant_id,
-                error,
-                requires_compensation: true,
-                ..
-            }] if context.saga_id == SagaId::new(16)
+        }] if context.saga_id == SagaId::new(16)
             && context.event_timestamp_millis == 200
-            && participant_id.as_ref() == TEST_STEP
-            && error.as_ref() == "authoritative order rejection"
+            && failure.participant_id.as_ref() == TEST_STEP
+            && failure.error_message.as_ref() == "authoritative order rejection"
+            && steps_to_compensate.as_slice() == [Box::<str>::from(TEST_STEP)]
     ));
 
     let terminal_entries = vec![JournalEntry {
