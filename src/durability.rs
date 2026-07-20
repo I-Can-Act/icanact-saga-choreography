@@ -133,27 +133,6 @@ pub fn accept_workflow_step<A>(
     participant_id: Box<str>,
     execution_id: StepExecutionId,
     policy: AcceptedStepPolicy,
-) -> Result<SagaChoreographyEvent, AcceptedStepError>
-where
-    A: SagaStateExt,
-{
-    accept_workflow_step_with_data(
-        actor,
-        context,
-        participant_id,
-        execution_id,
-        policy,
-        Vec::new(),
-        Vec::new(),
-    )
-}
-
-pub fn accept_workflow_step_with_data<A>(
-    actor: &mut A,
-    context: SagaContext,
-    participant_id: Box<str>,
-    execution_id: StepExecutionId,
-    policy: AcceptedStepPolicy,
     saga_input: Vec<u8>,
     compensation_data: Vec<u8>,
 ) -> Result<SagaChoreographyEvent, AcceptedStepError>
@@ -1657,13 +1636,11 @@ fn complete_workflow_step<A, F>(
             compensation_data,
         ) {
             Ok(event) => emit(event),
-            Err(error) => fail_workflow_step(
+            Err(error) => quarantine_workflow_step_persistence_failure(
                 actor,
                 workflow,
                 context,
-                crate::StepError::Terminal {
-                    reason: format!("accepted workflow step persistence failed: {error:?}").into(),
-                },
+                format!("accepted workflow step persistence failed: {error:?}").into(),
                 now,
                 emit,
             ),
@@ -1711,6 +1688,39 @@ fn complete_workflow_step<A, F>(
         output: emitted_output,
         saga_input,
         compensation_available,
+    });
+}
+
+fn quarantine_workflow_step_persistence_failure<A, F>(
+    actor: &mut A,
+    workflow: &'static dyn SagaWorkflowParticipant<A>,
+    context: &SagaContext,
+    reason: Box<str>,
+    now: u64,
+    emit: &mut F,
+) where
+    A: HasSagaParticipantSupport,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let saga_id = context.saga_id;
+    if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&saga_id) {
+        actor.saga_states().insert(
+            saga_id,
+            SagaStateEntry::Quarantined(state.quarantine(reason.clone(), now)),
+        );
+    }
+    actor.record_event(
+        saga_id,
+        ParticipantEvent::Quarantined {
+            reason: reason.clone(),
+            quarantined_at_millis: now,
+        },
+    );
+    emit(SagaChoreographyEvent::SagaQuarantined {
+        context: context.next_step(workflow.step_name().into()),
+        reason,
+        step: workflow.step_name().into(),
+        participant_id: workflow.participant_id_owned(),
     });
 }
 

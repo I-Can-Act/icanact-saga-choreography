@@ -148,9 +148,9 @@ pub fn drive_workflow_scenario<A>(
 use crate::{
     AcceptedCompensationCompletion, AcceptedCompensationFailure, AcceptedStepCompletion,
     AcceptedStepError, AcceptedStepFailure, AcceptedStepPolicy, StepExecutionId,
-    accept_workflow_step, accept_workflow_step_with_data, complete_accepted_workflow_compensation,
-    complete_accepted_workflow_step, fail_accepted_workflow_compensation,
-    fail_accepted_workflow_step, record_accepted_workflow_step_progress,
+    accept_workflow_step, complete_accepted_workflow_compensation, complete_accepted_workflow_step,
+    fail_accepted_workflow_compensation, fail_accepted_workflow_step,
+    record_accepted_workflow_step_progress,
 };
 #[cfg(any(test, feature = "test-harness"))]
 use std::collections::HashSet;
@@ -365,28 +365,13 @@ impl SagaTestWorld {
         participant_id: Box<str>,
         execution_id: StepExecutionId,
         policy: AcceptedStepPolicy,
-    ) -> Result<icanact_core::local::PublishStats, AcceptedStepError>
-    where
-        A: SagaStateExt,
-    {
-        let event = accept_workflow_step(actor, context, participant_id, execution_id, policy)?;
-        Ok(self.publish(event))
-    }
-
-    pub fn accept_step_with_data<A>(
-        &self,
-        actor: &mut A,
-        context: SagaContext,
-        participant_id: Box<str>,
-        execution_id: StepExecutionId,
-        policy: AcceptedStepPolicy,
         saga_input: Vec<u8>,
         compensation_data: Vec<u8>,
     ) -> Result<icanact_core::local::PublishStats, AcceptedStepError>
     where
         A: SagaStateExt,
     {
-        let event = accept_workflow_step_with_data(
+        let event = accept_workflow_step(
             actor,
             context,
             participant_id,

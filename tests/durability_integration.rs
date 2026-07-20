@@ -176,6 +176,8 @@ fn lmdb_open_recovers_accepted_step_metadata_for_restart_completion() {
         "order-manager".into(),
         execution_id.clone(),
         policy,
+        b"order-input".to_vec(),
+        Vec::new(),
     )
     .expect("step should be accepted before restart");
     drop(actor);
@@ -242,6 +244,8 @@ fn lmdb_open_recovers_accepted_steps_for_each_declared_saga_type() {
         "order-manager".into(),
         StepExecutionId::new("open-190"),
         policy.clone(),
+        b"open-input".to_vec(),
+        Vec::new(),
     )
     .expect("open workflow step should be accepted");
     accept_workflow_step(
@@ -250,6 +254,8 @@ fn lmdb_open_recovers_accepted_steps_for_each_declared_saga_type() {
         "order-manager".into(),
         StepExecutionId::new("close-191"),
         policy,
+        b"close-input".to_vec(),
+        Vec::new(),
     )
     .expect("close workflow step should be accepted");
     drop(actor);

@@ -194,7 +194,7 @@ Accepted steps carry an `AcceptedStepPolicy`: resettable `idle_timeout`, non-res
 
 When compensation dispatch is also asynchronous, return `CompensationOutput::Accepted { execution_id, policy }` from `compensate_step(...)`, then resolve it with `complete_accepted_workflow_compensation(...)` or `fail_accepted_workflow_compensation(...)`. Accepted compensation is durable across participant restart. Its idle or hard timeout quarantines the saga because an unresolved external release is ambiguous; the resolver never reports rollback complete before authoritative confirmation.
 
-In tests, use `SagaTestWorld::accept_step_with_data(...)`, `record_accepted_step_progress(...)`, `wait_for_step_accepted(saga_id, step_name, ...)`, `complete_accepted_step(...)`, `fail_accepted_step(...)`, and the accepted-compensation completion/failure helpers instead of hand-building lifecycle events.
+In tests, use `SagaTestWorld::accept_step(...)` with the original saga input and compensation data, `record_accepted_step_progress(...)`, `wait_for_step_accepted(saga_id, step_name, ...)`, `complete_accepted_step(...)`, `fail_accepted_step(...)`, and the accepted-compensation completion/failure helpers instead of hand-building lifecycle events.
 
 ## Routing Saga Events
 

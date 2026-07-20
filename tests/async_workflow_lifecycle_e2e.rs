@@ -15,12 +15,12 @@ use icanact_saga_choreography::{
     AcceptedWorkflowCompensation, CompensationError, CompensationOutput, DependencySpec,
     FailureAuthority, HasSagaParticipantSupport, HasSagaWorkflowParticipants, InMemoryDedupe,
     InMemoryJournal, ParticipantEvent, ParticipantJournal, SagaChoreographyEvent, SagaContext,
-    SagaId, SagaParticipantState, SagaParticipantSupport, SagaStateEntry, SagaStateExt,
-    SagaTerminalOutcome, SagaTestWorld, SagaWorkflowParticipant, StepError, StepExecutionId,
-    StepOutput, SuccessCriteria, TerminalPolicy, TerminalResolver, accept_workflow_step,
-    accept_workflow_step_with_data, complete_accepted_workflow_step, fail_accepted_workflow_step,
-    poll_accepted_workflow_step_timeouts, record_accepted_workflow_step_progress,
-    recover_accepted_workflow_steps_for_saga_type,
+    SagaId, SagaParticipant, SagaParticipantState, SagaParticipantSupport, SagaStateEntry,
+    SagaStateExt, SagaTerminalOutcome, SagaTestWorld, SagaWorkflowParticipant, StepError,
+    StepExecutionId, StepOutput, SuccessCriteria, TerminalPolicy, TerminalResolver,
+    accept_workflow_step as accept_workflow_step_with_state, complete_accepted_workflow_step,
+    fail_accepted_workflow_step, handle_saga_event_with_emit, poll_accepted_workflow_step_timeouts,
+    record_accepted_workflow_step_progress, recover_accepted_workflow_steps_for_saga_type,
 };
 
 struct HarnessActor {
@@ -225,6 +225,44 @@ impl HasSagaWorkflowParticipants for FailingJournalActor {
     }
 }
 
+impl SagaParticipant for FailingJournalActor {
+    type Error = String;
+
+    fn step_name(&self) -> &str {
+        "create_order"
+    }
+
+    fn saga_types(&self) -> &[&'static str] {
+        &["order_lifecycle"]
+    }
+
+    fn depends_on(&self) -> DependencySpec {
+        DependencySpec::OnSagaStart
+    }
+
+    fn execute_step(
+        &mut self,
+        _context: &SagaContext,
+        _input: &[u8],
+    ) -> Result<StepOutput, StepError> {
+        Ok(StepOutput::Accepted {
+            execution_id: StepExecutionId::new("external-create"),
+            policy: policy(AcceptedStepTimeoutOutcome::FailStep {
+                requires_compensation: true,
+            }),
+            compensation_data: b"cancel-external-create".to_vec(),
+        })
+    }
+
+    fn compensate_step(
+        &mut self,
+        _context: &SagaContext,
+        _compensation_data: &[u8],
+    ) -> Result<CompensationOutput, CompensationError> {
+        Ok(CompensationOutput::Completed)
+    }
+}
+
 struct RestartedHarnessActor {
     saga: SagaParticipantSupport<Arc<InMemoryJournal>, InMemoryDedupe>,
 }
@@ -272,6 +310,27 @@ fn policy(timeout_outcome: AcceptedStepTimeoutOutcome) -> AcceptedStepPolicy {
         hard_timeout: Duration::from_millis(250),
         timeout_outcome,
     }
+}
+
+fn accept_workflow_step<A>(
+    actor: &mut A,
+    context: SagaContext,
+    participant_id: Box<str>,
+    execution_id: StepExecutionId,
+    policy: AcceptedStepPolicy,
+) -> Result<SagaChoreographyEvent, AcceptedStepError>
+where
+    A: SagaStateExt,
+{
+    accept_workflow_step_with_state(
+        actor,
+        context,
+        participant_id,
+        execution_id,
+        policy,
+        b"original-saga-input".to_vec(),
+        Vec::new(),
+    )
 }
 
 fn completion(
@@ -391,12 +450,13 @@ fn accepted_step_does_not_complete_saga_until_late_completion() {
     let mut actor = HarnessActor::default();
     let ctx = context("create_order", 1);
     let mut resolver = TerminalResolver::new(terminal_policy());
+    let execution_id = StepExecutionId::new("effect-1");
 
     let accepted = accept_workflow_step(
         &mut actor,
         ctx.clone(),
         "order-manager".into(),
-        StepExecutionId::new("effect-1"),
+        execution_id.clone(),
         policy(AcceptedStepTimeoutOutcome::FailStep {
             requires_compensation: false,
         }),
@@ -416,6 +476,28 @@ fn accepted_step_does_not_complete_saga_until_late_completion() {
         resolver.ingest(&accepted).is_empty(),
         "accepted step is progress, not completion"
     );
+
+    let completed = complete_accepted_workflow_step(
+        &mut actor,
+        ctx.saga_id,
+        execution_id,
+        completion(
+            1_700_000_000_050,
+            b"created",
+            b"ignored-completion-input",
+            Vec::new(),
+        ),
+    )
+    .expect("authoritative completion should resolve the accepted step");
+    assert!(matches!(
+        &completed,
+        SagaChoreographyEvent::StepCompleted { saga_input, .. }
+            if saga_input.as_slice() == b"original-saga-input"
+    ));
+    assert!(matches!(
+        resolver.ingest(&completed).as_slice(),
+        [SagaChoreographyEvent::SagaCompleted { .. }]
+    ));
 }
 
 #[test]
@@ -423,7 +505,7 @@ fn accepted_order_timeout_compensates_the_current_step_before_terminal_failure()
     let ctx = context("create_order", 35);
     let mut actor = HarnessActor::default();
     let mut resolver = TerminalResolver::new(terminal_policy());
-    let accepted = accept_workflow_step_with_data(
+    let accepted = accept_workflow_step_with_state(
         &mut actor,
         ctx,
         "order-manager".into(),
@@ -640,6 +722,48 @@ fn accepted_completion_append_failure_keeps_step_pending_for_retry() {
 }
 
 #[test]
+fn accepted_step_metadata_persistence_failure_quarantines_external_effect() {
+    let mut actor = FailingJournalActor::fail_on_append(2);
+    let ctx = context("create_order", 42);
+    let mut emitted = Vec::new();
+
+    handle_saga_event_with_emit(
+        &mut actor,
+        SagaChoreographyEvent::SagaStarted {
+            context: ctx.clone(),
+            payload: b"create-order-input".to_vec(),
+        },
+        |event| emitted.push(event),
+    );
+
+    assert!(matches!(
+        emitted.as_slice(),
+        [SagaChoreographyEvent::StepStarted { .. }, SagaChoreographyEvent::SagaQuarantined {
+            reason,
+            step,
+            participant_id,
+            ..
+        }] if reason.contains("accepted step persistence failed")
+            && step.as_ref() == "create_order"
+            && participant_id.as_ref() == "create_order"
+    ));
+    assert!(matches!(
+        actor.saga.saga_states.get(&ctx.saga_id),
+        Some(SagaStateEntry::Quarantined(_))
+    ));
+    let journal = actor
+        .saga
+        .journal
+        .read(ctx.saga_id)
+        .expect("quarantine evidence should remain readable");
+    assert!(matches!(
+        journal.last().map(|entry| &entry.event),
+        Some(ParticipantEvent::Quarantined { reason, .. })
+            if reason.contains("accepted step persistence failed")
+    ));
+}
+
+#[test]
 fn accepted_failure_append_failure_keeps_step_pending_for_retry() {
     let mut actor = FailingJournalActor::fail_on_append(3);
     let ctx = context("create_order", 33);
@@ -683,7 +807,7 @@ fn compensating_failure_tombstones_forward_execution_but_keeps_compensation_data
     let mut actor = HarnessActor::default();
     let ctx = context("create_order", 38);
     let execution_id = StepExecutionId::new("effect-38");
-    accept_workflow_step_with_data(
+    accept_workflow_step_with_state(
         &mut actor,
         ctx.clone(),
         "order-manager".into(),
@@ -737,7 +861,7 @@ fn compensating_failure_restart_keeps_forward_execution_tombstoned() {
     let mut actor = RestartedHarnessActor::new(journal.clone());
     let ctx = context("create_order", 39);
     let execution_id = StepExecutionId::new("effect-39");
-    accept_workflow_step_with_data(
+    accept_workflow_step_with_state(
         &mut actor,
         ctx.clone(),
         "order-manager".into(),
@@ -1652,6 +1776,8 @@ fn saga_test_world_progress_helper_publishes_resolver_heartbeat() {
             policy(AcceptedStepTimeoutOutcome::FailStep {
                 requires_compensation: false,
             }),
+            b"testkit-saga-input".to_vec(),
+            Vec::new(),
         )
         .expect("testkit helper should publish accepted step");
     let accepted =

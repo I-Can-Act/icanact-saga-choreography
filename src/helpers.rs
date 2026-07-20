@@ -494,15 +494,19 @@ fn complete_step<P, F>(
             compensation_data,
         ) {
             Ok(event) => emit(event),
-            Err(error) => fail_step(
-                participant,
-                context,
-                StepError::Terminal {
-                    reason: format!("accepted step persistence failed: {error:?}").into(),
-                },
-                now,
-                emit,
-            ),
+            Err(error) => {
+                let step = participant.step_name().into();
+                let participant_id = participant.participant_id_owned();
+                quarantine_accepted_step_persistence_failure(
+                    participant,
+                    context,
+                    step,
+                    participant_id,
+                    format!("accepted step persistence failed: {error:?}").into(),
+                    now,
+                    emit,
+                );
+            }
         }
         return;
     }
@@ -580,15 +584,19 @@ fn complete_step_async<P, F>(
             compensation_data,
         ) {
             Ok(event) => emit(event),
-            Err(error) => fail_step_async(
-                participant,
-                context,
-                StepError::Terminal {
-                    reason: format!("accepted async step persistence failed: {error:?}").into(),
-                },
-                now,
-                emit,
-            ),
+            Err(error) => {
+                let step = participant.step_name().into();
+                let participant_id = participant.participant_id_owned();
+                quarantine_accepted_step_persistence_failure(
+                    participant,
+                    context,
+                    step,
+                    participant_id,
+                    format!("accepted async step persistence failed: {error:?}").into(),
+                    now,
+                    emit,
+                );
+            }
         }
         return;
     }
@@ -633,6 +641,40 @@ fn complete_step_async<P, F>(
         output: emitted_output,
         saga_input,
         compensation_available,
+    });
+}
+
+fn quarantine_accepted_step_persistence_failure<A, F>(
+    actor: &mut A,
+    context: &SagaContext,
+    step: Box<str>,
+    participant_id: Box<str>,
+    reason: Box<str>,
+    now: u64,
+    emit: &mut F,
+) where
+    A: SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let saga_id = context.saga_id;
+    if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&saga_id) {
+        actor.saga_states().insert(
+            saga_id,
+            SagaStateEntry::Quarantined(state.quarantine(reason.clone(), now)),
+        );
+    }
+    actor.record_event(
+        saga_id,
+        ParticipantEvent::Quarantined {
+            reason: reason.clone(),
+            quarantined_at_millis: now,
+        },
+    );
+    emit(SagaChoreographyEvent::SagaQuarantined {
+        context: context.next_step(step.clone()),
+        reason,
+        step,
+        participant_id,
     });
 }
 
