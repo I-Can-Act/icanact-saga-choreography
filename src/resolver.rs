@@ -448,6 +448,9 @@ impl TerminalResolver {
                 steps_to_compensate,
                 ..
             } => {
+                for step in steps_to_compensate {
+                    state.accepted_steps.remove(step.as_ref());
+                }
                 state.pending_compensation_steps = steps_to_compensate
                     .iter()
                     .filter(|step| !state.completed_compensation_steps.contains(*step))
@@ -701,6 +704,9 @@ fn apply_step_failure(
         if !state.compensation_requested {
             let steps_to_compensate: Vec<Box<str>> =
                 state.compensable_steps.iter().rev().cloned().collect();
+            for step in &steps_to_compensate {
+                state.accepted_steps.remove(step.as_ref());
+            }
             state.pending_compensation_steps = steps_to_compensate.iter().cloned().collect();
             state.compensation_requested = true;
 
@@ -1469,6 +1475,61 @@ mod tests {
                 .as_slice(),
             [SagaChoreographyEvent::SagaFailed { .. }]
         ));
+    }
+
+    #[test]
+    fn compensation_request_suppresses_forward_timeout_for_the_same_step() {
+        let mut resolver = TerminalResolver::new(TerminalPolicy::order_lifecycle_default());
+        let context = ctx_at("reserve", 24, 1_000, 1_000);
+        assert!(
+            resolver
+                .ingest_at(
+                    &SagaChoreographyEvent::SagaStarted {
+                        context: context.clone(),
+                        payload: Vec::new(),
+                    },
+                    1_000,
+                )
+                .is_empty()
+        );
+        assert!(
+            resolver
+                .ingest_at(
+                    &SagaChoreographyEvent::StepAccepted {
+                        context: context.clone(),
+                        participant_id: "reserve-participant".into(),
+                        execution_id: StepExecutionId::new("reserve-24"),
+                        deadline_at_millis: 1_100,
+                        hard_deadline_at_millis: 1_200,
+                        timeout_outcome: AcceptedStepTimeoutOutcome::QuarantineSaga,
+                        compensation_available: true,
+                    },
+                    1_010,
+                )
+                .is_empty()
+        );
+
+        let failure_events = resolver.ingest_at(
+            &SagaChoreographyEvent::StepFailed {
+                context: context.next_step("create_order".into()),
+                participant_id: "order-manager".into(),
+                error_code: Some("exchange_rejected".into()),
+                error: "create failed".into(),
+                requires_compensation: true,
+            },
+            1_020,
+        );
+        assert!(matches!(
+            failure_events.as_slice(),
+            [SagaChoreographyEvent::CompensationRequested {
+                steps_to_compensate,
+                ..
+            }] if steps_to_compensate.as_slice() == [Box::<str>::from("reserve")]
+        ));
+        assert!(
+            resolver.poll_timeouts_at(1_201).is_empty(),
+            "the forward timeout must not overwrite failure evidence while rollback owns the step"
+        );
     }
 
     #[test]
