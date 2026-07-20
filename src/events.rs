@@ -383,6 +383,14 @@ pub enum ParticipantEvent {
         /// The timestamp (in milliseconds since epoch) when compensation failed.
         failed_at_millis: u64,
     },
+    /// Durable copy of the compensation request that caused external rollback work.
+    CompensationRequestRecorded {
+        context: SagaContext,
+        failed_step: Box<str>,
+        reason: Box<str>,
+        steps_to_compensate: Vec<Box<str>>,
+        requested_at_millis: u64,
+    },
     /// Emitted when a participant is quarantined due to unrecoverable errors.
     Quarantined {
         /// The reason the participant was quarantined.

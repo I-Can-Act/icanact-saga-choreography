@@ -1136,6 +1136,18 @@ fn accepted_compensation_can_complete_after_participant_restart() {
     journal
         .append(
             ctx.saga_id,
+            ParticipantEvent::CompensationRequestRecorded {
+                context: ctx.clone(),
+                failed_step: "create_order".into(),
+                reason: "authoritative create failure".into(),
+                steps_to_compensate: vec!["create_order".into()],
+                requested_at_millis: accepted_at_millis,
+            },
+        )
+        .expect("compensation request should be durable before restart");
+    journal
+        .append(
+            ctx.saga_id,
             ParticipantEvent::AcceptedCompensationRecorded {
                 context: ctx.clone(),
                 participant_id: "order-manager".into(),
@@ -1148,6 +1160,23 @@ fn accepted_compensation_can_complete_after_participant_restart() {
             },
         )
         .expect("accepted compensation should be durable before restart");
+
+    let recovery_events = collect_startup_recovery_events_for_saga_type(
+        &journal,
+        &InMemoryDedupe::new(),
+        "create_order",
+        "order_lifecycle",
+    )
+    .expect("accepted compensation lifecycle should recover");
+    assert!(matches!(
+        recovery_events.as_slice(),
+        [SagaChoreographyEvent::CompensationRequested { steps_to_compensate, .. }, SagaChoreographyEvent::CompensationAccepted { .. }]
+            if steps_to_compensate.as_slice() == [Box::<str>::from("create_order")]
+    ));
+    let mut restarted_resolver = TerminalResolver::new(terminal_policy());
+    for event in &recovery_events {
+        assert!(restarted_resolver.ingest(event).is_empty());
+    }
 
     let mut reopened = RestartedHarnessActor::new(journal);
     recover_accepted_workflow_steps_for_saga_type(
@@ -1168,9 +1197,13 @@ fn accepted_compensation_can_complete_after_participant_restart() {
     )
     .expect("authoritative release should resolve after restart");
     assert!(matches!(
-        completed,
+        &completed,
         SagaChoreographyEvent::CompensationCompleted { context }
             if context.saga_id == ctx.saga_id
+    ));
+    assert!(matches!(
+        restarted_resolver.ingest(&completed).as_slice(),
+        [SagaChoreographyEvent::SagaFailed { .. }]
     ));
 }
 

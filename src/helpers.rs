@@ -95,11 +95,21 @@ pub fn handle_saga_event_with_emit<P, F>(
         }
 
         SagaChoreographyEvent::CompensationRequested {
+            failed_step,
+            reason,
             steps_to_compensate,
             ..
         } => {
             if steps_to_compensate.contains(&participant.step_name().into()) {
-                compensate_wrapper_with_emit(participant, &context, now, &mut emit);
+                compensate_wrapper_with_emit(
+                    participant,
+                    &context,
+                    failed_step,
+                    reason,
+                    steps_to_compensate,
+                    now,
+                    &mut emit,
+                );
             }
         }
 
@@ -212,11 +222,22 @@ pub async fn handle_async_saga_event_with_emit<P, F>(
             }
         }
         SagaChoreographyEvent::CompensationRequested {
+            failed_step,
+            reason,
             steps_to_compensate,
             ..
         } => {
             if steps_to_compensate.contains(&participant.step_name().into()) {
-                compensate_wrapper_with_emit_async(participant, &context, now, &mut emit).await;
+                compensate_wrapper_with_emit_async(
+                    participant,
+                    &context,
+                    failed_step,
+                    reason,
+                    steps_to_compensate,
+                    now,
+                    &mut emit,
+                )
+                .await;
             }
         }
         SagaChoreographyEvent::SagaCompleted { .. } => {
@@ -678,6 +699,54 @@ fn quarantine_accepted_step_persistence_failure<A, F>(
     });
 }
 
+fn quarantine_compensation_request_persistence_failure<A, F>(
+    actor: &mut A,
+    context: &SagaContext,
+    step: Box<str>,
+    participant_id: Box<str>,
+    reason: Box<str>,
+    now: u64,
+    emit: &mut F,
+) where
+    A: SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let saga_id = context.saga_id;
+    let state_entry = actor.saga_states().remove(&saga_id);
+    let quarantined = match state_entry {
+        Some(SagaStateEntry::Executing(state)) => Some(state.quarantine(reason.clone(), now)),
+        Some(SagaStateEntry::Completed(state)) => Some(
+            state
+                .start_compensation(now)
+                .quarantine(reason.clone(), now),
+        ),
+        Some(SagaStateEntry::Compensating(state)) => Some(state.quarantine(reason.clone(), now)),
+        Some(other) => {
+            actor.saga_states().insert(saga_id, other);
+            None
+        }
+        None => None,
+    };
+    if let Some(state) = quarantined {
+        actor
+            .saga_states()
+            .insert(saga_id, SagaStateEntry::Quarantined(state));
+    }
+    actor.record_event(
+        saga_id,
+        ParticipantEvent::Quarantined {
+            reason: reason.clone(),
+            quarantined_at_millis: now,
+        },
+    );
+    emit(SagaChoreographyEvent::SagaQuarantined {
+        context: context.next_step(step.clone()),
+        reason,
+        step,
+        participant_id,
+    });
+}
+
 /// Fail a step with state transition
 fn fail_step<P, F>(
     participant: &mut P,
@@ -766,6 +835,9 @@ fn fail_step_async<P, F>(
 fn compensate_wrapper_with_emit<P, F>(
     participant: &mut P,
     context: &SagaContext,
+    failed_step: Box<str>,
+    request_reason: Box<str>,
+    steps_to_compensate: Vec<Box<str>>,
     now: u64,
     emit: &mut F,
 ) where
@@ -773,6 +845,29 @@ fn compensate_wrapper_with_emit<P, F>(
     F: FnMut(SagaChoreographyEvent),
 {
     let saga_id = context.saga_id;
+    if let Err(error) = participant.record_event_strict(
+        saga_id,
+        ParticipantEvent::CompensationRequestRecorded {
+            context: context.clone(),
+            failed_step,
+            reason: request_reason,
+            steps_to_compensate,
+            requested_at_millis: now,
+        },
+    ) {
+        let step = participant.step_name().into();
+        let participant_id = participant.participant_id_owned();
+        quarantine_compensation_request_persistence_failure(
+            participant,
+            context,
+            step,
+            participant_id,
+            format!("compensation request persistence failed: {error:?}").into(),
+            now,
+            emit,
+        );
+        return;
+    }
 
     let accepted_compensation_data = participant
         .saga_support()
@@ -857,6 +952,9 @@ fn compensate_wrapper_with_emit<P, F>(
 async fn compensate_wrapper_with_emit_async<P, F>(
     participant: &mut P,
     context: &SagaContext,
+    failed_step: Box<str>,
+    request_reason: Box<str>,
+    steps_to_compensate: Vec<Box<str>>,
     now: u64,
     emit: &mut F,
 ) where
@@ -864,6 +962,29 @@ async fn compensate_wrapper_with_emit_async<P, F>(
     F: FnMut(SagaChoreographyEvent),
 {
     let saga_id = context.saga_id;
+    if let Err(error) = participant.record_event_strict(
+        saga_id,
+        ParticipantEvent::CompensationRequestRecorded {
+            context: context.clone(),
+            failed_step,
+            reason: request_reason,
+            steps_to_compensate,
+            requested_at_millis: now,
+        },
+    ) {
+        let step = participant.step_name().into();
+        let participant_id = participant.participant_id_owned();
+        quarantine_compensation_request_persistence_failure(
+            participant,
+            context,
+            step,
+            participant_id,
+            format!("compensation request persistence failed: {error:?}").into(),
+            now,
+            emit,
+        );
+        return;
+    }
 
     let accepted_compensation_data = participant
         .saga_support()

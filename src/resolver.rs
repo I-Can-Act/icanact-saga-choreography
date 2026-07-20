@@ -433,10 +433,16 @@ impl TerminalResolver {
                 }
                 state.terminal_latched = true;
             }
+            SagaChoreographyEvent::CompensationRequested {
+                steps_to_compensate,
+                ..
+            } => {
+                state.pending_compensation_steps = steps_to_compensate.iter().cloned().collect();
+                state.compensation_requested = true;
+            }
             SagaChoreographyEvent::SagaCompleted { .. }
             | SagaChoreographyEvent::SagaFailed { .. }
             | SagaChoreographyEvent::SagaQuarantined { .. }
-            | SagaChoreographyEvent::CompensationRequested { .. }
             | SagaChoreographyEvent::CompensationStarted { .. } => {}
         }
 
