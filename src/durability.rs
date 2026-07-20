@@ -32,6 +32,9 @@ pub enum RecoveryCollectionError {
         saga_id: SagaId,
         source: DedupeError,
     },
+    MissingCompensationState {
+        saga_id: SagaId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -843,6 +846,36 @@ where
             .journal
             .read(saga_id)
             .map_err(|source| RecoveryCollectionError::ReadSaga { saga_id, source })?;
+        if let Some(request) = recover_unstarted_compensation_request_from_entries(&entries)
+            && request.context().saga_type.as_ref() == saga_type
+            && request.context().step_name.as_ref() == step_name
+            && recover_accepted_workflow_step_from_entries(&entries).is_none()
+        {
+            let Some((output, compensation_data, completed_at_millis)) =
+                recover_completed_step_effect_for_unstarted_compensation(&entries)
+            else {
+                return Err(RecoveryCollectionError::MissingCompensationState { saga_id });
+            };
+            if compensation_data.is_empty() {
+                return Err(RecoveryCollectionError::MissingCompensationState { saga_id });
+            }
+            let context = request.context();
+            let state = crate::SagaParticipantState::new(
+                saga_id,
+                context.saga_type.clone(),
+                context.step_name.clone(),
+                context.correlation_id,
+                context.trace_id,
+                context.initiator_peer_id,
+                context.saga_started_at_millis,
+            )
+            .trigger("step_recovered", completed_at_millis)
+            .start_execution(completed_at_millis)
+            .complete(output, compensation_data, completed_at_millis);
+            support
+                .saga_states
+                .insert(saga_id, SagaStateEntry::Completed(state));
+        }
         if let Some(accepted) = recover_accepted_workflow_compensation_from_entries(&entries) {
             if accepted.context.saga_type.as_ref() != saga_type
                 || accepted.context.step_name.as_ref() != step_name
@@ -1085,6 +1118,42 @@ fn recover_unstarted_compensation_request_from_entries(
         }
     }
     request
+}
+
+fn recover_completed_step_effect_for_unstarted_compensation(
+    entries: &[JournalEntry],
+) -> Option<(Vec<u8>, Vec<u8>, u64)> {
+    let mut completed = None;
+    let mut effect_at_request = None;
+    for entry in entries {
+        match &entry.event {
+            ParticipantEvent::StepExecutionStarted { .. } => completed = None,
+            ParticipantEvent::StepExecutionCompleted {
+                output,
+                compensation_data,
+                completed_at_millis,
+            } => {
+                completed = Some((
+                    output.clone(),
+                    compensation_data.clone(),
+                    *completed_at_millis,
+                ));
+            }
+            ParticipantEvent::CompensationRequestRecorded { .. } => {
+                effect_at_request = completed.clone();
+            }
+            ParticipantEvent::CompensationStarted { .. }
+            | ParticipantEvent::AcceptedCompensationRecorded { .. }
+            | ParticipantEvent::CompensationCompleted { .. }
+            | ParticipantEvent::CompensationFailed { .. }
+            | ParticipantEvent::Quarantined { .. } => effect_at_request = None,
+            ParticipantEvent::SagaRegistered { .. }
+            | ParticipantEvent::StepTriggered { .. }
+            | ParticipantEvent::StepExecutionFailed { .. }
+            | ParticipantEvent::AcceptedStepRecorded { .. } => {}
+        }
+    }
+    effect_at_request
 }
 
 fn recover_accepted_workflow_step_from_entries(
@@ -2661,6 +2730,21 @@ fn collect_startup_recovery_events_for_saga_type_inner<
             && request.context().saga_type.as_ref() == saga_type
             && request.context().step_name.as_ref() == step_name
         {
+            let accepted_effect = recover_accepted_workflow_step_from_entries(&entries)
+                .is_some_and(|accepted| !accepted.compensation_data.is_empty());
+            let completed_effect =
+                recover_completed_step_effect_for_unstarted_compensation(&entries)
+                    .is_some_and(|(_, compensation_data, _)| !compensation_data.is_empty());
+            if !accepted_effect && !completed_effect {
+                out.push(SagaChoreographyEvent::SagaQuarantined {
+                    context: request.context().clone(),
+                    reason: "unstarted compensation recovery missing durable compensation state"
+                        .into(),
+                    step: request.context().step_name.clone(),
+                    participant_id: request.context().step_name.clone(),
+                });
+                continue;
+            }
             let dedupe_key = workflow_dedupe_key_for_event(&request);
             dedupe
                 .remove_processed(saga_id, &dedupe_key)

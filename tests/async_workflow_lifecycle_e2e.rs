@@ -1355,6 +1355,25 @@ fn unstarted_compensation_request_replays_and_rearms_its_dedupe_key() {
     let journal = InMemoryJournal::new();
     let dedupe = InMemoryDedupe::new();
     let ctx = context("create_order", 43);
+    journal
+        .append(
+            ctx.saga_id,
+            ParticipantEvent::StepExecutionStarted {
+                attempt: 1,
+                started_at_millis: 1_700_000_000_050,
+            },
+        )
+        .expect("forward execution start should persist");
+    journal
+        .append(
+            ctx.saga_id,
+            ParticipantEvent::StepExecutionCompleted {
+                output: b"created-order".to_vec(),
+                compensation_data: b"cancel-order-43".to_vec(),
+                completed_at_millis: 1_700_000_000_090,
+            },
+        )
+        .expect("forward effect and compensation payload should persist");
     let request = ParticipantEvent::CompensationRequestRecorded {
         context: ctx.clone(),
         failed_step: "create_order".into(),
@@ -1399,7 +1418,17 @@ fn unstarted_compensation_request_replays_and_rearms_its_dedupe_key() {
         "startup replay must be allowed through normal participant ingress exactly once"
     );
 
-    journal
+    let mut support = SagaParticipantSupport::new(journal, dedupe);
+    recover_accepted_workflow_steps_for_saga_type(&mut support, "create_order", "order_lifecycle")
+        .expect("compensable state should rehydrate before request replay");
+    assert!(matches!(
+        support.saga_states.get(&ctx.saga_id),
+        Some(SagaStateEntry::Completed(state))
+            if state.state.compensation_data.as_slice() == b"cancel-order-43"
+    ));
+
+    support
+        .journal
         .append(
             ctx.saga_id,
             ParticipantEvent::CompensationStarted {
@@ -1408,19 +1437,21 @@ fn unstarted_compensation_request_replays_and_rearms_its_dedupe_key() {
             },
         )
         .expect("compensation start should persist");
-    dedupe
+    support
+        .dedupe
         .mark_processed(ctx.saga_id, &dedupe_key)
         .expect("started request should remain deduped");
     let after_start = collect_startup_recovery_events_for_saga_type(
-        &journal,
-        &dedupe,
+        &support.journal,
+        &support.dedupe,
         "create_order",
         "order_lifecycle",
     )
     .expect("started compensation recovery should classify");
     assert!(after_start.is_empty());
     assert!(
-        dedupe
+        support
+            .dedupe
             .contains(ctx.saga_id, &dedupe_key)
             .expect("started dedupe key should remain readable")
     );
