@@ -2299,6 +2299,7 @@ pub fn collect_startup_recovery_events_for_saga_type<
             if let Some((error, failed_at_millis)) =
                 accepted_step_failure_requiring_compensation(&entries)
             {
+                out.push(startup_accepted_step_replay_event(&accepted));
                 let mut context = accepted.context;
                 context.event_timestamp_millis = failed_at_millis;
                 out.push(SagaChoreographyEvent::StepFailed {
@@ -2310,7 +2311,17 @@ pub fn collect_startup_recovery_events_for_saga_type<
                 });
                 continue;
             }
-            if let Some(timeout_event) = startup_accepted_step_timeout_event(accepted, now) {
+            if let Some(timeout_event) = startup_accepted_step_timeout_event(accepted.clone(), now)
+            {
+                if matches!(
+                    &timeout_event,
+                    SagaChoreographyEvent::StepFailed {
+                        requires_compensation: true,
+                        ..
+                    }
+                ) {
+                    out.push(startup_accepted_step_replay_event(&accepted));
+                }
                 out.push(timeout_event);
                 continue;
             }
@@ -2348,6 +2359,18 @@ pub fn collect_startup_recovery_events_for_saga_type<
         }
     }
     Ok(out)
+}
+
+fn startup_accepted_step_replay_event(accepted: &AcceptedWorkflowStep) -> SagaChoreographyEvent {
+    SagaChoreographyEvent::StepAccepted {
+        context: accepted.context.clone(),
+        participant_id: accepted.participant_id.clone(),
+        execution_id: accepted.execution_id.clone(),
+        deadline_at_millis: accepted.deadline_at_millis,
+        hard_deadline_at_millis: accepted.hard_deadline_at_millis,
+        timeout_outcome: accepted.policy.timeout_outcome.clone(),
+        compensation_available: !accepted.compensation_data.is_empty(),
+    }
 }
 
 fn startup_accepted_compensation_timeout_event(

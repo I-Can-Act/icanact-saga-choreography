@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use icanact_saga_choreography::durability::{
     apply_sync_workflow_participant_saga_ingress_with_hooks,
-    complete_accepted_workflow_compensation, fail_accepted_workflow_compensation,
+    collect_startup_recovery_events_for_saga_type, complete_accepted_workflow_compensation,
+    fail_accepted_workflow_compensation,
 };
 use icanact_saga_choreography::{
     AcceptedCompensationCompletion, AcceptedCompensationFailure, AcceptedStepCompletion,
@@ -755,6 +756,41 @@ fn compensating_failure_restart_keeps_forward_execution_tombstoned() {
         failure(1_700_000_000_100, "authoritative create failure", true),
     )
     .expect("compensating failure should be durable");
+
+    let recovery_events = collect_startup_recovery_events_for_saga_type(
+        &journal,
+        &InMemoryDedupe::new(),
+        "create_order",
+        "order_lifecycle",
+    )
+    .expect("durable failure recovery events should be collected");
+    assert!(matches!(
+        recovery_events.as_slice(),
+        [
+            SagaChoreographyEvent::StepAccepted {
+                compensation_available: true,
+                ..
+            },
+            SagaChoreographyEvent::StepFailed {
+                requires_compensation: true,
+                ..
+            }
+        ]
+    ));
+    let mut restarted_resolver = TerminalResolver::new(terminal_policy());
+    let mut resolver_events = Vec::new();
+    for event in &recovery_events {
+        resolver_events.extend(restarted_resolver.ingest(event));
+    }
+    assert!(matches!(
+        resolver_events.as_slice(),
+        [SagaChoreographyEvent::CompensationRequested {
+            failed_step,
+            steps_to_compensate,
+            ..
+        }] if failed_step.as_ref() == "create_order"
+            && steps_to_compensate.as_slice() == [Box::<str>::from("create_order")]
+    ));
     drop(actor);
 
     let mut reopened = RestartedHarnessActor::new(journal);
