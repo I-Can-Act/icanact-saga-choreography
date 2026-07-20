@@ -1427,6 +1427,75 @@ fn unstarted_compensation_request_replays_and_rearms_its_dedupe_key() {
 }
 
 #[test]
+fn completed_accepted_compensation_replays_terminal_resolution_after_restart() {
+    let journal = InMemoryJournal::new();
+    let ctx = context("create_order", 44);
+    let accepted_at_millis = 1_700_000_000_200;
+    journal
+        .append(
+            ctx.saga_id,
+            ParticipantEvent::CompensationRequestRecorded {
+                context: ctx.clone(),
+                failed_step: "create_order".into(),
+                reason: "authoritative create failure".into(),
+                failure: icanact_saga_choreography::SagaFailureDetails {
+                    step_name: "create_order".into(),
+                    participant_id: "order-manager".into(),
+                    error_code: Some("exchange_rejected".into()),
+                    error_message: "authoritative create failure".into(),
+                    at_millis: accepted_at_millis - 10,
+                },
+                steps_to_compensate: vec!["create_order".into()],
+                requested_at_millis: accepted_at_millis - 10,
+            },
+        )
+        .expect("compensation request should persist");
+    journal
+        .append(
+            ctx.saga_id,
+            ParticipantEvent::AcceptedCompensationRecorded {
+                context: ctx.clone(),
+                participant_id: "order-manager".into(),
+                execution_id: StepExecutionId::new("cancel-44"),
+                idle_timeout_millis: 5_000,
+                hard_timeout_millis: 10_000,
+                accepted_at_millis,
+                deadline_at_millis: accepted_at_millis + 5_000,
+                hard_deadline_at_millis: accepted_at_millis + 10_000,
+            },
+        )
+        .expect("accepted compensation should persist");
+    journal
+        .append(
+            ctx.saga_id,
+            ParticipantEvent::CompensationCompleted {
+                completed_at_millis: accepted_at_millis + 100,
+            },
+        )
+        .expect("authoritative compensation completion should persist");
+
+    let recovery_events = collect_startup_recovery_events_for_saga_type(
+        &journal,
+        &InMemoryDedupe::new(),
+        "create_order",
+        "order_lifecycle",
+    )
+    .expect("completed accepted compensation should recover");
+    assert!(matches!(
+        recovery_events.as_slice(),
+        [SagaChoreographyEvent::CompensationRequested { .. }, SagaChoreographyEvent::CompensationCompleted { context }]
+            if context.saga_id == ctx.saga_id
+                && context.event_timestamp_millis == accepted_at_millis + 100
+    ));
+    let mut resolver = TerminalResolver::new(terminal_policy());
+    assert!(resolver.ingest(&recovery_events[0]).is_empty());
+    assert!(matches!(
+        resolver.ingest(&recovery_events[1]).as_slice(),
+        [SagaChoreographyEvent::SagaFailed { .. }]
+    ));
+}
+
+#[test]
 fn accepted_compensation_failure_leaves_no_compensating_state() {
     for is_ambiguous in [false, true] {
         let mut actor = HarnessActor::default();

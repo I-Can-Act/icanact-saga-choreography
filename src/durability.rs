@@ -979,13 +979,72 @@ fn recover_compensation_request_from_entries(
                     steps_to_compensate: steps_to_compensate.clone(),
                 });
             }
-            ParticipantEvent::CompensationCompleted { .. }
-            | ParticipantEvent::CompensationFailed { .. }
-            | ParticipantEvent::Quarantined { .. } => request = None,
+            ParticipantEvent::CompensationFailed { .. } | ParticipantEvent::Quarantined { .. } => {
+                request = None
+            }
             _ => {}
         }
     }
     request
+}
+
+fn recover_completed_accepted_compensation_from_entries(
+    entries: &[JournalEntry],
+) -> Option<(AcceptedWorkflowCompensation, u64)> {
+    let mut accepted = None;
+    let mut completed = None;
+    for entry in entries {
+        match &entry.event {
+            ParticipantEvent::CompensationRequestRecorded { .. } => {
+                accepted = None;
+                completed = None;
+            }
+            ParticipantEvent::AcceptedCompensationRecorded {
+                context,
+                participant_id,
+                execution_id,
+                idle_timeout_millis,
+                hard_timeout_millis,
+                accepted_at_millis,
+                deadline_at_millis,
+                hard_deadline_at_millis,
+            } => {
+                accepted = Some(AcceptedWorkflowCompensation {
+                    context: context.clone(),
+                    participant_id: participant_id.clone(),
+                    execution_id: execution_id.clone(),
+                    policy: AcceptedStepPolicy {
+                        idle_timeout: Duration::from_millis(*idle_timeout_millis),
+                        hard_timeout: Duration::from_millis(*hard_timeout_millis),
+                        timeout_outcome: AcceptedStepTimeoutOutcome::QuarantineSaga,
+                    },
+                    accepted_at_millis: *accepted_at_millis,
+                    deadline_at_millis: *deadline_at_millis,
+                    hard_deadline_at_millis: *hard_deadline_at_millis,
+                });
+                completed = None;
+            }
+            ParticipantEvent::CompensationCompleted {
+                completed_at_millis,
+            } => {
+                if let Some(accepted) = accepted.take() {
+                    completed = Some((accepted, *completed_at_millis));
+                }
+            }
+            ParticipantEvent::CompensationFailed { .. } | ParticipantEvent::Quarantined { .. } => {
+                accepted = None;
+                completed = None;
+            }
+            ParticipantEvent::SagaRegistered { .. }
+            | ParticipantEvent::StepTriggered { .. }
+            | ParticipantEvent::StepExecutionStarted { .. }
+            | ParticipantEvent::StepExecutionCompleted { .. }
+            | ParticipantEvent::StepExecutionFailed { .. }
+            | ParticipantEvent::CompensationStarted { .. }
+            | ParticipantEvent::AcceptedStepRecorded { .. } => {}
+        }
+    }
+    completed
 }
 
 fn recover_unstarted_compensation_request_from_entries(
@@ -2554,6 +2613,28 @@ fn collect_startup_recovery_events_for_saga_type_inner<
         // before journaling StepExecutionStarted, there is no local execution
         // intent to resume here; the saga remains externally visible and is
         // resolved by terminal timeout policy instead of silent replay.
+        if let Some((accepted, completed_at_millis)) =
+            recover_completed_accepted_compensation_from_entries(&entries)
+            && accepted.context.saga_type.as_ref() == saga_type
+            && accepted.context.step_name.as_ref() == step_name
+        {
+            let Some(request) = recover_compensation_request_from_entries(&entries) else {
+                out.push(SagaChoreographyEvent::SagaQuarantined {
+                    context: accepted.context.clone(),
+                    reason:
+                        "completed accepted compensation recovery missing durable compensation request"
+                            .into(),
+                    step: accepted.context.step_name.clone(),
+                    participant_id: accepted.participant_id,
+                });
+                continue;
+            };
+            let mut context = accepted.context;
+            context.event_timestamp_millis = completed_at_millis;
+            out.push(request);
+            out.push(SagaChoreographyEvent::CompensationCompleted { context });
+            continue;
+        }
         if let Some(accepted) = recover_accepted_workflow_compensation_from_entries(&entries)
             && accepted.context.saga_type.as_ref() == saga_type
             && accepted.context.step_name.as_ref() == step_name
