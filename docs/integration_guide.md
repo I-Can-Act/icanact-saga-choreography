@@ -125,8 +125,10 @@ impl SagaParticipant for StepAActor {
 Use startup wiring like this:
 
 ```rust,ignore
+use std::path::Path;
+use std::sync::Arc;
 use icanact_saga_choreography::{
-    define_saga_workflow_contract, SagaChoreographyBus,
+    define_saga_workflow_contract, LmdbTerminalResolverJournal, SagaChoreographyBus,
 };
 
 define_saga_workflow_contract! {
@@ -147,8 +149,15 @@ define_saga_workflow_contract! {
 
 let bus = SagaChoreographyBus::new();
 bus.register_workflow_contract_provider::<ExampleWorkflowContract>()?;
+let resolver_journal = Arc::new(
+    LmdbTerminalResolverJournal::open(Path::new("./runtime/example-workflow-resolver"))
+        .map_err(|error| error.to_string())?,
+);
 let _resolver =
-    bus.attach_terminal_resolver_for_contract::<ExampleWorkflowContract>("terminal-resolver")?;
+    bus.attach_durable_terminal_resolver_for_contract::<ExampleWorkflowContract, _>(
+        "terminal-resolver",
+        resolver_journal,
+    )?;
 
 // If you do not use strict workflow bind helpers, register steps explicitly:
 bus.register_bound_workflow_step("example_workflow", "step_a")?;
@@ -164,6 +173,8 @@ For actors implementing `HasSagaWorkflowParticipants`, prefer:
 
 These bind the subscriber path and auto-register workflow steps as bound.
 Do not register steps as bound unless a real participant is wired for that step; otherwise the saga can still stall after start.
+Production restart recovery requires the durable resolver attachment above. The
+non-durable attachment used by `SagaTestWorld` is intentionally scoped to isolated tests.
 
 ## Event Flow
 

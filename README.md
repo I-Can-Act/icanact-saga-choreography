@@ -15,7 +15,7 @@ Choreography-based saga coordination for `icanact-core` actors.
 Before publishing `SagaStarted`, register all of the following on the saga bus:
 
 1. workflow contract (`register_workflow_contract_provider`)
-2. terminal resolver/policy (`attach_terminal_resolver_for_contract` or `attach_terminal_resolver`)
+2. durable terminal resolver/policy (`attach_durable_terminal_resolver_for_contract` in production)
 3. participant step bindings (strict workflow binding or explicit bound step registration)
 
 Registering a workflow contract alone is not enough; `attach_terminal_resolver*` must succeed.
@@ -24,8 +24,11 @@ If startup wiring is incomplete, saga start is failed immediately with a termina
 ## Minimal Startup Example
 
 ```rust,no_run
+use std::path::Path;
+use std::sync::Arc;
 use icanact_saga_choreography::{
-    define_saga_workflow_contract, SagaChoreographyBus, SagaWorkflowContract,
+    define_saga_workflow_contract, LmdbTerminalResolverJournal, SagaChoreographyBus,
+    SagaWorkflowContract,
 };
 
 fn main() -> Result<(), String> {
@@ -46,7 +49,14 @@ define_saga_workflow_contract! {
 
 let bus = SagaChoreographyBus::new();
 bus.register_workflow_contract_provider::<OpenPositionContract>()?;
-let _resolver = bus.attach_terminal_resolver_for_contract::<OpenPositionContract>("resolver")?;
+let journal = Arc::new(
+    LmdbTerminalResolverJournal::open(Path::new("./runtime/open-position-resolver"))
+        .map_err(|error| error.to_string())?,
+);
+let _resolver = bus.attach_durable_terminal_resolver_for_contract::<
+    OpenPositionContract,
+    _,
+>("resolver", journal)?;
 
 // Register bound steps if not using strict workflow binding helpers.
 bus.register_bound_workflow_step("open_position", "risk_check")?;
@@ -54,6 +64,10 @@ bus.register_bound_workflow_step("open_position", "create_order")?;
 Ok(())
 }
 ```
+
+The non-durable `attach_terminal_resolver*` methods are for isolated tests only. A
+process-restart-capable deployment must use a durable resolver journal so recovery can
+reconstruct compensation ownership across all participants.
 
 ## Timeout Semantics
 

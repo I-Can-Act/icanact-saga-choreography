@@ -116,7 +116,7 @@ sequenceDiagram
 4. Implement `SagaParticipant` for business behavior:
    step identity, forward execution, compensation, and dependencies.
 5. Add a saga event variant to the actor command enum and route it through `apply_sync_participant_saga_ingress(...)` or `apply_async_participant_saga_ingress(...)`.
-6. On startup, register workflow contract and attach terminal resolver.
+6. On startup, register the workflow contract and attach one durable terminal resolver journal per saga type.
 7. Bind participants and register bound steps:
    use strict workflow bind helpers for `HasSagaWorkflowParticipants`, otherwise register steps explicitly.
 8. Start sagas by publishing `SagaStarted` with context step name exactly equal to contract `first_step`.
@@ -140,6 +140,7 @@ sequenceDiagram
 - In this repository, in-memory implementations are available for tests/examples.
 - For production, use a durable backend by implementing the storage traits (for example LMDB/Heed).
 - Accepted-step metadata, original saga input, and compensation data are journaled before `StepAccepted` is published so restart recovery can rehydrate pending external executions.
+- The durable terminal resolver journals the saga-wide event history and rebuilds the complete compensation stack before participant recovery failures are replayed. Participant-local journals cannot infer effects owned by other actors.
 - A currently accepted step with compensation data is part of the resolver's compensation stack; timeout cannot skip release of that step's possible external effect.
 - Accepted compensation is journaled independently and must reach authoritative completion before terminal failure. Its timeout quarantines the saga.
 
