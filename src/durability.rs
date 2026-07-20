@@ -851,7 +851,7 @@ where
             .map_err(|source| RecoveryCollectionError::ReadSaga { saga_id, source })?;
         if let Some(request) = recover_unstarted_compensation_request_from_entries(&entries)
             && request.context().saga_type.as_ref() == saga_type
-            && request.context().step_name.as_ref() == step_name
+            && compensation_request_targets_step(&request, step_name)
             && recover_accepted_workflow_step_from_entries(&entries).is_none()
         {
             let Some((output, compensation_data, completed_at_millis)) =
@@ -862,7 +862,8 @@ where
             if compensation_data.is_empty() {
                 return Err(RecoveryCollectionError::MissingCompensationState { saga_id });
             }
-            let context = request.context();
+            let mut context = request.context().clone();
+            context.step_name = step_name.into();
             let state = crate::SagaParticipantState::new(
                 saga_id,
                 context.saga_type.clone(),
@@ -1187,6 +1188,18 @@ fn recover_unstarted_compensation_request_from_entries(
         }
     }
     request
+}
+
+fn compensation_request_targets_step(request: &SagaChoreographyEvent, step_name: &str) -> bool {
+    match request {
+        SagaChoreographyEvent::CompensationRequested {
+            steps_to_compensate,
+            ..
+        } => steps_to_compensate
+            .iter()
+            .any(|requested_step| requested_step.as_ref() == step_name),
+        _ => false,
+    }
 }
 
 fn recover_completed_step_effect_for_unstarted_compensation(
@@ -2824,7 +2837,7 @@ fn collect_startup_recovery_events_for_saga_type_inner<
         }
         if let Some(request) = recover_unstarted_compensation_request_from_entries(&entries)
             && request.context().saga_type.as_ref() == saga_type
-            && request.context().step_name.as_ref() == step_name
+            && compensation_request_targets_step(&request, step_name)
         {
             let accepted_effect = recover_accepted_workflow_step_from_entries(&entries)
                 .is_some_and(|accepted| !accepted.compensation_data.is_empty());

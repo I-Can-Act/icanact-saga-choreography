@@ -1372,8 +1372,10 @@ fn unstarted_compensation_request_replays_and_rearms_its_dedupe_key() {
             },
         )
         .expect("forward effect and compensation payload should persist");
+    let mut resolver_context = ctx.clone();
+    resolver_context.step_name = icanact_saga_choreography::TERMINAL_RESOLVER_STEP.into();
     let request = ParticipantEvent::CompensationRequestRecorded {
-        context: ctx.clone(),
+        context: resolver_context.clone(),
         failed_step: "create_order".into(),
         reason: "authoritative create failure".into(),
         failure: icanact_saga_choreography::SagaFailureDetails {
@@ -1391,7 +1393,10 @@ fn unstarted_compensation_request_replays_and_rearms_its_dedupe_key() {
         .expect("compensation request should persist");
     let dedupe_key = format!(
         "{}:{}:compensation_requested:{}:{}",
-        ctx.trace_id, ctx.saga_started_at_millis, ctx.step_name, "create_order"
+        resolver_context.trace_id,
+        resolver_context.saga_started_at_millis,
+        resolver_context.step_name,
+        "create_order"
     );
     dedupe
         .mark_processed(ctx.saga_id, &dedupe_key)
@@ -1422,7 +1427,8 @@ fn unstarted_compensation_request_replays_and_rearms_its_dedupe_key() {
     assert!(matches!(
         support.saga_states.get(&ctx.saga_id),
         Some(SagaStateEntry::Completed(state))
-            if state.state.compensation_data.as_slice() == b"cancel-order-43"
+            if state.step_name.as_ref() == "create_order"
+                && state.state.compensation_data.as_slice() == b"cancel-order-43"
     ));
 
     support
