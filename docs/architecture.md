@@ -119,8 +119,9 @@ sequenceDiagram
 6. On startup, register the workflow contract and attach one durable terminal resolver journal per saga type.
 7. Bind participants and register bound steps:
    use strict workflow bind helpers for `HasSagaWorkflowParticipants`, otherwise register steps explicitly.
-8. Start sagas by publishing `SagaStarted` with context step name exactly equal to contract `first_step`.
-9. Run recovery/reconciliation on startup via your durability layer and expose stats/admin commands.
+8. Activate terminal-resolver recovery for each contract after all participant bindings are live.
+9. Start sagas by publishing `SagaStarted` with context step name exactly equal to contract `first_step`.
+10. Run recovery/reconciliation on startup via your durability layer and expose stats/admin commands.
 
 ## Testing Model
 

@@ -163,6 +163,7 @@ let _resolver =
 bus.register_bound_workflow_step("example_workflow", "step_a")?;
 bus.register_bound_workflow_step("example_workflow", "step_b")?;
 bus.register_bound_workflow_step("example_workflow", "step_c")?;
+bus.activate_terminal_resolver_recovery_for_contract::<ExampleWorkflowContract>()?;
 ```
 
 For actors implementing `HasSagaWorkflowParticipants`, prefer:
@@ -175,6 +176,8 @@ These bind the subscriber path and auto-register workflow steps as bound.
 Do not register steps as bound unless a real participant is wired for that step; otherwise the saga can still stall after start.
 Production restart recovery requires the durable resolver attachment above. The
 non-durable attachment used by `SagaTestWorld` is intentionally scoped to isolated tests.
+Activate recovery only after strict participant binding is complete; attachment retains
+unpublished recovery output until that explicit boundary.
 
 ## Event Flow
 
