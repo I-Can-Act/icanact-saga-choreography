@@ -93,6 +93,11 @@ pub enum AcceptedStepError {
         expected: StepExecutionId,
         actual: StepExecutionId,
     },
+    WorkflowNotFound {
+        saga_id: super::SagaId,
+        saga_type: Box<str>,
+        step_name: Box<str>,
+    },
     AlreadyResolved {
         saga_id: super::SagaId,
         execution_id: StepExecutionId,

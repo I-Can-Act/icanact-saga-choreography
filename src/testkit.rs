@@ -400,7 +400,7 @@ impl SagaTestWorld {
         completion: AcceptedCompensationCompletion,
     ) -> Result<icanact_core::local::PublishStats, AcceptedStepError>
     where
-        A: SagaStateExt,
+        A: SagaStateExt + HasSagaWorkflowParticipants,
     {
         let event =
             complete_accepted_workflow_compensation(actor, saga_id, execution_id, completion)?;

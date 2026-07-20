@@ -51,6 +51,7 @@ impl HasSagaParticipantSupport for HarnessActor {
 struct DeferredWorkflowActor {
     saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
     emitted: Vec<SagaChoreographyEvent>,
+    compensation_completed_hooks: usize,
 }
 
 impl Default for DeferredWorkflowActor {
@@ -58,6 +59,7 @@ impl Default for DeferredWorkflowActor {
         Self {
             saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
             emitted: Vec::new(),
+            compensation_completed_hooks: 0,
         }
     }
 }
@@ -128,6 +130,10 @@ impl SagaWorkflowParticipant<DeferredWorkflowActor> for DeferredOrderWorkflow {
                 timeout_outcome: AcceptedStepTimeoutOutcome::QuarantineSaga,
             },
         })
+    }
+
+    fn on_compensation_completed(&self, actor: &mut DeferredWorkflowActor, _context: &SagaContext) {
+        actor.compensation_completed_hooks += 1;
     }
 }
 
@@ -265,6 +271,46 @@ impl SagaParticipant for FailingJournalActor {
 
 struct RestartedHarnessActor {
     saga: SagaParticipantSupport<Arc<InMemoryJournal>, InMemoryDedupe>,
+}
+
+struct RestartedHarnessWorkflow;
+
+static RESTARTED_HARNESS_WORKFLOW: RestartedHarnessWorkflow = RestartedHarnessWorkflow;
+static RESTARTED_HARNESS_WORKFLOWS: [&'static dyn SagaWorkflowParticipant<RestartedHarnessActor>;
+    1] = [&RESTARTED_HARNESS_WORKFLOW];
+
+impl SagaWorkflowParticipant<RestartedHarnessActor> for RestartedHarnessWorkflow {
+    fn step_name(&self) -> &'static str {
+        "create_order"
+    }
+
+    fn saga_types(&self) -> &[&'static str] {
+        &["order_lifecycle"]
+    }
+
+    fn execute_step(
+        &self,
+        _actor: &mut RestartedHarnessActor,
+        _context: &SagaContext,
+        _input: &[u8],
+    ) -> Result<StepOutput, StepError> {
+        unreachable!("restart harness only resolves persisted work")
+    }
+
+    fn compensate_step(
+        &self,
+        _actor: &mut RestartedHarnessActor,
+        _context: &SagaContext,
+        _compensation_data: &[u8],
+    ) -> Result<CompensationOutput, CompensationError> {
+        unreachable!("restart harness only resolves persisted work")
+    }
+}
+
+impl HasSagaWorkflowParticipants for RestartedHarnessActor {
+    fn saga_workflows() -> &'static [&'static dyn SagaWorkflowParticipant<Self>] {
+        &RESTARTED_HARNESS_WORKFLOWS
+    }
 }
 
 impl RestartedHarnessActor {
@@ -635,6 +681,7 @@ fn workflow_owned_order_and_release_wait_for_authoritative_completion() {
         },
     )
     .expect("authoritative release should resolve the accepted compensation");
+    assert_eq!(actor.compensation_completed_hooks, 1);
     let terminal = resolver.ingest(&compensation_completed);
     assert!(matches!(
         terminal.as_slice(),

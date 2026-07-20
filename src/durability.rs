@@ -505,6 +505,64 @@ pub fn complete_accepted_workflow_compensation<A>(
     completion: AcceptedCompensationCompletion,
 ) -> Result<SagaChoreographyEvent, AcceptedStepError>
 where
+    A: SagaStateExt + HasSagaWorkflowParticipants,
+{
+    let accepted = accepted_compensation_for_resolution(actor, saga_id, &execution_id)?;
+    let workflow = A::saga_workflows().iter().copied().find(|workflow| {
+        workflow.step_name() == accepted.context.step_name.as_ref()
+            && workflow
+                .saga_types()
+                .contains(&accepted.context.saga_type.as_ref())
+    });
+    let Some(workflow) = workflow else {
+        return Err(AcceptedStepError::WorkflowNotFound {
+            saga_id,
+            saga_type: accepted.context.saga_type.clone(),
+            step_name: accepted.context.step_name.clone(),
+        });
+    };
+    let event = complete_accepted_compensation_state(actor, saga_id, execution_id, completion)?;
+    workflow.on_compensation_completed(actor, event.context());
+    Ok(event)
+}
+
+pub fn complete_accepted_participant_compensation<P>(
+    participant: &mut P,
+    saga_id: SagaId,
+    execution_id: StepExecutionId,
+    completion: AcceptedCompensationCompletion,
+) -> Result<SagaChoreographyEvent, AcceptedStepError>
+where
+    P: SagaStateExt + SagaParticipant,
+{
+    let event =
+        complete_accepted_compensation_state(participant, saga_id, execution_id, completion)?;
+    participant.on_compensation_completed(event.context());
+    Ok(event)
+}
+
+pub fn complete_accepted_async_participant_compensation<P>(
+    participant: &mut P,
+    saga_id: SagaId,
+    execution_id: StepExecutionId,
+    completion: AcceptedCompensationCompletion,
+) -> Result<SagaChoreographyEvent, AcceptedStepError>
+where
+    P: SagaStateExt + AsyncSagaParticipant,
+{
+    let event =
+        complete_accepted_compensation_state(participant, saga_id, execution_id, completion)?;
+    participant.on_compensation_completed(event.context());
+    Ok(event)
+}
+
+fn complete_accepted_compensation_state<A>(
+    actor: &mut A,
+    saga_id: SagaId,
+    execution_id: StepExecutionId,
+    completion: AcceptedCompensationCompletion,
+) -> Result<SagaChoreographyEvent, AcceptedStepError>
+where
     A: SagaStateExt,
 {
     let accepted = accepted_compensation_for_resolution(actor, saga_id, &execution_id)?;
