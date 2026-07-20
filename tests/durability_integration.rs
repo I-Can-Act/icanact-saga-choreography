@@ -465,12 +465,11 @@ fn lmdb_open_rehydrates_expired_compensable_step_with_forward_tombstone() {
     );
     assert!(support.startup_recovery_events.iter().any(|event| matches!(
         event,
-        SagaChoreographyEvent::CompensationRequested {
+        SagaChoreographyEvent::StepFailed {
             context,
-            steps_to_compensate,
+            requires_compensation: true,
             ..
         } if context.saga_id == ctx.saga_id
-            && steps_to_compensate.as_slice() == [Box::<str>::from(TEST_STEP)]
     )));
 
     let mut reopened = LmdbAcceptedStepActor { saga: support };
@@ -759,12 +758,11 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
     .expect("startup recovery should collect expired accepted step");
     assert!(matches!(
         expired.as_slice(),
-        [SagaChoreographyEvent::CompensationRequested {
-            reason,
-            steps_to_compensate,
+        [SagaChoreographyEvent::StepFailed {
+            error,
+            requires_compensation: true,
             ..
-        }] if reason.contains("accepted step hard timeout after restart")
-            && steps_to_compensate.as_slice() == [Box::<str>::from(TEST_STEP)]
+        }] if error.contains("accepted step hard timeout after restart")
     ));
 
     let failed_journal = InMemoryJournal::new();
@@ -807,16 +805,16 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
     .expect("startup recovery should replay the durable accepted-step failure");
     assert!(matches!(
         failed.as_slice(),
-        [SagaChoreographyEvent::CompensationRequested {
+        [SagaChoreographyEvent::StepFailed {
             context,
-            failure,
-            steps_to_compensate,
+            participant_id,
+            error,
+            requires_compensation: true,
             ..
         }] if context.saga_id == SagaId::new(16)
             && context.event_timestamp_millis == 200
-            && failure.participant_id.as_ref() == TEST_STEP
-            && failure.error_message.as_ref() == "authoritative order rejection"
-            && steps_to_compensate.as_slice() == [Box::<str>::from(TEST_STEP)]
+            && participant_id.as_ref() == TEST_STEP
+            && error.as_ref() == "authoritative order rejection"
     ));
 
     let terminal_entries = vec![JournalEntry {

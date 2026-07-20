@@ -235,6 +235,25 @@ impl TerminalResolver {
         self.poll_timeouts_at(SagaContext::now_millis())
     }
 
+    pub(crate) fn restore_from_events(
+        policy: TerminalPolicy,
+        events: &[SagaChoreographyEvent],
+    ) -> (Self, Vec<SagaChoreographyEvent>) {
+        let mut resolver = Self::new(policy);
+        let mut unpublished = Vec::new();
+        for event in events {
+            if let Some(index) = unpublished
+                .iter()
+                .position(|candidate| resolver_output_matches(candidate, event))
+            {
+                unpublished.remove(index);
+            }
+            unpublished.extend(resolver.ingest_at(event, event.context().event_timestamp_millis));
+        }
+        unpublished.extend(resolver.poll_timeouts());
+        (resolver, unpublished)
+    }
+
     fn ingest_at(
         &mut self,
         event: &SagaChoreographyEvent,
@@ -515,6 +534,102 @@ impl TerminalResolver {
             };
             self.states.remove(&evicted);
         }
+    }
+}
+
+fn resolver_output_matches(
+    expected: &SagaChoreographyEvent,
+    observed: &SagaChoreographyEvent,
+) -> bool {
+    if expected == observed {
+        return true;
+    }
+    match (expected, observed) {
+        (
+            SagaChoreographyEvent::SagaCompleted { context: left },
+            SagaChoreographyEvent::SagaCompleted { context: right },
+        ) => left.saga_id == right.saga_id,
+        (
+            SagaChoreographyEvent::SagaFailed {
+                context: left_context,
+                reason: left_reason,
+                failure: left_failure,
+            },
+            SagaChoreographyEvent::SagaFailed {
+                context: right_context,
+                reason: right_reason,
+                failure: right_failure,
+            },
+        ) => {
+            left_context.saga_id == right_context.saga_id
+                && left_reason == right_reason
+                && left_failure == right_failure
+        }
+        (
+            SagaChoreographyEvent::SagaQuarantined {
+                context: left_context,
+                reason: left_reason,
+                step: left_step,
+                participant_id: left_participant,
+            },
+            SagaChoreographyEvent::SagaQuarantined {
+                context: right_context,
+                reason: right_reason,
+                step: right_step,
+                participant_id: right_participant,
+            },
+        ) => {
+            left_context.saga_id == right_context.saga_id
+                && left_reason == right_reason
+                && left_step == right_step
+                && left_participant == right_participant
+        }
+        (
+            SagaChoreographyEvent::CompensationRequested {
+                context: left_context,
+                failed_step: left_failed_step,
+                reason: left_reason,
+                failure: left_failure,
+                steps_to_compensate: left_steps,
+            },
+            SagaChoreographyEvent::CompensationRequested {
+                context: right_context,
+                failed_step: right_failed_step,
+                reason: right_reason,
+                failure: right_failure,
+                steps_to_compensate: right_steps,
+            },
+        ) => {
+            left_context.saga_id == right_context.saga_id
+                && left_failed_step == right_failed_step
+                && left_reason == right_reason
+                && left_failure == right_failure
+                && left_steps == right_steps
+        }
+        (
+            SagaChoreographyEvent::StepFailed {
+                context: left_context,
+                participant_id: left_participant,
+                error_code: left_code,
+                error: left_error,
+                requires_compensation: left_requires,
+            },
+            SagaChoreographyEvent::StepFailed {
+                context: right_context,
+                participant_id: right_participant,
+                error_code: right_code,
+                error: right_error,
+                requires_compensation: right_requires,
+            },
+        ) => {
+            left_context.saga_id == right_context.saga_id
+                && left_context.step_name == right_context.step_name
+                && left_participant == right_participant
+                && left_code == right_code
+                && left_error == right_error
+                && left_requires == right_requires
+        }
+        _ => false,
     }
 }
 
@@ -1771,6 +1886,68 @@ mod tests {
         assert!(
             !reason.contains("ready_not_started=risk_check(account-balance)"),
             "started blocker must not also be reported as never started: {reason}"
+        );
+    }
+
+    #[test]
+    fn durable_restore_reconstructs_complete_rollback_scope_before_recovered_failure() {
+        let mut required = HashSet::new();
+        required.insert(Box::<str>::from("finalize"));
+        let policy = TerminalPolicy::new(
+            "order_lifecycle".into(),
+            "multi_step/test".into(),
+            FailureAuthority::AnyParticipant,
+            SuccessCriteria::AllOf(required),
+            Duration::from_secs(3_600),
+            Duration::from_secs(3_600),
+            &[],
+        );
+        let now = SagaContext::now_millis();
+        let events = vec![
+            SagaChoreographyEvent::SagaStarted {
+                context: ctx_at("first_effect", 41, now, now),
+                payload: Vec::new(),
+            },
+            SagaChoreographyEvent::StepCompleted {
+                context: ctx_at("first_effect", 41, now, now.saturating_add(1)),
+                output: Vec::new(),
+                saga_input: Vec::new(),
+                compensation_available: true,
+            },
+            SagaChoreographyEvent::StepAccepted {
+                context: ctx_at("second_effect", 41, now, now.saturating_add(2)),
+                participant_id: "second-participant".into(),
+                execution_id: StepExecutionId::new("external-41"),
+                deadline_at_millis: now.saturating_add(30_000),
+                hard_deadline_at_millis: now.saturating_add(60_000),
+                timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
+                    requires_compensation: true,
+                },
+                compensation_available: true,
+            },
+        ];
+        let (mut restored, unpublished) = TerminalResolver::restore_from_events(policy, &events);
+        assert!(unpublished.is_empty());
+
+        let recovered_failure = SagaChoreographyEvent::StepFailed {
+            context: ctx_at("second_effect", 41, now, now.saturating_add(3)),
+            participant_id: "second-participant".into(),
+            error_code: Some("exchange_reject".into()),
+            error: "authoritative failure recovered after restart".into(),
+            requires_compensation: true,
+        };
+        let emitted = restored.ingest_at(&recovered_failure, now.saturating_add(3));
+
+        assert!(
+            matches!(
+                emitted.as_slice(),
+                [SagaChoreographyEvent::CompensationRequested {
+                    steps_to_compensate,
+                    ..
+                }] if steps_to_compensate.as_slice()
+                    == [Box::<str>::from("second_effect"), Box::<str>::from("first_effect")]
+            ),
+            "unexpected recovery output: {emitted:?}"
         );
     }
 }

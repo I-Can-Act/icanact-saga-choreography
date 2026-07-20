@@ -52,7 +52,7 @@ pub struct StepId {
 pub type PeerId = [u8; 32];
 
 /// Correlation context passed with every saga event
-#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct SagaContext {
     /// Unique saga execution identifier
     pub saga_id: SagaId,

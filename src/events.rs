@@ -13,7 +13,7 @@ pub struct SagaFailureDetails {
 }
 
 /// Events published via the local saga event bus.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum SagaChoreographyEvent {
     /// Emitted when a new SAGA orchestration begins.
     SagaStarted {
@@ -306,7 +306,7 @@ impl SagaChoreographyEvent {
 }
 
 /// Acknowledgment status for step processing responses.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum AckStatus {
     /// The step has been accepted and queued for processing.
     Accepted,

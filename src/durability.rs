@@ -2852,7 +2852,7 @@ fn collect_startup_recovery_events_for_saga_type_inner<
             if let Some((error, failed_at_millis)) =
                 accepted_step_failure_requiring_compensation(&entries)
             {
-                out.push(startup_accepted_step_compensation_event(
+                out.push(startup_accepted_step_failure_event(
                     &accepted,
                     None,
                     error,
@@ -2870,7 +2870,7 @@ fn collect_startup_recovery_events_for_saga_type_inner<
                     ..
                 } = timeout_event
                 {
-                    out.push(startup_accepted_step_compensation_event(
+                    out.push(startup_accepted_step_failure_event(
                         &accepted,
                         error_code,
                         error,
@@ -2943,36 +2943,20 @@ fn startup_accepted_step_replay_event(accepted: &AcceptedWorkflowStep) -> SagaCh
     }
 }
 
-fn startup_accepted_step_compensation_event(
+fn startup_accepted_step_failure_event(
     accepted: &AcceptedWorkflowStep,
     error_code: Option<Box<str>>,
     error: Box<str>,
     failed_at_millis: u64,
 ) -> SagaChoreographyEvent {
-    let failure = crate::SagaFailureDetails {
-        step_name: accepted.context.step_name.clone(),
+    let mut context = accepted.context.clone();
+    context.event_timestamp_millis = failed_at_millis;
+    SagaChoreographyEvent::StepFailed {
+        context,
         participant_id: accepted.participant_id.clone(),
         error_code,
-        error_message: error.clone(),
-        at_millis: failed_at_millis,
-    };
-    let mut context = accepted
-        .context
-        .next_step(crate::TERMINAL_RESOLVER_STEP.into());
-    context.event_timestamp_millis = failed_at_millis;
-    if accepted.compensation_data.is_empty() {
-        return SagaChoreographyEvent::SagaFailed {
-            context,
-            reason: "accepted step failed without durable compensation data".into(),
-            failure: Some(failure),
-        };
-    }
-    SagaChoreographyEvent::CompensationRequested {
-        context,
-        failed_step: accepted.context.step_name.clone(),
-        reason: error,
-        failure,
-        steps_to_compensate: vec![accepted.context.step_name.clone()],
+        error,
+        requires_compensation: !accepted.compensation_data.is_empty(),
     }
 }
 
