@@ -307,6 +307,11 @@ impl TerminalResolver {
                 ..
             } => {
                 let step_name = context.step_name.clone();
+                if state.compensation_requested
+                    && state.pending_compensation_steps.contains(&step_name)
+                {
+                    return out;
+                }
                 state.accepted_steps.remove(step_name.as_ref());
                 state.started_steps.insert(step_name.clone());
                 state.completed_steps.insert(step_name.clone());

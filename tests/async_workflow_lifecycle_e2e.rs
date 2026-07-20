@@ -505,11 +505,12 @@ fn accepted_order_timeout_compensates_the_current_step_before_terminal_failure()
     let ctx = context("create_order", 35);
     let mut actor = HarnessActor::default();
     let mut resolver = TerminalResolver::new(terminal_policy());
+    let execution_id = StepExecutionId::new("order-request-35");
     let accepted = accept_workflow_step_with_state(
         &mut actor,
-        ctx,
+        ctx.clone(),
         "order-manager".into(),
-        StepExecutionId::new("order-request-35"),
+        execution_id.clone(),
         AcceptedStepPolicy {
             idle_timeout: Duration::from_millis(1),
             hard_timeout: Duration::from_millis(1),
@@ -538,6 +539,30 @@ fn accepted_order_timeout_compensates_the_current_step_before_terminal_failure()
         ),
         "an accepted order step owns possible exchange effects and must compensate itself before the saga can fail: {timeout_events:?}"
     );
+
+    let late_completion = complete_accepted_workflow_step(
+        &mut actor,
+        ctx.saga_id,
+        execution_id,
+        completion(
+            SagaContext::now_millis(),
+            b"late-created-order",
+            b"ignored-completion-input",
+            b"order-request-35",
+        ),
+    )
+    .expect("authoritative completion can race with the compensation request");
+    assert!(
+        resolver.ingest(&late_completion).is_empty(),
+        "a timed-out forward step must not complete the saga after compensation is pending"
+    );
+    let compensation_completed = SagaChoreographyEvent::CompensationCompleted {
+        context: ctx.next_step("create_order".into()),
+    };
+    assert!(matches!(
+        resolver.ingest(&compensation_completed).as_slice(),
+        [SagaChoreographyEvent::SagaFailed { .. }]
+    ));
 }
 
 #[test]
