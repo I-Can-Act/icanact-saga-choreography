@@ -1,7 +1,7 @@
 //! Helper functions for saga handling
 
 use crate::{
-    AsyncSagaParticipant, CompensationError, DependencySpec, ParticipantEvent,
+    AsyncSagaParticipant, CompensationError, CompensationOutput, DependencySpec, ParticipantEvent,
     SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant, SagaParticipantState,
     SagaStateEntry, SagaStateExt, StepError, StepOutput,
 };
@@ -95,11 +95,23 @@ pub fn handle_saga_event_with_emit<P, F>(
         }
 
         SagaChoreographyEvent::CompensationRequested {
+            failed_step,
+            reason,
+            failure,
             steps_to_compensate,
             ..
         } => {
             if steps_to_compensate.contains(&participant.step_name().into()) {
-                compensate_wrapper_with_emit(participant, &context, now, &mut emit);
+                compensate_wrapper_with_emit(
+                    participant,
+                    &context,
+                    failed_step,
+                    reason,
+                    failure,
+                    steps_to_compensate,
+                    now,
+                    &mut emit,
+                );
             }
         }
 
@@ -212,11 +224,24 @@ pub async fn handle_async_saga_event_with_emit<P, F>(
             }
         }
         SagaChoreographyEvent::CompensationRequested {
+            failed_step,
+            reason,
+            failure,
             steps_to_compensate,
             ..
         } => {
             if steps_to_compensate.contains(&participant.step_name().into()) {
-                compensate_wrapper_with_emit_async(participant, &context, now, &mut emit).await;
+                compensate_wrapper_with_emit_async(
+                    participant,
+                    &context,
+                    failed_step,
+                    reason,
+                    failure,
+                    steps_to_compensate,
+                    now,
+                    &mut emit,
+                )
+                .await;
             }
         }
         SagaChoreographyEvent::SagaCompleted { .. } => {
@@ -337,6 +362,7 @@ fn dedupe_key_for_event(event: &SagaChoreographyEvent) -> String {
         SagaChoreographyEvent::StepCompleted { .. }
         | SagaChoreographyEvent::StepFailed { .. }
         | SagaChoreographyEvent::CompensationStarted { .. }
+        | SagaChoreographyEvent::CompensationAccepted { .. }
         | SagaChoreographyEvent::CompensationCompleted { .. }
         | SagaChoreographyEvent::CompensationFailed { .. }
         | SagaChoreographyEvent::SagaCompleted { .. }
@@ -477,6 +503,38 @@ fn complete_step<P, F>(
     F: FnMut(SagaChoreographyEvent),
 {
     let saga_id = context.saga_id;
+    if let StepOutput::Accepted {
+        execution_id,
+        policy,
+        compensation_data,
+    } = output
+    {
+        match crate::durability::accept_started_workflow_step(
+            participant,
+            context.next_step(participant.step_name().into()),
+            participant.participant_id_owned(),
+            execution_id,
+            policy,
+            saga_input,
+            compensation_data,
+        ) {
+            Ok(event) => emit(event),
+            Err(error) => {
+                let step = participant.step_name().into();
+                let participant_id = participant.participant_id_owned();
+                quarantine_accepted_step_persistence_failure(
+                    participant,
+                    context,
+                    step,
+                    participant_id,
+                    format!("accepted step persistence failed: {error:?}").into(),
+                    now,
+                    emit,
+                );
+            }
+        }
+        return;
+    }
     let (out_data, comp_data, compensation_available) = match output {
         StepOutput::Completed {
             output,
@@ -493,6 +551,7 @@ fn complete_step<P, F>(
             let compensation_available = !compensation_data.is_empty();
             (output, compensation_data, compensation_available)
         }
+        StepOutput::Accepted { .. } => unreachable!("accepted output returned above"),
     };
 
     // State: Executing -> Completed
@@ -534,6 +593,38 @@ fn complete_step_async<P, F>(
     F: FnMut(SagaChoreographyEvent),
 {
     let saga_id = context.saga_id;
+    if let StepOutput::Accepted {
+        execution_id,
+        policy,
+        compensation_data,
+    } = output
+    {
+        match crate::durability::accept_started_workflow_step(
+            participant,
+            context.next_step(participant.step_name().into()),
+            participant.participant_id_owned(),
+            execution_id,
+            policy,
+            saga_input,
+            compensation_data,
+        ) {
+            Ok(event) => emit(event),
+            Err(error) => {
+                let step = participant.step_name().into();
+                let participant_id = participant.participant_id_owned();
+                quarantine_accepted_step_persistence_failure(
+                    participant,
+                    context,
+                    step,
+                    participant_id,
+                    format!("accepted async step persistence failed: {error:?}").into(),
+                    now,
+                    emit,
+                );
+            }
+        }
+        return;
+    }
     let (out_data, comp_data, compensation_available) = match output {
         StepOutput::Completed {
             output,
@@ -550,6 +641,7 @@ fn complete_step_async<P, F>(
             let compensation_available = !compensation_data.is_empty();
             (output, compensation_data, compensation_available)
         }
+        StepOutput::Accepted { .. } => unreachable!("accepted output returned above"),
     };
 
     if let Some(SagaStateEntry::Executing(state)) = participant.saga_states().remove(&saga_id) {
@@ -574,6 +666,88 @@ fn complete_step_async<P, F>(
         output: emitted_output,
         saga_input,
         compensation_available,
+    });
+}
+
+fn quarantine_accepted_step_persistence_failure<A, F>(
+    actor: &mut A,
+    context: &SagaContext,
+    step: Box<str>,
+    participant_id: Box<str>,
+    reason: Box<str>,
+    now: u64,
+    emit: &mut F,
+) where
+    A: SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let saga_id = context.saga_id;
+    if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&saga_id) {
+        actor.saga_states().insert(
+            saga_id,
+            SagaStateEntry::Quarantined(state.quarantine(reason.clone(), now)),
+        );
+    }
+    actor.record_event(
+        saga_id,
+        ParticipantEvent::Quarantined {
+            reason: reason.clone(),
+            quarantined_at_millis: now,
+        },
+    );
+    emit(SagaChoreographyEvent::SagaQuarantined {
+        context: context.next_step(step.clone()),
+        reason,
+        step,
+        participant_id,
+    });
+}
+
+fn quarantine_compensation_request_persistence_failure<A, F>(
+    actor: &mut A,
+    context: &SagaContext,
+    step: Box<str>,
+    participant_id: Box<str>,
+    reason: Box<str>,
+    now: u64,
+    emit: &mut F,
+) where
+    A: SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let saga_id = context.saga_id;
+    let state_entry = actor.saga_states().remove(&saga_id);
+    let quarantined = match state_entry {
+        Some(SagaStateEntry::Executing(state)) => Some(state.quarantine(reason.clone(), now)),
+        Some(SagaStateEntry::Completed(state)) => Some(
+            state
+                .start_compensation(now)
+                .quarantine(reason.clone(), now),
+        ),
+        Some(SagaStateEntry::Compensating(state)) => Some(state.quarantine(reason.clone(), now)),
+        Some(other) => {
+            actor.saga_states().insert(saga_id, other);
+            None
+        }
+        None => None,
+    };
+    if let Some(state) = quarantined {
+        actor
+            .saga_states()
+            .insert(saga_id, SagaStateEntry::Quarantined(state));
+    }
+    actor.record_event(
+        saga_id,
+        ParticipantEvent::Quarantined {
+            reason: reason.clone(),
+            quarantined_at_millis: now,
+        },
+    );
+    emit(SagaChoreographyEvent::SagaQuarantined {
+        context: context.next_step(step.clone()),
+        reason,
+        step,
+        participant_id,
     });
 }
 
@@ -665,6 +839,10 @@ fn fail_step_async<P, F>(
 fn compensate_wrapper_with_emit<P, F>(
     participant: &mut P,
     context: &SagaContext,
+    failed_step: Box<str>,
+    request_reason: Box<str>,
+    failure: crate::SagaFailureDetails,
+    steps_to_compensate: Vec<Box<str>>,
     now: u64,
     emit: &mut F,
 ) where
@@ -672,34 +850,107 @@ fn compensate_wrapper_with_emit<P, F>(
     F: FnMut(SagaChoreographyEvent),
 {
     let saga_id = context.saga_id;
-
-    // Get compensation data from Completed state
-    if let Some(SagaStateEntry::Completed(state)) = participant.saga_states().remove(&saga_id) {
-        let comp_data = state.state.compensation_data.clone();
-
-        // State: Completed -> Compensating
-        let new_state = state.start_compensation(now);
-        participant
-            .saga_states()
-            .insert(saga_id, SagaStateEntry::Compensating(new_state));
-
-        // Persist
-        participant.record_event(
-            saga_id,
-            ParticipantEvent::CompensationStarted {
-                attempt: 1,
-                started_at_millis: now,
-            },
+    if let Err(error) = participant.record_event_strict(
+        saga_id,
+        ParticipantEvent::CompensationRequestRecorded {
+            context: context.clone(),
+            failed_step,
+            reason: request_reason,
+            failure,
+            steps_to_compensate,
+            requested_at_millis: now,
+        },
+    ) {
+        let step = participant.step_name().into();
+        let participant_id = participant.participant_id_owned();
+        quarantine_compensation_request_persistence_failure(
+            participant,
+            context,
+            step,
+            participant_id,
+            format!("compensation request persistence failed: {error:?}").into(),
+            now,
+            emit,
         );
+        return;
+    }
 
-        // Execute compensation
-        match participant.compensate_step(context, &comp_data) {
-            Ok(()) => {
-                complete_compensation(participant, context, now, emit);
+    let accepted_compensation_data = participant
+        .saga_support()
+        .accepted_workflow_steps
+        .get(&saga_id)
+        .map(|accepted| accepted.compensation_data.clone());
+    let state_entry = participant.saga_states().remove(&saga_id);
+    let (comp_data, new_state) = match state_entry {
+        Some(SagaStateEntry::Completed(state)) => {
+            let comp_data = state.state.compensation_data.clone();
+            (comp_data, state.start_compensation(now))
+        }
+        Some(SagaStateEntry::Executing(state)) => {
+            let Some(comp_data) = accepted_compensation_data else {
+                participant
+                    .saga_states()
+                    .insert(saga_id, SagaStateEntry::Executing(state));
+                return;
+            };
+            (comp_data, state.start_compensation(now))
+        }
+        Some(other) => {
+            participant.saga_states().insert(saga_id, other);
+            return;
+        }
+        None => return,
+    };
+    participant
+        .saga_states()
+        .insert(saga_id, SagaStateEntry::Compensating(new_state));
+    if let Some(accepted) = participant
+        .saga_support_mut()
+        .accepted_workflow_steps
+        .remove(&saga_id)
+    {
+        crate::durability::mark_accepted_step_resolved(participant, saga_id, accepted.execution_id);
+    }
+
+    participant.record_event(
+        saga_id,
+        ParticipantEvent::CompensationStarted {
+            attempt: 1,
+            started_at_millis: now,
+        },
+    );
+
+    match participant.compensate_step(context, &comp_data) {
+        Ok(CompensationOutput::Completed) => {
+            complete_compensation(participant, context, now, emit);
+        }
+        Ok(CompensationOutput::Accepted {
+            execution_id,
+            policy,
+        }) => {
+            let participant_id = participant.participant_id_owned();
+            match crate::durability::accept_started_workflow_compensation(
+                participant,
+                context.next_step(participant.step_name().into()),
+                participant_id,
+                execution_id,
+                policy,
+            ) {
+                Ok(event) => emit(event),
+                Err(error) => fail_compensation(
+                    participant,
+                    context,
+                    CompensationError::Ambiguous {
+                        reason: format!("accepted compensation persistence failed: {error:?}")
+                            .into(),
+                    },
+                    now,
+                    emit,
+                ),
             }
-            Err(error) => {
-                fail_compensation(participant, context, error, now, emit);
-            }
+        }
+        Err(error) => {
+            fail_compensation(participant, context, error, now, emit);
         }
     }
 }
@@ -707,6 +958,10 @@ fn compensate_wrapper_with_emit<P, F>(
 async fn compensate_wrapper_with_emit_async<P, F>(
     participant: &mut P,
     context: &SagaContext,
+    failed_step: Box<str>,
+    request_reason: Box<str>,
+    failure: crate::SagaFailureDetails,
+    steps_to_compensate: Vec<Box<str>>,
     now: u64,
     emit: &mut F,
 ) where
@@ -714,27 +969,108 @@ async fn compensate_wrapper_with_emit_async<P, F>(
     F: FnMut(SagaChoreographyEvent),
 {
     let saga_id = context.saga_id;
-
-    if let Some(SagaStateEntry::Completed(state)) = participant.saga_states().remove(&saga_id) {
-        let comp_data = state.state.compensation_data.clone();
-
-        let new_state = state.start_compensation(now);
-        participant
-            .saga_states()
-            .insert(saga_id, SagaStateEntry::Compensating(new_state));
-
-        participant.record_event(
-            saga_id,
-            ParticipantEvent::CompensationStarted {
-                attempt: 1,
-                started_at_millis: now,
-            },
+    if let Err(error) = participant.record_event_strict(
+        saga_id,
+        ParticipantEvent::CompensationRequestRecorded {
+            context: context.clone(),
+            failed_step,
+            reason: request_reason,
+            failure,
+            steps_to_compensate,
+            requested_at_millis: now,
+        },
+    ) {
+        let step = participant.step_name().into();
+        let participant_id = participant.participant_id_owned();
+        quarantine_compensation_request_persistence_failure(
+            participant,
+            context,
+            step,
+            participant_id,
+            format!("compensation request persistence failed: {error:?}").into(),
+            now,
+            emit,
         );
+        return;
+    }
 
-        match participant.compensate_step(context, &comp_data).await {
-            Ok(()) => complete_compensation_async(participant, context, now, emit),
-            Err(error) => fail_compensation_async(participant, context, error, now, emit),
+    let accepted_compensation_data = participant
+        .saga_support()
+        .accepted_workflow_steps
+        .get(&saga_id)
+        .map(|accepted| accepted.compensation_data.clone());
+    let state_entry = participant.saga_states().remove(&saga_id);
+    let (comp_data, new_state) = match state_entry {
+        Some(SagaStateEntry::Completed(state)) => {
+            let comp_data = state.state.compensation_data.clone();
+            (comp_data, state.start_compensation(now))
         }
+        Some(SagaStateEntry::Executing(state)) => {
+            let Some(comp_data) = accepted_compensation_data else {
+                participant
+                    .saga_states()
+                    .insert(saga_id, SagaStateEntry::Executing(state));
+                return;
+            };
+            (comp_data, state.start_compensation(now))
+        }
+        Some(other) => {
+            participant.saga_states().insert(saga_id, other);
+            return;
+        }
+        None => return,
+    };
+    participant
+        .saga_states()
+        .insert(saga_id, SagaStateEntry::Compensating(new_state));
+    if let Some(accepted) = participant
+        .saga_support_mut()
+        .accepted_workflow_steps
+        .remove(&saga_id)
+    {
+        crate::durability::mark_accepted_step_resolved(participant, saga_id, accepted.execution_id);
+    }
+
+    participant.record_event(
+        saga_id,
+        ParticipantEvent::CompensationStarted {
+            attempt: 1,
+            started_at_millis: now,
+        },
+    );
+
+    match participant.compensate_step(context, &comp_data).await {
+        Ok(CompensationOutput::Completed) => {
+            complete_compensation_async(participant, context, now, emit)
+        }
+        Ok(CompensationOutput::Accepted {
+            execution_id,
+            policy,
+        }) => {
+            let participant_id = participant.participant_id_owned();
+            match crate::durability::accept_started_workflow_compensation(
+                participant,
+                context.next_step(participant.step_name().into()),
+                participant_id,
+                execution_id,
+                policy,
+            ) {
+                Ok(event) => emit(event),
+                Err(error) => fail_compensation_async(
+                    participant,
+                    context,
+                    CompensationError::Ambiguous {
+                        reason: format!(
+                            "accepted async compensation persistence failed: {error:?}"
+                        )
+                        .into(),
+                    },
+                    now,
+                    emit,
+                ),
+            }
+        }
+        Err(error) => fail_compensation_async(participant, context, error, now, emit),
     }
 }
 
@@ -1029,11 +1365,11 @@ mod tests {
             &mut self,
             _context: &SagaContext,
             _compensation_data: &[u8],
-        ) -> Result<(), CompensationError> {
+        ) -> Result<CompensationOutput, CompensationError> {
             if let Some(err) = self.compensation_error.clone() {
                 return Err(err);
             }
-            Ok(())
+            Ok(CompensationOutput::Completed)
         }
     }
 
@@ -1279,6 +1615,13 @@ mod tests {
                 context,
                 failed_step: "risk_check".into(),
                 reason: "failed downstream".into(),
+                failure: crate::SagaFailureDetails {
+                    step_name: "risk_check".into(),
+                    participant_id: "risk".into(),
+                    error_code: None,
+                    error_message: "failed downstream".into(),
+                    at_millis: 1,
+                },
                 steps_to_compensate: vec!["risk_check".into()],
             },
             |event| emitted.push(event),
@@ -1330,6 +1673,13 @@ mod tests {
                 context,
                 failed_step: "risk_check".into(),
                 reason: "failed downstream".into(),
+                failure: crate::SagaFailureDetails {
+                    step_name: "risk_check".into(),
+                    participant_id: "risk".into(),
+                    error_code: None,
+                    error_message: "failed downstream".into(),
+                    at_millis: 1,
+                },
                 steps_to_compensate: vec!["risk_check".into()],
             },
             |event| emitted.push(event),

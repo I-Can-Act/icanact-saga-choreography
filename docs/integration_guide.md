@@ -48,7 +48,7 @@ If `step_c` fails, earlier steps may compensate.
 
 ```rust
 use icanact_saga_choreography::{
-    CompensationError, DependencySpec, HasSagaParticipantSupport, InMemoryDedupe,
+    CompensationError, CompensationOutput, DependencySpec, HasSagaParticipantSupport, InMemoryDedupe,
     InMemoryJournal, SagaContext, SagaParticipant, SagaParticipantSupport, StepError, StepOutput,
 };
 
@@ -108,8 +108,8 @@ impl SagaParticipant for StepAActor {
         &mut self,
         _context: &SagaContext,
         _compensation_data: &[u8],
-    ) -> Result<(), CompensationError> {
-        Ok(())
+    ) -> Result<CompensationOutput, CompensationError> {
+        Ok(CompensationOutput::Completed)
     }
 }
 ```
@@ -125,8 +125,10 @@ impl SagaParticipant for StepAActor {
 Use startup wiring like this:
 
 ```rust,ignore
+use std::path::Path;
+use std::sync::Arc;
 use icanact_saga_choreography::{
-    define_saga_workflow_contract, SagaChoreographyBus,
+    define_saga_workflow_contract, LmdbTerminalResolverJournal, SagaChoreographyBus,
 };
 
 define_saga_workflow_contract! {
@@ -147,13 +149,21 @@ define_saga_workflow_contract! {
 
 let bus = SagaChoreographyBus::new();
 bus.register_workflow_contract_provider::<ExampleWorkflowContract>()?;
+let resolver_journal = Arc::new(
+    LmdbTerminalResolverJournal::open(Path::new("./runtime/example-workflow-resolver"))
+        .map_err(|error| error.to_string())?,
+);
 let _resolver =
-    bus.attach_terminal_resolver_for_contract::<ExampleWorkflowContract>("terminal-resolver")?;
+    bus.attach_durable_terminal_resolver_for_contract::<ExampleWorkflowContract, _>(
+        "terminal-resolver",
+        resolver_journal,
+    )?;
 
 // If you do not use strict workflow bind helpers, register steps explicitly:
 bus.register_bound_workflow_step("example_workflow", "step_a")?;
 bus.register_bound_workflow_step("example_workflow", "step_b")?;
 bus.register_bound_workflow_step("example_workflow", "step_c")?;
+bus.activate_terminal_resolver_recovery_for_contract::<ExampleWorkflowContract>()?;
 ```
 
 For actors implementing `HasSagaWorkflowParticipants`, prefer:
@@ -164,6 +174,10 @@ For actors implementing `HasSagaWorkflowParticipants`, prefer:
 
 These bind the subscriber path and auto-register workflow steps as bound.
 Do not register steps as bound unless a real participant is wired for that step; otherwise the saga can still stall after start.
+Production restart recovery requires the durable resolver attachment above. The
+non-durable attachment used by `SagaTestWorld` is intentionally scoped to isolated tests.
+Activate recovery only after strict participant binding is complete; attachment retains
+unpublished recovery output until that explicit boundary.
 
 ## Event Flow
 
@@ -188,11 +202,13 @@ For runtime publishing paths, prefer `publish_strict(...)` so partial delivery i
 
 Saga choreography is async by nature. A sync actor or async actor can participate in the same workflow because the bus carries choreography events, not runtime-specific calls.
 
-Participants should accept responsibility on the control plane with `accept_workflow_step(...)`, then resolve later with `complete_accepted_workflow_step(...)`, `fail_accepted_workflow_step(...)`, or timeout/quarantine helpers. Sync actors usually resolve from a later tell/ask handler. Async actors usually resolve after awaited I/O in their native async handler. Originators can also be sync or async; they only need a bus handle and must publish `SagaStarted` through the normal choreography path.
+Participants whose `execute_step(...)` dispatches external work should return `StepOutput::Accepted { execution_id, policy, compensation_data }`. The normal ingress helper durably records acceptance and publishes `StepAccepted`; the participant then resolves later with `complete_accepted_workflow_step(...)` or `fail_accepted_workflow_step(...)`. Sync actors usually resolve from a later tell/ask handler. Async actors usually resolve after awaited I/O in their native async handler. Originators can also be sync or async; they only need a bus handle and must publish `SagaStarted` through the normal choreography path.
 
-Accepted steps carry an `AcceptedStepPolicy`: resettable `idle_timeout`, non-resettable `hard_timeout`, and `timeout_outcome`. Participant support persists metadata before returning `StepAccepted`; application code should publish helper output, not hand-build it. Publish `StepAccepted` from `accept_workflow_step(...)` so terminal resolver can enforce accepted-step deadlines. Publish `StepAccepted` from `record_accepted_workflow_step_progress(...)` on each progress heartbeat; participant-local idle deadline refresh alone does not refresh resolver state, so resolver can still time out active external execution. Terminal resolver observes published `StepAccepted` events and enforces per-step deadlines from watchdog. On restart, persisted accepted-step metadata is recovered and expired deadlines emit configured timeout outcome instead of stale saga recovery.
+Accepted steps carry an `AcceptedStepPolicy`: resettable `idle_timeout`, non-resettable `hard_timeout`, and `timeout_outcome`. Participant support persists the original saga input and compensation data before publishing `StepAccepted`; application code must not hand-build lifecycle events. Publish the event returned by `record_accepted_workflow_step_progress(...)` on each progress heartbeat; participant-local idle deadline refresh alone does not refresh resolver state. Terminal resolver enforces the per-step deadline. On restart, persisted accepted-step metadata is recovered and an expired deadline emits the configured outcome instead of generic stale-saga recovery.
 
-In tests, use `SagaTestWorld::accept_step(...)`, `record_accepted_step_progress(...)`, `wait_for_step_accepted(saga_id, step_name, ...)`, `complete_accepted_step(...)`, and `fail_accepted_step(...)` instead of hand-building accepted-step, progress, completion, or failure events.
+When compensation dispatch is also asynchronous, return `CompensationOutput::Accepted { execution_id, policy }` from `compensate_step(...)`. Resolve workflow-scoped actors with `complete_accepted_workflow_compensation(...)`, sync participants with `complete_accepted_participant_compensation(...)`, or async participants with `complete_accepted_async_participant_compensation(...)`; use `fail_accepted_workflow_compensation(...)` for failure. The completion helpers invoke the matching participant completion hook after durable resolution. Accepted compensation is durable across participant restart. Its idle or hard timeout quarantines the saga because an unresolved external release is ambiguous; the resolver never reports rollback complete before authoritative confirmation.
+
+In tests, use `SagaTestWorld::accept_step(...)` with the original saga input and compensation data, `record_accepted_step_progress(...)`, `wait_for_step_accepted(saga_id, step_name, ...)`, `complete_accepted_step(...)`, `fail_accepted_step(...)`, and the accepted-compensation completion/failure helpers instead of hand-building lifecycle events.
 
 ## Routing Saga Events
 

@@ -135,6 +135,24 @@ impl SagaParticipantState<Triggered> {
 }
 
 impl SagaParticipantState<Executing> {
+    pub fn start_compensation(self, now_millis: u64) -> SagaParticipantState<Compensating> {
+        SagaParticipantState {
+            saga_id: self.saga_id,
+            saga_type: self.saga_type,
+            step_name: self.step_name,
+            correlation_id: self.correlation_id,
+            trace_id: self.trace_id,
+            initiator_peer_id: self.initiator_peer_id,
+            saga_started_at_millis: self.saga_started_at_millis,
+            last_updated_at_millis: now_millis,
+            state: Compensating {
+                started_at_millis: now_millis,
+                attempt: 1,
+            },
+            events: self.events,
+        }
+    }
+
     pub fn complete(
         self,
         output: Vec<u8>,

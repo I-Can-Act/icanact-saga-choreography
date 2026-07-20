@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::{CompensationError, SagaContext, StepError, StepOutput};
+use crate::{CompensationError, CompensationOutput, SagaContext, StepError, StepOutput};
 
 use icanact_core::{ActorId, ActorIdError};
 
@@ -29,9 +29,9 @@ use icanact_core::{ActorId, ActorIdError};
 ///     }
 ///     
 ///     fn compensate_step(&mut self, ctx: &SagaContext, data: &[u8])
-///         -> Result<(), CompensationError>
+///         -> Result<CompensationOutput, CompensationError>
 ///     {
-///         // Cancel the order
+///         // Cancel the order and return Completed or Accepted
 ///     }
 /// }
 /// ```
@@ -85,7 +85,7 @@ pub trait SagaParticipant {
         &mut self,
         context: &SagaContext,
         compensation_data: &[u8],
-    ) -> Result<(), CompensationError>;
+    ) -> Result<CompensationOutput, CompensationError>;
 
     // === Optional Hooks ===
 
@@ -152,7 +152,7 @@ pub trait SagaWorkflowParticipant<A>: Send + Sync + 'static {
         actor: &mut A,
         context: &SagaContext,
         compensation_data: &[u8],
-    ) -> Result<(), CompensationError>;
+    ) -> Result<CompensationOutput, CompensationError>;
 
     /// Called after saga completes successfully.
     fn on_saga_completed(&self, _actor: &mut A, _context: &SagaContext) {}
@@ -225,7 +225,7 @@ pub trait AsyncSagaParticipant {
         &'a mut self,
         context: &'a SagaContext,
         compensation_data: &'a [u8],
-    ) -> SagaBoxFuture<'a, Result<(), CompensationError>>;
+    ) -> SagaBoxFuture<'a, Result<CompensationOutput, CompensationError>>;
 
     fn on_saga_completed(&mut self, _context: &SagaContext) {}
 

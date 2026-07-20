@@ -116,11 +116,12 @@ sequenceDiagram
 4. Implement `SagaParticipant` for business behavior:
    step identity, forward execution, compensation, and dependencies.
 5. Add a saga event variant to the actor command enum and route it through `apply_sync_participant_saga_ingress(...)` or `apply_async_participant_saga_ingress(...)`.
-6. On startup, register workflow contract and attach terminal resolver.
+6. On startup, register the workflow contract and attach one durable terminal resolver journal per saga type.
 7. Bind participants and register bound steps:
    use strict workflow bind helpers for `HasSagaWorkflowParticipants`, otherwise register steps explicitly.
-8. Start sagas by publishing `SagaStarted` with context step name exactly equal to contract `first_step`.
-9. Run recovery/reconciliation on startup via your durability layer and expose stats/admin commands.
+8. Activate terminal-resolver recovery for each contract after all participant bindings are live.
+9. Start sagas by publishing `SagaStarted` with context step name exactly equal to contract `first_step`.
+10. Run recovery/reconciliation on startup via your durability layer and expose stats/admin commands.
 
 ## Testing Model
 
@@ -139,7 +140,10 @@ sequenceDiagram
   when handling incoming events, with `failed_step` appended for compensation requests.
 - In this repository, in-memory implementations are available for tests/examples.
 - For production, use a durable backend by implementing the storage traits (for example LMDB/Heed).
-- Accepted-step metadata is journaled before `StepAccepted` is published so restart recovery can rehydrate pending external executions.
+- Accepted-step metadata, original saga input, and compensation data are journaled before `StepAccepted` is published so restart recovery can rehydrate pending external executions.
+- The durable terminal resolver journals the saga-wide event history and rebuilds the complete compensation stack before participant recovery failures are replayed. Participant-local journals cannot infer effects owned by other actors.
+- A currently accepted step with compensation data is part of the resolver's compensation stack; timeout cannot skip release of that step's possible external effect.
+- Accepted compensation is journaled independently and must reach authoritative completion before terminal failure. Its timeout quarantines the saga.
 
 ## Recovery, Cleanup, and Operations
 
@@ -150,7 +154,7 @@ sequenceDiagram
 - Terminal policies support two timeout dimensions:
 - `overall_timeout` (overall wall clock)
 - `stalled_timeout` (watchdog reset by each progress event)
-- Accepted steps add participant-declared `idle_timeout`, `hard_timeout`, and `timeout_outcome`; the terminal resolver watchdog enforces these from `StepAccepted`, and startup recovery emits expired accepted-step outcomes from journaled metadata.
+- Accepted steps add participant-declared `idle_timeout`, `hard_timeout`, and `timeout_outcome`; the terminal resolver watchdog enforces these from `StepAccepted`, and startup recovery emits expired accepted-step outcomes from journaled metadata. Accepted compensation uses its own per-execution deadlines and fails closed to quarantine.
 
 ## Observability
 

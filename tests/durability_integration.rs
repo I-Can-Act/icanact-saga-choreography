@@ -126,8 +126,8 @@ impl SagaParticipant for TestParticipant {
         &mut self,
         _context: &SagaContext,
         _compensation_data: &[u8],
-    ) -> Result<(), CompensationError> {
-        Ok(())
+    ) -> Result<icanact_saga_choreography::CompensationOutput, CompensationError> {
+        Ok(icanact_saga_choreography::CompensationOutput::Completed)
     }
 }
 
@@ -176,6 +176,8 @@ fn lmdb_open_recovers_accepted_step_metadata_for_restart_completion() {
         "order-manager".into(),
         execution_id.clone(),
         policy,
+        b"order-input".to_vec(),
+        Vec::new(),
     )
     .expect("step should be accepted before restart");
     drop(actor);
@@ -195,7 +197,6 @@ fn lmdb_open_recovers_accepted_step_metadata_for_restart_completion() {
         AcceptedStepCompletion {
             completed_at_millis: 1_700_000_000_900,
             output: b"completed-after-lmdb-restart".to_vec(),
-            saga_input: b"input".to_vec(),
             compensation_data: Vec::new(),
         },
     )
@@ -210,6 +211,139 @@ fn lmdb_open_recovers_accepted_step_metadata_for_restart_completion() {
         } if context.saga_id == ctx.saga_id
             && context.event_timestamp_millis == 1_700_000_000_900
             && output == b"completed-after-lmdb-restart"
+    ));
+}
+
+#[cfg(feature = "lmdb")]
+#[test]
+fn lmdb_open_recovers_accepted_steps_for_each_declared_saga_type() {
+    const OPEN_POSITION: &str = "open_position";
+    const CLOSE_POSITION: &str = "close_position";
+
+    let temp = tempfile::tempdir().expect("tempdir should open");
+    let open_context = context(190, OPEN_POSITION, TEST_STEP);
+    let close_context = context(191, CLOSE_POSITION, TEST_STEP);
+    let policy = AcceptedStepPolicy {
+        idle_timeout: std::time::Duration::from_secs(60),
+        hard_timeout: std::time::Duration::from_secs(60),
+        timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
+            requires_compensation: true,
+        },
+    };
+    let support =
+        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_types(
+            temp.path(),
+            TEST_STEP,
+            &[OPEN_POSITION, CLOSE_POSITION],
+        )
+        .expect("multi-workflow support should open before restart");
+    let mut actor = LmdbAcceptedStepActor { saga: support };
+    accept_workflow_step(
+        &mut actor,
+        open_context.clone(),
+        "order-manager".into(),
+        StepExecutionId::new("open-190"),
+        policy.clone(),
+        b"open-input".to_vec(),
+        Vec::new(),
+    )
+    .expect("open workflow step should be accepted");
+    accept_workflow_step(
+        &mut actor,
+        close_context.clone(),
+        "order-manager".into(),
+        StepExecutionId::new("close-191"),
+        policy,
+        b"close-input".to_vec(),
+        Vec::new(),
+    )
+    .expect("close workflow step should be accepted");
+    drop(actor);
+
+    let support =
+        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_types(
+            temp.path(),
+            TEST_STEP,
+            &[OPEN_POSITION, CLOSE_POSITION],
+        )
+        .expect("multi-workflow support should reopen after restart");
+    assert!(
+        support
+            .accepted_workflow_steps
+            .contains_key(&open_context.saga_id)
+    );
+    assert!(
+        support
+            .accepted_workflow_steps
+            .contains_key(&close_context.saga_id)
+    );
+}
+
+#[cfg(feature = "lmdb")]
+#[test]
+fn lmdb_multi_saga_open_only_replays_stale_journal_with_exact_type_evidence() {
+    const OPEN_POSITION: &str = "open_position";
+    const CLOSE_POSITION: &str = "close_position";
+
+    let temp = tempfile::tempdir().expect("tempdir should open");
+    let support =
+        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_types(
+            temp.path(),
+            TEST_STEP,
+            &[OPEN_POSITION, CLOSE_POSITION],
+        )
+        .expect("multi-workflow support should open");
+    support
+        .journal
+        .append(
+            SagaId::new(192),
+            ParticipantEvent::Quarantined {
+                reason: panic_quarantine_reason(
+                    ActiveSagaExecutionPhase::StepExecution,
+                    "untyped panic",
+                ),
+                quarantined_at_millis: SagaContext::now_millis(),
+            },
+        )
+        .expect("untyped legacy event should persist");
+    support
+        .journal
+        .append(
+            SagaId::new(193),
+            ParticipantEvent::SagaRegistered {
+                saga_type: OPEN_POSITION.into(),
+                step_name: TEST_STEP.into(),
+                registered_at_millis: 0,
+            },
+        )
+        .expect("typed registration should persist");
+    support
+        .journal
+        .append(
+            SagaId::new(193),
+            ParticipantEvent::Quarantined {
+                reason: panic_quarantine_reason(
+                    ActiveSagaExecutionPhase::StepExecution,
+                    "typed panic",
+                ),
+                quarantined_at_millis: SagaContext::now_millis(),
+            },
+        )
+        .expect("typed stale execution should persist");
+    drop(support);
+
+    let support =
+        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_types(
+            temp.path(),
+            TEST_STEP,
+            &[OPEN_POSITION, CLOSE_POSITION],
+        )
+        .expect("multi-workflow support should reopen");
+    assert!(matches!(
+        support.startup_recovery_events.as_slice(),
+        [SagaChoreographyEvent::SagaQuarantined { context, .. }]
+            if context.saga_id == SagaId::new(193)
+                && context.saga_type.as_ref() == OPEN_POSITION
     ));
 }
 
@@ -234,6 +368,8 @@ fn lmdb_open_does_not_rehydrate_expired_accepted_step() {
                 context: ctx.clone(),
                 participant_id: "order-manager".into(),
                 execution_id: execution_id.clone(),
+                saga_input: Vec::new(),
+                compensation_data: Vec::new(),
                 idle_timeout_millis: 1,
                 hard_timeout_millis: 1,
                 timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
@@ -266,12 +402,89 @@ fn lmdb_open_does_not_rehydrate_expired_accepted_step() {
     let completion = AcceptedStepCompletion {
         completed_at_millis: SagaContext::now_millis(),
         output: Vec::new(),
-        saga_input: Vec::new(),
         compensation_data: Vec::new(),
     };
     assert!(matches!(
         complete_accepted_workflow_step(&mut reopened, ctx.saga_id, execution_id, completion),
         Err(icanact_saga_choreography::AcceptedStepError::NotFound { .. })
+    ));
+}
+
+#[cfg(feature = "lmdb")]
+#[test]
+fn lmdb_open_rehydrates_expired_compensable_step_with_forward_tombstone() {
+    let temp = tempfile::tempdir().expect("tempdir should open");
+    let ctx = context(92, ORDER_LIFECYCLE, TEST_STEP);
+    let execution_id = StepExecutionId::new("external-92");
+    let support =
+        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_type(
+            temp.path(),
+            TEST_STEP,
+            ORDER_LIFECYCLE,
+        )
+        .expect("support should open before restart");
+    support
+        .journal
+        .append(
+            ctx.saga_id,
+            ParticipantEvent::AcceptedStepRecorded {
+                context: ctx.clone(),
+                participant_id: "order-manager".into(),
+                execution_id: execution_id.clone(),
+                saga_input: b"create-order-input".to_vec(),
+                compensation_data: b"cancel-order-92".to_vec(),
+                idle_timeout_millis: 1,
+                hard_timeout_millis: 1,
+                timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
+                    requires_compensation: true,
+                },
+                accepted_at_millis: 1,
+                deadline_at_millis: 1,
+                hard_deadline_at_millis: 1,
+            },
+        )
+        .expect("accepted metadata append should succeed");
+    drop(support);
+
+    let support =
+        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_type(
+            temp.path(),
+            TEST_STEP,
+            ORDER_LIFECYCLE,
+        )
+        .expect("support should reopen after restart");
+    assert_eq!(support.accepted_workflow_step_count(), 1);
+    assert_eq!(support.resolved_workflow_step_count(), 1);
+    assert_eq!(
+        support
+            .accepted_workflow_steps
+            .get(&ctx.saga_id)
+            .expect("expired compensable step must recover")
+            .compensation_data,
+        b"cancel-order-92"
+    );
+    assert!(support.startup_recovery_events.iter().any(|event| matches!(
+        event,
+        SagaChoreographyEvent::StepFailed {
+            context,
+            requires_compensation: true,
+            ..
+        } if context.saga_id == ctx.saga_id
+    )));
+
+    let mut reopened = LmdbAcceptedStepActor { saga: support };
+    assert!(matches!(
+        complete_accepted_workflow_step(
+            &mut reopened,
+            ctx.saga_id,
+            execution_id,
+            AcceptedStepCompletion {
+                completed_at_millis: SagaContext::now_millis(),
+                output: b"stale-success".to_vec(),
+                compensation_data: b"cancel-order-92".to_vec(),
+            },
+        ),
+        Err(icanact_saga_choreography::AcceptedStepError::AlreadyResolved { .. })
     ));
 }
 
@@ -491,6 +704,8 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
             context: context(14, ORDER_LIFECYCLE, TEST_STEP),
             participant_id: TEST_STEP.into(),
             execution_id: StepExecutionId::new("external-14"),
+            saga_input: Vec::new(),
+            compensation_data: Vec::new(),
             idle_timeout_millis: 1_000,
             hard_timeout_millis: 20_000,
             timeout_outcome: icanact_saga_choreography::AcceptedStepTimeoutOutcome::FailStep {
@@ -521,6 +736,10 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
                 context: context(15, ORDER_LIFECYCLE, TEST_STEP),
                 participant_id: TEST_STEP.into(),
                 execution_id: StepExecutionId::new("external-15"),
+                saga_input: Vec::new(),
+                // The accepted step itself has no release, but the resolver may
+                // still need to compensate an earlier completed effect.
+                compensation_data: Vec::new(),
                 idle_timeout_millis: 1,
                 hard_timeout_millis: 1,
                 timeout_outcome: icanact_saga_choreography::AcceptedStepTimeoutOutcome::FailStep {
@@ -541,11 +760,69 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
     .expect("startup recovery should collect expired accepted step");
     assert!(matches!(
         expired.as_slice(),
-        [SagaChoreographyEvent::StepFailed {
+        [SagaChoreographyEvent::StepAccepted {
+            timeouts_enabled: false,
+            ..
+        }, SagaChoreographyEvent::StepFailed {
             error,
             requires_compensation: true,
             ..
         }] if error.contains("accepted step hard timeout after restart")
+    ));
+
+    let failed_journal = InMemoryJournal::new();
+    let failed_dedupe = InMemoryDedupe::new();
+    failed_journal
+        .append(
+            SagaId::new(16),
+            ParticipantEvent::AcceptedStepRecorded {
+                context: context(16, ORDER_LIFECYCLE, TEST_STEP),
+                participant_id: TEST_STEP.into(),
+                execution_id: StepExecutionId::new("external-16"),
+                saga_input: b"input".to_vec(),
+                compensation_data: b"release-external-16".to_vec(),
+                idle_timeout_millis: 1_000,
+                hard_timeout_millis: 20_000,
+                timeout_outcome:
+                    icanact_saga_choreography::AcceptedStepTimeoutOutcome::QuarantineSaga,
+                accepted_at_millis: 100,
+                deadline_at_millis: 101,
+                hard_deadline_at_millis: 102,
+            },
+        )
+        .expect("accepted step should be durable");
+    failed_journal
+        .append(
+            SagaId::new(16),
+            ParticipantEvent::StepExecutionFailed {
+                error: "authoritative order rejection".into(),
+                requires_compensation: true,
+                failed_at_millis: 200,
+            },
+        )
+        .expect("accepted-step failure should be durable");
+    let failed = collect_startup_recovery_events_for_saga_type(
+        &failed_journal,
+        &failed_dedupe,
+        TEST_STEP,
+        ORDER_LIFECYCLE,
+    )
+    .expect("startup recovery should replay the durable accepted-step failure");
+    assert!(matches!(
+        failed.as_slice(),
+        [SagaChoreographyEvent::StepAccepted {
+            timeouts_enabled: false,
+            ..
+        }, SagaChoreographyEvent::StepFailed {
+            context,
+            participant_id,
+            error,
+            requires_compensation: true,
+            ..
+        }] if context.saga_id == SagaId::new(16)
+            && context.event_timestamp_millis == 200
+            && participant_id.as_ref() == TEST_STEP
+            && error.as_ref() == "authoritative order rejection"
     ));
 
     let terminal_entries = vec![JournalEntry {

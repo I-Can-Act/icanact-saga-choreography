@@ -63,6 +63,7 @@ mod stats;
 mod helpers;
 mod reply_registry;
 mod resolver;
+mod resolver_journal;
 #[cfg(any(test, feature = "test-harness"))]
 mod testkit;
 mod workflow_contract;
@@ -92,8 +93,8 @@ pub use state::{
     SagaParticipantState, SagaStateEntry, TimestampedEvent, Triggered,
 };
 pub use support::{
-    AcceptedWorkflowStep, HasSagaParticipantSupport, SagaParticipantSupport,
-    SagaParticipantSupportExt,
+    AcceptedWorkflowCompensation, AcceptedWorkflowStep, HasSagaParticipantSupport,
+    SagaParticipantSupport, SagaParticipantSupportExt,
 };
 
 // Events
@@ -104,9 +105,10 @@ pub use events::{
 
 // Errors
 pub use errors::{
-    AcceptedStepCompletion, AcceptedStepError, AcceptedStepFailure, AcceptedStepPolicy,
-    AcceptedStepPolicyError, AcceptedStepTimeoutOutcome, CompensationError, StepError,
-    StepExecutionId, StepOutput,
+    AcceptedCompensationCompletion, AcceptedCompensationFailure, AcceptedStepCompletion,
+    AcceptedStepError, AcceptedStepFailure, AcceptedStepPolicy, AcceptedStepPolicyError,
+    AcceptedStepTimeoutOutcome, CompensationError, CompensationOutput, StepError, StepExecutionId,
+    StepOutput,
 };
 
 // Traits
@@ -129,6 +131,12 @@ pub use helpers::{handle_async_saga_event_with_emit, handle_saga_event_with_emit
 pub use reply_registry::{SagaReplyToHandle, SagaReplyToResult};
 pub use resolver::{
     FailureAuthority, SuccessCriteria, TERMINAL_RESOLVER_STEP, TerminalPolicy, TerminalResolver,
+};
+#[cfg(feature = "lmdb")]
+pub use resolver_journal::lmdb::LmdbTerminalResolverJournal;
+pub use resolver_journal::{
+    InMemoryTerminalResolverJournal, TerminalResolverJournal, TerminalResolverJournalEntry,
+    TerminalResolverJournalError,
 };
 #[cfg(any(test, feature = "test-harness"))]
 pub use testkit::AsyncSagaParticipantHandle;

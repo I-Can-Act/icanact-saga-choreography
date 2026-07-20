@@ -109,10 +109,19 @@ pub fn compensation_requested(
     reason: impl Into<String>,
     steps_to_compensate: Vec<String>,
 ) -> SagaChoreographyEvent {
+    let failed_step = failed_step.into().into_boxed_str();
+    let reason = reason.into().into_boxed_str();
     SagaChoreographyEvent::CompensationRequested {
         context,
-        failed_step: failed_step.into().into_boxed_str(),
-        reason: reason.into().into_boxed_str(),
+        failed_step: failed_step.clone(),
+        reason: reason.clone(),
+        failure: crate::SagaFailureDetails {
+            step_name: failed_step,
+            participant_id: "testkit".into(),
+            error_code: None,
+            error_message: reason,
+            at_millis: 0,
+        },
         steps_to_compensate: steps_to_compensate
             .into_iter()
             .map(|step| step.into_boxed_str())
@@ -146,9 +155,11 @@ pub fn drive_workflow_scenario<A>(
 
 #[cfg(any(test, feature = "test-harness"))]
 use crate::{
-    AcceptedStepCompletion, AcceptedStepError, AcceptedStepFailure, AcceptedStepPolicy,
-    StepExecutionId, accept_workflow_step, complete_accepted_workflow_step,
-    fail_accepted_workflow_step, record_accepted_workflow_step_progress,
+    AcceptedCompensationCompletion, AcceptedCompensationFailure, AcceptedStepCompletion,
+    AcceptedStepError, AcceptedStepFailure, AcceptedStepPolicy, StepExecutionId,
+    accept_workflow_step, complete_accepted_workflow_compensation, complete_accepted_workflow_step,
+    fail_accepted_workflow_compensation, fail_accepted_workflow_step,
+    record_accepted_workflow_step_progress,
 };
 #[cfg(any(test, feature = "test-harness"))]
 use std::collections::HashSet;
@@ -363,11 +374,50 @@ impl SagaTestWorld {
         participant_id: Box<str>,
         execution_id: StepExecutionId,
         policy: AcceptedStepPolicy,
+        saga_input: Vec<u8>,
+        compensation_data: Vec<u8>,
     ) -> Result<icanact_core::local::PublishStats, AcceptedStepError>
     where
         A: SagaStateExt,
     {
-        let event = accept_workflow_step(actor, context, participant_id, execution_id, policy)?;
+        let event = accept_workflow_step(
+            actor,
+            context,
+            participant_id,
+            execution_id,
+            policy,
+            saga_input,
+            compensation_data,
+        )?;
+        Ok(self.publish(event))
+    }
+
+    pub fn complete_accepted_compensation<A>(
+        &self,
+        actor: &mut A,
+        saga_id: SagaId,
+        execution_id: StepExecutionId,
+        completion: AcceptedCompensationCompletion,
+    ) -> Result<icanact_core::local::PublishStats, AcceptedStepError>
+    where
+        A: SagaStateExt + HasSagaWorkflowParticipants,
+    {
+        let event =
+            complete_accepted_workflow_compensation(actor, saga_id, execution_id, completion)?;
+        Ok(self.publish(event))
+    }
+
+    pub fn fail_accepted_compensation<A>(
+        &self,
+        actor: &mut A,
+        saga_id: SagaId,
+        execution_id: StepExecutionId,
+        failure: AcceptedCompensationFailure,
+    ) -> Result<icanact_core::local::PublishStats, AcceptedStepError>
+    where
+        A: SagaStateExt,
+    {
+        let event = fail_accepted_workflow_compensation(actor, saga_id, execution_id, failure)?;
         Ok(self.publish(event))
     }
 
@@ -858,8 +908,8 @@ mod tests {
             &mut self,
             _context: &SagaContext,
             _compensation_data: &[u8],
-        ) -> Result<(), CompensationError> {
-            Ok(())
+        ) -> Result<crate::CompensationOutput, CompensationError> {
+            Ok(crate::CompensationOutput::Completed)
         }
     }
 

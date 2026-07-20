@@ -3,7 +3,7 @@
 use super::{AcceptedStepTimeoutOutcome, SagaContext, StepExecutionId};
 use icanact_core::ActorId;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct SagaFailureDetails {
     pub step_name: Box<str>,
     pub participant_id: Box<str>,
@@ -13,7 +13,7 @@ pub struct SagaFailureDetails {
 }
 
 /// Events published via the local saga event bus.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum SagaChoreographyEvent {
     /// Emitted when a new SAGA orchestration begins.
     SagaStarted {
@@ -55,8 +55,14 @@ pub enum SagaChoreographyEvent {
         deadline_at_millis: u64,
         /// Non-resettable hard deadline in epoch milliseconds.
         hard_deadline_at_millis: u64,
+        /// Whether timeout evaluation is armed for this accepted state.
+        /// Recovery hydration disarms it until the immediately following
+        /// authoritative failure is ingested.
+        timeouts_enabled: bool,
         /// Terminal outcome to apply when accepted step deadline expires.
         timeout_outcome: AcceptedStepTimeoutOutcome,
+        /// Whether this accepted step owns an effect that must be compensated on failure.
+        compensation_available: bool,
     },
     /// Emitted when a step completes successfully.
     StepCompleted {
@@ -91,6 +97,8 @@ pub enum SagaChoreographyEvent {
         failed_step: Box<str>,
         /// The reason compensation was requested.
         reason: Box<str>,
+        /// Exact failure evidence that triggered compensation.
+        failure: SagaFailureDetails,
         /// The list of step names that need to be compensated, in reverse execution order.
         steps_to_compensate: Vec<Box<str>>,
     },
@@ -98,6 +106,15 @@ pub enum SagaChoreographyEvent {
     CompensationStarted {
         /// The saga context containing identifiers and metadata.
         context: SagaContext,
+    },
+    /// Emitted when compensation was dispatched and awaits authoritative resolution.
+    #[non_exhaustive]
+    CompensationAccepted {
+        context: SagaContext,
+        participant_id: Box<str>,
+        execution_id: StepExecutionId,
+        deadline_at_millis: u64,
+        hard_deadline_at_millis: u64,
     },
     /// Emitted when compensation completes successfully.
     CompensationCompleted {
@@ -232,6 +249,7 @@ impl SagaChoreographyEvent {
             Self::StepFailed { context, .. } => context,
             Self::CompensationRequested { context, .. } => context,
             Self::CompensationStarted { context } => context,
+            Self::CompensationAccepted { context, .. } => context,
             Self::CompensationCompleted { context } => context,
             Self::CompensationFailed { context, .. } => context,
             Self::SagaQuarantined { context, .. } => context,
@@ -253,6 +271,7 @@ impl SagaChoreographyEvent {
             Self::StepFailed { .. } => "step_failed",
             Self::CompensationRequested { .. } => "compensation_requested",
             Self::CompensationStarted { .. } => "compensation_started",
+            Self::CompensationAccepted { .. } => "compensation_accepted",
             Self::CompensationCompleted { .. } => "compensation_completed",
             Self::CompensationFailed { .. } => "compensation_failed",
             Self::SagaQuarantined { .. } => "saga_quarantined",
@@ -291,7 +310,7 @@ impl SagaChoreographyEvent {
 }
 
 /// Acknowledgment status for step processing responses.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum AckStatus {
     /// The step has been accepted and queued for processing.
     Accepted,
@@ -370,6 +389,15 @@ pub enum ParticipantEvent {
         /// The timestamp (in milliseconds since epoch) when compensation failed.
         failed_at_millis: u64,
     },
+    /// Durable copy of the compensation request that caused external rollback work.
+    CompensationRequestRecorded {
+        context: SagaContext,
+        failed_step: Box<str>,
+        reason: Box<str>,
+        failure: SagaFailureDetails,
+        steps_to_compensate: Vec<Box<str>>,
+        requested_at_millis: u64,
+    },
     /// Emitted when a participant is quarantined due to unrecoverable errors.
     Quarantined {
         /// The reason the participant was quarantined.
@@ -391,11 +419,26 @@ pub enum ParticipantEvent {
         hard_timeout_millis: u64,
         /// Terminal outcome used when the accepted step times out.
         timeout_outcome: AcceptedStepTimeoutOutcome,
+        /// Original workflow input needed for deterministic recovery.
+        saga_input: Vec<u8>,
+        /// Compensation data for an accepted step that owns an external effect.
+        compensation_data: Vec<u8>,
         /// Timestamp when the participant accepted the step.
         accepted_at_millis: u64,
         /// Current resettable idle deadline in epoch milliseconds.
         deadline_at_millis: u64,
         /// Non-resettable hard deadline in epoch milliseconds.
+        hard_deadline_at_millis: u64,
+    },
+    /// Durable metadata for compensation awaiting authoritative resolution.
+    AcceptedCompensationRecorded {
+        context: SagaContext,
+        participant_id: Box<str>,
+        execution_id: StepExecutionId,
+        idle_timeout_millis: u64,
+        hard_timeout_millis: u64,
+        accepted_at_millis: u64,
+        deadline_at_millis: u64,
         hard_deadline_at_millis: u64,
     },
 }
