@@ -587,6 +587,31 @@ where
         .saga_support_mut()
         .accepted_workflow_compensations
         .remove(&saga_id);
+    let state_entry = actor.saga_states().remove(&saga_id);
+    match state_entry {
+        Some(SagaStateEntry::Compensating(state)) if failure.is_ambiguous => {
+            actor.saga_states().insert(
+                saga_id,
+                SagaStateEntry::Quarantined(
+                    state.quarantine(failure.reason.clone(), failure.failed_at_millis),
+                ),
+            );
+        }
+        Some(SagaStateEntry::Compensating(state)) => {
+            actor.saga_states().insert(
+                saga_id,
+                SagaStateEntry::Failed(state.fail(
+                    failure.reason.clone(),
+                    false,
+                    failure.failed_at_millis,
+                )),
+            );
+        }
+        Some(state) => {
+            actor.saga_states().insert(saga_id, state);
+        }
+        None => {}
+    }
     mark_accepted_step_resolved(actor, saga_id, execution_id);
     let mut context = accepted.context;
     context.event_timestamp_millis = failure.failed_at_millis;

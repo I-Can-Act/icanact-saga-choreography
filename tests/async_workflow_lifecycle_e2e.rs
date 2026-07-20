@@ -6,17 +6,18 @@ use std::time::Duration;
 
 use icanact_saga_choreography::durability::{
     apply_sync_workflow_participant_saga_ingress_with_hooks,
-    complete_accepted_workflow_compensation,
+    complete_accepted_workflow_compensation, fail_accepted_workflow_compensation,
 };
 use icanact_saga_choreography::{
-    AcceptedCompensationCompletion, AcceptedStepCompletion, AcceptedStepError, AcceptedStepFailure,
-    AcceptedStepPolicy, AcceptedStepTimeoutOutcome, CompensationError, CompensationOutput,
-    DependencySpec, FailureAuthority, HasSagaParticipantSupport, HasSagaWorkflowParticipants,
-    InMemoryDedupe, InMemoryJournal, ParticipantEvent, ParticipantJournal, SagaChoreographyEvent,
-    SagaContext, SagaId, SagaParticipantSupport, SagaStateExt, SagaTerminalOutcome, SagaTestWorld,
-    SagaWorkflowParticipant, StepError, StepExecutionId, StepOutput, SuccessCriteria,
-    TerminalPolicy, TerminalResolver, accept_workflow_step, accept_workflow_step_with_data,
-    complete_accepted_workflow_step, fail_accepted_workflow_step,
+    AcceptedCompensationCompletion, AcceptedCompensationFailure, AcceptedStepCompletion,
+    AcceptedStepError, AcceptedStepFailure, AcceptedStepPolicy, AcceptedStepTimeoutOutcome,
+    AcceptedWorkflowCompensation, CompensationError, CompensationOutput, DependencySpec,
+    FailureAuthority, HasSagaParticipantSupport, HasSagaWorkflowParticipants, InMemoryDedupe,
+    InMemoryJournal, ParticipantEvent, ParticipantJournal, SagaChoreographyEvent, SagaContext,
+    SagaId, SagaParticipantState, SagaParticipantSupport, SagaStateEntry, SagaStateExt,
+    SagaTerminalOutcome, SagaTestWorld, SagaWorkflowParticipant, StepError, StepExecutionId,
+    StepOutput, SuccessCriteria, TerminalPolicy, TerminalResolver, accept_workflow_step,
+    accept_workflow_step_with_data, complete_accepted_workflow_step, fail_accepted_workflow_step,
     poll_accepted_workflow_step_timeouts, record_accepted_workflow_step_progress,
     recover_accepted_workflow_steps_for_saga_type,
 };
@@ -1011,6 +1012,80 @@ fn accepted_compensation_can_complete_after_participant_restart() {
         SagaChoreographyEvent::CompensationCompleted { context }
             if context.saga_id == ctx.saga_id
     ));
+}
+
+#[test]
+fn accepted_compensation_failure_leaves_no_compensating_state() {
+    for is_ambiguous in [false, true] {
+        let mut actor = HarnessActor::default();
+        let ctx = context("create_order", if is_ambiguous { 41 } else { 40 });
+        let execution_id = StepExecutionId::new(if is_ambiguous {
+            "cancel-order-request-41"
+        } else {
+            "cancel-order-request-40"
+        });
+        let accepted_at_millis = 1_700_000_000_000;
+        let state = SagaParticipantState::new(
+            ctx.saga_id,
+            ctx.saga_type.clone(),
+            ctx.step_name.clone(),
+            ctx.correlation_id,
+            ctx.trace_id,
+            ctx.initiator_peer_id,
+            ctx.saga_started_at_millis,
+        )
+        .trigger("compensation_accepted", accepted_at_millis)
+        .start_execution(accepted_at_millis)
+        .start_compensation(accepted_at_millis);
+        actor
+            .saga
+            .saga_states
+            .insert(ctx.saga_id, SagaStateEntry::Compensating(state));
+        actor.saga.accepted_workflow_compensations.insert(
+            ctx.saga_id,
+            AcceptedWorkflowCompensation {
+                context: ctx.clone(),
+                participant_id: "order-manager".into(),
+                execution_id: execution_id.clone(),
+                policy: policy(AcceptedStepTimeoutOutcome::QuarantineSaga),
+                accepted_at_millis,
+                deadline_at_millis: accepted_at_millis + 100,
+                hard_deadline_at_millis: accepted_at_millis + 250,
+            },
+        );
+
+        let failed = fail_accepted_workflow_compensation(
+            &mut actor,
+            ctx.saga_id,
+            execution_id,
+            AcceptedCompensationFailure {
+                failed_at_millis: accepted_at_millis + 50,
+                reason: "authoritative cancel failure".into(),
+                is_ambiguous,
+            },
+        )
+        .expect("accepted compensation failure should resolve");
+
+        assert!(matches!(
+            failed,
+            SagaChoreographyEvent::CompensationFailed {
+                is_ambiguous: event_ambiguous,
+                ..
+            } if event_ambiguous == is_ambiguous
+        ));
+        if is_ambiguous {
+            assert!(matches!(
+                actor.saga.saga_states.get(&ctx.saga_id),
+                Some(SagaStateEntry::Quarantined(_))
+            ));
+        } else {
+            assert!(matches!(
+                actor.saga.saga_states.get(&ctx.saga_id),
+                Some(SagaStateEntry::Failed(_))
+            ));
+        }
+        assert_eq!(actor.saga.accepted_workflow_compensation_count(), 0);
+    }
 }
 
 #[test]
