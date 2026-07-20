@@ -214,6 +214,67 @@ fn lmdb_open_recovers_accepted_step_metadata_for_restart_completion() {
 
 #[cfg(feature = "lmdb")]
 #[test]
+fn lmdb_open_recovers_accepted_steps_for_each_declared_saga_type() {
+    const OPEN_POSITION: &str = "open_position";
+    const CLOSE_POSITION: &str = "close_position";
+
+    let temp = tempfile::tempdir().expect("tempdir should open");
+    let open_context = context(190, OPEN_POSITION, TEST_STEP);
+    let close_context = context(191, CLOSE_POSITION, TEST_STEP);
+    let policy = AcceptedStepPolicy {
+        idle_timeout: std::time::Duration::from_secs(60),
+        hard_timeout: std::time::Duration::from_secs(60),
+        timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
+            requires_compensation: true,
+        },
+    };
+    let support =
+        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_types(
+            temp.path(),
+            TEST_STEP,
+            &[OPEN_POSITION, CLOSE_POSITION],
+        )
+        .expect("multi-workflow support should open before restart");
+    let mut actor = LmdbAcceptedStepActor { saga: support };
+    accept_workflow_step(
+        &mut actor,
+        open_context.clone(),
+        "order-manager".into(),
+        StepExecutionId::new("open-190"),
+        policy.clone(),
+    )
+    .expect("open workflow step should be accepted");
+    accept_workflow_step(
+        &mut actor,
+        close_context.clone(),
+        "order-manager".into(),
+        StepExecutionId::new("close-191"),
+        policy,
+    )
+    .expect("close workflow step should be accepted");
+    drop(actor);
+
+    let support =
+        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_types(
+            temp.path(),
+            TEST_STEP,
+            &[OPEN_POSITION, CLOSE_POSITION],
+        )
+        .expect("multi-workflow support should reopen after restart");
+    assert!(
+        support
+            .accepted_workflow_steps
+            .contains_key(&open_context.saga_id)
+    );
+    assert!(
+        support
+            .accepted_workflow_steps
+            .contains_key(&close_context.saga_id)
+    );
+}
+
+#[cfg(feature = "lmdb")]
+#[test]
 fn lmdb_open_does_not_rehydrate_expired_accepted_step() {
     let temp = tempfile::tempdir().expect("tempdir should open");
     let ctx = context(91, ORDER_LIFECYCLE, TEST_STEP);

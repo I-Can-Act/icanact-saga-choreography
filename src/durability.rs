@@ -2696,15 +2696,37 @@ pub mod lmdb {
         step_name: &'static str,
         saga_type: &'static str,
     ) -> Result<SagaParticipantSupport<LmdbJournal, LmdbDedupe>, String> {
+        open_lmdb_participant_support_for_saga_types(base, step_name, &[saga_type])
+    }
+
+    pub fn open_lmdb_participant_support_for_saga_types(
+        base: &Path,
+        step_name: &'static str,
+        saga_types: &[&'static str],
+    ) -> Result<SagaParticipantSupport<LmdbJournal, LmdbDedupe>, String> {
+        if saga_types.is_empty() {
+            return Err("at least one recovery saga type is required".to_string());
+        }
         let journal = LmdbJournal::open(&base.join("journal")).map_err(|err| err.to_string())?;
         let dedupe = LmdbDedupe::open(&base.join("dedupe")).map_err(|err| err.to_string())?;
-        let startup_recovery_events =
-            collect_startup_recovery_events_for_saga_type(&journal, &dedupe, step_name, saga_type)
-                .map_err(|err| format!("startup recovery collection failed: {err:?}"))?;
+        let mut startup_recovery_events = Vec::new();
+        for saga_type in saga_types {
+            let mut events = collect_startup_recovery_events_for_saga_type(
+                &journal, &dedupe, step_name, saga_type,
+            )
+            .map_err(|err| {
+                format!("startup recovery collection failed for saga_type={saga_type}: {err:?}")
+            })?;
+            startup_recovery_events.append(&mut events);
+        }
         let mut support = SagaParticipantSupport::new(journal, dedupe)
             .with_startup_recovery_events(startup_recovery_events);
-        recover_accepted_workflow_steps_for_saga_type(&mut support, step_name, saga_type)
-            .map_err(|err| format!("accepted step recovery failed: {err:?}"))?;
+        for saga_type in saga_types {
+            recover_accepted_workflow_steps_for_saga_type(&mut support, step_name, saga_type)
+                .map_err(|err| {
+                    format!("accepted step recovery failed for saga_type={saga_type}: {err:?}")
+                })?;
+        }
         Ok(support)
     }
 
