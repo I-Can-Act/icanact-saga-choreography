@@ -2565,6 +2565,8 @@ fn collect_startup_recovery_events_for_saga_type_inner<
                 out.push(timeout_event);
                 continue;
             }
+            out.push(startup_accepted_step_replay_event(&accepted));
+            continue;
         }
         match classify_recovery(&entries, now, policy) {
             RecoveryDecision::QuarantineStale => {

@@ -928,6 +928,62 @@ fn compensating_failure_tombstones_forward_execution_but_keeps_compensation_data
 }
 
 #[test]
+fn live_accepted_step_replays_its_exact_deadline_policy_after_restart() {
+    let journal = Arc::new(InMemoryJournal::new());
+    let mut actor = RestartedHarnessActor::new(journal.clone());
+    let ctx = context("create_order", 42);
+    let accepted = accept_workflow_step_with_state(
+        &mut actor,
+        ctx.clone(),
+        "order-manager".into(),
+        StepExecutionId::new("effect-42"),
+        AcceptedStepPolicy {
+            idle_timeout: Duration::from_secs(60),
+            hard_timeout: Duration::from_secs(120),
+            timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
+                requires_compensation: true,
+            },
+        },
+        b"create-order-input".to_vec(),
+        b"cancel-order-42".to_vec(),
+    )
+    .expect("step should be accepted before restart");
+    let SagaChoreographyEvent::StepAccepted {
+        deadline_at_millis,
+        hard_deadline_at_millis,
+        ..
+    } = accepted
+    else {
+        panic!("expected accepted step event");
+    };
+
+    let recovery_events = collect_startup_recovery_events_for_saga_type(
+        journal.as_ref(),
+        &InMemoryDedupe::new(),
+        "create_order",
+        "order_lifecycle",
+    )
+    .expect("live accepted step should recover");
+    assert!(matches!(
+        recovery_events.as_slice(),
+        [SagaChoreographyEvent::StepAccepted {
+            context,
+            execution_id,
+            deadline_at_millis: replayed_deadline,
+            hard_deadline_at_millis: replayed_hard_deadline,
+            timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
+                requires_compensation: true,
+            },
+            compensation_available: true,
+            ..
+        }] if context.saga_id == ctx.saga_id
+            && execution_id.as_ref() == "effect-42"
+            && *replayed_deadline == deadline_at_millis
+            && *replayed_hard_deadline == hard_deadline_at_millis
+    ));
+}
+
+#[test]
 fn compensating_failure_restart_keeps_forward_execution_tombstoned() {
     let journal = Arc::new(InMemoryJournal::new());
     let mut actor = RestartedHarnessActor::new(journal.clone());
