@@ -569,6 +569,11 @@ fn timeout_events(
         return events;
     }
     if !state.accepted_compensations.is_empty() {
+        if let Some(event) = accepted_compensation_overall_timeout_event(policy, state, now_millis)
+        {
+            state.terminal_latched = true;
+            return vec![event];
+        }
         return Vec::new();
     }
     if let Some(timeout_event) = timeout_terminal_event(policy, state, now_millis) {
@@ -576,6 +581,31 @@ fn timeout_events(
         return vec![timeout_event];
     }
     Vec::new()
+}
+
+fn accepted_compensation_overall_timeout_event(
+    policy: &TerminalPolicy,
+    state: &SagaResolutionState,
+    now_millis: u64,
+) -> Option<SagaChoreographyEvent> {
+    let overall_timeout_ms = policy.overall_timeout.as_millis() as u64;
+    if now_millis.saturating_sub(state.started_at_millis) <= overall_timeout_ms {
+        return None;
+    }
+    let (step_name, accepted) = state
+        .accepted_compensations
+        .iter()
+        .min_by(|(left, _), (right, _)| left.cmp(right))?;
+    Some(SagaChoreographyEvent::SagaQuarantined {
+        context: terminal_context_at(&state.last_context, now_millis),
+        reason: format!(
+            "overall_timeout after {overall_timeout_ms}ms with unresolved accepted compensation: step={} execution_id={} policy={}",
+            step_name, accepted.execution_id, policy.policy_id
+        )
+        .into(),
+        step: step_name.clone(),
+        participant_id: accepted.participant_id.clone(),
+    })
 }
 
 fn accepted_compensation_timeout_event(
@@ -1551,6 +1581,72 @@ mod tests {
             resolver.poll_timeouts_at(1_201).is_empty(),
             "the forward timeout must not overwrite failure evidence while rollback owns the step"
         );
+    }
+
+    #[test]
+    fn accepted_compensation_preserves_hard_overall_timeout() {
+        let mut policy = TerminalPolicy::order_lifecycle_default();
+        policy.overall_timeout = Duration::from_millis(100);
+        policy.stalled_timeout = Duration::from_millis(50);
+        let mut resolver = TerminalResolver::new(policy);
+        let context = ctx_at("create_order", 25, 1_000, 1_000);
+        assert!(
+            resolver
+                .ingest_at(
+                    &SagaChoreographyEvent::SagaStarted {
+                        context: context.clone(),
+                        payload: Vec::new(),
+                    },
+                    1_000,
+                )
+                .is_empty()
+        );
+        assert!(
+            resolver
+                .ingest_at(
+                    &SagaChoreographyEvent::CompensationRequested {
+                        context: context.clone(),
+                        failed_step: "create_order".into(),
+                        reason: "create failed".into(),
+                        failure: crate::SagaFailureDetails {
+                            step_name: "create_order".into(),
+                            participant_id: "order-manager".into(),
+                            error_code: Some("exchange_rejected".into()),
+                            error_message: "create failed".into(),
+                            at_millis: 1_010,
+                        },
+                        steps_to_compensate: vec!["create_order".into()],
+                    },
+                    1_010,
+                )
+                .is_empty()
+        );
+        assert!(
+            resolver
+                .ingest_at(
+                    &SagaChoreographyEvent::CompensationAccepted {
+                        context: context.clone(),
+                        participant_id: "order-manager".into(),
+                        execution_id: StepExecutionId::new("cancel-25"),
+                        deadline_at_millis: 5_000,
+                        hard_deadline_at_millis: 10_000,
+                    },
+                    1_020,
+                )
+                .is_empty()
+        );
+        assert!(
+            resolver.poll_timeouts_at(1_060).is_empty(),
+            "accepted compensation should suppress only the stalled-progress timeout"
+        );
+        assert!(matches!(
+            resolver.poll_timeouts_at(1_101).as_slice(),
+            [SagaChoreographyEvent::SagaQuarantined {
+                reason,
+                step,
+                ..
+            }] if reason.contains("overall_timeout") && step.as_ref() == "create_order"
+        ));
     }
 
     #[test]
