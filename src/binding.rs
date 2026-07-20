@@ -688,8 +688,8 @@ mod tests {
             _actor: &mut BindingActor,
             _context: &SagaContext,
             _compensation_data: &[u8],
-        ) -> Result<(), CompensationError> {
-            Ok(())
+        ) -> Result<crate::CompensationOutput, CompensationError> {
+            Ok(crate::CompensationOutput::Completed)
         }
     }
 
@@ -719,8 +719,8 @@ mod tests {
             _actor: &mut DuplicateBindingActor,
             _context: &SagaContext,
             _compensation_data: &[u8],
-        ) -> Result<(), CompensationError> {
-            Ok(())
+        ) -> Result<crate::CompensationOutput, CompensationError> {
+            Ok(crate::CompensationOutput::Completed)
         }
     }
 
@@ -750,8 +750,8 @@ mod tests {
             _actor: &mut DuplicateBindingActor,
             _context: &SagaContext,
             _compensation_data: &[u8],
-        ) -> Result<(), CompensationError> {
-            Ok(())
+        ) -> Result<crate::CompensationOutput, CompensationError> {
+            Ok(crate::CompensationOutput::Completed)
         }
     }
 

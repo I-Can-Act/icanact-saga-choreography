@@ -126,8 +126,8 @@ impl SagaParticipant for TestParticipant {
         &mut self,
         _context: &SagaContext,
         _compensation_data: &[u8],
-    ) -> Result<(), CompensationError> {
-        Ok(())
+    ) -> Result<icanact_saga_choreography::CompensationOutput, CompensationError> {
+        Ok(icanact_saga_choreography::CompensationOutput::Completed)
     }
 }
 
@@ -195,7 +195,6 @@ fn lmdb_open_recovers_accepted_step_metadata_for_restart_completion() {
         AcceptedStepCompletion {
             completed_at_millis: 1_700_000_000_900,
             output: b"completed-after-lmdb-restart".to_vec(),
-            saga_input: b"input".to_vec(),
             compensation_data: Vec::new(),
         },
     )
@@ -234,6 +233,8 @@ fn lmdb_open_does_not_rehydrate_expired_accepted_step() {
                 context: ctx.clone(),
                 participant_id: "order-manager".into(),
                 execution_id: execution_id.clone(),
+                saga_input: Vec::new(),
+                compensation_data: Vec::new(),
                 idle_timeout_millis: 1,
                 hard_timeout_millis: 1,
                 timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
@@ -266,7 +267,6 @@ fn lmdb_open_does_not_rehydrate_expired_accepted_step() {
     let completion = AcceptedStepCompletion {
         completed_at_millis: SagaContext::now_millis(),
         output: Vec::new(),
-        saga_input: Vec::new(),
         compensation_data: Vec::new(),
     };
     assert!(matches!(
@@ -491,6 +491,8 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
             context: context(14, ORDER_LIFECYCLE, TEST_STEP),
             participant_id: TEST_STEP.into(),
             execution_id: StepExecutionId::new("external-14"),
+            saga_input: Vec::new(),
+            compensation_data: Vec::new(),
             idle_timeout_millis: 1_000,
             hard_timeout_millis: 20_000,
             timeout_outcome: icanact_saga_choreography::AcceptedStepTimeoutOutcome::FailStep {
@@ -521,6 +523,8 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
                 context: context(15, ORDER_LIFECYCLE, TEST_STEP),
                 participant_id: TEST_STEP.into(),
                 execution_id: StepExecutionId::new("external-15"),
+                saga_input: Vec::new(),
+                compensation_data: Vec::new(),
                 idle_timeout_millis: 1,
                 hard_timeout_millis: 1,
                 timeout_outcome: icanact_saga_choreography::AcceptedStepTimeoutOutcome::FailStep {

@@ -91,6 +91,9 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
             .accepted_workflow_steps
             .remove(&saga_id);
         self.saga_support_mut()
+            .accepted_workflow_compensations
+            .remove(&saga_id);
+        self.saga_support_mut()
             .resolved_workflow_steps
             .retain(|(resolved_saga_id, _)| *resolved_saga_id != saga_id);
     }

@@ -16,6 +16,19 @@ pub struct AcceptedWorkflowStep {
     pub participant_id: Box<str>,
     pub execution_id: StepExecutionId,
     pub policy: AcceptedStepPolicy,
+    pub saga_input: Vec<u8>,
+    pub compensation_data: Vec<u8>,
+    pub accepted_at_millis: u64,
+    pub deadline_at_millis: u64,
+    pub hard_deadline_at_millis: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct AcceptedWorkflowCompensation {
+    pub context: SagaContext,
+    pub participant_id: Box<str>,
+    pub execution_id: StepExecutionId,
+    pub policy: AcceptedStepPolicy,
     pub accepted_at_millis: u64,
     pub deadline_at_millis: u64,
     pub hard_deadline_at_millis: u64,
@@ -38,6 +51,7 @@ where
     pub terminal_saga_order: VecDeque<SagaId>,
     pub saga_run_started_at: HashMap<SagaId, u64>,
     pub accepted_workflow_steps: HashMap<SagaId, AcceptedWorkflowStep>,
+    pub accepted_workflow_compensations: HashMap<SagaId, AcceptedWorkflowCompensation>,
     pub resolved_workflow_steps: HashSet<(SagaId, StepExecutionId)>,
     pub journal: J,
     pub dedupe: D,
@@ -60,6 +74,7 @@ where
             terminal_saga_order: VecDeque::new(),
             saga_run_started_at: HashMap::new(),
             accepted_workflow_steps: HashMap::new(),
+            accepted_workflow_compensations: HashMap::new(),
             resolved_workflow_steps: HashSet::new(),
             journal,
             dedupe,
@@ -99,6 +114,10 @@ where
         self.accepted_workflow_steps.len()
     }
 
+    pub fn accepted_workflow_compensation_count(&self) -> usize {
+        self.accepted_workflow_compensations.len()
+    }
+
     pub fn has_resolved_workflow_step(
         &self,
         saga_id: SagaId,
@@ -132,6 +151,10 @@ where
             .field(
                 "accepted_workflow_steps_len",
                 &self.accepted_workflow_steps.len(),
+            )
+            .field(
+                "accepted_workflow_compensations_len",
+                &self.accepted_workflow_compensations.len(),
             )
             .field(
                 "resolved_workflow_steps_len",

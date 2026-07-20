@@ -1,16 +1,16 @@
 use icanact_saga_choreography::durability::apply_async_participant_saga_ingress_with_hooks;
 use icanact_saga_choreography::{
-    AsyncSagaParticipant, CompensationError, DependencySpec, HasSagaParticipantSupport,
-    InMemoryDedupe, InMemoryJournal, ParticipantEvent, ParticipantJournal, PeerId,
-    SagaChoreographyEvent, SagaContext, SagaId, SagaParticipantSupport, SagaStateEntry,
-    SagaStateExt, StepError, StepOutput,
+    AsyncSagaParticipant, CompensationError, CompensationOutput, DependencySpec,
+    HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal, ParticipantEvent,
+    ParticipantJournal, PeerId, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipantSupport,
+    SagaStateEntry, SagaStateExt, StepError, StepOutput,
 };
 
 struct AsyncTestParticipant {
     saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
     dependency_spec: DependencySpec,
     execute_output: Result<StepOutput, StepError>,
-    compensation_result: Result<(), CompensationError>,
+    compensation_result: Result<CompensationOutput, CompensationError>,
     executed_inputs: Vec<Vec<u8>>,
     compensation_calls: usize,
 }
@@ -24,7 +24,7 @@ impl Default for AsyncTestParticipant {
                 output: b"ok".to_vec(),
                 compensation_data: vec![1, 2, 3],
             }),
-            compensation_result: Ok(()),
+            compensation_result: Ok(CompensationOutput::Completed),
             executed_inputs: Vec::new(),
             compensation_calls: 0,
         }
@@ -73,7 +73,8 @@ impl AsyncSagaParticipant for AsyncTestParticipant {
         &'a mut self,
         _context: &'a SagaContext,
         _compensation_data: &'a [u8],
-    ) -> icanact_saga_choreography::SagaBoxFuture<'a, Result<(), CompensationError>> {
+    ) -> icanact_saga_choreography::SagaBoxFuture<'a, Result<CompensationOutput, CompensationError>>
+    {
         self.compensation_calls += 1;
         let result = self.compensation_result.clone();
         Box::pin(async move { result })

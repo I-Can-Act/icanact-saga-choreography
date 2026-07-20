@@ -92,8 +92,8 @@ pub use state::{
     SagaParticipantState, SagaStateEntry, TimestampedEvent, Triggered,
 };
 pub use support::{
-    AcceptedWorkflowStep, HasSagaParticipantSupport, SagaParticipantSupport,
-    SagaParticipantSupportExt,
+    AcceptedWorkflowCompensation, AcceptedWorkflowStep, HasSagaParticipantSupport,
+    SagaParticipantSupport, SagaParticipantSupportExt,
 };
 
 // Events
@@ -104,9 +104,10 @@ pub use events::{
 
 // Errors
 pub use errors::{
-    AcceptedStepCompletion, AcceptedStepError, AcceptedStepFailure, AcceptedStepPolicy,
-    AcceptedStepPolicyError, AcceptedStepTimeoutOutcome, CompensationError, StepError,
-    StepExecutionId, StepOutput,
+    AcceptedCompensationCompletion, AcceptedCompensationFailure, AcceptedStepCompletion,
+    AcceptedStepError, AcceptedStepFailure, AcceptedStepPolicy, AcceptedStepPolicyError,
+    AcceptedStepTimeoutOutcome, CompensationError, CompensationOutput, StepError, StepExecutionId,
+    StepOutput,
 };
 
 // Traits

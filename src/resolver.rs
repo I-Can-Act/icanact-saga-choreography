@@ -154,6 +154,7 @@ struct SagaResolutionState {
     pending_compensation_steps: HashSet<Box<str>>,
     pending_failure: Option<SagaFailureDetails>,
     accepted_steps: HashMap<Box<str>, AcceptedStepResolverState>,
+    accepted_compensations: HashMap<Box<str>, AcceptedCompensationResolverState>,
     started_at_millis: u64,
     last_progress_at_millis: u64,
     last_context: SagaContext,
@@ -167,6 +168,14 @@ struct AcceptedStepResolverState {
     deadline_at_millis: u64,
     hard_deadline_at_millis: u64,
     timeout_outcome: AcceptedStepTimeoutOutcome,
+}
+
+#[derive(Clone, Debug)]
+struct AcceptedCompensationResolverState {
+    participant_id: Box<str>,
+    execution_id: StepExecutionId,
+    deadline_at_millis: u64,
+    hard_deadline_at_millis: u64,
 }
 
 impl SagaResolutionState {
@@ -183,6 +192,7 @@ impl SagaResolutionState {
             pending_compensation_steps: HashSet::new(),
             pending_failure: None,
             accepted_steps: HashMap::new(),
+            accepted_compensations: HashMap::new(),
             started_at_millis,
             last_progress_at_millis: progress_at_millis,
             last_context: seed_context.clone(),
@@ -264,10 +274,20 @@ impl TerminalResolver {
                 deadline_at_millis,
                 hard_deadline_at_millis,
                 timeout_outcome,
+                compensation_available,
             } => {
-                state.started_steps.insert(context.step_name.clone());
+                let step_name = context.step_name.clone();
+                state.started_steps.insert(step_name.clone());
+                if *compensation_available
+                    && !state
+                        .compensable_steps
+                        .iter()
+                        .any(|candidate| candidate == &step_name)
+                {
+                    state.compensable_steps.push(step_name.clone());
+                }
                 state.accepted_steps.insert(
-                    context.step_name.clone(),
+                    step_name,
                     AcceptedStepResolverState {
                         participant_id: participant_id.clone(),
                         execution_id: execution_id.clone(),
@@ -297,6 +317,10 @@ impl TerminalResolver {
                         .any(|step| step == &step_name)
                 {
                     state.compensable_steps.push(step_name);
+                } else if !*compensation_available {
+                    state
+                        .compensable_steps
+                        .retain(|candidate| candidate != &step_name);
                 }
                 if self
                     .policy
@@ -337,7 +361,27 @@ impl TerminalResolver {
                     &mut out,
                 );
             }
+            SagaChoreographyEvent::CompensationAccepted {
+                context,
+                participant_id,
+                execution_id,
+                deadline_at_millis,
+                hard_deadline_at_millis,
+            } => {
+                state.accepted_compensations.insert(
+                    context.step_name.clone(),
+                    AcceptedCompensationResolverState {
+                        participant_id: participant_id.clone(),
+                        execution_id: execution_id.clone(),
+                        deadline_at_millis: *deadline_at_millis,
+                        hard_deadline_at_millis: *hard_deadline_at_millis,
+                    },
+                );
+            }
             SagaChoreographyEvent::CompensationCompleted { context } => {
+                state
+                    .accepted_compensations
+                    .remove(context.step_name.as_ref());
                 if state.compensation_requested {
                     state
                         .pending_compensation_steps
@@ -369,6 +413,9 @@ impl TerminalResolver {
                 error,
                 is_ambiguous,
             } => {
+                state
+                    .accepted_compensations
+                    .remove(context.step_name.as_ref());
                 if *is_ambiguous {
                     out.push(SagaChoreographyEvent::SagaQuarantined {
                         context: terminal_context(context),
@@ -473,6 +520,7 @@ fn is_progress_event(event: &SagaChoreographyEvent) -> bool {
             | SagaChoreographyEvent::StepFailed { .. }
             | SagaChoreographyEvent::CompensationRequested { .. }
             | SagaChoreographyEvent::CompensationStarted { .. }
+            | SagaChoreographyEvent::CompensationAccepted { .. }
             | SagaChoreographyEvent::CompensationCompleted { .. }
             | SagaChoreographyEvent::CompensationFailed { .. }
     )
@@ -483,14 +531,56 @@ fn timeout_events(
     state: &mut SagaResolutionState,
     now_millis: u64,
 ) -> Vec<SagaChoreographyEvent> {
+    if let Some(event) = accepted_compensation_timeout_event(state, now_millis) {
+        state.terminal_latched = true;
+        return vec![event];
+    }
     if let Some(events) = accepted_step_timeout_events(policy, state, now_millis) {
         return events;
+    }
+    if !state.accepted_compensations.is_empty() {
+        return Vec::new();
     }
     if let Some(timeout_event) = timeout_terminal_event(policy, state, now_millis) {
         state.terminal_latched = true;
         return vec![timeout_event];
     }
     Vec::new()
+}
+
+fn accepted_compensation_timeout_event(
+    state: &mut SagaResolutionState,
+    now_millis: u64,
+) -> Option<SagaChoreographyEvent> {
+    let expired = state
+        .accepted_compensations
+        .iter()
+        .find_map(|(step_name, accepted)| {
+            if now_millis > accepted.hard_deadline_at_millis {
+                Some((step_name.clone(), accepted.clone(), "hard"))
+            } else if now_millis > accepted.deadline_at_millis {
+                Some((step_name.clone(), accepted.clone(), "idle"))
+            } else {
+                None
+            }
+        })?;
+    let (step_name, accepted, timeout_kind) = expired;
+    state.accepted_compensations.remove(step_name.as_ref());
+    let mut context = state.last_context.next_step(step_name.clone());
+    context.event_timestamp_millis = now_millis;
+    Some(SagaChoreographyEvent::SagaQuarantined {
+        context: terminal_context_at(&context, now_millis),
+        reason: format!(
+            "accepted compensation {timeout_kind} timeout: step={} execution_id={} deadline_at_millis={} hard_deadline_at_millis={}",
+            step_name,
+            accepted.execution_id,
+            accepted.deadline_at_millis,
+            accepted.hard_deadline_at_millis
+        )
+        .into(),
+        step: step_name,
+        participant_id: accepted.participant_id,
+    })
 }
 
 fn accepted_step_timeout_events(
@@ -1090,6 +1180,7 @@ mod tests {
             timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
                 requires_compensation: false,
             },
+            compensation_available: false,
         };
         let _ = resolver.ingest_at(&accepted, 1_010);
 
@@ -1119,6 +1210,7 @@ mod tests {
             deadline_at_millis: 1_110,
             hard_deadline_at_millis: 1_120,
             timeout_outcome: AcceptedStepTimeoutOutcome::QuarantineSaga,
+            compensation_available: false,
         };
         let _ = resolver.ingest_at(&accepted, 1_010);
 
@@ -1160,6 +1252,7 @@ mod tests {
             deadline_at_millis: 1_110,
             hard_deadline_at_millis: 1_120,
             timeout_outcome: AcceptedStepTimeoutOutcome::QuarantineSaga,
+            compensation_available: false,
         };
         let _ = resolver.ingest_at(&accepted, 1_010);
 
@@ -1214,6 +1307,7 @@ mod tests {
                 timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
                     requires_compensation: false,
                 },
+                compensation_available: false,
             },
             1_020,
         );
@@ -1227,6 +1321,7 @@ mod tests {
                 timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
                     requires_compensation: true,
                 },
+                compensation_available: false,
             },
             1_030,
         );

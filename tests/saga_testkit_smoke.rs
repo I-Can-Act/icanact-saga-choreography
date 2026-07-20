@@ -137,9 +137,9 @@ impl SagaParticipant for SyncParticipant {
         &mut self,
         _context: &icanact_saga_choreography::SagaContext,
         _compensation_data: &[u8],
-    ) -> Result<(), CompensationError> {
+    ) -> Result<icanact_saga_choreography::CompensationOutput, CompensationError> {
         self.compensation_calls += 1;
-        Ok(())
+        Ok(icanact_saga_choreography::CompensationOutput::Completed)
     }
 }
 
@@ -247,8 +247,11 @@ impl AsyncSagaParticipant for AsyncParticipant {
         &'a mut self,
         _context: &'a icanact_saga_choreography::SagaContext,
         _compensation_data: &'a [u8],
-    ) -> icanact_saga_choreography::SagaBoxFuture<'a, Result<(), CompensationError>> {
-        Box::pin(async { Ok(()) })
+    ) -> icanact_saga_choreography::SagaBoxFuture<
+        'a,
+        Result<icanact_saga_choreography::CompensationOutput, CompensationError>,
+    > {
+        Box::pin(async { Ok(icanact_saga_choreography::CompensationOutput::Completed) })
     }
 }
 
@@ -497,8 +500,8 @@ impl SagaWorkflowParticipant<WorkflowActor> for AlphaWorkflow {
         _actor: &mut WorkflowActor,
         _context: &icanact_saga_choreography::SagaContext,
         _compensation_data: &[u8],
-    ) -> Result<(), CompensationError> {
-        Ok(())
+    ) -> Result<icanact_saga_choreography::CompensationOutput, CompensationError> {
+        Ok(icanact_saga_choreography::CompensationOutput::Completed)
     }
 }
 
@@ -529,8 +532,8 @@ impl SagaWorkflowParticipant<WorkflowActor> for BetaWorkflow {
         _actor: &mut WorkflowActor,
         _context: &icanact_saga_choreography::SagaContext,
         _compensation_data: &[u8],
-    ) -> Result<(), CompensationError> {
-        Ok(())
+    ) -> Result<icanact_saga_choreography::CompensationOutput, CompensationError> {
+        Ok(icanact_saga_choreography::CompensationOutput::Completed)
     }
 }
 
@@ -632,8 +635,8 @@ impl SagaWorkflowParticipant<DuplicateWorkflowActor> for DuplicateWorkflowOne {
         _actor: &mut DuplicateWorkflowActor,
         _context: &icanact_saga_choreography::SagaContext,
         _compensation_data: &[u8],
-    ) -> Result<(), CompensationError> {
-        Ok(())
+    ) -> Result<icanact_saga_choreography::CompensationOutput, CompensationError> {
+        Ok(icanact_saga_choreography::CompensationOutput::Completed)
     }
 }
 
@@ -663,8 +666,8 @@ impl SagaWorkflowParticipant<DuplicateWorkflowActor> for DuplicateWorkflowTwo {
         _actor: &mut DuplicateWorkflowActor,
         _context: &icanact_saga_choreography::SagaContext,
         _compensation_data: &[u8],
-    ) -> Result<(), CompensationError> {
-        Ok(())
+    ) -> Result<icanact_saga_choreography::CompensationOutput, CompensationError> {
+        Ok(icanact_saga_choreography::CompensationOutput::Completed)
     }
 }
 

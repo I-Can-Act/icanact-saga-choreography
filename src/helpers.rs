@@ -1,7 +1,7 @@
 //! Helper functions for saga handling
 
 use crate::{
-    AsyncSagaParticipant, CompensationError, DependencySpec, ParticipantEvent,
+    AsyncSagaParticipant, CompensationError, CompensationOutput, DependencySpec, ParticipantEvent,
     SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant, SagaParticipantState,
     SagaStateEntry, SagaStateExt, StepError, StepOutput,
 };
@@ -337,6 +337,7 @@ fn dedupe_key_for_event(event: &SagaChoreographyEvent) -> String {
         SagaChoreographyEvent::StepCompleted { .. }
         | SagaChoreographyEvent::StepFailed { .. }
         | SagaChoreographyEvent::CompensationStarted { .. }
+        | SagaChoreographyEvent::CompensationAccepted { .. }
         | SagaChoreographyEvent::CompensationCompleted { .. }
         | SagaChoreographyEvent::CompensationFailed { .. }
         | SagaChoreographyEvent::SagaCompleted { .. }
@@ -477,6 +478,34 @@ fn complete_step<P, F>(
     F: FnMut(SagaChoreographyEvent),
 {
     let saga_id = context.saga_id;
+    if let StepOutput::Accepted {
+        execution_id,
+        policy,
+        compensation_data,
+    } = output
+    {
+        match crate::durability::accept_started_workflow_step(
+            participant,
+            context.next_step(participant.step_name().into()),
+            participant.participant_id_owned(),
+            execution_id,
+            policy,
+            saga_input,
+            compensation_data,
+        ) {
+            Ok(event) => emit(event),
+            Err(error) => fail_step(
+                participant,
+                context,
+                StepError::Terminal {
+                    reason: format!("accepted step persistence failed: {error:?}").into(),
+                },
+                now,
+                emit,
+            ),
+        }
+        return;
+    }
     let (out_data, comp_data, compensation_available) = match output {
         StepOutput::Completed {
             output,
@@ -493,6 +522,7 @@ fn complete_step<P, F>(
             let compensation_available = !compensation_data.is_empty();
             (output, compensation_data, compensation_available)
         }
+        StepOutput::Accepted { .. } => unreachable!("accepted output returned above"),
     };
 
     // State: Executing -> Completed
@@ -534,6 +564,34 @@ fn complete_step_async<P, F>(
     F: FnMut(SagaChoreographyEvent),
 {
     let saga_id = context.saga_id;
+    if let StepOutput::Accepted {
+        execution_id,
+        policy,
+        compensation_data,
+    } = output
+    {
+        match crate::durability::accept_started_workflow_step(
+            participant,
+            context.next_step(participant.step_name().into()),
+            participant.participant_id_owned(),
+            execution_id,
+            policy,
+            saga_input,
+            compensation_data,
+        ) {
+            Ok(event) => emit(event),
+            Err(error) => fail_step_async(
+                participant,
+                context,
+                StepError::Terminal {
+                    reason: format!("accepted async step persistence failed: {error:?}").into(),
+                },
+                now,
+                emit,
+            ),
+        }
+        return;
+    }
     let (out_data, comp_data, compensation_available) = match output {
         StepOutput::Completed {
             output,
@@ -550,6 +608,7 @@ fn complete_step_async<P, F>(
             let compensation_available = !compensation_data.is_empty();
             (output, compensation_data, compensation_available)
         }
+        StepOutput::Accepted { .. } => unreachable!("accepted output returned above"),
     };
 
     if let Some(SagaStateEntry::Executing(state)) = participant.saga_states().remove(&saga_id) {
@@ -673,33 +732,82 @@ fn compensate_wrapper_with_emit<P, F>(
 {
     let saga_id = context.saga_id;
 
-    // Get compensation data from Completed state
-    if let Some(SagaStateEntry::Completed(state)) = participant.saga_states().remove(&saga_id) {
-        let comp_data = state.state.compensation_data.clone();
+    let accepted_compensation_data = participant
+        .saga_support()
+        .accepted_workflow_steps
+        .get(&saga_id)
+        .map(|accepted| accepted.compensation_data.clone());
+    let state_entry = participant.saga_states().remove(&saga_id);
+    let (comp_data, new_state) = match state_entry {
+        Some(SagaStateEntry::Completed(state)) => {
+            let comp_data = state.state.compensation_data.clone();
+            (comp_data, state.start_compensation(now))
+        }
+        Some(SagaStateEntry::Executing(state)) => {
+            let Some(comp_data) = accepted_compensation_data else {
+                participant
+                    .saga_states()
+                    .insert(saga_id, SagaStateEntry::Executing(state));
+                return;
+            };
+            (comp_data, state.start_compensation(now))
+        }
+        Some(other) => {
+            participant.saga_states().insert(saga_id, other);
+            return;
+        }
+        None => return,
+    };
+    participant
+        .saga_states()
+        .insert(saga_id, SagaStateEntry::Compensating(new_state));
+    if let Some(accepted) = participant
+        .saga_support_mut()
+        .accepted_workflow_steps
+        .remove(&saga_id)
+    {
+        crate::durability::mark_accepted_step_resolved(participant, saga_id, accepted.execution_id);
+    }
 
-        // State: Completed -> Compensating
-        let new_state = state.start_compensation(now);
-        participant
-            .saga_states()
-            .insert(saga_id, SagaStateEntry::Compensating(new_state));
+    participant.record_event(
+        saga_id,
+        ParticipantEvent::CompensationStarted {
+            attempt: 1,
+            started_at_millis: now,
+        },
+    );
 
-        // Persist
-        participant.record_event(
-            saga_id,
-            ParticipantEvent::CompensationStarted {
-                attempt: 1,
-                started_at_millis: now,
-            },
-        );
-
-        // Execute compensation
-        match participant.compensate_step(context, &comp_data) {
-            Ok(()) => {
-                complete_compensation(participant, context, now, emit);
+    match participant.compensate_step(context, &comp_data) {
+        Ok(CompensationOutput::Completed) => {
+            complete_compensation(participant, context, now, emit);
+        }
+        Ok(CompensationOutput::Accepted {
+            execution_id,
+            policy,
+        }) => {
+            let participant_id = participant.participant_id_owned();
+            match crate::durability::accept_started_workflow_compensation(
+                participant,
+                context.next_step(participant.step_name().into()),
+                participant_id,
+                execution_id,
+                policy,
+            ) {
+                Ok(event) => emit(event),
+                Err(error) => fail_compensation(
+                    participant,
+                    context,
+                    CompensationError::Ambiguous {
+                        reason: format!("accepted compensation persistence failed: {error:?}")
+                            .into(),
+                    },
+                    now,
+                    emit,
+                ),
             }
-            Err(error) => {
-                fail_compensation(participant, context, error, now, emit);
-            }
+        }
+        Err(error) => {
+            fail_compensation(participant, context, error, now, emit);
         }
     }
 }
@@ -715,26 +823,83 @@ async fn compensate_wrapper_with_emit_async<P, F>(
 {
     let saga_id = context.saga_id;
 
-    if let Some(SagaStateEntry::Completed(state)) = participant.saga_states().remove(&saga_id) {
-        let comp_data = state.state.compensation_data.clone();
-
-        let new_state = state.start_compensation(now);
-        participant
-            .saga_states()
-            .insert(saga_id, SagaStateEntry::Compensating(new_state));
-
-        participant.record_event(
-            saga_id,
-            ParticipantEvent::CompensationStarted {
-                attempt: 1,
-                started_at_millis: now,
-            },
-        );
-
-        match participant.compensate_step(context, &comp_data).await {
-            Ok(()) => complete_compensation_async(participant, context, now, emit),
-            Err(error) => fail_compensation_async(participant, context, error, now, emit),
+    let accepted_compensation_data = participant
+        .saga_support()
+        .accepted_workflow_steps
+        .get(&saga_id)
+        .map(|accepted| accepted.compensation_data.clone());
+    let state_entry = participant.saga_states().remove(&saga_id);
+    let (comp_data, new_state) = match state_entry {
+        Some(SagaStateEntry::Completed(state)) => {
+            let comp_data = state.state.compensation_data.clone();
+            (comp_data, state.start_compensation(now))
         }
+        Some(SagaStateEntry::Executing(state)) => {
+            let Some(comp_data) = accepted_compensation_data else {
+                participant
+                    .saga_states()
+                    .insert(saga_id, SagaStateEntry::Executing(state));
+                return;
+            };
+            (comp_data, state.start_compensation(now))
+        }
+        Some(other) => {
+            participant.saga_states().insert(saga_id, other);
+            return;
+        }
+        None => return,
+    };
+    participant
+        .saga_states()
+        .insert(saga_id, SagaStateEntry::Compensating(new_state));
+    if let Some(accepted) = participant
+        .saga_support_mut()
+        .accepted_workflow_steps
+        .remove(&saga_id)
+    {
+        crate::durability::mark_accepted_step_resolved(participant, saga_id, accepted.execution_id);
+    }
+
+    participant.record_event(
+        saga_id,
+        ParticipantEvent::CompensationStarted {
+            attempt: 1,
+            started_at_millis: now,
+        },
+    );
+
+    match participant.compensate_step(context, &comp_data).await {
+        Ok(CompensationOutput::Completed) => {
+            complete_compensation_async(participant, context, now, emit)
+        }
+        Ok(CompensationOutput::Accepted {
+            execution_id,
+            policy,
+        }) => {
+            let participant_id = participant.participant_id_owned();
+            match crate::durability::accept_started_workflow_compensation(
+                participant,
+                context.next_step(participant.step_name().into()),
+                participant_id,
+                execution_id,
+                policy,
+            ) {
+                Ok(event) => emit(event),
+                Err(error) => fail_compensation_async(
+                    participant,
+                    context,
+                    CompensationError::Ambiguous {
+                        reason: format!(
+                            "accepted async compensation persistence failed: {error:?}"
+                        )
+                        .into(),
+                    },
+                    now,
+                    emit,
+                ),
+            }
+        }
+        Err(error) => fail_compensation_async(participant, context, error, now, emit),
     }
 }
 
@@ -1029,11 +1194,11 @@ mod tests {
             &mut self,
             _context: &SagaContext,
             _compensation_data: &[u8],
-        ) -> Result<(), CompensationError> {
+        ) -> Result<CompensationOutput, CompensationError> {
             if let Some(err) = self.compensation_error.clone() {
                 return Err(err);
             }
-            Ok(())
+            Ok(CompensationOutput::Completed)
         }
     }
 

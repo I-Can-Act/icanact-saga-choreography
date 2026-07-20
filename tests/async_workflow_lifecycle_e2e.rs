@@ -4,13 +4,18 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use icanact_saga_choreography::durability::{
+    apply_sync_workflow_participant_saga_ingress_with_hooks,
+    complete_accepted_workflow_compensation,
+};
 use icanact_saga_choreography::{
-    AcceptedStepCompletion, AcceptedStepError, AcceptedStepFailure, AcceptedStepPolicy,
-    AcceptedStepTimeoutOutcome, FailureAuthority, HasSagaParticipantSupport,
-    HasSagaWorkflowParticipants, InMemoryDedupe, InMemoryJournal, ParticipantEvent,
-    ParticipantJournal, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipantSupport,
-    SagaStateExt, SagaTerminalOutcome, SagaTestWorld, SagaWorkflowParticipant, StepExecutionId,
-    SuccessCriteria, TerminalPolicy, TerminalResolver, accept_workflow_step,
+    AcceptedCompensationCompletion, AcceptedStepCompletion, AcceptedStepError, AcceptedStepFailure,
+    AcceptedStepPolicy, AcceptedStepTimeoutOutcome, CompensationError, CompensationOutput,
+    DependencySpec, FailureAuthority, HasSagaParticipantSupport, HasSagaWorkflowParticipants,
+    InMemoryDedupe, InMemoryJournal, ParticipantEvent, ParticipantJournal, SagaChoreographyEvent,
+    SagaContext, SagaId, SagaParticipantSupport, SagaStateExt, SagaTerminalOutcome, SagaTestWorld,
+    SagaWorkflowParticipant, StepError, StepExecutionId, StepOutput, SuccessCriteria,
+    TerminalPolicy, TerminalResolver, accept_workflow_step, accept_workflow_step_with_data,
     complete_accepted_workflow_step, fail_accepted_workflow_step,
     poll_accepted_workflow_step_timeouts, record_accepted_workflow_step_progress,
     recover_accepted_workflow_steps_for_saga_type,
@@ -38,6 +43,95 @@ impl HasSagaParticipantSupport for HarnessActor {
 
     fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
         &mut self.saga
+    }
+}
+
+struct DeferredWorkflowActor {
+    saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
+    emitted: Vec<SagaChoreographyEvent>,
+}
+
+impl Default for DeferredWorkflowActor {
+    fn default() -> Self {
+        Self {
+            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+            emitted: Vec::new(),
+        }
+    }
+}
+
+impl HasSagaParticipantSupport for DeferredWorkflowActor {
+    type Journal = InMemoryJournal;
+    type Dedupe = InMemoryDedupe;
+
+    fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+        &self.saga
+    }
+
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+        &mut self.saga
+    }
+}
+
+struct DeferredOrderWorkflow;
+
+static DEFERRED_ORDER_WORKFLOW: DeferredOrderWorkflow = DeferredOrderWorkflow;
+static DEFERRED_ORDER_WORKFLOWS: [&'static dyn SagaWorkflowParticipant<DeferredWorkflowActor>; 1] =
+    [&DEFERRED_ORDER_WORKFLOW];
+
+impl SagaWorkflowParticipant<DeferredWorkflowActor> for DeferredOrderWorkflow {
+    fn step_name(&self) -> &'static str {
+        "create_order"
+    }
+
+    fn saga_types(&self) -> &[&'static str] {
+        &["order_lifecycle"]
+    }
+
+    fn depends_on(&self) -> DependencySpec {
+        DependencySpec::OnSagaStart
+    }
+
+    fn execute_step(
+        &self,
+        _actor: &mut DeferredWorkflowActor,
+        _context: &SagaContext,
+        _input: &[u8],
+    ) -> Result<StepOutput, StepError> {
+        Ok(StepOutput::Accepted {
+            execution_id: StepExecutionId::new("order-request-36"),
+            policy: AcceptedStepPolicy {
+                idle_timeout: Duration::from_millis(1),
+                hard_timeout: Duration::from_millis(1),
+                timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
+                    requires_compensation: true,
+                },
+            },
+            compensation_data: b"release-order-request-36".to_vec(),
+        })
+    }
+
+    fn compensate_step(
+        &self,
+        _actor: &mut DeferredWorkflowActor,
+        _context: &SagaContext,
+        compensation_data: &[u8],
+    ) -> Result<CompensationOutput, CompensationError> {
+        assert_eq!(compensation_data, b"release-order-request-36");
+        Ok(CompensationOutput::Accepted {
+            execution_id: StepExecutionId::new("cancel-order-request-36"),
+            policy: AcceptedStepPolicy {
+                idle_timeout: Duration::from_secs(1),
+                hard_timeout: Duration::from_secs(1),
+                timeout_outcome: AcceptedStepTimeoutOutcome::QuarantineSaga,
+            },
+        })
+    }
+}
+
+impl HasSagaWorkflowParticipants for DeferredWorkflowActor {
+    fn saga_workflows() -> &'static [&'static dyn SagaWorkflowParticipant<Self>] {
+        &DEFERRED_ORDER_WORKFLOWS
     }
 }
 
@@ -181,13 +275,12 @@ fn policy(timeout_outcome: AcceptedStepTimeoutOutcome) -> AcceptedStepPolicy {
 fn completion(
     completed_at_millis: u64,
     output: impl Into<Vec<u8>>,
-    saga_input: impl Into<Vec<u8>>,
+    _saga_input: impl Into<Vec<u8>>,
     compensation_data: impl Into<Vec<u8>>,
 ) -> AcceptedStepCompletion {
     AcceptedStepCompletion {
         completed_at_millis,
         output: output.into(),
-        saga_input: saga_input.into(),
         compensation_data: compensation_data.into(),
     }
 }
@@ -321,6 +414,123 @@ fn accepted_step_does_not_complete_saga_until_late_completion() {
         resolver.ingest(&accepted).is_empty(),
         "accepted step is progress, not completion"
     );
+}
+
+#[test]
+fn accepted_order_timeout_compensates_the_current_step_before_terminal_failure() {
+    let ctx = context("create_order", 35);
+    let mut actor = HarnessActor::default();
+    let mut resolver = TerminalResolver::new(terminal_policy());
+    let accepted = accept_workflow_step_with_data(
+        &mut actor,
+        ctx,
+        "order-manager".into(),
+        StepExecutionId::new("order-request-35"),
+        AcceptedStepPolicy {
+            idle_timeout: Duration::from_millis(1),
+            hard_timeout: Duration::from_millis(1),
+            timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
+                requires_compensation: true,
+            },
+        },
+        Vec::new(),
+        b"order-request-35".to_vec(),
+    )
+    .expect("order step should be accepted");
+
+    assert!(resolver.ingest(&accepted).is_empty());
+    std::thread::sleep(Duration::from_millis(3));
+    let timeout_events = resolver.poll_timeouts();
+
+    assert!(
+        matches!(
+            timeout_events.as_slice(),
+            [SagaChoreographyEvent::CompensationRequested {
+                failed_step,
+                steps_to_compensate,
+                ..
+            }] if failed_step.as_ref() == "create_order"
+                && steps_to_compensate.as_slice() == [Box::<str>::from("create_order")]
+        ),
+        "an accepted order step owns possible exchange effects and must compensate itself before the saga can fail: {timeout_events:?}"
+    );
+}
+
+#[test]
+fn workflow_owned_order_and_release_wait_for_authoritative_completion() {
+    let ctx = context("create_order", 36);
+    let started = SagaChoreographyEvent::SagaStarted {
+        context: ctx.clone(),
+        payload: b"create-order-intent".to_vec(),
+    };
+    let mut actor = DeferredWorkflowActor::default();
+    let mut resolver = TerminalResolver::new(terminal_policy());
+    assert!(resolver.ingest(&started).is_empty());
+
+    apply_sync_workflow_participant_saga_ingress_with_hooks(
+        &mut actor,
+        started,
+        |_actor, _event| {},
+        |_event| panic!("workflow emitted an invalid transition"),
+        |actor, event| actor.emitted.push(event.clone()),
+    );
+    let accepted = actor
+        .emitted
+        .iter()
+        .find(|event| matches!(event, SagaChoreographyEvent::StepAccepted { .. }))
+        .cloned()
+        .expect("workflow should emit StepAccepted instead of premature StepCompleted");
+    assert!(matches!(
+        accepted,
+        SagaChoreographyEvent::StepAccepted {
+            compensation_available: true,
+            ..
+        }
+    ));
+    assert!(resolver.ingest(&accepted).is_empty());
+
+    std::thread::sleep(Duration::from_millis(3));
+    let timeout_events = resolver.poll_timeouts();
+    let [compensation_requested] = timeout_events.as_slice() else {
+        panic!("accepted order timeout must request its own compensation: {timeout_events:?}");
+    };
+    assert!(matches!(
+        compensation_requested,
+        SagaChoreographyEvent::CompensationRequested {
+            steps_to_compensate,
+            ..
+        } if steps_to_compensate.as_slice() == [Box::<str>::from("create_order")]
+    ));
+
+    apply_sync_workflow_participant_saga_ingress_with_hooks(
+        &mut actor,
+        compensation_requested.clone(),
+        |_actor, _event| {},
+        |_event| panic!("compensation emitted an invalid transition"),
+        |actor, event| actor.emitted.push(event.clone()),
+    );
+    let compensation_accepted = actor
+        .emitted
+        .iter()
+        .find(|event| matches!(event, SagaChoreographyEvent::CompensationAccepted { .. }))
+        .cloned()
+        .expect("exchange release should remain pending until authoritative completion");
+    assert!(resolver.ingest(&compensation_accepted).is_empty());
+
+    let compensation_completed = complete_accepted_workflow_compensation(
+        &mut actor,
+        ctx.saga_id,
+        StepExecutionId::new("cancel-order-request-36"),
+        AcceptedCompensationCompletion {
+            completed_at_millis: SagaContext::now_millis(),
+        },
+    )
+    .expect("authoritative release should resolve the accepted compensation");
+    let terminal = resolver.ingest(&compensation_completed);
+    assert!(matches!(
+        terminal.as_slice(),
+        [SagaChoreographyEvent::SagaFailed { .. }]
+    ));
 }
 
 #[test]
@@ -638,6 +848,53 @@ fn accepted_step_can_complete_after_participant_restart() {
         } if context.saga_id == ctx.saga_id
             && context.event_timestamp_millis == 1_700_000_000_230
             && output == b"created-after-restart"
+    ));
+}
+
+#[test]
+fn accepted_compensation_can_complete_after_participant_restart() {
+    let journal = Arc::new(InMemoryJournal::new());
+    let ctx = context("create_order", 37);
+    let execution_id = StepExecutionId::new("cancel-order-request-37");
+    let accepted_at_millis = SagaContext::now_millis();
+    journal
+        .append(
+            ctx.saga_id,
+            ParticipantEvent::AcceptedCompensationRecorded {
+                context: ctx.clone(),
+                participant_id: "order-manager".into(),
+                execution_id: execution_id.clone(),
+                idle_timeout_millis: 5_000,
+                hard_timeout_millis: 10_000,
+                accepted_at_millis,
+                deadline_at_millis: accepted_at_millis + 5_000,
+                hard_deadline_at_millis: accepted_at_millis + 10_000,
+            },
+        )
+        .expect("accepted compensation should be durable before restart");
+
+    let mut reopened = RestartedHarnessActor::new(journal);
+    recover_accepted_workflow_steps_for_saga_type(
+        reopened.saga_support_mut(),
+        "create_order",
+        "order_lifecycle",
+    )
+    .expect("accepted compensation metadata should recover");
+    assert_eq!(reopened.saga.accepted_workflow_compensation_count(), 1);
+
+    let completed = complete_accepted_workflow_compensation(
+        &mut reopened,
+        ctx.saga_id,
+        execution_id,
+        AcceptedCompensationCompletion {
+            completed_at_millis: accepted_at_millis + 100,
+        },
+    )
+    .expect("authoritative release should resolve after restart");
+    assert!(matches!(
+        completed,
+        SagaChoreographyEvent::CompensationCompleted { context }
+            if context.saga_id == ctx.saga_id
     ));
 }
 

@@ -139,7 +139,9 @@ sequenceDiagram
   when handling incoming events, with `failed_step` appended for compensation requests.
 - In this repository, in-memory implementations are available for tests/examples.
 - For production, use a durable backend by implementing the storage traits (for example LMDB/Heed).
-- Accepted-step metadata is journaled before `StepAccepted` is published so restart recovery can rehydrate pending external executions.
+- Accepted-step metadata, original saga input, and compensation data are journaled before `StepAccepted` is published so restart recovery can rehydrate pending external executions.
+- A currently accepted step with compensation data is part of the resolver's compensation stack; timeout cannot skip release of that step's possible external effect.
+- Accepted compensation is journaled independently and must reach authoritative completion before terminal failure. Its timeout quarantines the saga.
 
 ## Recovery, Cleanup, and Operations
 
@@ -150,7 +152,7 @@ sequenceDiagram
 - Terminal policies support two timeout dimensions:
 - `overall_timeout` (overall wall clock)
 - `stalled_timeout` (watchdog reset by each progress event)
-- Accepted steps add participant-declared `idle_timeout`, `hard_timeout`, and `timeout_outcome`; the terminal resolver watchdog enforces these from `StepAccepted`, and startup recovery emits expired accepted-step outcomes from journaled metadata.
+- Accepted steps add participant-declared `idle_timeout`, `hard_timeout`, and `timeout_outcome`; the terminal resolver watchdog enforces these from `StepAccepted`, and startup recovery emits expired accepted-step outcomes from journaled metadata. Accepted compensation uses its own per-execution deadlines and fails closed to quarantine.
 
 ## Observability
 

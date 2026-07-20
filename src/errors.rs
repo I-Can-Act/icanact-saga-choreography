@@ -68,7 +68,6 @@ pub enum AcceptedStepPolicyError {
 pub struct AcceptedStepCompletion {
     pub completed_at_millis: u64,
     pub output: Vec<u8>,
-    pub saga_input: Vec<u8>,
     pub compensation_data: Vec<u8>,
 }
 
@@ -116,6 +115,15 @@ pub enum AcceptedStepError {
 /// Output from step execution
 #[derive(Clone, Debug)]
 pub enum StepOutput {
+    /// The participant durably accepted responsibility and will resolve later.
+    Accepted {
+        /// Stable external or participant-local execution identity.
+        execution_id: StepExecutionId,
+        /// Per-execution timeout policy.
+        policy: AcceptedStepPolicy,
+        /// Data required to release any side effect if the accepted step fails.
+        compensation_data: Vec<u8>,
+    },
     /// Step completed successfully
     Completed {
         /// Output data (passed to next step or stored)
@@ -132,6 +140,34 @@ pub enum StepOutput {
         /// Effect identifier (actor message to send)
         effect: Box<str>,
     },
+}
+
+/// Output from compensation execution.
+#[derive(Clone, Debug)]
+pub enum CompensationOutput {
+    /// Compensation completed synchronously.
+    Completed,
+    /// Compensation was dispatched and will resolve from authoritative state later.
+    Accepted {
+        /// Stable compensation execution identity.
+        execution_id: StepExecutionId,
+        /// Deadline policy; compensation timeout must quarantine ambiguous state.
+        policy: AcceptedStepPolicy,
+    },
+}
+
+/// Completion data for a previously accepted compensation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceptedCompensationCompletion {
+    pub completed_at_millis: u64,
+}
+
+/// Failure data for a previously accepted compensation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceptedCompensationFailure {
+    pub failed_at_millis: u64,
+    pub reason: Box<str>,
+    pub is_ambiguous: bool,
 }
 
 /// Error from step execution

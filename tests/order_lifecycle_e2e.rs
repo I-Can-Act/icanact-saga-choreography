@@ -142,7 +142,7 @@ struct ConfigurableParticipant {
     step_name: &'static str,
     dependency_spec: DependencySpec,
     execute_result: Option<Result<StepOutput, StepError>>,
-    compensate_result: Result<(), CompensationError>,
+    compensate_result: Result<icanact_saga_choreography::CompensationOutput, CompensationError>,
     should_panic: bool,
     saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
     active_saga_execution: Option<ActiveSagaExecution>,
@@ -160,7 +160,7 @@ impl ConfigurableParticipant {
                 output: vec![],
                 compensation_data: vec![1],
             })),
-            compensate_result: Ok(()),
+            compensate_result: Ok(icanact_saga_choreography::CompensationOutput::Completed),
             should_panic: false,
             saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
             active_saga_execution: None,
@@ -176,7 +176,8 @@ impl ConfigurableParticipant {
     }
 
     fn with_compensate_result(mut self, result: Result<(), CompensationError>) -> Self {
-        self.compensate_result = result;
+        self.compensate_result =
+            result.map(|()| icanact_saga_choreography::CompensationOutput::Completed);
         self
     }
 
@@ -309,7 +310,7 @@ impl SagaParticipant for ConfigurableParticipant {
         &mut self,
         _context: &SagaContext,
         _compensation_data: &[u8],
-    ) -> Result<(), CompensationError> {
+    ) -> Result<icanact_saga_choreography::CompensationOutput, CompensationError> {
         self.compensated_count += 1;
         self.compensate_result.clone()
     }
