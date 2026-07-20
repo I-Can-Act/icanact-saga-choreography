@@ -279,6 +279,11 @@ impl TerminalResolver {
                 compensation_available,
             } => {
                 let step_name = context.step_name.clone();
+                if state.compensation_requested
+                    && state.pending_compensation_steps.contains(&step_name)
+                {
+                    return out;
+                }
                 state.started_steps.insert(step_name.clone());
                 if *compensation_available
                     && !state
@@ -1526,6 +1531,22 @@ mod tests {
                 ..
             }] if steps_to_compensate.as_slice() == [Box::<str>::from("reserve")]
         ));
+        assert!(
+            resolver
+                .ingest_at(
+                    &SagaChoreographyEvent::StepAccepted {
+                        context: context.clone(),
+                        participant_id: "reserve-participant".into(),
+                        execution_id: StepExecutionId::new("reserve-24-replayed"),
+                        deadline_at_millis: 1_100,
+                        hard_deadline_at_millis: 1_200,
+                        timeout_outcome: AcceptedStepTimeoutOutcome::QuarantineSaga,
+                        compensation_available: true,
+                    },
+                    1_030,
+                )
+                .is_empty()
+        );
         assert!(
             resolver.poll_timeouts_at(1_201).is_empty(),
             "the forward timeout must not overwrite failure evidence while rollback owns the step"
