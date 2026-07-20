@@ -1527,6 +1527,44 @@ fn accepted_compensation_failure_leaves_no_compensating_state() {
             "cancel-order-request-40"
         });
         let accepted_at_millis = 1_700_000_000_000;
+        actor
+            .saga
+            .journal
+            .append(
+                ctx.saga_id,
+                ParticipantEvent::CompensationRequestRecorded {
+                    context: ctx.clone(),
+                    failed_step: "create_order".into(),
+                    reason: "create failed".into(),
+                    failure: icanact_saga_choreography::SagaFailureDetails {
+                        step_name: "create_order".into(),
+                        participant_id: "order-manager".into(),
+                        error_code: Some("exchange_rejected".into()),
+                        error_message: "create failed".into(),
+                        at_millis: accepted_at_millis - 10,
+                    },
+                    steps_to_compensate: vec!["create_order".into()],
+                    requested_at_millis: accepted_at_millis - 10,
+                },
+            )
+            .expect("compensation request should persist");
+        actor
+            .saga
+            .journal
+            .append(
+                ctx.saga_id,
+                ParticipantEvent::AcceptedCompensationRecorded {
+                    context: ctx.clone(),
+                    participant_id: "order-manager".into(),
+                    execution_id: execution_id.clone(),
+                    idle_timeout_millis: 100,
+                    hard_timeout_millis: 250,
+                    accepted_at_millis,
+                    deadline_at_millis: accepted_at_millis + 100,
+                    hard_deadline_at_millis: accepted_at_millis + 250,
+                },
+            )
+            .expect("accepted compensation should persist");
         let state = SagaParticipantState::new(
             ctx.saga_id,
             ctx.saga_type.clone(),
@@ -1608,6 +1646,37 @@ fn accepted_compensation_failure_leaves_no_compensating_state() {
             ));
         }
         assert_eq!(actor.saga.accepted_workflow_compensation_count(), 0);
+
+        let recovery_events = collect_startup_recovery_events_for_saga_type(
+            &actor.saga.journal,
+            &InMemoryDedupe::new(),
+            "create_order",
+            "order_lifecycle",
+        )
+        .expect("accepted compensation failure should recover");
+        assert!(matches!(
+            recovery_events.as_slice(),
+            [SagaChoreographyEvent::CompensationRequested { .. }, SagaChoreographyEvent::CompensationFailed {
+                error,
+                is_ambiguous: replayed_ambiguous,
+                ..
+            }] if error.as_ref() == "authoritative cancel failure"
+                && *replayed_ambiguous == is_ambiguous
+        ));
+        let mut resolver = TerminalResolver::new(terminal_policy());
+        assert!(resolver.ingest(&recovery_events[0]).is_empty());
+        let terminal = resolver.ingest(&recovery_events[1]);
+        if is_ambiguous {
+            assert!(matches!(
+                terminal.as_slice(),
+                [SagaChoreographyEvent::SagaQuarantined { .. }]
+            ));
+        } else {
+            assert!(matches!(
+                terminal.as_slice(),
+                [SagaChoreographyEvent::SagaFailed { .. }]
+            ));
+        }
     }
 }
 
