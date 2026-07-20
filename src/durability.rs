@@ -2992,7 +2992,7 @@ fn startup_accepted_step_failure_event(
         participant_id: accepted.participant_id.clone(),
         error_code,
         error,
-        requires_compensation: !accepted.compensation_data.is_empty(),
+        requires_compensation: true,
     }
 }
 

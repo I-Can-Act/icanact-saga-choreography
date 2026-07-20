@@ -737,7 +737,9 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
                 participant_id: TEST_STEP.into(),
                 execution_id: StepExecutionId::new("external-15"),
                 saga_input: Vec::new(),
-                compensation_data: b"release-external-15".to_vec(),
+                // The accepted step itself has no release, but the resolver may
+                // still need to compensate an earlier completed effect.
+                compensation_data: Vec::new(),
                 idle_timeout_millis: 1,
                 hard_timeout_millis: 1,
                 timeout_outcome: icanact_saga_choreography::AcceptedStepTimeoutOutcome::FailStep {
