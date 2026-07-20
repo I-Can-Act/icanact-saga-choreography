@@ -336,6 +336,84 @@ fn lmdb_open_does_not_rehydrate_expired_accepted_step() {
     ));
 }
 
+#[cfg(feature = "lmdb")]
+#[test]
+fn lmdb_open_rehydrates_expired_compensable_step_with_forward_tombstone() {
+    let temp = tempfile::tempdir().expect("tempdir should open");
+    let ctx = context(92, ORDER_LIFECYCLE, TEST_STEP);
+    let execution_id = StepExecutionId::new("external-92");
+    let support =
+        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_type(
+            temp.path(),
+            TEST_STEP,
+            ORDER_LIFECYCLE,
+        )
+        .expect("support should open before restart");
+    support
+        .journal
+        .append(
+            ctx.saga_id,
+            ParticipantEvent::AcceptedStepRecorded {
+                context: ctx.clone(),
+                participant_id: "order-manager".into(),
+                execution_id: execution_id.clone(),
+                saga_input: b"create-order-input".to_vec(),
+                compensation_data: b"cancel-order-92".to_vec(),
+                idle_timeout_millis: 1,
+                hard_timeout_millis: 1,
+                timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
+                    requires_compensation: true,
+                },
+                accepted_at_millis: 1,
+                deadline_at_millis: 1,
+                hard_deadline_at_millis: 1,
+            },
+        )
+        .expect("accepted metadata append should succeed");
+    drop(support);
+
+    let support =
+        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_type(
+            temp.path(),
+            TEST_STEP,
+            ORDER_LIFECYCLE,
+        )
+        .expect("support should reopen after restart");
+    assert_eq!(support.accepted_workflow_step_count(), 1);
+    assert_eq!(support.resolved_workflow_step_count(), 1);
+    assert_eq!(
+        support
+            .accepted_workflow_steps
+            .get(&ctx.saga_id)
+            .expect("expired compensable step must recover")
+            .compensation_data,
+        b"cancel-order-92"
+    );
+    assert!(support.startup_recovery_events.iter().any(|event| matches!(
+        event,
+        SagaChoreographyEvent::StepFailed {
+            context,
+            requires_compensation: true,
+            ..
+        } if context.saga_id == ctx.saga_id
+    )));
+
+    let mut reopened = LmdbAcceptedStepActor { saga: support };
+    assert!(matches!(
+        complete_accepted_workflow_step(
+            &mut reopened,
+            ctx.saga_id,
+            execution_id,
+            AcceptedStepCompletion {
+                completed_at_millis: SagaContext::now_millis(),
+                output: b"stale-success".to_vec(),
+                compensation_data: b"cancel-order-92".to_vec(),
+            },
+        ),
+        Err(icanact_saga_choreography::AcceptedStepError::AlreadyResolved { .. })
+    ));
+}
+
 #[test]
 fn ingress_applies_side_effects_and_publishes_valid_emitted_events() {
     let mut participant = TestParticipant::new(TEST_STEP, ExecuteMode::Normal);

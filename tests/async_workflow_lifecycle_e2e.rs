@@ -677,6 +677,121 @@ fn accepted_failure_append_failure_keeps_step_pending_for_retry() {
 }
 
 #[test]
+fn compensating_failure_tombstones_forward_execution_but_keeps_compensation_data() {
+    let mut actor = HarnessActor::default();
+    let ctx = context("create_order", 38);
+    let execution_id = StepExecutionId::new("effect-38");
+    accept_workflow_step_with_data(
+        &mut actor,
+        ctx.clone(),
+        "order-manager".into(),
+        execution_id.clone(),
+        policy(AcceptedStepTimeoutOutcome::FailStep {
+            requires_compensation: true,
+        }),
+        b"create-order-input".to_vec(),
+        b"cancel-order-38".to_vec(),
+    )
+    .expect("step should be accepted");
+
+    fail_accepted_workflow_step(
+        &mut actor,
+        ctx.saga_id,
+        execution_id.clone(),
+        failure(1_700_000_000_080, "authoritative create failure", true),
+    )
+    .expect("compensating failure should resolve the forward execution");
+
+    assert_eq!(actor.saga.accepted_workflow_step_count(), 1);
+    assert_eq!(actor.saga.resolved_workflow_step_count(), 1);
+    assert_eq!(
+        actor
+            .saga
+            .accepted_workflow_steps
+            .get(&ctx.saga_id)
+            .expect("compensation data must remain available")
+            .compensation_data,
+        b"cancel-order-38"
+    );
+    assert!(matches!(
+        complete_accepted_workflow_step(
+            &mut actor,
+            ctx.saga_id,
+            execution_id,
+            completion(
+                1_700_000_000_090,
+                b"stale-success",
+                b"create-order-input",
+                b"cancel-order-38",
+            ),
+        ),
+        Err(AcceptedStepError::AlreadyResolved { .. })
+    ));
+}
+
+#[test]
+fn compensating_failure_restart_keeps_forward_execution_tombstoned() {
+    let journal = Arc::new(InMemoryJournal::new());
+    let mut actor = RestartedHarnessActor::new(journal.clone());
+    let ctx = context("create_order", 39);
+    let execution_id = StepExecutionId::new("effect-39");
+    accept_workflow_step_with_data(
+        &mut actor,
+        ctx.clone(),
+        "order-manager".into(),
+        execution_id.clone(),
+        policy(AcceptedStepTimeoutOutcome::FailStep {
+            requires_compensation: true,
+        }),
+        b"create-order-input".to_vec(),
+        b"cancel-order-39".to_vec(),
+    )
+    .expect("step should be accepted before restart");
+    fail_accepted_workflow_step(
+        &mut actor,
+        ctx.saga_id,
+        execution_id.clone(),
+        failure(1_700_000_000_100, "authoritative create failure", true),
+    )
+    .expect("compensating failure should be durable");
+    drop(actor);
+
+    let mut reopened = RestartedHarnessActor::new(journal);
+    recover_accepted_workflow_steps_for_saga_type(
+        reopened.saga_support_mut(),
+        "create_order",
+        "order_lifecycle",
+    )
+    .expect("compensating failure should recover");
+
+    assert_eq!(reopened.saga.accepted_workflow_step_count(), 1);
+    assert_eq!(reopened.saga.resolved_workflow_step_count(), 1);
+    assert_eq!(
+        reopened
+            .saga
+            .accepted_workflow_steps
+            .get(&ctx.saga_id)
+            .expect("compensation data must recover")
+            .compensation_data,
+        b"cancel-order-39"
+    );
+    assert!(matches!(
+        complete_accepted_workflow_step(
+            &mut reopened,
+            ctx.saga_id,
+            execution_id,
+            completion(
+                1_700_000_000_110,
+                b"stale-success",
+                b"create-order-input",
+                b"cancel-order-39",
+            ),
+        ),
+        Err(AcceptedStepError::AlreadyResolved { .. })
+    ));
+}
+
+#[test]
 fn accepted_timeout_append_failure_keeps_step_pending_for_retry() {
     let mut actor = FailingJournalActor::fail_on_append(3);
     let ctx = context("create_order", 34);
