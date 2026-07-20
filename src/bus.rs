@@ -1429,6 +1429,7 @@ mod tests {
                 execution_id: StepExecutionId::new("external-812"),
                 deadline_at_millis: SagaContext::now_millis().saturating_add(30_000),
                 hard_deadline_at_millis: SagaContext::now_millis().saturating_add(60_000),
+                timeouts_enabled: true,
                 timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
                     requires_compensation: true,
                 },

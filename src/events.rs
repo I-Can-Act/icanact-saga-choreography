@@ -55,6 +55,10 @@ pub enum SagaChoreographyEvent {
         deadline_at_millis: u64,
         /// Non-resettable hard deadline in epoch milliseconds.
         hard_deadline_at_millis: u64,
+        /// Whether timeout evaluation is armed for this accepted state.
+        /// Recovery hydration disarms it until the immediately following
+        /// authoritative failure is ingested.
+        timeouts_enabled: bool,
         /// Terminal outcome to apply when accepted step deadline expires.
         timeout_outcome: AcceptedStepTimeoutOutcome,
         /// Whether this accepted step owns an effect that must be compensated on failure.

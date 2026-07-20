@@ -1020,8 +1020,7 @@ fn compensating_failure_restart_keeps_forward_execution_tombstoned() {
     assert!(matches!(
         recovery_events.as_slice(),
         [SagaChoreographyEvent::StepAccepted {
-            deadline_at_millis: u64::MAX,
-            hard_deadline_at_millis: u64::MAX,
+            timeouts_enabled: false,
             ..
         }, SagaChoreographyEvent::StepFailed {
             context,

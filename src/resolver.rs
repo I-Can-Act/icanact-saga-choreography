@@ -168,6 +168,7 @@ struct AcceptedStepResolverState {
     execution_id: StepExecutionId,
     deadline_at_millis: u64,
     hard_deadline_at_millis: u64,
+    timeouts_enabled: bool,
     timeout_outcome: AcceptedStepTimeoutOutcome,
 }
 
@@ -294,6 +295,7 @@ impl TerminalResolver {
                 execution_id,
                 deadline_at_millis,
                 hard_deadline_at_millis,
+                timeouts_enabled,
                 timeout_outcome,
                 compensation_available,
             } => {
@@ -319,6 +321,7 @@ impl TerminalResolver {
                         execution_id: execution_id.clone(),
                         deadline_at_millis: *deadline_at_millis,
                         hard_deadline_at_millis: *hard_deadline_at_millis,
+                        timeouts_enabled: *timeouts_enabled,
                         timeout_outcome: timeout_outcome.clone(),
                     },
                 );
@@ -767,7 +770,9 @@ fn accepted_step_timeout_events(
         .accepted_steps
         .iter()
         .filter_map(|(step_name, accepted)| {
-            if now_millis > accepted.hard_deadline_at_millis {
+            if !accepted.timeouts_enabled {
+                None
+            } else if now_millis > accepted.hard_deadline_at_millis {
                 Some((step_name.clone(), accepted.clone(), true))
             } else if now_millis > accepted.deadline_at_millis {
                 Some((step_name.clone(), accepted.clone(), false))
@@ -1356,6 +1361,7 @@ mod tests {
             execution_id: StepExecutionId::new("external-9"),
             deadline_at_millis: 1_110,
             hard_deadline_at_millis: 1_300,
+            timeouts_enabled: true,
             timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
                 requires_compensation: false,
             },
@@ -1388,6 +1394,7 @@ mod tests {
             execution_id: StepExecutionId::new("external-9"),
             deadline_at_millis: 1_110,
             hard_deadline_at_millis: 1_120,
+            timeouts_enabled: true,
             timeout_outcome: AcceptedStepTimeoutOutcome::QuarantineSaga,
             compensation_available: false,
         };
@@ -1430,6 +1437,7 @@ mod tests {
             execution_id: StepExecutionId::new("external-9"),
             deadline_at_millis: 1_110,
             hard_deadline_at_millis: 1_120,
+            timeouts_enabled: true,
             timeout_outcome: AcceptedStepTimeoutOutcome::QuarantineSaga,
             compensation_available: false,
         };
@@ -1483,6 +1491,7 @@ mod tests {
                 execution_id: StepExecutionId::new("external-risk"),
                 deadline_at_millis: 1_100,
                 hard_deadline_at_millis: 1_500,
+                timeouts_enabled: true,
                 timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
                     requires_compensation: false,
                 },
@@ -1497,6 +1506,7 @@ mod tests {
                 execution_id: StepExecutionId::new("external-order"),
                 deadline_at_millis: 1_100,
                 hard_deadline_at_millis: 1_500,
+                timeouts_enabled: true,
                 timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
                     requires_compensation: true,
                 },
@@ -1651,6 +1661,7 @@ mod tests {
                         execution_id: StepExecutionId::new("reserve-24"),
                         deadline_at_millis: 1_100,
                         hard_deadline_at_millis: 1_200,
+                        timeouts_enabled: true,
                         timeout_outcome: AcceptedStepTimeoutOutcome::QuarantineSaga,
                         compensation_available: true,
                     },
@@ -1685,6 +1696,7 @@ mod tests {
                         execution_id: StepExecutionId::new("reserve-24-replayed"),
                         deadline_at_millis: 1_100,
                         hard_deadline_at_millis: 1_200,
+                        timeouts_enabled: true,
                         timeout_outcome: AcceptedStepTimeoutOutcome::QuarantineSaga,
                         compensation_available: true,
                     },
@@ -1920,6 +1932,7 @@ mod tests {
                 execution_id: StepExecutionId::new("external-41"),
                 deadline_at_millis: now.saturating_add(30_000),
                 hard_deadline_at_millis: now.saturating_add(60_000),
+                timeouts_enabled: true,
                 timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
                     requires_compensation: true,
                 },

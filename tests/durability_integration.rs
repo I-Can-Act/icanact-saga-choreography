@@ -759,8 +759,7 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
     assert!(matches!(
         expired.as_slice(),
         [SagaChoreographyEvent::StepAccepted {
-            deadline_at_millis: u64::MAX,
-            hard_deadline_at_millis: u64::MAX,
+            timeouts_enabled: false,
             ..
         }, SagaChoreographyEvent::StepFailed {
             error,
@@ -810,8 +809,7 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
     assert!(matches!(
         failed.as_slice(),
         [SagaChoreographyEvent::StepAccepted {
-            deadline_at_millis: u64::MAX,
-            hard_deadline_at_millis: u64::MAX,
+            timeouts_enabled: false,
             ..
         }, SagaChoreographyEvent::StepFailed {
             context,

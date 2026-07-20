@@ -248,6 +248,7 @@ where
         execution_id,
         deadline_at_millis,
         hard_deadline_at_millis,
+        timeouts_enabled: true,
         timeout_outcome,
         compensation_available,
     })
@@ -327,6 +328,7 @@ where
         execution_id,
         deadline_at_millis,
         hard_deadline_at_millis,
+        timeouts_enabled: true,
         timeout_outcome,
         compensation_available,
     })
@@ -767,6 +769,7 @@ where
         execution_id,
         deadline_at_millis,
         hard_deadline_at_millis,
+        timeouts_enabled: true,
         timeout_outcome,
         compensation_available: !accepted_snapshot.compensation_data.is_empty(),
     })
@@ -2940,6 +2943,7 @@ fn startup_accepted_step_replay_event(accepted: &AcceptedWorkflowStep) -> SagaCh
         execution_id: accepted.execution_id.clone(),
         deadline_at_millis: accepted.deadline_at_millis,
         hard_deadline_at_millis: accepted.hard_deadline_at_millis,
+        timeouts_enabled: true,
         timeout_outcome: accepted.policy.timeout_outcome.clone(),
         compensation_available: !accepted.compensation_data.is_empty(),
     }
@@ -2952,12 +2956,11 @@ fn startup_accepted_step_failure_hydration_event(
         context: accepted.context.clone(),
         participant_id: accepted.participant_id.clone(),
         execution_id: accepted.execution_id.clone(),
-        // The immediately following durable StepFailed is authoritative. These
-        // recovery-only deadlines prevent the resolver from racing that failure
-        // with a stale timeout while still rebuilding compensation ownership for
-        // an in-memory resolver.
-        deadline_at_millis: u64::MAX,
-        hard_deadline_at_millis: u64::MAX,
+        deadline_at_millis: accepted.deadline_at_millis,
+        hard_deadline_at_millis: accepted.hard_deadline_at_millis,
+        // The immediately following durable StepFailed is authoritative. This
+        // recovery-only hydration must not race that failure with a stale timeout.
+        timeouts_enabled: false,
         timeout_outcome: accepted.policy.timeout_outcome.clone(),
         compensation_available: !accepted.compensation_data.is_empty(),
     }
@@ -3985,6 +3988,7 @@ mod property_tests {
                 execution_id: crate::StepExecutionId::new("exec"),
                 deadline_at_millis: 5_000,
                 hard_deadline_at_millis: 9_000,
+                timeouts_enabled: true,
                 timeout_outcome: AcceptedStepTimeoutOutcome::QuarantineSaga,
                 compensation_available: false,
             },
