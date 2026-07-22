@@ -33,7 +33,8 @@ required-features = ["test-harness"]
 
 [dependencies]
 # Core dependencies
-icanact-core = { git = "ssh://git@github.com/moofone/actor-framework-core.git", rev = "55214d1ffa329f70b493e8862ad304ff9a5d60ff", features = ["async-actors"] }
+# Temporary policy: follow actor-core main while its public contracts are changing rapidly.
+icanact-core = { git = "ssh://git@github.com/moofone/actor-framework-core.git", branch = "main", features = ["async-actors"] }
 rkyv = { version = "0.8", features = ["std", "bytecheck"] }
 thiserror = "1.0"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros", "sync"] }
@@ -44,7 +45,8 @@ heed = { version = "0.20", optional = true }
 tracing-subscriber = { version = "0.3", optional = true }
 
 [dev-dependencies]
-icanact-core = { git = "ssh://git@github.com/moofone/actor-framework-core.git", rev = "55214d1ffa329f70b493e8862ad304ff9a5d60ff", features = ["async-actors", "test-support"] }
+# Keep normal and test builds on one actor-core source identity.
+icanact-core = { git = "ssh://git@github.com/moofone/actor-framework-core.git", branch = "main", features = ["async-actors", "test-support"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros", "sync", "test-util"] }
 tracing = "0.1"
