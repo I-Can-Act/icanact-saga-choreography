@@ -29,6 +29,10 @@ pub struct AcceptedWorkflowCompensation {
     pub participant_id: Box<str>,
     pub execution_id: StepExecutionId,
     pub policy: AcceptedStepPolicy,
+    /// Original workflow input needed to rebuild participant-owned volatile projections.
+    pub saga_input: Vec<u8>,
+    /// Exact compensation input used when this accepted compensation was started.
+    pub compensation_data: Vec<u8>,
     pub accepted_at_millis: u64,
     pub deadline_at_millis: u64,
     pub hard_deadline_at_millis: u64,

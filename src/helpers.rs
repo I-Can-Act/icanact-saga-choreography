@@ -875,25 +875,30 @@ fn compensate_wrapper_with_emit<P, F>(
         return;
     }
 
-    let accepted_compensation_data = participant
+    let accepted_recovery_data = participant
         .saga_support()
         .accepted_workflow_steps
         .get(&saga_id)
-        .map(|accepted| accepted.compensation_data.clone());
+        .map(|accepted| {
+            (
+                accepted.saga_input.clone(),
+                accepted.compensation_data.clone(),
+            )
+        });
     let state_entry = participant.saga_states().remove(&saga_id);
-    let (comp_data, new_state) = match state_entry {
+    let (saga_input, comp_data, new_state) = match state_entry {
         Some(SagaStateEntry::Completed(state)) => {
             let comp_data = state.state.compensation_data.clone();
-            (comp_data, state.start_compensation(now))
+            (Vec::new(), comp_data, state.start_compensation(now))
         }
         Some(SagaStateEntry::Executing(state)) => {
-            let Some(comp_data) = accepted_compensation_data else {
+            let Some((saga_input, comp_data)) = accepted_recovery_data else {
                 participant
                     .saga_states()
                     .insert(saga_id, SagaStateEntry::Executing(state));
                 return;
             };
-            (comp_data, state.start_compensation(now))
+            (saga_input, comp_data, state.start_compensation(now))
         }
         Some(other) => {
             participant.saga_states().insert(saga_id, other);
@@ -935,6 +940,8 @@ fn compensate_wrapper_with_emit<P, F>(
                 participant_id,
                 execution_id,
                 policy,
+                saga_input,
+                comp_data,
             ) {
                 Ok(event) => emit(event),
                 Err(error) => fail_compensation(
@@ -994,25 +1001,30 @@ async fn compensate_wrapper_with_emit_async<P, F>(
         return;
     }
 
-    let accepted_compensation_data = participant
+    let accepted_recovery_data = participant
         .saga_support()
         .accepted_workflow_steps
         .get(&saga_id)
-        .map(|accepted| accepted.compensation_data.clone());
+        .map(|accepted| {
+            (
+                accepted.saga_input.clone(),
+                accepted.compensation_data.clone(),
+            )
+        });
     let state_entry = participant.saga_states().remove(&saga_id);
-    let (comp_data, new_state) = match state_entry {
+    let (saga_input, comp_data, new_state) = match state_entry {
         Some(SagaStateEntry::Completed(state)) => {
             let comp_data = state.state.compensation_data.clone();
-            (comp_data, state.start_compensation(now))
+            (Vec::new(), comp_data, state.start_compensation(now))
         }
         Some(SagaStateEntry::Executing(state)) => {
-            let Some(comp_data) = accepted_compensation_data else {
+            let Some((saga_input, comp_data)) = accepted_recovery_data else {
                 participant
                     .saga_states()
                     .insert(saga_id, SagaStateEntry::Executing(state));
                 return;
             };
-            (comp_data, state.start_compensation(now))
+            (saga_input, comp_data, state.start_compensation(now))
         }
         Some(other) => {
             participant.saga_states().insert(saga_id, other);
@@ -1054,6 +1066,8 @@ async fn compensate_wrapper_with_emit_async<P, F>(
                 participant_id,
                 execution_id,
                 policy,
+                saga_input,
+                comp_data,
             ) {
                 Ok(event) => emit(event),
                 Err(error) => fail_compensation_async(
