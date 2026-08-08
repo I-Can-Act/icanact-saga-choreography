@@ -437,6 +437,8 @@ pub(crate) fn accept_started_workflow_compensation<A>(
     participant_id: Box<str>,
     execution_id: StepExecutionId,
     policy: AcceptedStepPolicy,
+    saga_input: Vec<u8>,
+    compensation_data: Vec<u8>,
 ) -> Result<SagaChoreographyEvent, AcceptedStepError>
 where
     A: SagaStateExt,
@@ -470,6 +472,8 @@ where
         participant_id: participant_id.clone(),
         execution_id: execution_id.clone(),
         policy,
+        saga_input,
+        compensation_data,
         accepted_at_millis,
         deadline_at_millis,
         hard_deadline_at_millis,
@@ -481,6 +485,8 @@ where
                 context: accepted.context.clone(),
                 participant_id: accepted.participant_id.clone(),
                 execution_id: accepted.execution_id.clone(),
+                saga_input: accepted.saga_input.clone(),
+                compensation_data: accepted.compensation_data.clone(),
                 idle_timeout_millis: accepted.policy.idle_timeout.as_millis() as u64,
                 hard_timeout_millis: accepted.policy.hard_timeout.as_millis() as u64,
                 accepted_at_millis,
@@ -963,6 +969,8 @@ fn recover_accepted_workflow_compensation_from_entries(
                 context,
                 participant_id,
                 execution_id,
+                saga_input,
+                compensation_data,
                 idle_timeout_millis,
                 hard_timeout_millis,
                 accepted_at_millis,
@@ -978,6 +986,8 @@ fn recover_accepted_workflow_compensation_from_entries(
                         hard_timeout: Duration::from_millis(*hard_timeout_millis),
                         timeout_outcome: AcceptedStepTimeoutOutcome::QuarantineSaga,
                     },
+                    saga_input: saga_input.clone(),
+                    compensation_data: compensation_data.clone(),
                     accepted_at_millis: *accepted_at_millis,
                     deadline_at_millis: *deadline_at_millis,
                     hard_deadline_at_millis: *hard_deadline_at_millis,
@@ -1037,6 +1047,8 @@ fn recover_completed_accepted_compensation_from_entries(
                 context,
                 participant_id,
                 execution_id,
+                saga_input,
+                compensation_data,
                 idle_timeout_millis,
                 hard_timeout_millis,
                 accepted_at_millis,
@@ -1052,6 +1064,8 @@ fn recover_completed_accepted_compensation_from_entries(
                         hard_timeout: Duration::from_millis(*hard_timeout_millis),
                         timeout_outcome: AcceptedStepTimeoutOutcome::QuarantineSaga,
                     },
+                    saga_input: saga_input.clone(),
+                    compensation_data: compensation_data.clone(),
                     accepted_at_millis: *accepted_at_millis,
                     deadline_at_millis: *deadline_at_millis,
                     hard_deadline_at_millis: *hard_deadline_at_millis,
@@ -1096,6 +1110,8 @@ fn recover_failed_accepted_compensation_from_entries(
                 context,
                 participant_id,
                 execution_id,
+                saga_input,
+                compensation_data,
                 idle_timeout_millis,
                 hard_timeout_millis,
                 accepted_at_millis,
@@ -1111,6 +1127,8 @@ fn recover_failed_accepted_compensation_from_entries(
                         hard_timeout: Duration::from_millis(*hard_timeout_millis),
                         timeout_outcome: AcceptedStepTimeoutOutcome::QuarantineSaga,
                     },
+                    saga_input: saga_input.clone(),
+                    compensation_data: compensation_data.clone(),
                     accepted_at_millis: *accepted_at_millis,
                     deadline_at_millis: *deadline_at_millis,
                     hard_deadline_at_millis: *hard_deadline_at_millis,
@@ -2209,25 +2227,30 @@ fn compensate_workflow_with_emit<A, F>(
         );
         return;
     }
-    let accepted_compensation_data = actor
+    let accepted_recovery_data = actor
         .saga_support()
         .accepted_workflow_steps
         .get(&saga_id)
-        .map(|accepted| accepted.compensation_data.clone());
+        .map(|accepted| {
+            (
+                accepted.saga_input.clone(),
+                accepted.compensation_data.clone(),
+            )
+        });
     let state_entry = actor.saga_states().remove(&saga_id);
-    let (comp_data, compensating_state) = match state_entry {
+    let (saga_input, comp_data, compensating_state) = match state_entry {
         Some(SagaStateEntry::Completed(state)) => {
             let comp_data = state.state.compensation_data.clone();
-            (comp_data, state.start_compensation(now))
+            (Vec::new(), comp_data, state.start_compensation(now))
         }
         Some(SagaStateEntry::Executing(state)) => {
-            let Some(comp_data) = accepted_compensation_data else {
+            let Some((saga_input, comp_data)) = accepted_recovery_data else {
                 actor
                     .saga_states()
                     .insert(saga_id, SagaStateEntry::Executing(state));
                 return;
             };
-            (comp_data, state.start_compensation(now))
+            (saga_input, comp_data, state.start_compensation(now))
         }
         Some(other) => {
             actor.saga_states().insert(saga_id, other);
@@ -2267,6 +2290,8 @@ fn compensate_workflow_with_emit<A, F>(
             workflow.participant_id_owned(),
             execution_id,
             policy,
+            saga_input,
+            comp_data,
         ) {
             Ok(event) => emit(event),
             Err(error) => fail_workflow_compensation(

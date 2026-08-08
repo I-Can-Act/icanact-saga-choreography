@@ -1286,6 +1286,8 @@ fn accepted_compensation_can_complete_after_participant_restart() {
                 context: ctx.clone(),
                 participant_id: "order-manager".into(),
                 execution_id: execution_id.clone(),
+                saga_input: b"original-order-saga-input".to_vec(),
+                compensation_data: b"req-order-37".to_vec(),
                 idle_timeout_millis: 5_000,
                 hard_timeout_millis: 10_000,
                 accepted_at_millis,
@@ -1320,6 +1322,19 @@ fn accepted_compensation_can_complete_after_participant_restart() {
     )
     .expect("accepted compensation metadata should recover");
     assert_eq!(reopened.saga.accepted_workflow_compensation_count(), 1);
+    let recovered = reopened
+        .saga
+        .accepted_workflow_compensations
+        .get(&ctx.saga_id)
+        .expect("accepted compensation recovery projection should exist");
+    assert_eq!(
+        recovered.saga_input, b"original-order-saga-input",
+        "the native accepted-compensation journal must preserve the original workflow input needed to rebuild participant projections"
+    );
+    assert_eq!(
+        recovered.compensation_data, b"req-order-37",
+        "the native accepted-compensation journal must preserve the exact compensation input"
+    );
 
     let completed = complete_accepted_workflow_compensation(
         &mut reopened,
@@ -1492,6 +1507,8 @@ fn completed_accepted_compensation_replays_terminal_resolution_after_restart() {
                 context: ctx.clone(),
                 participant_id: "order-manager".into(),
                 execution_id: StepExecutionId::new("cancel-44"),
+                saga_input: Vec::new(),
+                compensation_data: Vec::new(),
                 idle_timeout_millis: 5_000,
                 hard_timeout_millis: 10_000,
                 accepted_at_millis,
@@ -1571,6 +1588,8 @@ fn accepted_compensation_failure_leaves_no_compensating_state() {
                     context: ctx.clone(),
                     participant_id: "order-manager".into(),
                     execution_id: execution_id.clone(),
+                    saga_input: Vec::new(),
+                    compensation_data: Vec::new(),
                     idle_timeout_millis: 100,
                     hard_timeout_millis: 250,
                     accepted_at_millis,
@@ -1602,6 +1621,8 @@ fn accepted_compensation_failure_leaves_no_compensating_state() {
                 participant_id: "order-manager".into(),
                 execution_id: execution_id.clone(),
                 policy: policy(AcceptedStepTimeoutOutcome::QuarantineSaga),
+                saga_input: Vec::new(),
+                compensation_data: Vec::new(),
                 accepted_at_millis,
                 deadline_at_millis: accepted_at_millis + 100,
                 hard_deadline_at_millis: accepted_at_millis + 250,

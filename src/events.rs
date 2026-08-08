@@ -435,6 +435,10 @@ pub enum ParticipantEvent {
         context: SagaContext,
         participant_id: Box<str>,
         execution_id: StepExecutionId,
+        /// Original workflow input needed for deterministic participant recovery.
+        saga_input: Vec<u8>,
+        /// Exact compensation input accepted by the participant.
+        compensation_data: Vec<u8>,
         idle_timeout_millis: u64,
         hard_timeout_millis: u64,
         accepted_at_millis: u64,
