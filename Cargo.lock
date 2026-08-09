@@ -405,7 +405,7 @@ dependencies = [
 [[package]]
 name = "icanact-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/moofone/actor-framework-core.git?rev=f1cedf9#f1cedf92e844a42ca457ce5f5420831fc36d6b03"
+source = "git+ssh://git@github.com/moofone/actor-framework-core.git?rev=9dc6cd1#9dc6cd1aaf418a96722c353096e0295cd3a26bcb"
 dependencies = [
  "arc-swap",
  "crossbeam-epoch",
@@ -421,7 +421,7 @@ dependencies = [
 [[package]]
 name = "icanact-core-derive"
 version = "0.1.0"
-source = "git+ssh://git@github.com/moofone/actor-framework-core.git?rev=f1cedf9#f1cedf92e844a42ca457ce5f5420831fc36d6b03"
+source = "git+ssh://git@github.com/moofone/actor-framework-core.git?rev=9dc6cd1#9dc6cd1aaf418a96722c353096e0295cd3a26bcb"
 dependencies = [
  "proc-macro2",
  "quote",
