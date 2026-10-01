@@ -151,3 +151,17 @@ impl std::fmt::Debug for SagaContext {
             .finish()
     }
 }
+
+use crate::{RunIncarnation, RunKey};
+
+impl SagaContext {
+    /// Run incarnation of this context (ADR-0001).
+    pub fn run_incarnation(&self) -> RunIncarnation {
+        RunIncarnation::new(self.saga_started_at_millis)
+    }
+
+    /// Run identity of this context (ADR-0001).
+    pub fn run_key(&self) -> RunKey {
+        RunKey::new(self.saga_type.clone(), self.saga_id, self.run_incarnation())
+    }
+}

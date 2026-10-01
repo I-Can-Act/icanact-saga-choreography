@@ -34,6 +34,12 @@ pub struct Compensated {
 pub struct Quarantined {
     pub quarantined_at_millis: u64,
     pub reason: Box<str>,
+    /// Kind of state the run was in when quarantined (`"executing"`, `"compensating"`,
+    /// `"completed"`, ...); `"none"` when no prior state existed (lookup failed before any work).
+    pub prior_state: &'static str,
+    /// Undo data of a run quarantined from `Completed`, kept for reconciliation (ADR-0002 §2.2).
+    /// The journal's `StepExecutionCompleted` row holds the same data durably.
+    pub compensation_data: Option<Vec<u8>>,
 }
 
 impl markers::StepState for Idle {}
@@ -218,6 +224,37 @@ impl SagaParticipantState<Executing> {
             state: Quarantined {
                 quarantined_at_millis: now_millis,
                 reason,
+                prior_state: "executing",
+                compensation_data: None,
+            },
+            events: self.events,
+        }
+    }
+}
+
+impl SagaParticipantState<Failed> {
+    /// Quarantines a failed run. A failed run that still requires compensation is not terminal in
+    /// memory, while the journal's `Quarantined` row makes recovery treat it as terminal; moving it
+    /// to `Quarantined` keeps both views the same.
+    pub fn quarantine(
+        self,
+        reason: Box<str>,
+        now_millis: u64,
+    ) -> SagaParticipantState<Quarantined> {
+        SagaParticipantState {
+            saga_id: self.saga_id,
+            saga_type: self.saga_type,
+            step_name: self.step_name,
+            correlation_id: self.correlation_id,
+            trace_id: self.trace_id,
+            initiator_peer_id: self.initiator_peer_id,
+            saga_started_at_millis: self.saga_started_at_millis,
+            last_updated_at_millis: now_millis,
+            state: Quarantined {
+                quarantined_at_millis: now_millis,
+                reason,
+                prior_state: "failed",
+                compensation_data: None,
             },
             events: self.events,
         }
@@ -225,6 +262,33 @@ impl SagaParticipantState<Executing> {
 }
 
 impl SagaParticipantState<Completed> {
+    /// Quarantines a completed run (e.g. a later event's dedupe lookup failed) without losing its
+    /// undo data: the memory state must match the journal's `Quarantined` row, and a quarantined
+    /// run never runs business effects automatically (owner decision Q6).
+    pub fn quarantine(
+        self,
+        reason: Box<str>,
+        now_millis: u64,
+    ) -> SagaParticipantState<Quarantined> {
+        SagaParticipantState {
+            saga_id: self.saga_id,
+            saga_type: self.saga_type,
+            step_name: self.step_name,
+            correlation_id: self.correlation_id,
+            trace_id: self.trace_id,
+            initiator_peer_id: self.initiator_peer_id,
+            saga_started_at_millis: self.saga_started_at_millis,
+            last_updated_at_millis: now_millis,
+            state: Quarantined {
+                quarantined_at_millis: now_millis,
+                reason,
+                prior_state: "completed",
+                compensation_data: Some(self.state.compensation_data),
+            },
+            events: self.events,
+        }
+    }
+
     pub fn start_compensation(self, now_millis: u64) -> SagaParticipantState<Compensating> {
         SagaParticipantState {
             saga_id: self.saga_id,
@@ -303,6 +367,8 @@ impl SagaParticipantState<Compensating> {
             state: Quarantined {
                 quarantined_at_millis: now_millis,
                 reason,
+                prior_state: "compensating",
+                compensation_data: None,
             },
             events: self.events,
         }

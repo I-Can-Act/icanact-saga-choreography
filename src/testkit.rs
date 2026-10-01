@@ -5,6 +5,13 @@ use crate::{
     SagaStateExt, apply_sync_workflow_participant_saga_ingress, handle_saga_event_with_emit,
 };
 
+/// Process-constant recent run incarnation: terminal resolvers fence runs against the real
+/// clock, so a fixed epoch would be rejected as an expired incarnation.
+fn fixture_start_millis() -> u64 {
+    static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BASE.get_or_init(SagaContext::now_millis)
+}
+
 /// Small deterministic builder for saga test contexts.
 #[derive(Debug, Clone)]
 pub struct DeterministicContextBuilder {
@@ -27,8 +34,8 @@ impl Default for DeterministicContextBuilder {
             correlation_id: 1,
             causation_id: 1,
             trace_id: 1,
-            started_at_millis: 1_700_000_000_000,
-            event_at_millis: 1_700_000_000_000,
+            started_at_millis: fixture_start_millis(),
+            event_at_millis: fixture_start_millis(),
         }
     }
 }
@@ -859,7 +866,14 @@ mod tests {
     impl Default for TestParticipant {
         fn default() -> Self {
             Self {
-                saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+                saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new())
+                    // fixtures use fixed 2023 timestamps; keep them inside the replay window
+                    .with_replay_horizon(
+                        crate::ReplayHorizon::new(std::time::Duration::from_secs(
+                            100 * 365 * 24 * 3600,
+                        ))
+                        .expect("horizon above the floor"),
+                    ),
                 called: false,
             }
         }

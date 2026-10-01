@@ -1,13 +1,13 @@
 //! First-class embedded saga support for participants.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use icanact_core::local::PublishStats;
 
 use crate::{
-    AcceptedStepPolicy, ParticipantDedupeStore, ParticipantJournal, ParticipantStats,
-    SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId, SagaStateEntry,
-    StepExecutionId,
+    AcceptedStepPolicy, InboxState, ParticipantDedupeStore, ParticipantJournal, ParticipantStats,
+    ReplayHorizon, RunKey, SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId,
+    SagaStateEntry, StepExecutionId,
 };
 
 #[derive(Clone, Debug)]
@@ -48,15 +48,19 @@ where
     J: ParticipantJournal,
     D: ParticipantDedupeStore,
 {
-    pub saga_states: HashMap<SagaId, SagaStateEntry>,
-    pub dependency_completions: HashMap<SagaId, HashSet<Box<str>>>,
-    pub dependency_fired: HashSet<SagaId>,
-    pub terminal_sagas: HashSet<SagaId>,
-    pub terminal_saga_order: VecDeque<SagaId>,
-    pub saga_run_started_at: HashMap<SagaId, u64>,
-    pub accepted_workflow_steps: HashMap<SagaId, AcceptedWorkflowStep>,
-    pub accepted_workflow_compensations: HashMap<SagaId, AcceptedWorkflowCompensation>,
-    pub resolved_workflow_steps: HashSet<(SagaId, StepExecutionId)>,
+    pub saga_states: HashMap<RunKey, SagaStateEntry>,
+    pub dependency_completions: HashMap<RunKey, HashSet<Box<str>>>,
+    pub dependency_fired: HashSet<RunKey>,
+    pub terminal_sagas: HashSet<RunKey>,
+    pub terminal_saga_order: VecDeque<RunKey>,
+    /// Runs admitted by this participant and not yet terminal; ordered so the runs of
+    /// one `(saga_type, saga_id)` form a contiguous range (ADR-0001).
+    pub admitted_runs: BTreeSet<RunKey>,
+    pub accepted_workflow_steps: HashMap<RunKey, AcceptedWorkflowStep>,
+    pub accepted_workflow_compensations: HashMap<RunKey, AcceptedWorkflowCompensation>,
+    pub resolved_workflow_steps: HashSet<(RunKey, StepExecutionId)>,
+    pub inbox_states: HashMap<RunKey, InboxState>,
+    pub replay_horizon: ReplayHorizon,
     pub journal: J,
     pub dedupe: D,
     pub stats: ParticipantStats,
@@ -76,16 +80,24 @@ where
             dependency_fired: HashSet::new(),
             terminal_sagas: HashSet::new(),
             terminal_saga_order: VecDeque::new(),
-            saga_run_started_at: HashMap::new(),
+            admitted_runs: BTreeSet::new(),
             accepted_workflow_steps: HashMap::new(),
             accepted_workflow_compensations: HashMap::new(),
             resolved_workflow_steps: HashSet::new(),
+            inbox_states: HashMap::new(),
+            replay_horizon: ReplayHorizon::PARTICIPANT_DEFAULT,
             journal,
             dedupe,
             stats: ParticipantStats::new(),
             startup_recovery_events: Vec::new(),
             bus: None,
         }
+    }
+
+    /// Replay horizon for this participant's tombstones; must cover every joined saga's policy horizon (ADR-0001).
+    pub fn with_replay_horizon(mut self, horizon: ReplayHorizon) -> Self {
+        self.replay_horizon = horizon;
+        self
     }
 
     pub fn with_startup_recovery_events(mut self, events: Vec<SagaChoreographyEvent>) -> Self {
@@ -110,8 +122,16 @@ where
         }
     }
 
+    /// True when any run of `saga_id` has an accepted workflow step.
     pub fn has_accepted_workflow_step(&self, saga_id: SagaId) -> bool {
-        self.accepted_workflow_steps.contains_key(&saga_id)
+        self.accepted_workflow_steps
+            .keys()
+            .any(|run| run.saga_id() == saga_id)
+    }
+
+    /// True when `run` has an accepted workflow step.
+    pub fn has_accepted_workflow_step_for_run(&self, run: &RunKey) -> bool {
+        self.accepted_workflow_steps.contains_key(run)
     }
 
     pub fn accepted_workflow_step_count(&self) -> usize {
@@ -128,7 +148,8 @@ where
         execution_id: &StepExecutionId,
     ) -> bool {
         self.resolved_workflow_steps
-            .contains(&(saga_id, execution_id.clone()))
+            .iter()
+            .any(|(run, resolved)| run.saga_id() == saga_id && resolved == execution_id)
     }
 
     pub fn resolved_workflow_step_count(&self) -> usize {
@@ -151,7 +172,7 @@ where
             .field("dependency_fired_len", &self.dependency_fired.len())
             .field("terminal_sagas_len", &self.terminal_sagas.len())
             .field("terminal_saga_order_len", &self.terminal_saga_order.len())
-            .field("saga_run_started_at_len", &self.saga_run_started_at.len())
+            .field("admitted_runs_len", &self.admitted_runs.len())
             .field(
                 "accepted_workflow_steps_len",
                 &self.accepted_workflow_steps.len(),

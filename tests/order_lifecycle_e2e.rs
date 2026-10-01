@@ -9,6 +9,8 @@
 //! panics, idempotency, dependency gating, and terminal latch.
 
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use icanact_core::local_sync;
@@ -321,7 +323,10 @@ impl SagaParticipant for ConfigurableParticipant {
 // ---------------------------------------------------------------------------
 
 fn context_for(saga_id: u64) -> SagaContext {
-    let now = SagaContext::now_millis();
+    let now = {
+        static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *BASE.get_or_init(SagaContext::now_millis)
+    };
     SagaContext {
         saga_id: SagaId::new(saga_id),
         saga_type: SAGA_TYPE.into(),
@@ -354,15 +359,15 @@ fn test_policy() -> TerminalPolicy {
     required.insert(STEP_POSITION.into());
     required.insert(STEP_BALANCE.into());
     required.insert(STEP_ORDER.into());
-    TerminalPolicy {
-        saga_type: SAGA_TYPE.into(),
-        policy_id: "order_lifecycle/e2e_test".into(),
-        failure_authority: FailureAuthority::AnyParticipant,
-        success_criteria: SuccessCriteria::AllOf(required),
-        overall_timeout: Duration::from_secs(60),
-        stalled_timeout: Duration::from_secs(60),
-        workflow_steps: OrderLifecycleE2eContract::steps(),
-    }
+    TerminalPolicy::new(
+        SAGA_TYPE.into(),
+        "order_lifecycle/e2e_test".into(),
+        FailureAuthority::AnyParticipant,
+        SuccessCriteria::AllOf(required),
+        Duration::from_secs(60),
+        Duration::from_secs(60),
+        OrderLifecycleE2eContract::steps(),
+    )
 }
 
 struct OrderLifecycleE2eContract;
@@ -1172,6 +1177,14 @@ fn order_panics_after_both_succeed() {
         .attach_terminal_resolver(test_policy(), "e2e-resolver")
         .expect("terminal resolver should attach");
     let (terminal_ref, terminal_h) = spawn_terminal_probe(&world, &bus);
+    let aborted = Arc::new(AtomicBool::new(false));
+    let aborted_probe = Arc::clone(&aborted);
+    let _observer = bus.subscribe_saga_type_fn(SAGA_TYPE, move |event| {
+        if matches!(event, SagaChoreographyEvent::SagaAbortRequested { .. }) {
+            aborted_probe.store(true, Ordering::SeqCst);
+        }
+        true
+    });
 
     let (p_ref, p_h) = spawn_and_subscribe(
         &world,
@@ -1219,6 +1232,10 @@ fn order_panics_after_both_succeed() {
     wait_until(TIMEOUT, || {
         query_terminal_counts(&terminal_ref).quarantined >= 1
     });
+    assert!(
+        !aborted.load(Ordering::SeqCst),
+        "setup must not trigger a delivery-shortfall abort: it races step completion and makes the resolver compensate"
+    );
     assert_eq!(
         query_state(&p_ref).compensated_count,
         0,

@@ -1,9 +1,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
+use tracing::{error, warn};
+
 use crate::{
-    AcceptedStepTimeoutOutcome, SagaChoreographyEvent, SagaContext, SagaFailureDetails, SagaId,
-    SagaWorkflowStepContract, StepExecutionId, WorkflowDependencySpec,
+    AcceptedStepTimeoutOutcome, KnownRuns, ReplayHorizon, RunAdmission, RunIdentityError, RunKey,
+    RunStatus, SagaChoreographyEvent, SagaContext, SagaFailureDetails, SagaWorkflowStepContract,
+    StepExecutionId, WorkflowDependencySpec, admit_run,
 };
 
 pub const TERMINAL_RESOLVER_STEP: &str = "terminal_resolver";
@@ -89,22 +92,44 @@ impl SuccessCriteria {
     }
 }
 
+/// Default number of re-requests after `CompensationFailedRetryable` (ADR-0004).
+pub const DEFAULT_COMPENSATION_RETRY_LIMIT: u32 = 3;
+
+/// What happens to completed effects of losing AnyOf/Quorum branches (ADR-0004).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LoserPolicy {
+    /// Undo completed compensable losing-branch steps before completion (ADR-0004).
+    #[default]
+    Compensate,
+    /// Keep losing-branch effects and record them (ADR-0004).
+    Keep,
+}
+
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct TerminalPolicy {
     pub saga_type: Box<str>,
     pub policy_id: Box<str>,
     pub failure_authority: FailureAuthority,
     pub success_criteria: SuccessCriteria,
-    /// Hard wall-clock budget measured from saga start.
+    /// Hard wall-clock budget for forward progress, measured from saga start.
+    /// Rollback gets its own budget of the same length, measured from when
+    /// rollback began, so a run can last up to `overall_timeout` plus that
+    /// rollback budget (about 2x) before it is quarantined.
     pub overall_timeout: Duration,
     /// Progress watchdog budget measured since last observed progress event.
     /// This window resets on each non-terminal participant progress event.
     pub stalled_timeout: Duration,
     /// Declared workflow graph used to diagnose stalled required paths.
     pub workflow_steps: &'static [SagaWorkflowStepContract],
+    compensation_retry_limit: u32,
+    replay_horizon: Option<ReplayHorizon>,
+    loser_policy: LoserPolicy,
 }
 
 impl TerminalPolicy {
+    /// Builds a terminal policy for one saga type from its workflow contract (ADR-0004).
     pub fn new(
         saga_type: Box<str>,
         policy_id: Box<str>,
@@ -122,11 +147,49 @@ impl TerminalPolicy {
             overall_timeout,
             stalled_timeout,
             workflow_steps,
+            compensation_retry_limit: DEFAULT_COMPENSATION_RETRY_LIMIT,
+            replay_horizon: None,
+            loser_policy: LoserPolicy::Compensate,
         }
+    }
+
+    /// Maximum re-requests after `CompensationFailedRetryable` (ADR-0004).
+    pub fn with_compensation_retry_limit(mut self, limit: u32) -> Self {
+        self.compensation_retry_limit = limit;
+        self
+    }
+
+    /// Explicit replay horizon for finalized-run tombstones (ADR-0001).
+    pub fn with_replay_horizon(mut self, horizon: ReplayHorizon) -> Self {
+        self.replay_horizon = Some(horizon);
+        self
+    }
+
+    /// Loser policy for AnyOf/Quorum groups (ADR-0004).
+    pub fn with_loser_policy(mut self, policy: LoserPolicy) -> Self {
+        self.loser_policy = policy;
+        self
+    }
+
+    /// Maximum re-requests after `CompensationFailedRetryable` (ADR-0004).
+    pub fn compensation_retry_limit(&self) -> u32 {
+        self.compensation_retry_limit
+    }
+
+    /// Explicit horizon, else `max(2 × overall_timeout, MIN_REPLAY_HORIZON)` (ADR-0001).
+    pub fn replay_horizon(&self) -> ReplayHorizon {
+        self.replay_horizon
+            .unwrap_or_else(|| ReplayHorizon::for_overall_timeout(self.overall_timeout))
+    }
+
+    /// Loser policy for AnyOf/Quorum groups (ADR-0004).
+    pub fn loser_policy(&self) -> LoserPolicy {
+        self.loser_policy
     }
 }
 
 /// Reasons a [`TerminalPolicy`] can never resolve (or resolves vacuously).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalPolicyError {
     EmptyAllOf,
@@ -136,6 +199,7 @@ pub enum TerminalPolicyError {
     QuorumExceedsGroup,
     ZeroOverallTimeout,
     ZeroStalledTimeout,
+    ReplayHorizonShorterThanOverallTimeout,
 }
 
 impl std::fmt::Display for TerminalPolicyError {
@@ -148,6 +212,9 @@ impl std::fmt::Display for TerminalPolicyError {
             Self::QuorumExceedsGroup => "Quorum required_count exceeds group size",
             Self::ZeroOverallTimeout => "overall_timeout is zero",
             Self::ZeroStalledTimeout => "stalled_timeout is zero",
+            Self::ReplayHorizonShorterThanOverallTimeout => {
+                "replay_horizon is shorter than overall_timeout"
+            }
         })
     }
 }
@@ -186,6 +253,12 @@ impl TerminalPolicy {
         if self.stalled_timeout.is_zero() {
             return Err(TerminalPolicyError::ZeroStalledTimeout);
         }
+        if self
+            .replay_horizon
+            .is_some_and(|horizon| horizon.get() < self.overall_timeout)
+        {
+            return Err(TerminalPolicyError::ReplayHorizonShorterThanOverallTimeout);
+        }
         Ok(())
     }
 }
@@ -207,20 +280,41 @@ impl TerminalPolicy {
     }
 }
 
+/// Lifecycle phase of one run (ADR-0004 §2.1). Forward success is decided
+/// only in `Running`; `Aborting` is a rollback in progress.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolverPhase {
+    Running,
+    Aborting,
+    Terminal,
+    Quarantined,
+}
+
 #[derive(Clone, Debug)]
 struct SagaResolutionState {
+    phase: ResolverPhase,
+    /// Effects that completed during rollback and cannot be undone.
+    unresolved: Vec<Box<str>>,
+    /// Set for internal aborts (timeouts, `SagaAbortRequested`): the settled
+    /// `SagaFailed` carries this reason and no step failure.
+    abort_reason: Option<Box<str>>,
+    /// When rollback began; rollback timeouts are measured from here.
+    aborting_since_millis: Option<u64>,
     started_steps: HashSet<Box<str>>,
     acked_steps: HashSet<Box<str>>,
     completed_steps: HashSet<Box<str>>,
     failed_steps: HashSet<Box<str>>,
     compensable_steps: Vec<Box<str>>,
-    compensation_requested: bool,
     pending_compensation_steps: HashSet<Box<str>>,
     completed_compensation_steps: HashSet<Box<str>>,
+    /// Steps whose `CompensationStarted` was observed (duplicate detection).
+    started_compensation_steps: HashSet<Box<str>>,
     pending_failure: Option<SagaFailureDetails>,
     accepted_steps: HashMap<Box<str>, AcceptedStepResolverState>,
     accepted_compensations: HashMap<Box<str>, AcceptedCompensationResolverState>,
     started_at_millis: u64,
+    /// Receive-time wall-clock mark of the last *novel* progress. Never moves
+    /// backwards; duplicates/replays and regressing clocks do not refresh it.
     last_progress_at_millis: u64,
     last_context: SagaContext,
     terminal_latched: bool,
@@ -249,16 +343,22 @@ struct AcceptedCompensationResolverState {
 impl SagaResolutionState {
     fn new(seed_context: &SagaContext, now_millis: u64) -> Self {
         let started_at_millis = now_millis.max(seed_context.saga_started_at_millis);
-        let progress_at_millis = now_millis.max(started_at_millis);
+        // Stall window starts at receive time; a skewed/future-dated start
+        // stamp must not extend it.
+        let progress_at_millis = now_millis;
         Self {
             completed_steps: HashSet::new(),
             started_steps: HashSet::new(),
             acked_steps: HashSet::new(),
             failed_steps: HashSet::new(),
             compensable_steps: Vec::new(),
-            compensation_requested: false,
+            phase: ResolverPhase::Running,
+            unresolved: Vec::new(),
+            abort_reason: None,
+            aborting_since_millis: None,
             pending_compensation_steps: HashSet::new(),
             completed_compensation_steps: HashSet::new(),
+            started_compensation_steps: HashSet::new(),
             pending_failure: None,
             accepted_steps: HashMap::new(),
             accepted_compensations: HashMap::new(),
@@ -274,9 +374,9 @@ impl SagaResolutionState {
 #[derive(Debug)]
 pub struct TerminalResolver {
     policy: TerminalPolicy,
-    states: HashMap<SagaId, SagaResolutionState>,
-    terminal_latched_order: VecDeque<SagaId>,
-    terminal_latched_set: HashSet<SagaId>,
+    states: HashMap<RunKey, SagaResolutionState>,
+    terminal_latched_order: VecDeque<RunKey>,
+    terminal_latched_set: HashSet<RunKey>,
     terminal_latch_retention: usize,
 }
 
@@ -322,25 +422,104 @@ impl TerminalResolver {
         (resolver, unpublished)
     }
 
+    /// Wrapper over [`Self::try_ingest_at`]: a rejected run is logged with its
+    /// `RunKey` and produces no events (no event is safe for a stale/expired run).
     fn ingest_at(
         &mut self,
         event: &SagaChoreographyEvent,
         now_millis: u64,
     ) -> Vec<SagaChoreographyEvent> {
+        match self.try_ingest_at(event, now_millis) {
+            Ok(events) => events,
+            Err(error) => {
+                warn!(
+                    event = "saga_run_identity_rejected",
+                    run = %event.context().run_key(),
+                    %error,
+                    "terminal resolver rejected event"
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    fn run_status(&self, run: &RunKey) -> RunStatus {
+        if self.terminal_latched_set.contains(run) {
+            return RunStatus::Terminal;
+        }
+        match self.states.get(run) {
+            Some(state) if state.terminal_latched => RunStatus::Terminal,
+            Some(_) => RunStatus::Active,
+            None => RunStatus::Unknown,
+        }
+    }
+
+    fn known_runs(&self, run: &RunKey) -> KnownRuns {
+        let mut known = KnownRuns::default();
+        let latched = self.terminal_latched_set.iter().map(|key| (key, true));
+        let live = self
+            .states
+            .iter()
+            .map(|(key, state)| (key, !state.terminal_latched));
+        for (key, active) in latched.chain(live) {
+            if key == run || key.saga_id() != run.saga_id() {
+                continue;
+            }
+            known.newest = known.newest.max(Some(key.incarnation()));
+            if active && !self.terminal_latched_set.contains(key) {
+                known.other_active += 1;
+            }
+        }
+        known
+    }
+
+    /// Checked ingress (ADR-0001 §2.2): `Err` for a stale or expired run.
+    pub fn try_ingest_at(
+        &mut self,
+        event: &SagaChoreographyEvent,
+        now_millis: u64,
+    ) -> Result<Vec<SagaChoreographyEvent>, RunIdentityError> {
         if event.context().saga_type.as_ref() != self.policy.saga_type.as_ref() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
-        let saga_id = event.context().saga_id;
-        if self.terminal_latched_set.contains(&saga_id) {
-            warn_if_contradictory_terminal(self.states.get(&saga_id), event);
-            return Vec::new();
+        let run = event.context().run_key();
+        let exact = self.run_status(&run);
+        let known = if exact == RunStatus::Unknown {
+            self.known_runs(&run)
+        } else {
+            KnownRuns::default()
+        };
+        let cutoff = self.policy.replay_horizon().cutoff(now_millis);
+        let is_start = matches!(event, SagaChoreographyEvent::SagaStarted { .. });
+        match admit_run(exact, known, &run, is_start, cutoff)? {
+            RunAdmission::NewRun { concurrent: true } => warn!(
+                event = "saga_concurrent_run_admitted",
+                run = %run,
+                other_active = known.other_active,
+                "admitted a newer run while another run of the saga id is active"
+            ),
+            RunAdmission::DuplicateStart => return Ok(Vec::new()),
+            RunAdmission::TerminalRun => {
+                warn_if_contradictory_terminal(self.states.get(&run), event);
+                return Ok(Vec::new());
+            }
+            RunAdmission::NewRun { .. } | RunAdmission::CurrentRun => {}
         }
+        Ok(self.apply_event(run, event, now_millis))
+    }
+
+    fn apply_event(
+        &mut self,
+        run: RunKey,
+        event: &SagaChoreographyEvent,
+        now_millis: u64,
+    ) -> Vec<SagaChoreographyEvent> {
         let mut out = Vec::new();
         let mut should_latch_terminal = false;
         let state = self
             .states
-            .entry(saga_id)
+            .entry(run.clone())
             .or_insert_with(|| SagaResolutionState::new(event.context(), now_millis));
 
         if state.terminal_latched {
@@ -349,8 +528,10 @@ impl TerminalResolver {
         }
 
         state.last_context = event.context().clone();
-        if is_progress_event(event) {
-            state.last_progress_at_millis = now_millis;
+        // Only novel progress refreshes the stall clock, and the mark never
+        // moves backwards (duplicates/replays and regressing clocks are inert).
+        if is_progress_event(event) && is_novel_progress(state, event) {
+            state.last_progress_at_millis = state.last_progress_at_millis.max(now_millis);
         }
 
         match event {
@@ -369,12 +550,18 @@ impl TerminalResolver {
                 compensation_available,
             } => {
                 let step_name = context.step_name.clone();
-                if state.compensation_requested
+                if state.phase == ResolverPhase::Aborting
                     && state.pending_compensation_steps.contains(&step_name)
                 {
                     return out;
                 }
                 state.started_steps.insert(step_name.clone());
+                if state.phase == ResolverPhase::Aborting && *compensation_available {
+                    // An accepted compensable step may produce an effect: it is
+                    // owed an undo exactly like a late completion.
+                    apply_late_completion(state, context, step_name, true, &mut out);
+                    return out;
+                }
                 if *compensation_available
                     && !state
                         .compensable_steps
@@ -383,13 +570,22 @@ impl TerminalResolver {
                 {
                     state.compensable_steps.push(step_name.clone());
                 }
+                // A heartbeat of the same execution never shortens a stored deadline.
+                let (deadline_at_millis, hard_deadline_at_millis) =
+                    match state.accepted_steps.get(step_name.as_ref()) {
+                        Some(known) if known.execution_id == *execution_id => (
+                            known.deadline_at_millis.max(*deadline_at_millis),
+                            known.hard_deadline_at_millis.max(*hard_deadline_at_millis),
+                        ),
+                        _ => (*deadline_at_millis, *hard_deadline_at_millis),
+                    };
                 state.accepted_steps.insert(
                     step_name,
                     AcceptedStepResolverState {
                         participant_id: participant_id.clone(),
                         execution_id: execution_id.clone(),
-                        deadline_at_millis: *deadline_at_millis,
-                        hard_deadline_at_millis: *hard_deadline_at_millis,
+                        deadline_at_millis,
+                        hard_deadline_at_millis,
                         timeouts_enabled: *timeouts_enabled,
                         timeout_outcome: timeout_outcome.clone(),
                     },
@@ -405,14 +601,31 @@ impl TerminalResolver {
                 ..
             } => {
                 let step_name = context.step_name.clone();
-                if state.compensation_requested
+                if state.phase == ResolverPhase::Aborting
                     && state.pending_compensation_steps.contains(&step_name)
                 {
+                    return out;
+                }
+                if state.phase == ResolverPhase::Aborting
+                    && state.completed_steps.contains(&step_name)
+                {
+                    // Redelivery of an effect already accounted for.
                     return out;
                 }
                 state.accepted_steps.remove(step_name.as_ref());
                 state.started_steps.insert(step_name.clone());
                 state.completed_steps.insert(step_name.clone());
+                if state.phase == ResolverPhase::Aborting {
+                    // Late forward effect during rollback: never a success.
+                    apply_late_completion(
+                        state,
+                        context,
+                        step_name,
+                        *compensation_available,
+                        &mut out,
+                    );
+                    return out;
+                }
                 if *compensation_available
                     && !state
                         .compensable_steps
@@ -488,29 +701,13 @@ impl TerminalResolver {
                 state
                     .completed_compensation_steps
                     .insert(context.step_name.clone());
-                if state.compensation_requested {
+                // A successful (retried) undo resolves an earlier retryable failure.
+                state.unresolved.retain(|step| step != &context.step_name);
+                if state.phase == ResolverPhase::Aborting {
                     state
                         .pending_compensation_steps
                         .remove(context.step_name.as_ref());
-                    if state.pending_compensation_steps.is_empty() {
-                        let failure = state.pending_failure.clone();
-                        let reason: Box<str> = failure
-                            .as_ref()
-                            .map(|f| {
-                                format!(
-                                    "compensation finished after failure at step={}",
-                                    f.step_name
-                                )
-                            })
-                            .unwrap_or_else(|| "compensation finished".to_string())
-                            .into();
-                        out.push(SagaChoreographyEvent::SagaFailed {
-                            context: terminal_context(context),
-                            reason,
-                            failure,
-                        });
-                        state.terminal_latched = true;
-                    }
+                    settle(state, context, None, &mut out);
                 }
             }
             SagaChoreographyEvent::CompensationFailed {
@@ -542,17 +739,33 @@ impl TerminalResolver {
             SagaChoreographyEvent::CompensationRequested {
                 failure,
                 steps_to_compensate,
+                failed_step,
+                reason,
                 ..
             } => {
+                if state.phase == ResolverPhase::Running
+                    && failed_step.as_ref() == TERMINAL_RESOLVER_STEP
+                {
+                    // Replay of a journaled internal abort: rebuild what
+                    // `begin_internal_abort` set so settlement matches live.
+                    state.abort_reason = Some(reason.clone());
+                }
                 for step in steps_to_compensate {
                     state.accepted_steps.remove(step.as_ref());
                 }
-                state.pending_compensation_steps = steps_to_compensate
+                let newly_pending: Vec<Box<str>> = steps_to_compensate
                     .iter()
                     .filter(|step| !state.completed_compensation_steps.contains(*step))
                     .cloned()
                     .collect();
-                state.compensation_requested = true;
+                if state.phase == ResolverPhase::Aborting {
+                    // Per-step requests (late effects) extend the owed set.
+                    state.pending_compensation_steps.extend(newly_pending);
+                } else {
+                    state.pending_compensation_steps = newly_pending.into_iter().collect();
+                }
+                state.phase = ResolverPhase::Aborting;
+                state.aborting_since_millis.get_or_insert(now_millis);
                 state.pending_failure = Some(failure.clone());
             }
             SagaChoreographyEvent::SagaCompleted { .. }
@@ -563,7 +776,59 @@ impl TerminalResolver {
                 state.terminal_latched = true;
                 state.terminal_outcome = Some(event.event_type());
             }
-            SagaChoreographyEvent::CompensationStarted { .. } => {}
+            SagaChoreographyEvent::CompensationStarted { context } => {
+                state
+                    .started_compensation_steps
+                    .insert(context.step_name.clone());
+            }
+            SagaChoreographyEvent::SagaEffectsRetained { .. } => {}
+            SagaChoreographyEvent::SagaAbortRequested {
+                context,
+                reason,
+                source,
+            } => {
+                if state.phase == ResolverPhase::Running {
+                    begin_internal_abort(
+                        state,
+                        terminal_context(context),
+                        &format!("{source:?}"),
+                        reason.clone(),
+                        now_millis,
+                        context.event_timestamp_millis,
+                        &mut out,
+                    );
+                } else {
+                    warn!(
+                        event = "saga_abort_requested_while_rolling_back",
+                        run = %context.run_key(),
+                        reason = %reason,
+                        "abort request recorded; rollback already in progress"
+                    );
+                }
+            }
+            SagaChoreographyEvent::CompensationFailedRetryable { context, error, .. } => {
+                state
+                    .accepted_compensations
+                    .remove(context.step_name.as_ref());
+                // The undo never ran: the effect is still live. Never a
+                // `SagaFailed` (interim until bounded retries exist).
+                error!(
+                    event = "saga_compensation_failed_retryable",
+                    run = %context.run_key(),
+                    step = %context.step_name,
+                    %error,
+                    "compensation failed; effect remains unresolved"
+                );
+                if !state.unresolved.contains(&context.step_name) {
+                    state.unresolved.push(context.step_name.clone());
+                }
+                if state.phase == ResolverPhase::Aborting {
+                    state
+                        .pending_compensation_steps
+                        .remove(context.step_name.as_ref());
+                    settle(state, context, None, &mut out);
+                }
+            }
         }
 
         if state.terminal_latched && state.terminal_outcome.is_none() {
@@ -572,9 +837,18 @@ impl TerminalResolver {
                 .find(|e| is_terminal_event(e))
                 .map(SagaChoreographyEvent::event_type);
         }
+        sync_terminal_phase(state);
 
         if !state.terminal_latched {
+            let before = out.len();
             out.extend(timeout_events(&self.policy, state, now_millis));
+            if state.terminal_latched {
+                state.terminal_outcome = out[before..]
+                    .iter()
+                    .find(|e| is_terminal_event(e))
+                    .map(SagaChoreographyEvent::event_type);
+                sync_terminal_phase(state);
+            }
         }
 
         if state.terminal_latched {
@@ -582,7 +856,7 @@ impl TerminalResolver {
         }
 
         if should_latch_terminal {
-            self.latch_terminal(saga_id);
+            self.latch_terminal(run);
         }
 
         out
@@ -591,7 +865,7 @@ impl TerminalResolver {
     fn poll_timeouts_at(&mut self, now_millis: u64) -> Vec<SagaChoreographyEvent> {
         let mut out = Vec::new();
         let mut newly_latched = Vec::new();
-        for (saga_id, state) in self.states.iter_mut() {
+        for (run, state) in self.states.iter_mut() {
             if state.terminal_latched {
                 continue;
             }
@@ -602,21 +876,22 @@ impl TerminalResolver {
                     .iter()
                     .find(|e| is_terminal_event(e))
                     .map(SagaChoreographyEvent::event_type);
-                newly_latched.push(*saga_id);
+                sync_terminal_phase(state);
+                newly_latched.push(run.clone());
             }
         }
-        for saga_id in newly_latched {
-            self.latch_terminal(saga_id);
+        for run in newly_latched {
+            self.latch_terminal(run);
         }
         out
     }
 
-    fn latch_terminal(&mut self, saga_id: SagaId) {
-        if !self.terminal_latched_set.insert(saga_id) {
+    fn latch_terminal(&mut self, run: RunKey) {
+        if !self.terminal_latched_set.insert(run.clone()) {
             return;
         }
 
-        self.terminal_latched_order.push_back(saga_id);
+        self.terminal_latched_order.push_back(run);
         while self.terminal_latched_order.len() > self.terminal_latch_retention {
             let Some(evicted) = self.terminal_latched_order.pop_front() else {
                 break;
@@ -773,6 +1048,76 @@ fn terminal_context_at(context: &SagaContext, now_millis: u64) -> SagaContext {
     next
 }
 
+/// Whether a progress-shaped event changes resolver state; replays of already
+/// observed progress must not extend the stall deadline.
+fn is_novel_progress(state: &SagaResolutionState, event: &SagaChoreographyEvent) -> bool {
+    match event {
+        SagaChoreographyEvent::SagaStarted { .. } => false,
+        SagaChoreographyEvent::StepStarted { context } => {
+            !state.started_steps.contains(&context.step_name)
+        }
+        SagaChoreographyEvent::StepAck { context, .. } => {
+            !state.acked_steps.contains(&context.step_name)
+        }
+        SagaChoreographyEvent::StepCompleted { context, .. } => {
+            !state.completed_steps.contains(&context.step_name)
+        }
+        SagaChoreographyEvent::StepFailed { context, .. } => {
+            !state.failed_steps.contains(&context.step_name)
+        }
+        SagaChoreographyEvent::StepAccepted {
+            context,
+            execution_id,
+            deadline_at_millis,
+            hard_deadline_at_millis,
+            ..
+        } => state
+            .accepted_steps
+            .get(context.step_name.as_ref())
+            .is_none_or(|known| {
+                known.execution_id != *execution_id
+                    || known.deadline_at_millis < *deadline_at_millis
+                    || known.hard_deadline_at_millis < *hard_deadline_at_millis
+            }),
+        SagaChoreographyEvent::CompensationAccepted {
+            context,
+            execution_id,
+            deadline_at_millis,
+            hard_deadline_at_millis,
+            ..
+        } => state
+            .accepted_compensations
+            .get(context.step_name.as_ref())
+            .is_none_or(|known| {
+                known.execution_id != *execution_id
+                    || known.deadline_at_millis != *deadline_at_millis
+                    || known.hard_deadline_at_millis != *hard_deadline_at_millis
+            }),
+        SagaChoreographyEvent::CompensationCompleted { context } => !state
+            .completed_compensation_steps
+            .contains(&context.step_name),
+        SagaChoreographyEvent::CompensationRequested {
+            steps_to_compensate,
+            ..
+        } => {
+            state.phase != ResolverPhase::Aborting
+                || steps_to_compensate.iter().any(|step| {
+                    !state.pending_compensation_steps.contains(step)
+                        && !state.completed_compensation_steps.contains(step)
+                })
+        }
+        SagaChoreographyEvent::CompensationStarted { context } => !state
+            .started_compensation_steps
+            .contains(&context.step_name),
+        SagaChoreographyEvent::CompensationFailedRetryable { context, .. } => {
+            !state.unresolved.contains(&context.step_name)
+        }
+        // `CompensationFailed` latches the run on first sight, so a second one
+        // never reaches here; everything else is fresh progress.
+        _ => true,
+    }
+}
+
 fn is_progress_event(event: &SagaChoreographyEvent) -> bool {
     matches!(
         event,
@@ -787,6 +1132,7 @@ fn is_progress_event(event: &SagaChoreographyEvent) -> bool {
             | SagaChoreographyEvent::CompensationAccepted { .. }
             | SagaChoreographyEvent::CompensationCompleted { .. }
             | SagaChoreographyEvent::CompensationFailed { .. }
+            | SagaChoreographyEvent::CompensationFailedRetryable { .. }
     )
 }
 
@@ -810,11 +1156,7 @@ fn timeout_events(
         }
         return Vec::new();
     }
-    if let Some(timeout_event) = timeout_terminal_event(policy, state, now_millis) {
-        state.terminal_latched = true;
-        return vec![timeout_event];
-    }
-    Vec::new()
+    timeout_abort_events(policy, state, now_millis)
 }
 
 fn accepted_compensation_overall_timeout_event(
@@ -953,6 +1295,59 @@ fn accepted_step_timeout_events(
     Some(timeout_events)
 }
 
+fn sync_terminal_phase(state: &mut SagaResolutionState) {
+    if !state.terminal_latched {
+        return;
+    }
+    state.phase = if state.terminal_outcome == Some("saga_quarantined") {
+        ResolverPhase::Quarantined
+    } else {
+        ResolverPhase::Terminal
+    };
+}
+
+/// A forward `StepCompleted` that lands while rolling back. Compensable
+/// effects become owed an undo; the rest stay `unresolved` until settlement
+/// quarantines the run. Never evaluates success criteria.
+fn apply_late_completion(
+    state: &mut SagaResolutionState,
+    context: &SagaContext,
+    step_name: Box<str>,
+    compensation_available: bool,
+    out: &mut Vec<SagaChoreographyEvent>,
+) {
+    let failure = state.pending_failure.clone();
+    match failure {
+        Some(failure) if compensation_available => {
+            if state.completed_compensation_steps.contains(&step_name) {
+                return;
+            }
+            if !state.compensable_steps.contains(&step_name) {
+                state.compensable_steps.push(step_name.clone());
+            }
+            state.pending_compensation_steps.insert(step_name.clone());
+            out.push(SagaChoreographyEvent::CompensationRequested {
+                context: terminal_context(context),
+                failed_step: failure.step_name.clone(),
+                reason: "late_effect_during_rollback".into(),
+                failure,
+                steps_to_compensate: vec![step_name],
+            });
+        }
+        _ => {
+            error!(
+                event = "saga_late_effect_not_compensable",
+                run = %context.run_key(),
+                step = %step_name,
+                "effect completed during rollback and cannot be undone"
+            );
+            if !state.unresolved.contains(&step_name) {
+                state.unresolved.push(step_name);
+            }
+        }
+    }
+}
+
 fn apply_step_failure(
     state: &mut SagaResolutionState,
     context: &SagaContext,
@@ -970,34 +1365,47 @@ fn apply_step_failure(
         at_millis: context.event_timestamp_millis,
     };
 
+    if state.phase == ResolverPhase::Aborting {
+        // Rollback in progress: evidence only. No terminal, and the recorded
+        // cause of the rollback is not overwritten.
+        state.unresolved.retain(|step| step != &context.step_name);
+        warn!(
+            event = "saga_step_failed_while_rolling_back",
+            run = %context.run_key(),
+            step = %context.step_name,
+            %error,
+            "step failure recorded as evidence; rollback continues"
+        );
+        return;
+    }
+
     if requires_compensation {
         state.pending_failure = Some(failure.clone());
-        if !state.compensation_requested {
-            let steps_to_compensate: Vec<Box<str>> =
-                state.compensable_steps.iter().rev().cloned().collect();
-            for step in &steps_to_compensate {
-                state.accepted_steps.remove(step.as_ref());
-            }
-            state.pending_compensation_steps = steps_to_compensate.iter().cloned().collect();
-            state.compensation_requested = true;
-
-            out.push(SagaChoreographyEvent::CompensationRequested {
-                context: terminal_context(context),
-                failed_step: context.step_name.clone(),
-                reason: error.clone(),
-                failure: failure.clone(),
-                steps_to_compensate,
-            });
+        let steps_to_compensate: Vec<Box<str>> =
+            state.compensable_steps.iter().rev().cloned().collect();
+        for step in &steps_to_compensate {
+            state.accepted_steps.remove(step.as_ref());
         }
+        state.pending_compensation_steps = steps_to_compensate.iter().cloned().collect();
+        state.phase = ResolverPhase::Aborting;
+        state
+            .aborting_since_millis
+            .get_or_insert(context.event_timestamp_millis);
 
-        if state.pending_compensation_steps.is_empty() {
-            out.push(SagaChoreographyEvent::SagaFailed {
-                context: terminal_context(context),
-                reason: "step failed and no compensations were pending".into(),
-                failure: Some(failure),
-            });
-            state.terminal_latched = true;
-        }
+        out.push(SagaChoreographyEvent::CompensationRequested {
+            context: terminal_context(context),
+            failed_step: context.step_name.clone(),
+            reason: error.clone(),
+            failure,
+            steps_to_compensate,
+        });
+
+        settle(
+            state,
+            context,
+            Some("step failed and no compensations were pending"),
+            out,
+        );
     } else {
         out.push(SagaChoreographyEvent::SagaFailed {
             context: terminal_context(context),
@@ -1006,6 +1414,95 @@ fn apply_step_failure(
         });
         state.terminal_latched = true;
     }
+}
+
+/// Steps that started/acked/were accepted and have neither completed, failed
+/// nor been undone: their effect on the world is unknown.
+fn in_flight_steps(state: &SagaResolutionState) -> Vec<Box<str>> {
+    let mut steps: Vec<Box<str>> = state
+        .started_steps
+        .iter()
+        .chain(state.acked_steps.iter())
+        .chain(state.accepted_steps.keys())
+        .filter(|step| {
+            !state.completed_steps.contains(*step)
+                && !state.failed_steps.contains(*step)
+                && !state.completed_compensation_steps.contains(*step)
+        })
+        .cloned()
+        .collect();
+    steps.sort();
+    steps.dedup();
+    steps
+}
+
+/// Single settlement point for a rollback (ADR-0004 §2.3). With nothing left
+/// owed: any unresolved effect or in-flight step quarantines the run, else it
+/// fails. A no-op while undo is still pending or once latched.
+fn settle(
+    state: &mut SagaResolutionState,
+    context: &SagaContext,
+    clean_reason: Option<&str>,
+    out: &mut Vec<SagaChoreographyEvent>,
+) {
+    if state.terminal_latched || !state.pending_compensation_steps.is_empty() {
+        return;
+    }
+    let mut stuck: Vec<Box<str>> = state.unresolved.clone();
+    stuck.extend(in_flight_steps(state));
+    stuck.sort();
+    stuck.dedup();
+    if !stuck.is_empty() {
+        let steps = stuck.join(", ");
+        error!(
+            event = "saga_quarantined_unresolved_effects",
+            run = %context.run_key(),
+            steps = %steps,
+            "rollback settled with effects that are unresolved or in flight"
+        );
+        latch_event(
+            state,
+            out,
+            SagaChoreographyEvent::SagaQuarantined {
+                context: terminal_context(context),
+                reason: match state.abort_reason.as_deref() {
+                    Some(abort) => {
+                        format!("{abort}; rollback settled with unresolved effects: {steps}")
+                    }
+                    None => format!("rollback settled with unresolved effects: {steps}"),
+                }
+                .into(),
+                step: stuck[0].clone(),
+                participant_id: TERMINAL_RESOLVER_STEP.into(),
+            },
+        );
+        return;
+    }
+    let (failure, reason) = match state.abort_reason.clone() {
+        Some(reason) => (None, reason),
+        None => {
+            let failure = state.pending_failure.clone();
+            let reason: Box<str> = match (clean_reason, failure.as_ref()) {
+                (Some(reason), _) => reason.into(),
+                (None, Some(f)) => format!(
+                    "compensation finished after failure at step={}",
+                    f.step_name
+                )
+                .into(),
+                (None, None) => "compensation finished".into(),
+            };
+            (failure, reason)
+        }
+    };
+    latch_event(
+        state,
+        out,
+        SagaChoreographyEvent::SagaFailed {
+            context: terminal_context(context),
+            reason,
+            failure,
+        },
+    );
 }
 
 #[derive(Debug)]
@@ -1220,44 +1717,140 @@ fn emit_timeout_diagnostic(
     );
 }
 
-fn timeout_terminal_event(
+/// Overall/stalled timeouts are infrastructure aborts (ADR-0004 §2.2): in
+/// `Running` they begin a rollback; while already rolling back they quarantine
+/// the run with whatever is still owed.
+fn timeout_abort_events(
     policy: &TerminalPolicy,
-    state: &SagaResolutionState,
+    state: &mut SagaResolutionState,
     now_millis: u64,
-) -> Option<SagaChoreographyEvent> {
-    let elapsed_ms = now_millis.saturating_sub(state.started_at_millis);
+) -> Vec<SagaChoreographyEvent> {
+    let rolling_back = state.phase == ResolverPhase::Aborting;
+    // Rollback gets its own budget, measured from when it began.
+    let since = match (rolling_back, state.aborting_since_millis) {
+        (true, Some(since)) => since,
+        _ => state.started_at_millis,
+    };
+    let elapsed_ms = now_millis.saturating_sub(since);
     let overall_timeout_ms = policy.overall_timeout.as_millis() as u64;
-    if elapsed_ms > overall_timeout_ms {
-        let diagnostic = timeout_diagnostics(policy, state);
-        emit_timeout_diagnostic(policy, state, "overall_timeout", &diagnostic);
-        let reason = diagnostic.reason(
-            format!("overall_timeout after {overall_timeout_ms}ms"),
-            &policy.policy_id,
-        );
-        return Some(SagaChoreographyEvent::SagaFailed {
-            context: terminal_context_at(&state.last_context, now_millis),
-            reason: reason.into(),
-            failure: None,
-        });
-    }
-
     let stalled_ms = now_millis.saturating_sub(state.last_progress_at_millis);
     let stalled_timeout_ms = policy.stalled_timeout.as_millis() as u64;
-    if stalled_ms > stalled_timeout_ms {
-        let diagnostic = timeout_diagnostics(policy, state);
-        emit_timeout_diagnostic(policy, state, "stalled_timeout", &diagnostic);
-        let reason = diagnostic.reason(
+    let (code, prefix) = if elapsed_ms > overall_timeout_ms {
+        (
+            "overall_timeout",
+            format!("overall_timeout after {overall_timeout_ms}ms"),
+        )
+    } else if stalled_ms > stalled_timeout_ms {
+        (
+            "stalled_timeout",
             format!("stalled_timeout after {stalled_timeout_ms}ms without progress"),
-            &policy.policy_id,
-        );
-        return Some(SagaChoreographyEvent::SagaFailed {
-            context: terminal_context_at(&state.last_context, now_millis),
-            reason: reason.into(),
-            failure: None,
-        });
+        )
+    } else {
+        return Vec::new();
+    };
+    let diagnostic = timeout_diagnostics(policy, state);
+    emit_timeout_diagnostic(policy, state, code, &diagnostic);
+    let reason: Box<str> = diagnostic.reason(prefix, &policy.policy_id).into();
+    let context = terminal_context_at(&state.last_context, now_millis);
+    let mut out = Vec::new();
+    match state.phase {
+        ResolverPhase::Running => {
+            begin_internal_abort(
+                state, context, code, reason, now_millis, now_millis, &mut out,
+            );
+        }
+        ResolverPhase::Aborting => {
+            let mut stuck: Vec<Box<str>> = state
+                .pending_compensation_steps
+                .iter()
+                .cloned()
+                .chain(state.unresolved.iter().cloned())
+                .chain(in_flight_steps(state))
+                .collect();
+            stuck.sort();
+            stuck.dedup();
+            error!(
+                event = "saga_quarantined_rollback_timeout",
+                run = %state.last_context.run_key(),
+                steps = %stuck.join(", "),
+                "rollback timed out with undo outstanding"
+            );
+            let step = stuck
+                .first()
+                .cloned()
+                .unwrap_or_else(|| TERMINAL_RESOLVER_STEP.into());
+            latch_event(
+                state,
+                &mut out,
+                SagaChoreographyEvent::SagaQuarantined {
+                    context,
+                    reason: format!("{reason}; rollback incomplete: {}", stuck.join(", ")).into(),
+                    step,
+                    participant_id: TERMINAL_RESOLVER_STEP.into(),
+                },
+            );
+        }
+        ResolverPhase::Terminal | ResolverPhase::Quarantined => {}
+    }
+    out
+}
+
+fn latch_event(
+    state: &mut SagaResolutionState,
+    out: &mut Vec<SagaChoreographyEvent>,
+    event: SagaChoreographyEvent,
+) {
+    state.terminal_latched = true;
+    state.terminal_outcome = Some(event.event_type());
+    out.push(event);
+    sync_terminal_phase(state);
+}
+
+/// Begin an internal abort (timeout / `SagaAbortRequested`): undo every known
+/// compensable effect, then fail only at clean settlement. Nothing owed and
+/// nothing in flight fails directly; unknown in-flight effects quarantine.
+fn begin_internal_abort(
+    state: &mut SagaResolutionState,
+    context: SagaContext,
+    code: &str,
+    reason: Box<str>,
+    now_millis: u64,
+    at_millis: u64,
+    out: &mut Vec<SagaChoreographyEvent>,
+) {
+    let owed: Vec<Box<str>> = state.compensable_steps.iter().rev().cloned().collect();
+
+    if owed.is_empty() {
+        // Nothing to undo: settle at once (fail, or quarantine in-flight steps).
+        state.abort_reason = Some(reason.clone());
+        state.pending_failure = None;
+        settle(state, &context, None, out);
+        return;
     }
 
-    None
+    for step in &owed {
+        state.accepted_steps.remove(step.as_ref());
+    }
+    let failure = SagaFailureDetails {
+        step_name: TERMINAL_RESOLVER_STEP.into(),
+        participant_id: TERMINAL_RESOLVER_STEP.into(),
+        error_code: Some(code.into()),
+        error_message: reason.clone(),
+        at_millis,
+    };
+    state.pending_failure = Some(failure.clone());
+    state.abort_reason = Some(reason.clone());
+    state.pending_compensation_steps = owed.iter().cloned().collect();
+    state.phase = ResolverPhase::Aborting;
+    state.aborting_since_millis = Some(now_millis);
+    state.last_progress_at_millis = now_millis;
+    out.push(SagaChoreographyEvent::CompensationRequested {
+        context,
+        failed_step: TERMINAL_RESOLVER_STEP.into(),
+        reason,
+        failure,
+        steps_to_compensate: owed,
+    });
 }
 
 #[cfg(test)]
@@ -1266,11 +1859,13 @@ mod tests {
     use std::time::Duration;
 
     use crate::{
-        AcceptedStepTimeoutOutcome, SagaChoreographyEvent, SagaContext, SagaId,
+        AcceptedStepTimeoutOutcome, RunIdentityError, SagaChoreographyEvent, SagaContext, SagaId,
         SagaWorkflowStepContract, StepExecutionId, WorkflowDependencySpec,
     };
 
-    use super::{FailureAuthority, SuccessCriteria, TerminalPolicy, TerminalResolver};
+    use super::{
+        FailureAuthority, SuccessCriteria, TerminalPolicy, TerminalResolver, is_terminal_event,
+    };
 
     static OPEN_POSITION_STEPS: &[SagaWorkflowStepContract] = &[
         SagaWorkflowStepContract {
@@ -1307,18 +1902,30 @@ mod tests {
     fn open_position_policy(stalled_timeout: Duration) -> TerminalPolicy {
         let mut required_steps = HashSet::new();
         required_steps.insert("create_order".into());
-        TerminalPolicy {
-            saga_type: "order_lifecycle".into(),
-            policy_id: "open_position/default".into(),
-            failure_authority: FailureAuthority::AnyParticipant,
-            success_criteria: SuccessCriteria::AllOf(required_steps),
-            overall_timeout: Duration::from_secs(5),
+        TerminalPolicy::new(
+            "order_lifecycle".into(),
+            "open_position/default".into(),
+            FailureAuthority::AnyParticipant,
+            SuccessCriteria::AllOf(required_steps),
+            Duration::from_secs(5),
             stalled_timeout,
-            workflow_steps: OPEN_POSITION_STEPS,
-        }
+            OPEN_POSITION_STEPS,
+        )
+    }
+
+    fn run_key(saga_id: u64, started_at_millis: u64) -> crate::RunKey {
+        ctx_at(
+            "create_order",
+            saga_id,
+            started_at_millis,
+            started_at_millis,
+        )
+        .run_key()
     }
 
     fn ctx(step: &str) -> SagaContext {
+        static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let base = *BASE.get_or_init(SagaContext::now_millis);
         SagaContext {
             saga_id: SagaId::new(9),
             saga_type: "order_lifecycle".into(),
@@ -1329,8 +1936,8 @@ mod tests {
             step_index: 0,
             attempt: 0,
             initiator_peer_id: [0; 32],
-            saga_started_at_millis: SagaContext::now_millis(),
-            event_timestamp_millis: SagaContext::now_millis(),
+            saga_started_at_millis: base,
+            event_timestamp_millis: base,
         }
     }
 
@@ -1360,15 +1967,15 @@ mod tests {
         let mut required: HashSet<Box<str>> = HashSet::new();
         required.insert("a".into());
         required.insert("b".into());
-        let policy = TerminalPolicy {
-            saga_type: "order_lifecycle".into(),
-            policy_id: "test".into(),
-            failure_authority: FailureAuthority::AnyParticipant,
-            success_criteria: SuccessCriteria::AllOf(required),
-            overall_timeout: Duration::from_secs(60),
-            stalled_timeout: Duration::from_secs(60),
-            workflow_steps: &[],
-        };
+        let policy = TerminalPolicy::new(
+            "order_lifecycle".into(),
+            "test".into(),
+            FailureAuthority::AnyParticipant,
+            SuccessCriteria::AllOf(required),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            &[],
+        );
         let mut resolver = TerminalResolver::new(policy);
 
         let out1 = resolver.ingest(&SagaChoreographyEvent::StepCompleted {
@@ -1411,15 +2018,15 @@ mod tests {
     fn unauthorized_step_failure_is_ignored() {
         let mut only_steps = HashSet::new();
         only_steps.insert("allowed".into());
-        let policy = TerminalPolicy {
-            saga_type: "order_lifecycle".into(),
-            policy_id: "test".into(),
-            failure_authority: FailureAuthority::OnlySteps(only_steps),
-            success_criteria: SuccessCriteria::AnyOf(HashSet::new()),
-            overall_timeout: Duration::from_secs(30),
-            stalled_timeout: Duration::from_secs(30),
-            workflow_steps: &[],
-        };
+        let policy = TerminalPolicy::new(
+            "order_lifecycle".into(),
+            "test".into(),
+            FailureAuthority::OnlySteps(only_steps),
+            SuccessCriteria::AnyOf(HashSet::new()),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            &[],
+        );
         let mut resolver = TerminalResolver::new(policy);
         let out = resolver.ingest(&SagaChoreographyEvent::StepFailed {
             context: ctx("denied"),
@@ -1435,15 +2042,15 @@ mod tests {
     fn authoritative_quarantine_is_absorbing_live_and_after_restore() {
         let mut required_steps = HashSet::new();
         required_steps.insert("create_order".into());
-        let policy = TerminalPolicy {
-            saga_type: "order_lifecycle".into(),
-            policy_id: "absorbing".into(),
-            failure_authority: FailureAuthority::AnyParticipant,
-            success_criteria: SuccessCriteria::AllOf(required_steps),
-            overall_timeout: Duration::from_millis(100),
-            stalled_timeout: Duration::from_secs(60),
-            workflow_steps: &[],
-        };
+        let policy = TerminalPolicy::new(
+            "order_lifecycle".into(),
+            "absorbing".into(),
+            FailureAuthority::AnyParticipant,
+            SuccessCriteria::AllOf(required_steps),
+            Duration::from_millis(100),
+            Duration::from_secs(60),
+            &[],
+        );
         let started = SagaChoreographyEvent::SagaStarted {
             context: ctx_at("risk_check", 9, 1_000, 1_000),
             payload: Vec::new(),
@@ -1486,15 +2093,15 @@ mod tests {
     fn hard_timeout_triggers_without_new_events() {
         let mut required_steps = HashSet::new();
         required_steps.insert("create_order".into());
-        let policy = TerminalPolicy {
-            saga_type: "order_lifecycle".into(),
-            policy_id: "hard-timeout".into(),
-            failure_authority: FailureAuthority::AnyParticipant,
-            success_criteria: SuccessCriteria::AllOf(required_steps),
-            overall_timeout: Duration::from_millis(100),
-            stalled_timeout: Duration::from_secs(60),
-            workflow_steps: &[],
-        };
+        let policy = TerminalPolicy::new(
+            "order_lifecycle".into(),
+            "hard-timeout".into(),
+            FailureAuthority::AnyParticipant,
+            SuccessCriteria::AllOf(required_steps),
+            Duration::from_millis(100),
+            Duration::from_secs(60),
+            &[],
+        );
         let mut resolver = TerminalResolver::new(policy);
         let start = SagaChoreographyEvent::SagaStarted {
             context: ctx_at("risk_check", 9, 1_000, 1_000),
@@ -1583,15 +2190,15 @@ mod tests {
         denied_steps.insert("create_order".into());
         let mut required_steps = HashSet::new();
         required_steps.insert("create_order".into());
-        let policy = TerminalPolicy {
-            saga_type: "order_lifecycle".into(),
-            policy_id: "accepted-timeout-deny".into(),
-            failure_authority: FailureAuthority::DenySteps(denied_steps),
-            success_criteria: SuccessCriteria::AllOf(required_steps),
-            overall_timeout: Duration::from_secs(5),
-            stalled_timeout: Duration::from_secs(5),
-            workflow_steps: &[],
-        };
+        let policy = TerminalPolicy::new(
+            "order_lifecycle".into(),
+            "accepted-timeout-deny".into(),
+            FailureAuthority::DenySteps(denied_steps),
+            SuccessCriteria::AllOf(required_steps),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            &[],
+        );
         let mut resolver = TerminalResolver::new(policy);
         let start = SagaChoreographyEvent::SagaStarted {
             context: ctx_at("create_order", 9, 1_000, 1_000),
@@ -1625,15 +2232,15 @@ mod tests {
         authorized.insert("create_order".into());
         let mut required = HashSet::new();
         required.insert("create_order".into());
-        let policy = TerminalPolicy {
-            saga_type: "order_lifecycle".into(),
-            policy_id: "accepted-timeout/sibling".into(),
-            failure_authority: FailureAuthority::OnlySteps(authorized),
-            success_criteria: SuccessCriteria::AllOf(required),
-            overall_timeout: Duration::from_secs(5),
-            stalled_timeout: Duration::from_secs(5),
-            workflow_steps: OPEN_POSITION_STEPS,
-        };
+        let policy = TerminalPolicy::new(
+            "order_lifecycle".into(),
+            "accepted-timeout/sibling".into(),
+            FailureAuthority::OnlySteps(authorized),
+            SuccessCriteria::AllOf(required),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            OPEN_POSITION_STEPS,
+        );
         let mut resolver = TerminalResolver::new(policy);
         let _ = resolver.ingest_at(
             &SagaChoreographyEvent::SagaStarted {
@@ -1695,6 +2302,68 @@ mod tests {
     }
 
     #[test]
+    fn old_run_timeout_cannot_mutate_new_incarnation() {
+        let mut resolver = TerminalResolver::new(open_position_policy(Duration::from_secs(5)));
+        let start = |incarnation: u64| SagaChoreographyEvent::SagaStarted {
+            context: ctx_at("create_order", 31, incarnation, incarnation),
+            payload: Vec::new(),
+        };
+        assert!(resolver.try_ingest_at(&start(1_000), 1_000).is_ok());
+        // Newer incarnation coexists with the still-active older one (ADR-0001 §2.2).
+        assert!(resolver.try_ingest_at(&start(5_000), 5_000).is_ok());
+
+        // Only the old run is past its overall deadline.
+        let timeouts = resolver.poll_timeouts_at(6_500);
+        assert!(
+            timeouts
+                .iter()
+                .all(|event| event.context().saga_started_at_millis == 1_000),
+            "timeout must carry only the old incarnation: {timeouts:?}"
+        );
+        assert!(
+            timeouts.iter().any(is_terminal_event),
+            "old run must time out: {timeouts:?}"
+        );
+
+        let completed = resolver.ingest_at(
+            &SagaChoreographyEvent::StepCompleted {
+                context: ctx_at("create_order", 31, 5_000, 7_000),
+                output: Vec::new(),
+                saga_input: Vec::new(),
+                compensation_available: false,
+            },
+            7_000,
+        );
+        assert!(
+            matches!(
+                completed.as_slice(),
+                [SagaChoreographyEvent::SagaCompleted { context }]
+                    if context.saga_started_at_millis == 5_000
+            ),
+            "new incarnation must resolve independently: {completed:?}"
+        );
+    }
+
+    #[test]
+    fn stale_start_is_rejected_by_try_ingest_at() {
+        let mut resolver = TerminalResolver::new(open_position_policy(Duration::from_secs(5)));
+        let start = |incarnation: u64| SagaChoreographyEvent::SagaStarted {
+            context: ctx_at("create_order", 32, incarnation, incarnation),
+            payload: Vec::new(),
+        };
+        assert!(resolver.try_ingest_at(&start(2_000), 2_000).is_ok());
+        let result = resolver.try_ingest_at(&start(1_000), 2_001);
+        assert!(
+            matches!(result, Err(RunIdentityError::StaleIncarnation { .. })),
+            "stale start must be rejected: {result:?}"
+        );
+        assert!(
+            resolver.ingest_at(&start(1_000), 2_002).is_empty(),
+            "ingest_at wrapper yields no events on rejection"
+        );
+    }
+
+    #[test]
     fn evicted_terminal_state_keeps_latch_tombstone() {
         let mut resolver = TerminalResolver::new(open_position_policy(Duration::from_secs(5)));
         resolver.terminal_latch_retention = 1;
@@ -1737,7 +2406,7 @@ mod tests {
             2_010,
         );
         assert!(
-            !resolver.states.contains_key(&SagaId::new(21)),
+            !resolver.states.contains_key(&run_key(21, 1_000)),
             "retention should evict detailed state for the oldest terminal saga"
         );
 
@@ -1755,7 +2424,7 @@ mod tests {
             "late events for evicted terminal sagas must stay latched"
         );
         assert!(
-            !resolver.states.contains_key(&SagaId::new(21)),
+            !resolver.states.contains_key(&run_key(21, 1_000)),
             "late event must not resurrect evicted terminal saga state"
         );
     }
@@ -1947,15 +2616,15 @@ mod tests {
     fn progress_timeout_resets_after_progress_event() {
         let mut required_steps = HashSet::new();
         required_steps.insert("create_order".into());
-        let policy = TerminalPolicy {
-            saga_type: "order_lifecycle".into(),
-            policy_id: "progress-timeout".into(),
-            failure_authority: FailureAuthority::AnyParticipant,
-            success_criteria: SuccessCriteria::AllOf(required_steps),
-            overall_timeout: Duration::from_secs(5),
-            stalled_timeout: Duration::from_millis(100),
-            workflow_steps: &[],
-        };
+        let policy = TerminalPolicy::new(
+            "order_lifecycle".into(),
+            "progress-timeout".into(),
+            FailureAuthority::AnyParticipant,
+            SuccessCriteria::AllOf(required_steps),
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+            &[],
+        );
         let mut resolver = TerminalResolver::new(policy);
         let start = SagaChoreographyEvent::SagaStarted {
             context: ctx_at("risk_check", 9, 1_000, 1_000),
@@ -1975,10 +2644,97 @@ mod tests {
         assert!(
             matches!(
                 timed_out.first(),
-                Some(SagaChoreographyEvent::SagaFailed { reason, .. })
+                Some(SagaChoreographyEvent::SagaQuarantined { reason, .. })
                 if reason.as_ref().contains("stalled_timeout")
             ),
-            "expected stalled-timeout failure, got: {timed_out:?}"
+            "expected stalled-timeout quarantine (positions_check in flight), got: {timed_out:?}"
+        );
+    }
+
+    fn stall_policy() -> TerminalPolicy {
+        let mut required_steps = HashSet::new();
+        required_steps.insert("create_order".into());
+        TerminalPolicy::new(
+            "order_lifecycle".into(),
+            "stall-dedupe".into(),
+            FailureAuthority::AnyParticipant,
+            SuccessCriteria::AllOf(required_steps),
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+            &[],
+        )
+    }
+
+    fn is_stall_quarantine(events: &[SagaChoreographyEvent]) -> bool {
+        matches!(
+            events.first(),
+            Some(SagaChoreographyEvent::SagaQuarantined { reason, .. })
+            if reason.as_ref().contains("stalled_timeout")
+        )
+    }
+
+    #[test]
+    fn duplicate_progress_does_not_extend_stall_deadline() {
+        let mut resolver = TerminalResolver::new(stall_policy());
+        let start = SagaChoreographyEvent::SagaStarted {
+            context: ctx_at("risk_check", 9, 1_000, 1_000),
+            payload: Vec::new(),
+        };
+        let _ = resolver.ingest_at(&start, 1_000);
+        let progress = SagaChoreographyEvent::StepStarted {
+            context: ctx_at("positions_check", 9, 1_000, 1_050),
+        };
+        let _ = resolver.ingest_at(&progress, 1_050);
+        // Replays of the same progress and a late duplicate SagaStarted.
+        for at in [1_070, 1_090, 1_120] {
+            let _ = resolver.ingest_at(&progress, at);
+            let _ = resolver.ingest_at(&start, at);
+        }
+        assert!(resolver.poll_timeouts_at(1_150).is_empty());
+        let timed_out = resolver.poll_timeouts_at(1_151);
+        assert!(
+            is_stall_quarantine(&timed_out),
+            "duplicates must not extend the stall deadline past 1050+100: {timed_out:?}"
+        );
+    }
+
+    #[test]
+    fn regressing_progress_time_does_not_pull_stall_deadline_back() {
+        let mut resolver = TerminalResolver::new(stall_policy());
+        let start = SagaChoreographyEvent::SagaStarted {
+            context: ctx_at("risk_check", 9, 1_000, 1_000),
+            payload: Vec::new(),
+        };
+        let _ = resolver.ingest_at(&start, 1_000);
+        let first = SagaChoreographyEvent::StepStarted {
+            context: ctx_at("positions_check", 9, 1_000, 1_090),
+        };
+        let _ = resolver.ingest_at(&first, 1_090);
+        // Novel progress observed with an older clock reading.
+        let older = SagaChoreographyEvent::StepStarted {
+            context: ctx_at("fraud_check", 9, 1_000, 1_020),
+        };
+        let _ = resolver.ingest_at(&older, 1_020);
+        assert!(
+            resolver.poll_timeouts_at(1_150).is_empty(),
+            "a regressing clock must not move the progress mark backwards"
+        );
+        assert!(is_stall_quarantine(&resolver.poll_timeouts_at(1_191)));
+    }
+
+    #[test]
+    fn future_dated_saga_start_does_not_extend_initial_stall_window() {
+        let mut resolver = TerminalResolver::new(stall_policy());
+        let start = SagaChoreographyEvent::SagaStarted {
+            context: ctx_at("risk_check", 9, 50_000, 1_000),
+            payload: Vec::new(),
+        };
+        let _ = resolver.ingest_at(&start, 1_000);
+        let timed_out = resolver.poll_timeouts_at(1_101);
+        assert!(
+            is_stall_quarantine(&timed_out)
+                || matches!(timed_out.first(), Some(SagaChoreographyEvent::SagaFailed { reason, .. }) if reason.contains("stalled_timeout")),
+            "stall window is measured from receive time: {timed_out:?}"
         );
     }
 
@@ -2011,7 +2767,7 @@ mod tests {
 
         let timed_out = resolver.poll_timeouts_at(1_121);
         let Some(SagaChoreographyEvent::SagaFailed { reason, .. }) = timed_out.first() else {
-            panic!("expected stalled timeout, got: {timed_out:?}");
+            panic!("expected stalled timeout failure, got: {timed_out:?}");
         };
         assert!(
             reason.contains("missing_steps=create_order"),
@@ -2055,8 +2811,8 @@ mod tests {
         );
 
         let timed_out = resolver.poll_timeouts_at(1_111);
-        let Some(SagaChoreographyEvent::SagaFailed { reason, .. }) = timed_out.first() else {
-            panic!("expected stalled timeout, got: {timed_out:?}");
+        let Some(SagaChoreographyEvent::SagaQuarantined { reason, .. }) = timed_out.first() else {
+            panic!("expected stalled timeout quarantine (in-flight step), got: {timed_out:?}");
         };
         assert!(
             reason.contains("started_not_completed=risk_check(account-balance)"),
@@ -2128,6 +2884,586 @@ mod tests {
                     == [Box::<str>::from("second_effect"), Box::<str>::from("first_effect")]
             ),
             "unexpected recovery output: {emitted:?}"
+        );
+    }
+
+    fn rollback_policy() -> TerminalPolicy {
+        let mut required = HashSet::new();
+        required.insert(Box::<str>::from("B"));
+        TerminalPolicy::new(
+            "order_lifecycle".into(),
+            "late_completion/test".into(),
+            FailureAuthority::AnyParticipant,
+            SuccessCriteria::AllOf(required),
+            Duration::from_secs(3_600),
+            Duration::from_secs(3_600),
+            &[],
+        )
+    }
+
+    fn completed(step: &str, at: u64, compensable: bool) -> SagaChoreographyEvent {
+        SagaChoreographyEvent::StepCompleted {
+            context: ctx_at(step, 51, 1_000, at),
+            output: Vec::new(),
+            saga_input: Vec::new(),
+            compensation_available: compensable,
+        }
+    }
+
+    fn undo_ack(step: &str, at: u64) -> SagaChoreographyEvent {
+        SagaChoreographyEvent::CompensationCompleted {
+            context: ctx_at(step, 51, 1_000, at),
+        }
+    }
+
+    /// A compensable done, B dispatched, C fails -> rollback owes {A}.
+    fn rolling_back() -> (TerminalResolver, Vec<SagaChoreographyEvent>) {
+        let mut resolver = TerminalResolver::new(rollback_policy());
+        assert!(
+            resolver
+                .ingest_at(&completed("A", 1_010, true), 1_010)
+                .is_empty()
+        );
+        let emitted = resolver.ingest_at(
+            &SagaChoreographyEvent::StepFailed {
+                context: ctx_at("C", 51, 1_000, 1_020),
+                participant_id: "c".into(),
+                error_code: None,
+                error: "c failed".into(),
+                requires_compensation: true,
+            },
+            1_020,
+        );
+        assert!(matches!(
+            emitted.as_slice(),
+            [SagaChoreographyEvent::CompensationRequested { .. }]
+        ));
+        (resolver, emitted)
+    }
+
+    fn no_completed(events: &[SagaChoreographyEvent]) -> bool {
+        !events
+            .iter()
+            .any(|e| matches!(e, SagaChoreographyEvent::SagaCompleted { .. }))
+    }
+
+    #[test]
+    fn late_forward_completion_during_rollback_never_completes_saga() {
+        let (mut resolver, _) = rolling_back();
+        let late = resolver.ingest_at(&completed("B", 1_030, true), 1_030);
+        assert!(no_completed(&late), "success during rollback: {late:?}");
+        assert!(
+            matches!(
+                late.as_slice(),
+                [SagaChoreographyEvent::CompensationRequested { steps_to_compensate, .. }]
+                    if steps_to_compensate.as_slice() == [Box::<str>::from("B")]
+            ),
+            "late compensable B must be owed an undo: {late:?}"
+        );
+        // A's ack alone must not settle: B's undo is still owed.
+        assert!(resolver.ingest_at(&undo_ack("A", 1_040), 1_040).is_empty());
+        let end = resolver.ingest_at(&undo_ack("B", 1_050), 1_050);
+        assert!(matches!(
+            end.as_slice(),
+            [SagaChoreographyEvent::SagaFailed { .. }]
+        ));
+    }
+
+    #[test]
+    fn late_completion_after_undo_ack_order_never_completes_saga() {
+        let (mut resolver, _) = rolling_back();
+        let ack = resolver.ingest_at(&undo_ack("A", 1_030), 1_030);
+        assert!(no_completed(&ack));
+        let late = resolver.ingest_at(&completed("B", 1_040, true), 1_040);
+        assert!(no_completed(&late), "success after rollback: {late:?}");
+    }
+
+    #[test]
+    fn late_non_compensable_completion_during_rollback_quarantines() {
+        let (mut resolver, _) = rolling_back();
+        let late = resolver.ingest_at(&completed("B", 1_030, false), 1_030);
+        assert!(late.is_empty(), "no verdict before undo settles: {late:?}");
+        let end = resolver.ingest_at(&undo_ack("A", 1_040), 1_040);
+        assert!(no_completed(&end));
+        assert!(
+            matches!(
+                end.as_slice(),
+                [SagaChoreographyEvent::SagaQuarantined { step, .. }] if step.as_ref() == "B"
+            ),
+            "B must stay unresolved in quarantine: {end:?}"
+        );
+    }
+
+    fn timeout_policy(overall_ms: u64, stalled_ms: u64) -> TerminalPolicy {
+        let mut policy = rollback_policy();
+        policy.overall_timeout = Duration::from_millis(overall_ms);
+        policy.stalled_timeout = Duration::from_millis(stalled_ms);
+        policy
+    }
+
+    fn assert_timeout_rolls_back(policy: TerminalPolicy, fire_at: u64, needle: &str) {
+        let mut resolver = TerminalResolver::new(policy);
+        assert!(
+            resolver
+                .ingest_at(&completed("A", 1_010, true), 1_010)
+                .is_empty()
+        );
+        let out = resolver.poll_timeouts_at(fire_at);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [SagaChoreographyEvent::CompensationRequested { steps_to_compensate, reason, .. }]
+                    if steps_to_compensate.as_slice() == [Box::<str>::from("A")]
+                        && reason.contains(needle)
+            ),
+            "{needle} must request A's undo, not fail directly: {out:?}"
+        );
+        // Not re-quarantined by the very next poll while the undo is in flight.
+        assert!(resolver.poll_timeouts_at(fire_at + 1).is_empty());
+        let end = resolver.ingest_at(&undo_ack("A", fire_at + 2), fire_at + 2);
+        assert!(
+            matches!(
+                end.as_slice(),
+                [SagaChoreographyEvent::SagaFailed { reason, failure: None, .. }]
+                    if reason.contains(needle)
+            ),
+            "clean settlement fails the saga: {end:?}"
+        );
+    }
+
+    #[test]
+    fn infrastructure_abort_compensates_known_effects_before_terminal_failure() {
+        assert_timeout_rolls_back(timeout_policy(500, 3_600_000), 1_600, "overall_timeout");
+        assert_timeout_rolls_back(timeout_policy(3_600_000, 500), 1_600, "stalled_timeout");
+    }
+
+    #[test]
+    fn abort_request_compensates_known_effects_before_terminal_failure() {
+        let mut resolver = TerminalResolver::new(rollback_policy());
+        resolver.ingest_at(&completed("A", 1_010, true), 1_010);
+        let out = resolver.ingest_at(
+            &SagaChoreographyEvent::SagaAbortRequested {
+                context: ctx_at("bus", 51, 1_000, 1_020),
+                reason: "delivery shortfall".into(),
+                source: crate::AbortSource::DeliveryShortfall,
+            },
+            1_020,
+        );
+        assert!(
+            matches!(
+                out.as_slice(),
+                [SagaChoreographyEvent::CompensationRequested { steps_to_compensate, .. }]
+                    if steps_to_compensate.as_slice() == [Box::<str>::from("A")]
+            ),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn abort_with_nothing_owed_fails_and_unknown_in_flight_quarantines() {
+        let mut resolver = TerminalResolver::new(timeout_policy(500, 3_600_000));
+        resolver.ingest_at(&completed("A", 1_010, false), 1_010);
+        let out = resolver.poll_timeouts_at(1_600);
+        assert!(
+            matches!(out.as_slice(), [SagaChoreographyEvent::SagaFailed { .. }]),
+            "{out:?}"
+        );
+
+        let mut resolver = TerminalResolver::new(timeout_policy(500, 3_600_000));
+        resolver.ingest_at(
+            &SagaChoreographyEvent::StepStarted {
+                context: ctx_at("B", 52, 1_000, 1_010),
+            },
+            1_010,
+        );
+        let out = resolver.poll_timeouts_at(1_600);
+        assert!(
+            matches!(out.as_slice(), [SagaChoreographyEvent::SagaQuarantined { step, .. }] if step.as_ref() == "B"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn timeout_while_rolling_back_quarantines_owed_steps() {
+        let mut resolver = TerminalResolver::new(timeout_policy(500, 3_600_000));
+        resolver.ingest_at(&completed("A", 1_010, true), 1_010);
+        resolver.poll_timeouts_at(1_600);
+        let out = resolver.poll_timeouts_at(2_200);
+        assert!(
+            matches!(out.as_slice(), [SagaChoreographyEvent::SagaQuarantined { step, .. }] if step.as_ref() == "A"),
+            "{out:?}"
+        );
+    }
+
+    // ---- W3 review fixes (BLOCKER 2, HIGH 1-3, MEDIUM 2-4, LOW 3, LOW 5) ----
+
+    fn started(step: &str, at: u64) -> SagaChoreographyEvent {
+        SagaChoreographyEvent::StepStarted {
+            context: ctx_at(step, 51, 1_000, at),
+        }
+    }
+
+    fn step_failed(step: &str, at: u64, requires_compensation: bool) -> SagaChoreographyEvent {
+        SagaChoreographyEvent::StepFailed {
+            context: ctx_at(step, 51, 1_000, at),
+            participant_id: step.into(),
+            error_code: None,
+            error: format!("{step} failed").into(),
+            requires_compensation,
+        }
+    }
+
+    fn accepted(
+        step: &str,
+        at: u64,
+        deadline: u64,
+        hard: u64,
+        compensable: bool,
+    ) -> SagaChoreographyEvent {
+        SagaChoreographyEvent::StepAccepted {
+            context: ctx_at(step, 51, 1_000, at),
+            participant_id: step.into(),
+            execution_id: StepExecutionId::new("exec-1"),
+            deadline_at_millis: deadline,
+            hard_deadline_at_millis: hard,
+            timeouts_enabled: true,
+            timeout_outcome: AcceptedStepTimeoutOutcome::QuarantineSaga,
+            compensation_available: compensable,
+        }
+    }
+
+    /// A compensable done, B started (in flight), C fails -> rollback owes {A}.
+    fn rolling_back_with_b_in_flight() -> TerminalResolver {
+        let mut resolver = TerminalResolver::new(rollback_policy());
+        resolver.ingest_at(&completed("A", 1_010, true), 1_010);
+        resolver.ingest_at(&started("B", 1_015), 1_015);
+        let out = resolver.ingest_at(&step_failed("C", 1_020, true), 1_020);
+        assert!(matches!(
+            out.as_slice(),
+            [SagaChoreographyEvent::CompensationRequested { .. }]
+        ));
+        resolver
+    }
+
+    #[test]
+    fn rollback_with_step_in_flight_quarantines_instead_of_failing() {
+        let mut resolver = rolling_back_with_b_in_flight();
+        let end = resolver.ingest_at(&undo_ack("A", 1_040), 1_040);
+        assert!(
+            matches!(
+                end.as_slice(),
+                [SagaChoreographyEvent::SagaQuarantined { step, .. }] if step.as_ref() == "B"
+            ),
+            "B was dispatched and never finished: {end:?}"
+        );
+    }
+
+    #[test]
+    fn in_flight_step_resolved_by_failure_lets_rollback_fail_cleanly() {
+        let mut resolver = rolling_back_with_b_in_flight();
+        assert!(
+            resolver
+                .ingest_at(&step_failed("B", 1_030, false), 1_030)
+                .is_empty()
+        );
+        let end = resolver.ingest_at(&undo_ack("A", 1_040), 1_040);
+        assert!(
+            matches!(end.as_slice(), [SagaChoreographyEvent::SagaFailed { .. }]),
+            "{end:?}"
+        );
+    }
+
+    #[test]
+    fn failure_with_nothing_owed_and_step_in_flight_quarantines() {
+        let mut resolver = TerminalResolver::new(rollback_policy());
+        resolver.ingest_at(&started("B", 1_015), 1_015);
+        let out = resolver.ingest_at(&step_failed("C", 1_020, true), 1_020);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [
+                    SagaChoreographyEvent::CompensationRequested { .. },
+                    SagaChoreographyEvent::SagaQuarantined { step, .. },
+                ] if step.as_ref() == "B"
+            ),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn accepted_compensable_step_during_rollback_is_owed_an_undo() {
+        let (mut resolver, _) = rolling_back();
+        let out = resolver.ingest_at(&accepted("B", 1_030, 9_000, 9_500, true), 1_030);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [SagaChoreographyEvent::CompensationRequested { steps_to_compensate, .. }]
+                    if steps_to_compensate.as_slice() == [Box::<str>::from("B")]
+            ),
+            "{out:?}"
+        );
+        assert!(resolver.ingest_at(&undo_ack("A", 1_040), 1_040).is_empty());
+        let end = resolver.ingest_at(&undo_ack("B", 1_050), 1_050);
+        assert!(
+            matches!(end.as_slice(), [SagaChoreographyEvent::SagaFailed { .. }]),
+            "{end:?}"
+        );
+    }
+
+    #[test]
+    fn step_failure_during_rollback_only_records_evidence() {
+        let (mut resolver, _) = rolling_back();
+        assert!(
+            resolver
+                .ingest_at(&step_failed("D", 1_030, false), 1_030)
+                .is_empty(),
+            "no terminal while undo is pending"
+        );
+        assert!(
+            resolver
+                .ingest_at(&step_failed("E", 1_031, true), 1_031)
+                .is_empty()
+        );
+        let end = resolver.ingest_at(&undo_ack("A", 1_040), 1_040);
+        assert!(
+            matches!(
+                end.as_slice(),
+                [SagaChoreographyEvent::SagaFailed { failure: Some(f), .. }]
+                    if f.step_name.as_ref() == "C"
+            ),
+            "first failure stays the recorded cause: {end:?}"
+        );
+    }
+
+    fn retryable(step: &str, at: u64) -> SagaChoreographyEvent {
+        SagaChoreographyEvent::CompensationFailedRetryable {
+            context: ctx_at(step, 51, 1_000, at),
+            participant_id: step.into(),
+            error: "undo failed".into(),
+        }
+    }
+
+    #[test]
+    fn retryable_compensation_failure_during_rollback_quarantines() {
+        let (mut resolver, _) = rolling_back();
+        let out = resolver.ingest_at(&retryable("A", 1_030), 1_030);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [SagaChoreographyEvent::SagaQuarantined { step, .. }] if step.as_ref() == "A"
+            ),
+            "undo never ran: {out:?}"
+        );
+    }
+
+    #[test]
+    fn successful_retried_undo_clears_unresolved_and_settles_failed() {
+        let (mut resolver, _) = rolling_back();
+        // B completes late and is owed an undo, so the run keeps rolling back.
+        let late = resolver.ingest_at(&completed("B", 1_030, true), 1_030);
+        assert_eq!(late.len(), 1, "late B owed an undo: {late:?}");
+        assert!(resolver.ingest_at(&retryable("A", 1_040), 1_040).is_empty());
+        // A's undo is retried and succeeds: no longer unresolved.
+        assert!(resolver.ingest_at(&undo_ack("A", 1_050), 1_050).is_empty());
+        let end = resolver.ingest_at(&undo_ack("B", 1_060), 1_060);
+        assert!(
+            matches!(end.as_slice(), [SagaChoreographyEvent::SagaFailed { .. }]),
+            "clean rollback must not quarantine: {end:?}"
+        );
+    }
+
+    #[test]
+    fn retryable_compensation_failure_outside_rollback_never_fails_saga() {
+        let mut resolver = TerminalResolver::new(rollback_policy());
+        resolver.ingest_at(&completed("A", 1_010, true), 1_010);
+        let out = resolver.ingest_at(&retryable("A", 1_030), 1_030);
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn duplicate_completion_of_finished_step_during_rollback_is_ignored() {
+        let mut resolver = TerminalResolver::new(rollback_policy());
+        resolver.ingest_at(&completed("A", 1_010, true), 1_010);
+        resolver.ingest_at(&completed("D", 1_012, false), 1_012);
+        resolver.ingest_at(&step_failed("C", 1_020, true), 1_020);
+        assert!(
+            resolver
+                .ingest_at(&completed("D", 1_030, false), 1_030)
+                .is_empty()
+        );
+        let end = resolver.ingest_at(&undo_ack("A", 1_040), 1_040);
+        assert!(
+            matches!(end.as_slice(), [SagaChoreographyEvent::SagaFailed { .. }]),
+            "redelivery is not a late effect: {end:?}"
+        );
+    }
+
+    #[test]
+    fn older_accepted_heartbeat_does_not_shorten_deadline() {
+        let mut resolver = TerminalResolver::new(rollback_policy());
+        resolver.ingest_at(&accepted("B", 1_010, 5_000, 6_000, false), 1_010);
+        resolver.ingest_at(&accepted("B", 1_020, 3_000, 4_000, false), 1_020);
+        assert!(
+            resolver.poll_timeouts_at(4_500).is_empty(),
+            "the older heartbeat must not pull the deadline back"
+        );
+    }
+
+    /// Events journaled by a run that began an internal (overall-timeout) abort.
+    fn rollback_events() -> (TerminalPolicy, Vec<SagaChoreographyEvent>) {
+        let base = SagaContext::now_millis();
+        let mut policy = timeout_policy(50, 3_600_000);
+        let done = SagaChoreographyEvent::StepCompleted {
+            context: ctx_at("A", 51, base, base + 1),
+            output: Vec::new(),
+            saga_input: Vec::new(),
+            compensation_available: true,
+        };
+        let mut resolver = TerminalResolver::new(policy.clone());
+        resolver.ingest_at(&done, base + 1);
+        let request = resolver.poll_timeouts_at(base + 100);
+        assert!(matches!(
+            request.as_slice(),
+            [SagaChoreographyEvent::CompensationRequested { .. }]
+        ));
+        // Restore happens at real time: give the restored policy room.
+        policy.overall_timeout = Duration::from_secs(3_600);
+        let mut events = vec![done];
+        events.extend(request);
+        (policy, events)
+    }
+
+    fn ack_a(base_ctx: &SagaContext) -> SagaChoreographyEvent {
+        let mut context = base_ctx.clone();
+        context.step_name = "A".into();
+        context.event_timestamp_millis += 5;
+        SagaChoreographyEvent::CompensationCompleted { context }
+    }
+
+    #[test]
+    fn restore_mid_internal_abort_settles_with_timeout_reason_once() {
+        let (policy, events) = rollback_events();
+        let (mut resolver, unpublished) =
+            TerminalResolver::restore_from_events(policy.clone(), &events);
+        assert!(unpublished.is_empty(), "{unpublished:?}");
+        let ack = ack_a(events[1].context());
+        let end = resolver.ingest_at(&ack, ack.context().event_timestamp_millis);
+        assert!(
+            matches!(
+                end.as_slice(),
+                [SagaChoreographyEvent::SagaFailed { reason, failure: None, .. }]
+                    if reason.contains("overall_timeout")
+            ),
+            "{end:?}"
+        );
+        // Journal already holds the terminal: restoring it again republishes nothing.
+        let mut journal = events.clone();
+        journal.push(ack);
+        journal.extend(end);
+        let (_, unpublished) = TerminalResolver::restore_from_events(policy, &journal);
+        assert!(
+            unpublished.is_empty(),
+            "no duplicate terminal after restore: {unpublished:?}"
+        );
+    }
+
+    #[test]
+    fn restore_mid_internal_abort_with_step_in_flight_quarantines() {
+        let (policy, mut events) = rollback_events();
+        let mut context = events[1].context().clone();
+        context.step_name = "B".into();
+        events.insert(1, SagaChoreographyEvent::StepStarted { context });
+        let ack = ack_a(events[2].context());
+        let (mut resolver, _) = TerminalResolver::restore_from_events(policy, &events);
+        let end = resolver.ingest_at(&ack, ack.context().event_timestamp_millis);
+        assert!(
+            matches!(
+                end.as_slice(),
+                [SagaChoreographyEvent::SagaQuarantined { step, .. }] if step.as_ref() == "B"
+            ),
+            "{end:?}"
+        );
+    }
+
+    #[test]
+    fn live_abort_failure_stamp_uses_event_timestamp() {
+        let mut resolver = TerminalResolver::new(rollback_policy());
+        resolver.ingest_at(&completed("A", 1_010, true), 1_010);
+        let out = resolver.ingest_at(
+            &SagaChoreographyEvent::SagaAbortRequested {
+                context: ctx_at("bus", 51, 1_000, 1_020),
+                reason: "delivery shortfall".into(),
+                source: crate::AbortSource::DeliveryShortfall,
+            },
+            1_500,
+        );
+        assert!(
+            matches!(
+                out.as_slice(),
+                [SagaChoreographyEvent::CompensationRequested { failure, .. }]
+                    if failure.at_millis == 1_020
+            ),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn in_flight_step_that_fails_after_abort_does_not_quarantine_falsely() {
+        let mut resolver = TerminalResolver::new(timeout_policy(500, 3_600_000));
+        resolver.ingest_at(&completed("A", 1_010, true), 1_010);
+        resolver.ingest_at(&started("B", 1_015), 1_015);
+        let out = resolver.poll_timeouts_at(1_600);
+        assert!(matches!(
+            out.as_slice(),
+            [SagaChoreographyEvent::CompensationRequested { .. }]
+        ));
+        assert!(
+            resolver
+                .ingest_at(&step_failed("B", 1_610, false), 1_610)
+                .is_empty()
+        );
+        let end = resolver.ingest_at(&undo_ack("A", 1_620), 1_620);
+        assert!(
+            matches!(
+                end.as_slice(),
+                [SagaChoreographyEvent::SagaFailed { failure: None, .. }]
+            ),
+            "B resolved by its failure: {end:?}"
+        );
+    }
+
+    #[test]
+    fn timeout_latched_inside_apply_event_sets_terminal_outcome() {
+        let mut resolver = TerminalResolver::new(rollback_policy());
+        resolver.ingest_at(&accepted("B", 1_010, 1_100, 1_200, false), 1_010);
+        let out = resolver.ingest_at(&started("X", 1_500), 1_500);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [SagaChoreographyEvent::SagaQuarantined { .. }]
+            ),
+            "{out:?}"
+        );
+        let state = resolver.states.values().next().expect("state");
+        assert_eq!(state.terminal_outcome, Some("saga_quarantined"));
+        assert_eq!(state.phase, super::ResolverPhase::Quarantined);
+    }
+
+    #[test]
+    fn duplicate_compensation_started_does_not_extend_stall_deadline() {
+        let mut resolver = TerminalResolver::new(stall_policy());
+        resolver.ingest_at(&completed("A", 1_000, true), 1_000);
+        let comp = SagaChoreographyEvent::CompensationStarted {
+            context: ctx_at("A", 51, 1_000, 1_050),
+        };
+        resolver.ingest_at(&comp, 1_050);
+        for at in [1_070, 1_090, 1_120] {
+            resolver.ingest_at(&comp, at);
+        }
+        assert!(resolver.poll_timeouts_at(1_150).is_empty());
+        assert!(
+            !resolver.poll_timeouts_at(1_151).is_empty(),
+            "duplicate CompensationStarted must not extend the stall deadline"
         );
     }
 }

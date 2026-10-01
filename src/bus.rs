@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -8,13 +8,15 @@ use icanact_core::CorrelationRegistry;
 use icanact_core::local::{FirehosePubSub, FirehoseSubscription, PublishStats};
 use icanact_core::local_sync::{self, SyncActor};
 
+use crate::events::AbortSource;
 use crate::reply_registry::{SagaReplyToHandle, SagaReplyToResult};
+use crate::resolver::{FailureAuthority, SuccessCriteria};
 use crate::workflow_contract::required_path_steps_from_success_criteria;
 use crate::{
-    HasSagaWorkflowParticipants, SagaChoreographyEvent, SagaId, SagaReplyTo, SagaTerminalOutcome,
-    SagaWorkflowContract, SagaWorkflowStepContract, TERMINAL_RESOLVER_STEP, TerminalPolicy,
-    TerminalResolver, TerminalResolverJournal, required_steps_from_success_criteria,
-    validate_workflow_contract,
+    HasSagaWorkflowParticipants, RunIncarnation, RunKey, SagaChoreographyEvent, SagaContext,
+    SagaId, SagaReplyTo, SagaTerminalOutcome, SagaWorkflowContract, SagaWorkflowStepContract,
+    TERMINAL_RESOLVER_STEP, TerminalPolicy, TerminalResolver, TerminalResolverJournal,
+    required_steps_from_success_criteria, validate_workflow_contract,
 };
 
 #[derive(Clone, Debug)]
@@ -27,9 +29,9 @@ struct WorkflowContractState {
 
 #[derive(Default)]
 struct BusStateActor {
-    terminal_replies: HashMap<SagaId, SagaReplyTo>,
-    terminal_outcomes: HashMap<SagaId, SagaTerminalOutcome>,
-    terminal_order: VecDeque<SagaId>,
+    terminal_replies: HashMap<RunKey, SagaReplyTo>,
+    terminal_outcomes: HashMap<RunKey, SagaTerminalOutcome>,
+    terminal_order: VecDeque<RunKey>,
     terminal_policies_by_saga_type: HashMap<Box<str>, Box<str>>,
     workflow_contracts_by_saga_type: HashMap<Box<str>, WorkflowContractState>,
     bound_steps_by_saga_type: HashMap<Box<str>, HashSet<Box<str>>>,
@@ -69,20 +71,32 @@ enum BusStateAsk {
         saga_type: Box<str>,
     },
     StoreTerminalReply {
-        saga_id: SagaId,
+        run: RunKey,
         reply: SagaReplyTo,
         retention_limit: usize,
     },
     StoreTerminalOutcome {
-        saga_id: SagaId,
+        run: RunKey,
         outcome: SagaTerminalOutcome,
         retention_limit: usize,
     },
     TakeTerminalReply {
-        saga_id: SagaId,
+        run: RunKey,
     },
     TakeTerminalOutcome {
+        run: RunKey,
+    },
+    /// `SagaId` wrapper: resolves the newest cached incarnation (ADR-0001).
+    TakeNewestTerminalReply {
         saga_id: SagaId,
+    },
+    /// `SagaId` wrapper: resolves the newest cached incarnation (ADR-0001).
+    TakeNewestTerminalOutcome {
+        saga_id: SagaId,
+    },
+    /// Is a strictly newer incarnation of the same `SagaId` cached?
+    HasNewerTerminal {
+        run: RunKey,
     },
 }
 
@@ -99,21 +113,47 @@ enum BusStateReply {
 }
 
 impl BusStateActor {
+    fn newest_cached_run(&self, saga_id: SagaId) -> Option<RunKey> {
+        self.terminal_outcomes
+            .keys()
+            .chain(self.terminal_replies.keys())
+            .filter(|run| run.saga_id() == saga_id)
+            .max_by(|a, b| a.incarnation().cmp(&b.incarnation()).then_with(|| a.cmp(b)))
+            .cloned()
+    }
+
+    fn take_reply(&mut self, run: &RunKey) -> Option<SagaReplyTo> {
+        let reply = self.terminal_replies.remove(run);
+        if reply.is_some() {
+            self.terminal_outcomes.remove(run);
+        }
+        reply
+    }
+
+    fn take_outcome(&mut self, run: &RunKey) -> Option<SagaTerminalOutcome> {
+        let reply = self.terminal_replies.remove(run).map(|reply| reply.outcome);
+        let direct = self.terminal_outcomes.remove(run);
+        reply.or(direct)
+    }
+
     fn insert_terminal_outcome(
         &mut self,
-        saga_id: SagaId,
+        run: RunKey,
         outcome: SagaTerminalOutcome,
         retention_limit: usize,
     ) {
-        let inserted_new = self.terminal_outcomes.insert(saga_id, outcome).is_none();
+        let inserted_new = self
+            .terminal_outcomes
+            .insert(run.clone(), outcome)
+            .is_none();
         if inserted_new {
-            self.terminal_order.push_back(saga_id);
+            self.terminal_order.push_back(run.clone());
         }
         while self.terminal_order.len() > retention_limit {
             let Some(candidate) = self.terminal_order.pop_front() else {
                 break;
             };
-            if candidate != saga_id {
+            if candidate != run {
                 self.terminal_outcomes.remove(&candidate);
                 self.terminal_replies.remove(&candidate);
                 break;
@@ -212,43 +252,103 @@ impl SyncActor for BusStateActor {
                 BusStateReply::OptionalU32(expected)
             }
             BusStateAsk::StoreTerminalReply {
-                saga_id,
+                run,
                 reply,
                 retention_limit,
             } => {
                 let outcome = reply.outcome.clone();
-                self.terminal_replies.insert(saga_id, reply);
-                self.insert_terminal_outcome(saga_id, outcome, retention_limit);
+                self.terminal_replies.insert(run.clone(), reply);
+                self.insert_terminal_outcome(run, outcome, retention_limit);
                 BusStateReply::Unit
             }
             BusStateAsk::StoreTerminalOutcome {
-                saga_id,
+                run,
                 outcome,
                 retention_limit,
             } => {
-                self.insert_terminal_outcome(saga_id, outcome, retention_limit);
+                self.insert_terminal_outcome(run, outcome, retention_limit);
                 BusStateReply::Unit
             }
-            BusStateAsk::TakeTerminalReply { saga_id } => {
-                let reply = self.terminal_replies.remove(&saga_id);
-                if reply.is_some() {
-                    self.terminal_outcomes.remove(&saga_id);
-                }
+            BusStateAsk::TakeTerminalReply { run } => {
+                BusStateReply::TerminalReply(self.take_reply(&run))
+            }
+            BusStateAsk::TakeTerminalOutcome { run } => {
+                BusStateReply::TerminalOutcome(self.take_outcome(&run))
+            }
+            BusStateAsk::TakeNewestTerminalReply { saga_id } => {
+                let reply = self
+                    .newest_cached_run(saga_id)
+                    .and_then(|run| self.take_reply(&run));
                 BusStateReply::TerminalReply(reply)
             }
-            BusStateAsk::TakeTerminalOutcome { saga_id } => {
-                let reply = self
-                    .terminal_replies
-                    .remove(&saga_id)
-                    .map(|reply| reply.outcome);
-                let direct = self.terminal_outcomes.remove(&saga_id);
-                BusStateReply::TerminalOutcome(reply.or(direct))
+            BusStateAsk::TakeNewestTerminalOutcome { saga_id } => {
+                let outcome = self
+                    .newest_cached_run(saga_id)
+                    .and_then(|run| self.take_outcome(&run));
+                BusStateReply::TerminalOutcome(outcome)
             }
+            BusStateAsk::HasNewerTerminal { run } => BusStateReply::Bool(
+                self.newest_cached_run(run.saga_id())
+                    .is_some_and(|newest| newest.incarnation() > run.incarnation()),
+            ),
         }
     }
 }
 
+/// Identity of the configuration a resolver was attached with: the full policy
+/// (Debug fingerprint) plus the address of the durable journal, if any.
+#[derive(Clone, PartialEq, Eq)]
+struct ResolverAttachConfig {
+    policy: String,
+    journal: Option<usize>,
+}
+
+impl ResolverAttachConfig {
+    fn new(policy: &TerminalPolicy, journal: Option<&Arc<dyn TerminalResolverJournal>>) -> Self {
+        Self {
+            policy: canonical_policy_fingerprint(policy),
+            journal: journal.map(|journal| Arc::as_ptr(journal).cast::<()>() as usize),
+        }
+    }
+}
+
+fn sorted_steps(steps: &HashSet<Box<str>>) -> Vec<&str> {
+    let mut sorted: Vec<&str> = steps.iter().map(AsRef::as_ref).collect();
+    sorted.sort_unstable();
+    sorted
+}
+
+/// Deterministic rendering of a policy: `HashSet`-backed members are sorted so
+/// two equal policies always fingerprint identically.
+fn canonical_policy_fingerprint(policy: &TerminalPolicy) -> String {
+    let authority = match &policy.failure_authority {
+        FailureAuthority::AnyParticipant => "AnyParticipant".to_string(),
+        FailureAuthority::OnlySteps(steps) => format!("OnlySteps({:?})", sorted_steps(steps)),
+        FailureAuthority::DenySteps(steps) => format!("DenySteps({:?})", sorted_steps(steps)),
+    };
+    let criteria = match &policy.success_criteria {
+        SuccessCriteria::AllOf(steps) => format!("AllOf({:?})", sorted_steps(steps)),
+        SuccessCriteria::AnyOf(steps) => format!("AnyOf({:?})", sorted_steps(steps)),
+        SuccessCriteria::Quorum {
+            group_steps,
+            required_count,
+        } => format!("Quorum({:?},{required_count})", sorted_steps(group_steps)),
+    };
+    format!(
+        "saga_type={} policy_id={} authority={authority} criteria={criteria} overall={:?} stalled={:?} steps={:?} retry={} horizon={:?} loser={:?}",
+        policy.saga_type,
+        policy.policy_id,
+        policy.overall_timeout,
+        policy.stalled_timeout,
+        policy.workflow_steps,
+        policy.compensation_retry_limit(),
+        policy.replay_horizon(),
+        policy.loser_policy(),
+    )
+}
+
 struct TerminalResolverRuntime {
+    config: ResolverAttachConfig,
     subscription: FirehoseSubscription,
     shutdown: Arc<AtomicBool>,
     resolver_ref: local_sync::SyncActorRef<TerminalResolverActor>,
@@ -259,14 +359,14 @@ enum TerminalResolverRegistryAsk {
     Existing(Box<str>),
     Register {
         saga_type: Box<str>,
-        runtime: TerminalResolverRuntime,
+        runtime: Box<TerminalResolverRuntime>,
     },
     ActivateRecovery(Box<str>),
     ShutdownAll,
 }
 
 enum TerminalResolverRegistryReply {
-    Existing(Option<FirehoseSubscription>),
+    Existing(Option<(FirehoseSubscription, ResolverAttachConfig)>),
     Registered(FirehoseSubscription),
     RecoveryActivated(bool),
     ShutdownComplete,
@@ -292,14 +392,14 @@ impl SyncActor for TerminalResolverRegistryActor {
                 TerminalResolverRegistryReply::Existing(
                     self.runtimes
                         .get(saga_type.as_ref())
-                        .map(|runtime| runtime.subscription.clone()),
+                        .map(|runtime| (runtime.subscription.clone(), runtime.config.clone())),
                 )
             }
             TerminalResolverRegistryAsk::Register { saga_type, runtime } => {
                 match self.runtimes.entry(saga_type) {
                     std::collections::hash_map::Entry::Vacant(entry) => {
                         let subscription = runtime.subscription.clone();
-                        entry.insert(runtime);
+                        entry.insert(*runtime);
                         TerminalResolverRegistryReply::Registered(subscription)
                     }
                     std::collections::hash_map::Entry::Occupied(entry) => {
@@ -403,7 +503,21 @@ impl SyncActor for TerminalResolverActor {
                     }
                     return;
                 }
-                self.resolver.ingest(&event)
+                match self
+                    .resolver
+                    .try_ingest_at(&event, SagaContext::now_millis())
+                {
+                    Ok(events) => events,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "core::saga",
+                            event = "terminal_resolver_run_identity_rejected",
+                            run = %event.context().run_key(),
+                            error = ?error
+                        );
+                        return;
+                    }
+                }
             }
             TerminalResolverTell::ActivateRecovery => {
                 let recovery_events = std::mem::take(&mut self.recovery_events);
@@ -416,16 +530,74 @@ impl SyncActor for TerminalResolverActor {
     }
 }
 
+/// Test-only callback run between resolver subscribe and registry register.
+#[cfg(test)]
+type AttachHook = Arc<std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
+
+thread_local! {
+    /// Addresses of attach locks the current thread holds (re-entrancy guard).
+    static HELD_ATTACH_LOCKS: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Holds `resolver_attach_lock` unless this thread already holds it.
+struct AttachLockGuard<'a> {
+    key: usize,
+    _guard: Option<std::sync::MutexGuard<'a, ()>>,
+}
+
+impl<'a> AttachLockGuard<'a> {
+    fn acquire(lock: &'a Arc<std::sync::Mutex<()>>) -> Self {
+        let key = Arc::as_ptr(lock) as usize;
+        if HELD_ATTACH_LOCKS.with(|held| held.borrow().contains(&key)) {
+            return Self { key, _guard: None };
+        }
+        let guard = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        HELD_ATTACH_LOCKS.with(|held| held.borrow_mut().push(key));
+        Self {
+            key,
+            _guard: Some(guard),
+        }
+    }
+}
+
+impl Drop for AttachLockGuard<'_> {
+    fn drop(&mut self) {
+        if self._guard.is_some() {
+            HELD_ATTACH_LOCKS.with(|held| {
+                let mut held = held.borrow_mut();
+                if let Some(pos) = held.iter().rposition(|k| *k == self.key) {
+                    held.remove(pos);
+                }
+            });
+        }
+    }
+}
+
 pub struct SagaChoreographyBus {
     bus: FirehosePubSub<SagaChoreographyEvent>,
-    pending_replies: CorrelationRegistry<SagaId, SagaReplyToResult>,
+    pending_replies: CorrelationRegistry<RunKey, SagaReplyToResult>,
+    /// Waiters registered by bare `SagaId` (no run known); see `complete_terminal_reply_for_run`.
+    legacy_pending_replies: CorrelationRegistry<SagaId, SagaReplyToResult>,
     state_ref: local_sync::SyncActorRef<BusStateActor>,
     terminal_resolver_registry_ref: local_sync::SyncActorRef<TerminalResolverRegistryActor>,
+    /// Serializes resolver attach so setup/commit is atomic per bus.
+    resolver_attach_lock: Arc<std::sync::Mutex<()>>,
+    /// Per saga type: count of `SagaAbortRequested` events the attached
+    /// resolver's own subscription successfully handed to the resolver actor.
+    /// Short-held; never locked across a publish and never asks the registry
+    /// actor, so the resolver thread can consult it without deadlock risk.
+    resolver_abort_ingest: Arc<std::sync::Mutex<HashMap<Box<str>, Arc<AtomicU64>>>>,
+    #[cfg(test)]
+    attach_hook: AttachHook,
     _lifecycle: Arc<BusActorLifecycle>,
 }
 
 struct BusActorLifecycle {
-    pending_replies: CorrelationRegistry<SagaId, SagaReplyToResult>,
+    pending_replies: CorrelationRegistry<RunKey, SagaReplyToResult>,
+    legacy_pending_replies: CorrelationRegistry<SagaId, SagaReplyToResult>,
     state_handle: Option<local_sync::ActorHandle>,
     terminal_resolver_registry_ref: local_sync::SyncActorRef<TerminalResolverRegistryActor>,
     terminal_resolver_registry_handle: Option<local_sync::ActorHandle>,
@@ -444,6 +616,9 @@ impl Drop for BusActorLifecycle {
         }
 
         for (_, reply) in self.pending_replies.drain() {
+            let _ = reply.reply(Err("saga bus dropped".to_string()));
+        }
+        for (_, reply) in self.legacy_pending_replies.drain() {
             let _ = reply.reply(Err("saga bus dropped".to_string()));
         }
     }
@@ -498,6 +673,14 @@ pub enum SagaBusPublishError {
         attempted: u32,
         delivered: u32,
     },
+    /// A `SagaAbortRequested` reached no attached resolver; a terminal
+    /// `SagaFailed` fallback was published instead.
+    AbortNotDelivered {
+        saga_id: SagaId,
+        saga_type: Box<str>,
+        attempted: u32,
+        delivered: u32,
+    },
     TerminalEscalationPartialDelivery {
         saga_id: SagaId,
         saga_type: Box<str>,
@@ -523,8 +706,10 @@ impl SagaChoreographyBus {
         let (terminal_resolver_registry_ref, terminal_resolver_registry_handle) =
             local_sync::spawn(TerminalResolverRegistryActor::default());
         let pending_replies = CorrelationRegistry::new();
+        let legacy_pending_replies = CorrelationRegistry::new();
         let lifecycle = Arc::new(BusActorLifecycle {
             pending_replies: pending_replies.clone(),
+            legacy_pending_replies: legacy_pending_replies.clone(),
             state_handle: Some(state_handle),
             terminal_resolver_registry_ref: terminal_resolver_registry_ref.clone(),
             terminal_resolver_registry_handle: Some(terminal_resolver_registry_handle),
@@ -532,8 +717,13 @@ impl SagaChoreographyBus {
         Self {
             bus: FirehosePubSub::new(),
             pending_replies,
+            legacy_pending_replies,
             state_ref,
             terminal_resolver_registry_ref,
+            resolver_attach_lock: Arc::new(std::sync::Mutex::new(())),
+            resolver_abort_ingest: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            attach_hook: Arc::new(std::sync::Mutex::new(None)),
             _lifecycle: lifecycle,
         }
     }
@@ -580,6 +770,9 @@ impl SagaChoreographyBus {
         &self,
         event: SagaChoreographyEvent,
     ) -> (PublishStats, Option<Box<str>>) {
+        if matches!(event, SagaChoreographyEvent::SagaAbortRequested { .. }) {
+            return (self.publish_abort_event(event).0, None);
+        }
         let event_type = event.event_type();
         let mut expected_min_delivery: Option<u32> = None;
         let mut expected_required_path: Box<str> = "".into();
@@ -598,7 +791,7 @@ impl SagaChoreographyBus {
                     failure: None,
                 };
                 if let Some(outcome) = terminal.terminal_outcome() {
-                    self.store_terminal_outcome(terminal.context().saga_id, outcome);
+                    self.store_terminal_outcome(terminal.context().run_key(), outcome);
                 }
                 return (self.publish_event(terminal), Some(reason));
             }
@@ -610,7 +803,7 @@ impl SagaChoreographyBus {
                     failure: None,
                 };
                 if let Some(outcome) = terminal.terminal_outcome() {
-                    self.store_terminal_outcome(terminal.context().saga_id, outcome);
+                    self.store_terminal_outcome(terminal.context().run_key(), outcome);
                 }
                 return (self.publish_event(terminal), Some(reason));
             }
@@ -630,40 +823,126 @@ impl SagaChoreographyBus {
             expected_context = Some(event.context().clone());
         }
         if let Some(outcome) = event.terminal_outcome() {
-            self.store_terminal_outcome(event.context().saga_id, outcome);
+            self.store_terminal_outcome(event.context().run_key(), outcome);
         }
         let stats = self.publish_event(event);
         if let (Some(required_min_delivery), Some(context)) =
             (expected_min_delivery, expected_context)
             && stats.delivered < required_min_delivery
         {
-            let terminal = SagaChoreographyEvent::SagaFailed {
-                    context: context.next_step(TERMINAL_RESOLVER_STEP.into()),
-                    reason: format!(
-                        "required_path_delivery_shortfall: saga_type={} event_type={} step={} delivered={} attempted={} required_min_delivered={} required_path={}",
-                        context.saga_type,
-                        event_type,
-                        context.step_name,
-                        stats.delivered,
-                        stats.attempted,
-                        required_min_delivery,
-                        expected_required_path
-                    )
-                    .into(),
-                    failure: None,
-                };
-            if let Some(outcome) = terminal.terminal_outcome() {
-                self.store_terminal_outcome(terminal.context().saga_id, outcome);
-            }
-            let _ = self.publish_event(terminal);
+            let reason: Box<str> = format!(
+                "required_path_delivery_shortfall: saga_type={} event_type={} step={} delivered={} attempted={} required_min_delivered={} required_path={}",
+                context.saga_type,
+                event_type,
+                context.step_name,
+                stats.delivered,
+                stats.attempted,
+                required_min_delivery,
+                expected_required_path
+            )
+            .into();
+            let _ = self.publish_abort_or_fail(&context, reason, AbortSource::DeliveryShortfall);
         }
         (stats, None)
+    }
+
+    /// Requests a resolver-driven abort (ADR-0004 §2.6).
+    fn publish_abort_or_fail(
+        &self,
+        context: &crate::SagaContext,
+        reason: Box<str>,
+        source: AbortSource,
+    ) -> PublishStats {
+        let abort = SagaChoreographyEvent::SagaAbortRequested {
+            context: context.next_step(TERMINAL_RESOLVER_STEP.into()),
+            reason,
+            source,
+        };
+        self.publish_abort_event(abort).0
+    }
+
+    /// Abort-ingest counter of the attached resolver for `saga_type`, if any.
+    fn resolver_abort_counter(&self, saga_type: &str) -> Option<Arc<AtomicU64>> {
+        self.resolver_abort_ingest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(saga_type)
+            .cloned()
+    }
+
+    /// Publishes a `SagaAbortRequested`. The abort only counts as delivered
+    /// when the attached resolver's own subscription handed it to the resolver
+    /// actor (ADR-0004 §2.6); otherwise an `error!` is logged and the only
+    /// safe event left, a terminal `SagaFailed`, is published. The `bool` is
+    /// whether the abort reached a resolver.
+    ///
+    /// `resolver_attach_lock` is held across the attached check and the abort
+    /// publish, so a concurrent attach (subscribe -> register) is either fully
+    /// before or fully after the abort: exactly one authority (resolver or
+    /// fallback) sees it. Attach never publishes while holding the lock; the
+    /// lock is skipped when this thread already holds it (a subscriber that
+    /// publishes an abort re-entrantly).
+    fn publish_abort_event(&self, abort: SagaChoreographyEvent) -> (PublishStats, bool) {
+        let context = abort.context().clone();
+        let (reason, source) = match &abort {
+            SagaChoreographyEvent::SagaAbortRequested { reason, source, .. } => {
+                (reason.clone(), *source)
+            }
+            _ => (Box::<str>::from("abort"), AbortSource::DeliveryShortfall),
+        };
+        let (stats, resolver_attached, reached) = {
+            let _guard = AttachLockGuard::acquire(&self.resolver_attach_lock);
+            let counter = self.resolver_abort_counter(context.saga_type.as_ref());
+            let before = counter.as_ref().map(|c| c.load(Ordering::Acquire));
+            let stats = self.publish_event(abort);
+            let reached = match (&counter, before) {
+                (Some(counter), Some(before)) => counter.load(Ordering::Acquire) != before,
+                _ => false,
+            };
+            (stats, counter.is_some(), reached)
+        };
+        if reached {
+            return (stats, true);
+        }
+        tracing::error!(
+            target: "core::saga",
+            event = "saga_abort_request_undelivered",
+            run = ?context.run_key(),
+            source = ?source,
+            reason = %reason,
+            resolver_attached,
+            resolver_received = reached,
+            delivered = stats.delivered,
+            "abort request reached no resolver; publishing terminal SagaFailed"
+        );
+        let terminal = SagaChoreographyEvent::SagaFailed {
+            context: context.next_step(TERMINAL_RESOLVER_STEP.into()),
+            reason,
+            failure: None,
+        };
+        if let Some(outcome) = terminal.terminal_outcome() {
+            self.store_terminal_outcome(terminal.context().run_key(), outcome);
+        }
+        (self.publish_event(terminal), false)
     }
 
     pub fn publish_strict(
         &self,
         event: SagaChoreographyEvent,
     ) -> Result<PublishStats, SagaBusPublishError> {
+        if matches!(event, SagaChoreographyEvent::SagaAbortRequested { .. }) {
+            let (stats, resolver_delivered) = self.publish_abort_event(event.clone());
+            if !resolver_delivered {
+                let context = event.context();
+                return Err(SagaBusPublishError::AbortNotDelivered {
+                    saga_id: context.saga_id,
+                    saga_type: context.saga_type.clone(),
+                    attempted: stats.attempted,
+                    delivered: stats.delivered,
+                });
+            }
+            return Ok(stats);
+        }
         let (stats, rejected) = self.publish_with_admission(event.clone());
         if let Some(reason) = rejected {
             // The diagnostic SagaFailed was already published; the start itself
@@ -713,24 +992,22 @@ impl SagaChoreographyBus {
             SagaChoreographyEvent::SagaCompleted { .. }
                 | SagaChoreographyEvent::SagaFailed { .. }
                 | SagaChoreographyEvent::SagaQuarantined { .. }
+                | SagaChoreographyEvent::SagaAbortRequested { .. }
         );
         if is_terminal {
             return Err(partial);
         }
 
-        let terminal = SagaChoreographyEvent::SagaFailed {
-            context: context.next_step(TERMINAL_RESOLVER_STEP.into()),
-            reason: format!(
-                "publish_partial_delivery attempted={} delivered={} event_type={} step={}",
-                attempted,
-                delivered,
-                event.event_type(),
-                context.step_name
-            )
-            .into(),
-            failure: None,
-        };
-        let terminal_stats = self.publish(terminal);
+        let reason: Box<str> = format!(
+            "publish_partial_delivery attempted={} delivered={} event_type={} step={}",
+            attempted,
+            delivered,
+            event.event_type(),
+            context.step_name
+        )
+        .into();
+        let terminal_stats =
+            self.publish_abort_or_fail(&context, reason, AbortSource::PartialDelivery);
         if terminal_stats.attempted != terminal_stats.delivered {
             return Err(SagaBusPublishError::TerminalEscalationPartialDelivery {
                 saga_id: context.saga_id,
@@ -743,11 +1020,17 @@ impl SagaChoreographyBus {
         Err(partial)
     }
 
-    fn register_terminal_policy(&self, policy: &TerminalPolicy) {
-        let _ = self.ask_state(BusStateAsk::RegisterTerminalPolicy {
+    fn register_terminal_policy(&self, policy: &TerminalPolicy) -> Result<(), String> {
+        match self.ask_state(BusStateAsk::RegisterTerminalPolicy {
             saga_type: policy.saga_type.clone(),
             policy_id: policy.policy_id.clone(),
-        });
+        }) {
+            Some(_) => Ok(()),
+            None => Err(format!(
+                "terminal policy readiness not registered: bus state unavailable saga_type={} policy_id={}",
+                policy.saga_type, policy.policy_id
+            )),
+        }
     }
 
     pub fn register_workflow_contract_provider<C: SagaWorkflowContract>(
@@ -870,12 +1153,36 @@ impl SagaChoreographyBus {
         self.subscribe_fn(saga_type, f)
     }
 
+    /// Registers a waiter for the terminal reply of the exact `run` (ADR-0001).
+    pub fn register_terminal_reply_for_run(
+        &self,
+        run: &RunKey,
+        reply: SagaReplyToHandle,
+    ) -> Result<(), Box<str>> {
+        match self.pending_replies.register(run.clone(), reply) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let reply = err.into_reply();
+                let _ = reply.reply(Err("terminal reply already registered for run".into()));
+                tracing::warn!(
+                    target: "core::saga",
+                    event = "terminal_reply_already_registered",
+                    run = %run
+                );
+                Err("terminal reply already registered for run".into())
+            }
+        }
+    }
+
+    /// `SagaId` wrapper: the run is unknown at registration, so the waiter resolves with the
+    /// first terminal event of any incarnation of `saga_id` that is not superseded by a newer
+    /// cached terminal. Prefer [`Self::register_terminal_reply_for_run`].
     pub fn register_terminal_reply(
         &self,
         saga_id: SagaId,
         reply: SagaReplyToHandle,
     ) -> Result<(), Box<str>> {
-        match self.pending_replies.register(saga_id, reply) {
+        match self.legacy_pending_replies.register(saga_id, reply) {
             Ok(()) => Ok(()),
             Err(err) => {
                 let reply = err.into_reply();
@@ -885,13 +1192,41 @@ impl SagaChoreographyBus {
         }
     }
 
+    /// Caches and delivers `reply` for the exact `run` only (ADR-0001).
+    pub fn complete_terminal_reply_for_run(&self, run: &RunKey, reply: SagaReplyTo) -> bool {
+        self.store_terminal_reply(run.clone(), reply.clone());
+        let exact = self.pending_replies.resolve(run, Ok(reply.clone())).is_ok();
+        // Unscoped waiters never receive a reply from an older incarnation once a newer
+        // incarnation has a cached terminal.
+        let superseded = matches!(
+            self.ask_state(BusStateAsk::HasNewerTerminal { run: run.clone() }),
+            Some(BusStateReply::Bool(true))
+        );
+        let legacy = !superseded
+            && self
+                .legacy_pending_replies
+                .resolve(&run.saga_id(), Ok(reply))
+                .is_ok();
+        exact || legacy
+    }
+
+    /// `SagaId` wrapper: delivers to unscoped waiters and caches under an unscoped key that
+    /// sorts below every real incarnation.
     pub fn complete_terminal_reply(&self, saga_id: SagaId, reply: SagaReplyTo) -> bool {
-        self.store_terminal_reply(saga_id, reply.clone());
-        self.pending_replies.resolve(&saga_id, Ok(reply)).is_ok()
+        self.store_terminal_reply(unscoped_run(saga_id), reply.clone());
+        self.legacy_pending_replies
+            .resolve(&saga_id, Ok(reply))
+            .is_ok()
+    }
+
+    pub fn reject_terminal_reply_for_run(&self, run: &RunKey, reason: impl Into<String>) -> bool {
+        self.pending_replies
+            .resolve(run, Err(reason.into()))
+            .is_ok()
     }
 
     pub fn reject_terminal_reply(&self, saga_id: SagaId, reason: impl Into<String>) -> bool {
-        self.pending_replies
+        self.legacy_pending_replies
             .resolve(&saga_id, Err(reason.into()))
             .is_ok()
     }
@@ -904,6 +1239,13 @@ impl SagaChoreographyBus {
         self.attach_terminal_resolver_inner(policy, responder, None)
     }
 
+    /// Attaches a durable resolver restored from `journal`.
+    ///
+    /// Durable resolvers must be attached **before** participants run startup
+    /// recovery. A `SagaAbortRequested` published while no resolver is
+    /// attached is answered with a fallback terminal `SagaFailed` that the
+    /// resolver never journals; a durable resolver attached later could then
+    /// emit a second, contradicting outcome for the same run (ADR-0004 §2.6).
     pub fn attach_durable_terminal_resolver<J: TerminalResolverJournal>(
         &self,
         policy: TerminalPolicy,
@@ -919,7 +1261,24 @@ impl SagaChoreographyBus {
         responder: &'static str,
         journal: Option<Arc<dyn TerminalResolverJournal>>,
     ) -> Result<FirehoseSubscription, String> {
+        if let Err(error) = policy.validate() {
+            tracing::error!(
+                target: "core::saga",
+                event = "terminal_resolver_policy_invalid",
+                saga_type = policy.saga_type.as_ref(),
+                policy_id = policy.policy_id.as_ref(),
+                error = %error,
+                "terminal policy rejected before resolver registration"
+            );
+            return Err(format!(
+                "invalid terminal policy saga_type={} policy_id={}: {error}",
+                policy.saga_type, policy.policy_id
+            ));
+        }
+        // One attach at a time: reserve -> setup -> commit is atomic for publishers.
+        let _attach_guard = AttachLockGuard::acquire(&self.resolver_attach_lock);
         let saga_type_topic = policy.saga_type.clone();
+        let requested = ResolverAttachConfig::new(&policy, journal.as_ref());
         let existing =
             match self
                 .terminal_resolver_registry_ref
@@ -952,11 +1311,26 @@ impl SagaChoreographyBus {
                     ));
                 }
             };
-        if let Some(subscription) = existing {
-            return Ok(subscription);
+        if let Some((subscription, attached)) = existing {
+            if attached == requested {
+                // A previous attach may have failed after registering the
+                // runtime but before readiness; make the retry commit it.
+                self.register_terminal_policy(&policy)?;
+                return Ok(subscription);
+            }
+            tracing::error!(
+                target: "core::saga",
+                event = "terminal_resolver_attach_config_mismatch",
+                saga_type = policy.saga_type.as_ref(),
+                policy_id = policy.policy_id.as_ref(),
+                "resolver already attached with a different configuration"
+            );
+            return Err(format!(
+                "AlreadyAttachedWithDifferentConfig: terminal resolver saga_type={} policy_id={} is already attached with a different policy or journal",
+                policy.saga_type, policy.policy_id
+            ));
         }
 
-        self.register_terminal_policy(&policy);
         let bus = self.clone();
         let responder: Arc<str> = Arc::from(responder);
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -992,9 +1366,17 @@ impl SagaChoreographyBus {
             responder: Arc::clone(&responder),
             saga_type: saga_type_topic.clone(),
         });
-        spawn_terminal_watchdog_if_needed(&policy, resolver_ref.clone(), Arc::clone(&shutdown))?;
+        if let Err(error) =
+            spawn_terminal_watchdog_if_needed(&policy, resolver_ref.clone(), Arc::clone(&shutdown))
+        {
+            shutdown.store(true, Ordering::Release);
+            resolver_handle.shutdown();
+            return Err(error);
+        }
         let subscription_saga_type = policy.saga_type.clone();
         let subscription_resolver_ref = resolver_ref.clone();
+        let abort_ingested = Arc::new(AtomicU64::new(0));
+        let subscription_abort_ingested = Arc::clone(&abort_ingested);
         let subscription = self.subscribe_fn(saga_type_topic.as_ref(), move |event| {
             if !subscription_resolver_ref
                 .tell(TerminalResolverTell::Ingest(Box::new(event.clone())))
@@ -1002,42 +1384,67 @@ impl SagaChoreographyBus {
                 tracing::error!(
                     target: "core::saga",
                     event = "terminal_resolver_ingest_failed",
-                    saga_type = subscription_saga_type.as_ref()
+                    saga_type = subscription_saga_type.as_ref(),
+                    run = ?event.context().run_key(),
+                    "resolver subscription could not hand the event to the resolver actor"
                 );
+                return false;
+            }
+            if matches!(event, SagaChoreographyEvent::SagaAbortRequested { .. }) {
+                subscription_abort_ingested.fetch_add(1, Ordering::AcqRel);
             }
             true
+        });
+        #[cfg(test)]
+        {
+            let hook = self
+                .attach_hook
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let rollback_shutdown = Arc::clone(&shutdown);
+        let rollback_subscription = subscription.clone();
+        let runtime = Box::new(TerminalResolverRuntime {
+            config: requested,
+            subscription,
+            shutdown,
+            resolver_ref,
+            handle: resolver_handle,
         });
         let registered =
             match self
                 .terminal_resolver_registry_ref
                 .ask(TerminalResolverRegistryAsk::Register {
-                    saga_type: saga_type_topic,
-                    runtime: TerminalResolverRuntime {
-                        subscription,
-                        shutdown,
-                        resolver_ref,
-                        handle: resolver_handle,
-                    },
+                    saga_type: saga_type_topic.clone(),
+                    runtime,
                 }) {
                 Ok(TerminalResolverRegistryReply::Registered(subscription)) => subscription,
-                Ok(TerminalResolverRegistryReply::Existing(_)) => {
-                    return Err(
-                        "terminal resolver registry returned unexpected existing reply".to_string(),
+                other => {
+                    // Commit failed: tear the half-built resolver down; no readiness published.
+                    rollback_shutdown.store(true, Ordering::Release);
+                    self.unsubscribe(rollback_subscription);
+                    tracing::error!(
+                        target: "core::saga",
+                        event = "terminal_resolver_register_failed",
+                        saga_type = policy.saga_type.as_ref(),
+                        "terminal resolver registration failed; setup rolled back"
                     );
-                }
-                Ok(TerminalResolverRegistryReply::ShutdownComplete) => {
-                    return Err("terminal resolver registry returned shutdown reply".to_string());
-                }
-                Ok(TerminalResolverRegistryReply::RecoveryActivated(_)) => {
-                    return Err(
-                        "terminal resolver registry returned unexpected activation reply"
-                            .to_string(),
-                    );
-                }
-                Err(err) => {
-                    return Err(format!("terminal resolver registry unavailable: {err:?}"));
+                    return Err(match other {
+                        Err(err) => format!("terminal resolver registry unavailable: {err:?}"),
+                        Ok(_) => "terminal resolver registry returned unexpected reply".to_string(),
+                    });
                 }
             };
+        self.resolver_abort_ingest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(saga_type_topic, abort_ingested);
+        // Readiness is committed only now that the resolver is fully registered.
+        self.register_terminal_policy(&policy)?;
         Ok(registered)
     }
 
@@ -1082,15 +1489,34 @@ impl SagaChoreographyBus {
         self.activate_terminal_resolver_recovery(C::saga_type())
     }
 
+    /// `SagaId` wrapper: takes the newest cached incarnation's reply.
     pub fn take_terminal_reply(&self, saga_id: SagaId) -> Option<SagaReplyTo> {
-        match self.ask_state(BusStateAsk::TakeTerminalReply { saga_id }) {
+        match self.ask_state(BusStateAsk::TakeNewestTerminalReply { saga_id }) {
             Some(BusStateReply::TerminalReply(reply)) => reply,
             _ => None,
         }
     }
 
+    pub fn take_terminal_reply_for_run(&self, run: &RunKey) -> Option<SagaReplyTo> {
+        match self.ask_state(BusStateAsk::TakeTerminalReply { run: run.clone() }) {
+            Some(BusStateReply::TerminalReply(reply)) => reply,
+            _ => None,
+        }
+    }
+
+    /// `SagaId` wrapper: takes the newest cached incarnation's outcome.
     pub fn take_terminal_outcome(&self, saga_id: SagaId) -> Option<crate::SagaTerminalOutcome> {
-        match self.ask_state(BusStateAsk::TakeTerminalOutcome { saga_id }) {
+        match self.ask_state(BusStateAsk::TakeNewestTerminalOutcome { saga_id }) {
+            Some(BusStateReply::TerminalOutcome(outcome)) => outcome,
+            _ => None,
+        }
+    }
+
+    pub fn take_terminal_outcome_for_run(
+        &self,
+        run: &RunKey,
+    ) -> Option<crate::SagaTerminalOutcome> {
+        match self.ask_state(BusStateAsk::TakeTerminalOutcome { run: run.clone() }) {
             Some(BusStateReply::TerminalOutcome(outcome)) => outcome,
             _ => None,
         }
@@ -1115,8 +1541,8 @@ impl SagaChoreographyBus {
         let Some(outcome) = event.terminal_outcome() else {
             return false;
         };
-        self.complete_terminal_reply(
-            event.context().saga_id,
+        self.complete_terminal_reply_for_run(
+            &event.context().run_key(),
             SagaReplyTo {
                 responder: responder.into(),
                 outcome,
@@ -1228,6 +1654,7 @@ impl SagaChoreographyBus {
             SagaChoreographyEvent::SagaCompleted { .. }
                 | SagaChoreographyEvent::SagaFailed { .. }
                 | SagaChoreographyEvent::SagaQuarantined { .. }
+                | SagaChoreographyEvent::SagaAbortRequested { .. }
         ) {
             return None;
         }
@@ -1245,23 +1672,28 @@ impl SagaChoreographyBus {
         }
     }
 
-    fn store_terminal_reply(&self, saga_id: SagaId, reply: SagaReplyTo) {
+    fn store_terminal_reply(&self, run: RunKey, reply: SagaReplyTo) {
         let retention_limit = self.terminal_retention_limit();
         let _ = self.ask_state(BusStateAsk::StoreTerminalReply {
-            saga_id,
+            run,
             reply,
             retention_limit,
         });
     }
 
-    fn store_terminal_outcome(&self, saga_id: SagaId, outcome: SagaTerminalOutcome) {
+    fn store_terminal_outcome(&self, run: RunKey, outcome: SagaTerminalOutcome) {
         let retention_limit = self.terminal_retention_limit();
         let _ = self.ask_state(BusStateAsk::StoreTerminalOutcome {
-            saga_id,
+            run,
             outcome,
             retention_limit,
         });
     }
+}
+
+/// Cache key for `SagaId`-only completions: empty type, incarnation 0 (below any real run).
+fn unscoped_run(saga_id: SagaId) -> RunKey {
+    RunKey::new("", saga_id, RunIncarnation::new(0))
 }
 
 fn terminal_watchdog_tick_interval() -> Duration {
@@ -1327,8 +1759,13 @@ impl Clone for SagaChoreographyBus {
         Self {
             bus: self.bus.clone(),
             pending_replies: self.pending_replies.clone(),
+            legacy_pending_replies: self.legacy_pending_replies.clone(),
             state_ref: self.state_ref.clone(),
             terminal_resolver_registry_ref: self.terminal_resolver_registry_ref.clone(),
+            resolver_attach_lock: Arc::clone(&self.resolver_attach_lock),
+            resolver_abort_ingest: Arc::clone(&self.resolver_abort_ingest),
+            #[cfg(test)]
+            attach_hook: Arc::clone(&self.attach_hook),
             _lifecycle: Arc::clone(&self._lifecycle),
         }
     }
@@ -1358,10 +1795,18 @@ mod tests {
         TerminalResolverJournalEntry, TerminalResolverJournalError, WorkflowDependencySpec,
     };
 
-    use super::{DEFAULT_TERMINAL_RETENTION_LIMIT, SagaChoreographyBus};
+    use super::{BusStateAsk, DEFAULT_TERMINAL_RETENTION_LIMIT, SagaChoreographyBus};
+    use crate::AbortSource;
+    use icanact_core::local::FirehoseSubscription;
+
+    /// Process-constant recent incarnation: all events of one saga must share one run.
+    fn run_start_millis() -> u64 {
+        static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *BASE.get_or_init(SagaContext::now_millis)
+    }
 
     fn context_for(saga_type: &str, step_name: &str, saga_id: u64) -> SagaContext {
-        let now = SagaContext::now_millis();
+        let now = run_start_millis();
         SagaContext {
             saga_id: SagaId::new(saga_id),
             saga_type: saga_type.into(),
@@ -1398,6 +1843,11 @@ mod tests {
             saga_id: SagaId,
             reply: super::SagaReplyToHandle,
         },
+        RegisterRun {
+            bus: SagaChoreographyBus,
+            run: crate::RunKey,
+            reply: super::SagaReplyToHandle,
+        },
     }
 
     fn register_pending_reply(
@@ -1415,6 +1865,9 @@ mod tests {
             } => {
                 let _ = bus.register_terminal_reply(saga_id, reply);
             }
+            ProbeMsg::RegisterRun { bus, run, reply } => {
+                let _ = bus.register_terminal_reply_for_run(&run, reply);
+            }
         });
         let pending = probe_addr
             .ask_delegated(|reply| ProbeMsg::Register {
@@ -1424,6 +1877,81 @@ mod tests {
             })
             .expect("pending reply should be registered");
         (pending, probe_handle)
+    }
+
+    fn register_pending_reply_for_run(
+        bus: SagaChoreographyBus,
+        run: crate::RunKey,
+    ) -> (
+        local_sync::PendingAsk<SagaReplyToResult>,
+        local_sync::mpsc::ActorHandle,
+    ) {
+        let (probe_addr, probe_handle) = local_sync::mpsc::spawn(8, |msg: ProbeMsg| {
+            if let ProbeMsg::RegisterRun { bus, run, reply } = msg {
+                let _ = bus.register_terminal_reply_for_run(&run, reply);
+            }
+        });
+        let pending = probe_addr
+            .ask_delegated(|reply| ProbeMsg::RegisterRun { bus, run, reply })
+            .expect("pending reply should be registered");
+        (pending, probe_handle)
+    }
+
+    fn run_terminal_event(saga_id: u64, incarnation: u64, failed: bool) -> SagaChoreographyEvent {
+        let context = SagaContext {
+            saga_started_at_millis: incarnation,
+            step_name: TERMINAL_RESOLVER_STEP.into(),
+            ..context("create_order", saga_id)
+        };
+        if failed {
+            SagaChoreographyEvent::SagaFailed {
+                context,
+                reason: "run failed".into(),
+                failure: None,
+            }
+        } else {
+            SagaChoreographyEvent::SagaCompleted { context }
+        }
+    }
+
+    #[test]
+    fn reply_for_old_run_not_delivered_to_new_run() {
+        let bus = SagaChoreographyBus::new();
+        let old_event = run_terminal_event(4242, 1_000, false);
+        let new_event = run_terminal_event(4242, 2_000, true);
+        let old_run = old_event.context().run_key();
+        let new_run = new_event.context().run_key();
+        let (pending_old, probe_old) = register_pending_reply_for_run(bus.clone(), old_run.clone());
+        let (pending_new, probe_new) = register_pending_reply_for_run(bus.clone(), new_run.clone());
+        thread::sleep(Duration::from_millis(20));
+
+        // Old run terminates first: only its own waiter and cache entry may see it.
+        assert!(bus.complete_terminal_reply_from_event(&old_event, "resolver"));
+        let old_reply = pending_old
+            .wait_timeout(Duration::from_secs(2))
+            .expect("old run waiter resolves")
+            .expect("old run reply ok");
+        assert!(matches!(
+            old_reply.outcome,
+            SagaTerminalOutcome::Completed { .. }
+        ));
+        assert!(
+            bus.take_terminal_outcome_for_run(&new_run).is_none(),
+            "old run's terminal outcome must not be cached for the new run"
+        );
+
+        assert!(bus.complete_terminal_reply_from_event(&new_event, "resolver"));
+        let new_reply = pending_new
+            .wait_timeout(Duration::from_secs(2))
+            .expect("new run waiter resolves")
+            .expect("new run reply ok");
+        assert!(
+            matches!(new_reply.outcome, SagaTerminalOutcome::Failed { .. }),
+            "new run waiter must get its own outcome, got {:?}",
+            new_reply.outcome
+        );
+        probe_old.shutdown();
+        probe_new.shutdown();
     }
 
     struct RejectingTerminalResolverJournal;
@@ -1443,6 +1971,144 @@ mod tests {
         ) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError> {
             Ok(Vec::new())
         }
+    }
+
+    struct UnreadableTerminalResolverJournal;
+
+    impl TerminalResolverJournal for UnreadableTerminalResolverJournal {
+        fn append(
+            &self,
+            _event: SagaChoreographyEvent,
+        ) -> Result<u64, TerminalResolverJournalError> {
+            Ok(0)
+        }
+
+        fn read_all(
+            &self,
+        ) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError> {
+            Err(TerminalResolverJournalError::Storage(
+                "injected resolver journal read failure".into(),
+            ))
+        }
+    }
+
+    #[test]
+    fn resolver_attach_failure_and_race_leave_one_consistent_registration() {
+        // (1) journal read failure must not leave policy-only readiness behind.
+        let bus = SagaChoreographyBus::new();
+        let failed = bus.attach_durable_terminal_resolver(
+            TerminalPolicy::order_lifecycle_default(),
+            "terminal-resolver",
+            Arc::new(UnreadableTerminalResolverJournal),
+        );
+        assert!(failed.is_err(), "unreadable journal must fail the attach");
+        assert!(
+            !bus.has_terminal_policy_for_saga_type("order_lifecycle"),
+            "failed attach must not leave a registered terminal policy"
+        );
+        // A later attach with a healthy journal then succeeds from a clean slate.
+        let journal = Arc::new(InMemoryTerminalResolverJournal::default());
+        let durable = bus
+            .attach_durable_terminal_resolver(
+                TerminalPolicy::order_lifecycle_default(),
+                "terminal-resolver",
+                Arc::clone(&journal),
+            )
+            .expect("retry after a failed attach must succeed");
+        assert!(bus.has_terminal_policy_for_saga_type("order_lifecycle"));
+        // Same configuration is idempotent.
+        let again = bus
+            .attach_durable_terminal_resolver(
+                TerminalPolicy::order_lifecycle_default(),
+                "terminal-resolver",
+                Arc::clone(&journal),
+            )
+            .expect("same-config reattach is idempotent");
+        assert_eq!(durable, again);
+        // (3) incompatible reattach is an explicit error, never silently the old one.
+        let mismatch = bus
+            .attach_terminal_resolver(
+                TerminalPolicy::order_lifecycle_default(),
+                "terminal-resolver",
+            )
+            .expect_err("durable -> in-memory reattach must be rejected");
+        assert!(
+            mismatch.contains("AlreadyAttachedWithDifferentConfig"),
+            "got: {mismatch}"
+        );
+        let other_journal = Arc::new(InMemoryTerminalResolverJournal::default());
+        let mismatch = bus
+            .attach_durable_terminal_resolver(
+                TerminalPolicy::order_lifecycle_default(),
+                "terminal-resolver",
+                other_journal,
+            )
+            .expect_err("different journal must be rejected");
+        assert!(
+            mismatch.contains("AlreadyAttachedWithDifferentConfig"),
+            "got: {mismatch}"
+        );
+
+        // In-memory first, then durable.
+        let bus = SagaChoreographyBus::new();
+        bus.attach_terminal_resolver(
+            TerminalPolicy::order_lifecycle_default(),
+            "terminal-resolver",
+        )
+        .expect("in-memory attach");
+        let mismatch = bus
+            .attach_durable_terminal_resolver(
+                TerminalPolicy::order_lifecycle_default(),
+                "terminal-resolver",
+                Arc::new(InMemoryTerminalResolverJournal::default()),
+            )
+            .expect_err("in-memory -> durable reattach must be rejected");
+        assert!(
+            mismatch.contains("AlreadyAttachedWithDifferentConfig"),
+            "got: {mismatch}"
+        );
+
+        // (2) racing incompatible attaches: exactly one wins, the other is rejected.
+        let bus = Arc::new(SagaChoreographyBus::new());
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let in_memory = {
+            let (bus, barrier) = (Arc::clone(&bus), Arc::clone(&barrier));
+            thread::spawn(move || {
+                barrier.wait();
+                bus.attach_terminal_resolver(
+                    TerminalPolicy::order_lifecycle_default(),
+                    "terminal-resolver",
+                )
+            })
+        };
+        let durable = {
+            let (bus, barrier) = (Arc::clone(&bus), Arc::clone(&barrier));
+            thread::spawn(move || {
+                barrier.wait();
+                bus.attach_durable_terminal_resolver(
+                    TerminalPolicy::order_lifecycle_default(),
+                    "terminal-resolver",
+                    Arc::new(InMemoryTerminalResolverJournal::default()),
+                )
+            })
+        };
+        let results = [
+            in_memory.join().expect("in-memory attach thread"),
+            durable.join().expect("durable attach thread"),
+        ];
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "exactly one racing attach may win: {results:?}"
+        );
+        let loser = results
+            .iter()
+            .find_map(|result| result.as_ref().err())
+            .expect("one attach must be rejected");
+        assert!(
+            loser.contains("AlreadyAttachedWithDifferentConfig"),
+            "got: {loser}"
+        );
     }
 
     #[test]
@@ -1772,6 +2438,282 @@ mod tests {
         assert_eq!(delivered.load(Ordering::Relaxed), 1);
     }
 
+    fn many_step_policy(capacity: usize, reverse: bool) -> TerminalPolicy {
+        let names: Vec<String> = (0..24).map(|i| format!("step_{i}")).collect();
+        let mut all_of: HashSet<Box<str>> = HashSet::with_capacity(capacity);
+        let mut only: HashSet<Box<str>> = HashSet::with_capacity(capacity);
+        let iter: Box<dyn Iterator<Item = &String>> = if reverse {
+            Box::new(names.iter().rev())
+        } else {
+            Box::new(names.iter())
+        };
+        for name in iter {
+            all_of.insert(name.as_str().into());
+            only.insert(name.as_str().into());
+        }
+        TerminalPolicy::new(
+            "order_lifecycle".into(),
+            "order_lifecycle/many".into(),
+            FailureAuthority::OnlySteps(only),
+            SuccessCriteria::AllOf(all_of),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            &[],
+        )
+    }
+
+    #[test]
+    fn same_config_reattach_with_multi_step_policy_is_always_ok() {
+        for round in 0..64 {
+            let bus = SagaChoreographyBus::new();
+            let first = bus
+                .attach_terminal_resolver(many_step_policy(round, false), "terminal-resolver")
+                .expect("first attach");
+            let second = bus
+                .attach_terminal_resolver(
+                    many_step_policy(round * 7 + 1, true),
+                    "terminal-resolver",
+                )
+                .expect("same-config reattach must not depend on HashSet iteration order");
+            assert_eq!(first, second);
+        }
+    }
+
+    fn abort_event(saga_id: u64) -> SagaChoreographyEvent {
+        SagaChoreographyEvent::SagaAbortRequested {
+            context: context_for("order_lifecycle", "create_order", saga_id),
+            reason: "participant abort".into(),
+            source: AbortSource::StaleRecovery,
+        }
+    }
+
+    #[test]
+    fn abort_with_no_subscribers_errors_and_falls_back_to_saga_failed() {
+        let bus = SagaChoreographyBus::new();
+        let result = bus.publish_strict(abort_event(8101));
+        assert!(
+            result.is_err(),
+            "undelivered abort must not be Ok: {result:?}"
+        );
+        assert!(
+            matches!(
+                bus.take_terminal_outcome(SagaId::new(8101)),
+                Some(SagaTerminalOutcome::Failed { .. })
+            ),
+            "undelivered abort must fall back to a terminal SagaFailed"
+        );
+    }
+
+    #[test]
+    fn abort_reaching_only_non_resolver_subscriber_errors_and_falls_back() {
+        let bus = SagaChoreographyBus::new();
+        let _sub = bus.subscribe_saga_type_fn("order_lifecycle", |_: &SagaChoreographyEvent| true);
+        let result = bus.publish_strict(abort_event(8102));
+        assert!(
+            result.is_err(),
+            "abort with no resolver must not be Ok: {result:?}"
+        );
+        assert!(
+            matches!(
+                bus.take_terminal_outcome(SagaId::new(8102)),
+                Some(SagaTerminalOutcome::Failed { .. })
+            ),
+            "abort with no attached resolver must fall back to SagaFailed"
+        );
+    }
+
+    #[test]
+    fn abort_with_attached_resolver_is_ok() {
+        let bus = SagaChoreographyBus::new();
+        bus.attach_terminal_resolver(
+            TerminalPolicy::order_lifecycle_default(),
+            "terminal-resolver",
+        )
+        .expect("attach");
+        let result = bus.publish_strict(abort_event(8103));
+        assert!(
+            result.is_ok(),
+            "abort delivered to resolver must be Ok: {result:?}"
+        );
+    }
+
+    #[test]
+    fn attach_fails_when_readiness_cannot_be_registered() {
+        let mut bus = SagaChoreographyBus::new();
+        Arc::get_mut(&mut bus._lifecycle)
+            .expect("sole lifecycle owner")
+            .state_handle
+            .take()
+            .expect("state handle")
+            .shutdown();
+        wait_until(Instant::now() + Duration::from_millis(500), || {
+            bus.state_ref
+                .ask(BusStateAsk::HasTerminalPolicy {
+                    saga_type: "x".into(),
+                })
+                .is_err()
+        });
+        let result = bus.attach_terminal_resolver(
+            TerminalPolicy::order_lifecycle_default(),
+            "terminal-resolver",
+        );
+        assert!(result.is_err(), "attach without readiness must be Err");
+    }
+
+    /// P1-1: an abort published between the resolver's subscribe and its
+    /// registry registration must reach exactly one authority.
+    #[test]
+    fn abort_during_attach_window_has_exactly_one_authority() {
+        use std::sync::mpsc;
+        let bus = SagaChoreographyBus::new();
+        // Threads that delivered a SagaFailed; delivery is synchronous on the
+        // publishing thread, so the fallback shows up as the publisher's id.
+        let failed_on = Arc::new(std::sync::Mutex::new(Vec::<thread::ThreadId>::new()));
+        let _capture = bus.subscribe_saga_type_fn("order_lifecycle", {
+            let failed_on = Arc::clone(&failed_on);
+            move |event: &SagaChoreographyEvent| {
+                if matches!(event, SagaChoreographyEvent::SagaFailed { .. }) {
+                    failed_on
+                        .lock()
+                        .expect("failed_on")
+                        .push(thread::current().id());
+                }
+                true
+            }
+        });
+        let (subscribed_tx, subscribed_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let go_rx = std::sync::Mutex::new(go_rx);
+        let subscribed_tx = std::sync::Mutex::new(subscribed_tx);
+        *bus.attach_hook.lock().expect("hook") = Some(Arc::new(move || {
+            let _ = subscribed_tx.lock().expect("tx").send(());
+            let _ = go_rx.lock().expect("rx").recv();
+        }));
+        let attacher = {
+            let bus = bus.clone();
+            thread::spawn(move || {
+                bus.attach_terminal_resolver(
+                    TerminalPolicy::order_lifecycle_default(),
+                    "terminal-resolver",
+                )
+                .map(|_| ())
+            })
+        };
+        subscribed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("attach reached subscribe/register window");
+        let (done_tx, done_rx) = mpsc::channel();
+        let publisher = {
+            let bus = bus.clone();
+            thread::spawn(move || {
+                let result = bus.publish_strict(abort_event(8201));
+                let _ = done_tx.send(());
+                (result, thread::current().id())
+            })
+        };
+        // Fixed code: the publisher is parked on the attach lock and cannot
+        // finish until the attach is released. Buggy code finishes at once.
+        let finished_inside_window = done_rx.recv_timeout(Duration::from_millis(500)).is_ok();
+        go_tx.send(()).expect("release attach");
+        attacher
+            .join()
+            .expect("attach thread")
+            .expect("attach succeeds");
+        let (result, publisher_id) = publisher.join().expect("publisher thread");
+        assert!(
+            !finished_inside_window,
+            "abort published inside the attach window must wait for the attach"
+        );
+        assert!(result.is_ok(), "resolver is the authority: {result:?}");
+        assert!(
+            !failed_on.lock().expect("failed_on").contains(&publisher_id),
+            "no fallback SagaFailed may be published by the abort publisher"
+        );
+    }
+
+    /// P2-1: unsubscribing the resolver's subscription means it no longer
+    /// receives aborts; the abort must not count as delivered.
+    #[test]
+    fn abort_after_resolver_unsubscribed_is_not_delivered() {
+        let bus = SagaChoreographyBus::new();
+        let resolver_sub = bus
+            .attach_terminal_resolver(
+                TerminalPolicy::order_lifecycle_default(),
+                "terminal-resolver",
+            )
+            .expect("attach");
+        let failed = Arc::new(AtomicUsize::new(0));
+        let _participant = bus.subscribe_saga_type_fn("order_lifecycle", {
+            let failed = Arc::clone(&failed);
+            move |event: &SagaChoreographyEvent| {
+                if matches!(event, SagaChoreographyEvent::SagaFailed { .. }) {
+                    failed.fetch_add(1, Ordering::SeqCst);
+                }
+                true
+            }
+        });
+        assert!(bus.unsubscribe(resolver_sub));
+        let result = bus.publish_strict(abort_event(8202));
+        assert!(
+            matches!(
+                result,
+                Err(super::SagaBusPublishError::AbortNotDelivered { .. })
+            ),
+            "abort lost with the resolver unsubscribed must be AbortNotDelivered: {result:?}"
+        );
+        assert_eq!(failed.load(Ordering::SeqCst), 1, "fallback SagaFailed");
+    }
+
+    /// P2-6: a retried attach that finds the runtime already registered must
+    /// still commit readiness.
+    #[test]
+    fn retried_attach_registers_missing_readiness() {
+        let bus = SagaChoreographyBus::new();
+        bus.attach_terminal_resolver(
+            TerminalPolicy::order_lifecycle_default(),
+            "terminal-resolver",
+        )
+        .expect("first attach");
+        // Model a first attempt that registered the runtime but failed
+        // readiness: same registry, readiness state that never saw it.
+        let mut retry_bus = bus.clone();
+        let (fresh_state, _fresh_handle) = local_sync::spawn(super::BusStateActor::default());
+        retry_bus.state_ref = fresh_state;
+        assert!(!retry_bus.has_terminal_policy_for_saga_type("order_lifecycle"));
+        retry_bus
+            .attach_terminal_resolver(
+                TerminalPolicy::order_lifecycle_default(),
+                "terminal-resolver",
+            )
+            .expect("retry attach");
+        assert!(
+            retry_bus.has_terminal_policy_for_saga_type("order_lifecycle"),
+            "retry returned Ok so readiness must be present"
+        );
+    }
+
+    /// Deadlock check: the resolver thread publishes aborts through the bus
+    /// (`publish_strict` partial delivery); dropping the last user handle
+    /// while that is possible must not hang.
+    #[test]
+    fn dropping_bus_with_resolver_does_not_hang() {
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let bus = SagaChoreographyBus::new();
+            bus.attach_terminal_resolver(
+                TerminalPolicy::order_lifecycle_default(),
+                "terminal-resolver",
+            )
+            .expect("attach");
+            let _ = bus.publish_strict(abort_event(8203));
+            drop(bus);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("bus drop with an attached resolver must not hang");
+    }
+
     #[test]
     fn terminal_outcome_retention_is_bounded() {
         let bus = SagaChoreographyBus::new();
@@ -1898,7 +2840,8 @@ mod tests {
     #[test]
     fn terminal_policy_without_contract_fails_saga_started() {
         let bus = SagaChoreographyBus::new();
-        bus.register_terminal_policy(&TerminalPolicy::order_lifecycle_default());
+        bus.register_terminal_policy(&TerminalPolicy::order_lifecycle_default())
+            .expect("register policy");
         let saga_id = SagaId::new(9002);
         let started = SagaChoreographyEvent::SagaStarted {
             context: context("create_order", saga_id.get()),
@@ -2048,15 +2991,15 @@ mod tests {
             let mut possible_success_steps = HashSet::new();
             possible_success_steps.insert("risk_check".into());
             possible_success_steps.insert("manual_review".into());
-            TerminalPolicy {
-                saga_type: "order_lifecycle".into(),
-                policy_id: "order_lifecycle/any-of".into(),
-                failure_authority: FailureAuthority::AnyParticipant,
-                success_criteria: SuccessCriteria::AnyOf(possible_success_steps),
-                overall_timeout: Duration::from_secs(30),
-                stalled_timeout: Duration::from_secs(5),
-                workflow_steps: Self::steps(),
-            }
+            TerminalPolicy::new(
+                "order_lifecycle".into(),
+                "order_lifecycle/any-of".into(),
+                FailureAuthority::AnyParticipant,
+                SuccessCriteria::AnyOf(possible_success_steps),
+                Duration::from_secs(30),
+                Duration::from_secs(5),
+                Self::steps(),
+            )
         }
     }
 
@@ -2082,15 +3025,15 @@ mod tests {
         fn terminal_policy() -> TerminalPolicy {
             let mut required_steps = HashSet::new();
             required_steps.insert("create_order".into());
-            TerminalPolicy {
-                saga_type: "different_saga_type".into(),
-                policy_id: "different_saga_type/default".into(),
-                failure_authority: FailureAuthority::AnyParticipant,
-                success_criteria: SuccessCriteria::AllOf(required_steps),
-                overall_timeout: Duration::from_secs(30),
-                stalled_timeout: Duration::from_secs(30),
-                workflow_steps: Self::steps(),
-            }
+            TerminalPolicy::new(
+                "different_saga_type".into(),
+                "different_saga_type/default".into(),
+                FailureAuthority::AnyParticipant,
+                SuccessCriteria::AllOf(required_steps),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                Self::steps(),
+            )
         }
     }
 
@@ -2289,9 +3232,10 @@ mod tests {
 
         let _ = bus.publish(started);
 
-        let Some(SagaTerminalOutcome::Failed { reason, .. }) = bus.take_terminal_outcome(saga_id)
-        else {
-            panic!("expected immediate terminal failure for live delivery shortfall");
+        // The bus now requests an abort; the resolver authors the terminal.
+        let outcome = take_outcome_eventually(&bus, saga_id);
+        let Some(SagaTerminalOutcome::Failed { reason, .. }) = outcome else {
+            panic!("expected terminal failure for live delivery shortfall");
         };
         assert!(
             reason.contains("required_path_delivery_shortfall"),
@@ -2373,9 +3317,10 @@ mod tests {
             compensation_available: false,
         });
 
-        let Some(SagaTerminalOutcome::Failed { reason, .. }) = bus.take_terminal_outcome(saga_id)
-        else {
-            panic!("expected immediate terminal failure for required dependency route loss");
+        // The bus now requests an abort; the resolver authors the terminal.
+        let outcome = take_outcome_eventually(&bus, saga_id);
+        let Some(SagaTerminalOutcome::Failed { reason, .. }) = outcome else {
+            panic!("expected terminal failure for required dependency route loss");
         };
         assert!(
             reason.contains("required_path_delivery_shortfall"),
@@ -2481,6 +3426,115 @@ mod tests {
         );
     }
 
+    fn captured_events(
+        bus: &SagaChoreographyBus,
+    ) -> (
+        Arc<std::sync::Mutex<Vec<SagaChoreographyEvent>>>,
+        FirehoseSubscription,
+    ) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sub = bus.subscribe_saga_type_fn("order_lifecycle", {
+            let seen = Arc::clone(&seen);
+            move |event| {
+                seen.lock().expect("capture lock").push(event.clone());
+                true
+            }
+        });
+        (seen, sub)
+    }
+
+    fn take_outcome_eventually(
+        bus: &SagaChoreographyBus,
+        saga_id: SagaId,
+    ) -> Option<SagaTerminalOutcome> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Some(outcome) = bus.take_terminal_outcome(saga_id) {
+                return Some(outcome);
+            }
+            thread::yield_now();
+        }
+        None
+    }
+
+    fn shortfall_bus() -> SagaChoreographyBus {
+        let bus = SagaChoreographyBus::new();
+        bus.register_workflow_contract_provider::<MultiStepOrderLifecycleContract>()
+            .expect("workflow contract registration should succeed");
+        bus.register_bound_workflow_step("order_lifecycle", "risk_check")
+            .expect("risk_check binding should succeed");
+        bus.register_bound_workflow_step("order_lifecycle", "create_order")
+            .expect("create_order binding should succeed");
+        bus
+    }
+
+    fn shortfall_event(saga_id: u64) -> SagaChoreographyEvent {
+        SagaChoreographyEvent::StepCompleted {
+            context: context("risk_check", saga_id),
+            output: Vec::new(),
+            saga_input: Vec::new(),
+            compensation_available: false,
+        }
+    }
+
+    #[test]
+    fn delivery_shortfall_requests_abort_not_terminal_failure() {
+        let bus = shortfall_bus();
+        let _resolver = bus
+            .attach_terminal_resolver_for_contract::<MultiStepOrderLifecycleContract>(
+                "test-resolver",
+            )
+            .expect("terminal resolver should attach");
+        let (seen, _sub) = captured_events(&bus);
+
+        let _ = bus.publish_strict(shortfall_event(90071));
+
+        let events = seen.lock().expect("capture lock");
+        let aborts: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    SagaChoreographyEvent::SagaAbortRequested {
+                        source: AbortSource::DeliveryShortfall,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(aborts.len(), 1, "exactly one abort request, got {events:?}");
+        // The bus itself must not synthesize a terminal failure; any
+        // SagaFailed must come after the abort (resolver-authored).
+        let abort_pos = events
+            .iter()
+            .position(|e| matches!(e, SagaChoreographyEvent::SagaAbortRequested { .. }))
+            .expect("abort present");
+        assert!(
+            !events[..abort_pos]
+                .iter()
+                .any(|e| matches!(e, SagaChoreographyEvent::SagaFailed { .. })),
+            "bus published SagaFailed before/instead of abort: {events:?}"
+        );
+    }
+
+    #[test]
+    fn undelivered_abort_falls_back_to_saga_failed() {
+        let bus = shortfall_bus();
+        let resolver = bus
+            .attach_terminal_resolver_for_contract::<MultiStepOrderLifecycleContract>(
+                "test-resolver",
+            )
+            .expect("terminal resolver should attach");
+        // Policy stays registered but nothing is subscribed: the abort
+        // request reaches no resolver and must fall back to SagaFailed.
+        assert!(bus.unsubscribe(resolver));
+        let _ = bus.publish_strict(shortfall_event(90072));
+        assert!(matches!(
+            bus.take_terminal_outcome(SagaId::new(90072)),
+            Some(SagaTerminalOutcome::Failed { .. })
+        ));
+    }
+
     struct DeniedRequiredStepContract;
 
     impl SagaWorkflowContract for DeniedRequiredStepContract {
@@ -2505,15 +3559,15 @@ mod tests {
             denied.insert("create_order".into());
             let mut required_steps = HashSet::new();
             required_steps.insert("create_order".into());
-            TerminalPolicy {
-                saga_type: "order_lifecycle".into(),
-                policy_id: "order_lifecycle/denied-required".into(),
-                failure_authority: FailureAuthority::DenySteps(denied),
-                success_criteria: SuccessCriteria::AllOf(required_steps),
-                overall_timeout: Duration::from_secs(30),
-                stalled_timeout: Duration::from_secs(30),
-                workflow_steps: Self::steps(),
-            }
+            TerminalPolicy::new(
+                "order_lifecycle".into(),
+                "order_lifecycle/denied-required".into(),
+                FailureAuthority::DenySteps(denied),
+                SuccessCriteria::AllOf(required_steps),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                Self::steps(),
+            )
         }
     }
 
@@ -2624,15 +3678,15 @@ mod tests {
             .expect("create_order binding should succeed");
         let mut required_steps = HashSet::new();
         required_steps.insert("create_order".into());
-        let policy = TerminalPolicy {
-            saga_type: "order_lifecycle".into(),
-            policy_id: "watchdog/stall".into(),
-            failure_authority: FailureAuthority::AnyParticipant,
-            success_criteria: SuccessCriteria::AllOf(required_steps),
-            overall_timeout: Duration::from_secs(5),
-            stalled_timeout: Duration::from_millis(120),
-            workflow_steps: MultiStepOrderLifecycleContract::steps(),
-        };
+        let policy = TerminalPolicy::new(
+            "order_lifecycle".into(),
+            "watchdog/stall".into(),
+            FailureAuthority::AnyParticipant,
+            SuccessCriteria::AllOf(required_steps),
+            Duration::from_secs(5),
+            Duration::from_millis(120),
+            MultiStepOrderLifecycleContract::steps(),
+        );
         let _resolver_sub = bus
             .attach_terminal_resolver(policy, "terminal-resolver")
             .expect("terminal resolver should attach");
