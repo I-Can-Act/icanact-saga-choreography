@@ -1,7 +1,9 @@
 //! Helper functions for saga handling
 
 use crate::ReconciliationNeeded;
-use crate::state_ext::{EventAdmission, admit_event, finalize_terminal_run};
+use crate::state_ext::{
+    EventAdmission, admit_event, finalize_terminal_run, quarantine_preserving_state,
+};
 use crate::{
     AsyncSagaParticipant, CompensationError, CompensationOutput, DependencySpec, ParticipantEvent,
     RunKey, RunTerminalOutcome, SagaChoreographyEvent, SagaContext, SagaParticipant,
@@ -356,23 +358,11 @@ pub(crate) fn quarantine_admission_lookup_failure<A, F>(
         run = %run,
         reason = %reason
     );
-    let state = SagaParticipantState::new(
-        context.saga_id,
-        context.saga_type.clone(),
-        step.clone(),
-        context.correlation_id,
-        context.trace_id,
-        context.initiator_peer_id,
-        context.saga_started_at_millis,
-    )
-    .trigger(label, now)
-    .start_execution(now)
-    .quarantine(reason.clone(), now);
-    actor
-        .saga_states()
-        .insert(run.clone(), SagaStateEntry::Quarantined(state));
-    // Later events of this run are ignored as terminal rather than re-admitted.
-    actor.latch_terminal_saga(&run);
+    // Later events of this run are ignored as terminal rather than re-admitted, unless the run
+    // already has non-quarantinable state (e.g. `Completed`) that must stay reachable.
+    if quarantine_preserving_state(actor, context, &step, label, &reason, now) {
+        actor.latch_terminal_saga(&run);
+    }
     actor.record_event_run(
         &run,
         ParticipantEvent::Quarantined {

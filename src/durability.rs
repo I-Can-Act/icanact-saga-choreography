@@ -2469,21 +2469,14 @@ fn quarantine_workflow_dedupe_failure<A, F>(
         run = %run,
         reason = %reason
     );
-    let state = crate::SagaParticipantState::new(
-        context.saga_id,
-        context.saga_type.clone(),
-        workflow.step_name().into(),
-        context.correlation_id,
-        context.trace_id,
-        context.initiator_peer_id,
-        context.saga_started_at_millis,
-    )
-    .trigger("dedupe_check_failed", now)
-    .start_execution(now)
-    .quarantine(reason.clone(), now);
-    actor
-        .saga_states()
-        .insert(run.clone(), SagaStateEntry::Quarantined(state));
+    crate::state_ext::quarantine_preserving_state(
+        actor,
+        context,
+        workflow.step_name(),
+        "dedupe_check_failed",
+        &reason,
+        now,
+    );
     actor.record_event_run(
         &run,
         ParticipantEvent::Quarantined {

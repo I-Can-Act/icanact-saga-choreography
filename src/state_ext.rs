@@ -11,7 +11,7 @@ use crate::{
     DedupeError, HasSagaParticipantSupport, InboxState, InboxTxn, JournalError, KnownRuns,
     ParticipantDedupeStore, ParticipantEvent, ParticipantJournal, RunAdmission, RunIdentityError,
     RunIncarnation, RunKey, RunStatus, RunTerminalOutcome, RunTombstone, SagaChoreographyEvent,
-    SagaId, SagaStateEntry, admit_run,
+    SagaContext, SagaId, SagaParticipantState, SagaStateEntry, admit_run,
 };
 use crate::{IngressOutcome, IngressRejection};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -593,6 +593,50 @@ pub(crate) fn admit_event<A: SagaStateExt + ?Sized>(
             EventAdmission::Skip(IngressOutcome::Rejected(IngressRejection::RunIdentity(err)))
         }
     }
+}
+
+/// Quarantines a run in memory after a pre-effect lookup failure without destroying evidence
+/// (ADR-0002 §2.2). A missing run gets a fresh `Quarantined` entry; `Executing`/`Compensating`
+/// move through their typestate transition. Any other existing entry (`Completed` with its
+/// compensation data, `Failed`, `Compensated`, an earlier `Quarantined`) is left untouched, because
+/// `Quarantined` cannot carry that data; the journal `Quarantined` row and `SagaQuarantined` event
+/// still record the quarantine. Returns whether the run is now `Quarantined` in memory.
+pub(crate) fn quarantine_preserving_state<A: SagaStateExt + ?Sized>(
+    actor: &mut A,
+    context: &SagaContext,
+    step: &str,
+    trigger: &str,
+    reason: &str,
+    now: u64,
+) -> bool {
+    let run = context.run_key();
+    let reason: Box<str> = reason.into();
+    let entry = match actor.saga_states().remove(&run) {
+        None => SagaStateEntry::Quarantined(
+            SagaParticipantState::new(
+                context.saga_id,
+                context.saga_type.clone(),
+                step.into(),
+                context.correlation_id,
+                context.trace_id,
+                context.initiator_peer_id,
+                context.saga_started_at_millis,
+            )
+            .trigger(trigger, now)
+            .start_execution(now)
+            .quarantine(reason, now),
+        ),
+        Some(SagaStateEntry::Executing(state)) => {
+            SagaStateEntry::Quarantined(state.quarantine(reason, now))
+        }
+        Some(SagaStateEntry::Compensating(state)) => {
+            SagaStateEntry::Quarantined(state.quarantine(reason, now))
+        }
+        Some(other) => other,
+    };
+    let quarantined = matches!(entry, SagaStateEntry::Quarantined(_));
+    actor.saga_states().insert(run, entry);
+    quarantined
 }
 
 /// Finalizes a `Completed`/`Failed` run after its terminal event (ADR-0001 §2.5, §2.7).
