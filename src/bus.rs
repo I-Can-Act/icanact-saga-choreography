@@ -1068,6 +1068,20 @@ impl SagaChoreographyBus {
         responder: &'static str,
         journal: Option<Arc<dyn TerminalResolverJournal>>,
     ) -> Result<FirehoseSubscription, String> {
+        if let Err(error) = policy.validate() {
+            tracing::error!(
+                target: "core::saga",
+                event = "terminal_resolver_policy_invalid",
+                saga_type = policy.saga_type.as_ref(),
+                policy_id = policy.policy_id.as_ref(),
+                error = %error,
+                "terminal policy rejected before resolver registration"
+            );
+            return Err(format!(
+                "invalid terminal policy saga_type={} policy_id={}: {error}",
+                policy.saga_type, policy.policy_id
+            ));
+        }
         let saga_type_topic = policy.saga_type.clone();
         let existing =
             match self
