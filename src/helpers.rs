@@ -1,6 +1,5 @@
 //! Helper functions for saga handling
 
-use crate::ReconciliationNeeded;
 use crate::state_ext::{
     EventAdmission, admit_event, finalize_terminal_run, quarantine_run_with_evidence,
 };
@@ -11,6 +10,7 @@ use crate::{
     event_identity,
 };
 use crate::{CommitStage, IngressFailure, IngressOutcome, IngressRejection, ReconciliationCause};
+use crate::{JournalError, ReconciliationNeeded};
 
 /// Saga event handler with an explicit emit sink for produced choreography events.
 pub fn handle_saga_event_with_emit<P, F>(
@@ -681,8 +681,9 @@ where
         ) {
             Ok(event) => emit(event),
             Err(error) => {
-                let step = participant.step_name().into();
+                let step: Box<str> = participant.step_name().into();
                 let participant_id = participant.participant_id_owned();
+                let needs_reconciliation = accepted_step_reconciliation(context, &step, &error);
                 quarantine_accepted_step_persistence_failure(
                     participant,
                     context,
@@ -692,6 +693,7 @@ where
                     now,
                     emit,
                 );
+                return needs_reconciliation;
             }
         }
         return IngressOutcome::Applied;
@@ -769,8 +771,9 @@ where
         ) {
             Ok(event) => emit(event),
             Err(error) => {
-                let step = participant.step_name().into();
+                let step: Box<str> = participant.step_name().into();
                 let participant_id = participant.participant_id_owned();
+                let needs_reconciliation = accepted_step_reconciliation(context, &step, &error);
                 quarantine_accepted_step_persistence_failure(
                     participant,
                     context,
@@ -780,6 +783,7 @@ where
                     now,
                     emit,
                 );
+                return needs_reconciliation;
             }
         }
         return IngressOutcome::Applied;
@@ -1000,6 +1004,30 @@ where
     }
     emit(failed);
     IngressOutcome::Applied
+}
+
+/// An accepted step whose metadata could not be persisted may have started an external effect
+/// the journal does not know about: report it like the workflow adapter does (W3 review MEDIUM 6).
+fn accepted_step_reconciliation(
+    context: &SagaContext,
+    step: &str,
+    error: &crate::AcceptedStepError,
+) -> IngressOutcome {
+    let run = context.run_key();
+    tracing::error!(
+        target: "core::saga",
+        event = "accepted_step_persistence_failed",
+        run = %run,
+        error = ?error
+    );
+    IngressOutcome::ReconciliationNeeded(ReconciliationNeeded {
+        run,
+        step: step.into(),
+        cause: ReconciliationCause::ResultCommitFailed(SagaStateStoreError::Journal(
+            JournalError::Storage(format!("accepted step persistence failed: {error:?}").into()),
+        )),
+        compensation_data: Vec::new(),
+    })
 }
 
 fn quarantine_accepted_step_persistence_failure<A, F>(
