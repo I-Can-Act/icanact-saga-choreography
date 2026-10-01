@@ -37,7 +37,10 @@ impl HasSagaParticipantSupport for Actor {
 }
 
 fn ctx() -> SagaContext {
-    let now = SagaContext::now_millis();
+    let now = {
+        static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *BASE.get_or_init(SagaContext::now_millis)
+    };
     SagaContext {
         saga_id: SagaId::new(19),
         saga_type: "r19_saga".into(),

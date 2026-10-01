@@ -1157,9 +1157,14 @@ fn accepted_timeout_append_failure_keeps_step_pending_for_retry() {
         panic!("expected accepted step");
     };
 
+    let outcome = poll_accepted_workflow_step_timeouts(&mut actor, deadline_at_millis + 1);
     assert!(
-        poll_accepted_workflow_step_timeouts(&mut actor, deadline_at_millis + 1).is_empty(),
+        outcome.has_no_events(),
         "timeout event must not publish when terminal append fails"
+    );
+    assert!(
+        !outcome.is_clean(),
+        "the failed terminal append must be reported in errors"
     );
     assert_eq!(actor.saga.accepted_workflow_step_count(), 1);
     assert_eq!(actor.saga.resolved_workflow_step_count(), 0);

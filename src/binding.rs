@@ -785,7 +785,10 @@ mod tests {
     }
 
     fn context(step_name: &str, saga_id: u64) -> SagaContext {
-        let now = SagaContext::now_millis();
+        let now = {
+            static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            *BASE.get_or_init(SagaContext::now_millis)
+        };
         SagaContext {
             saga_id: SagaId::new(saga_id),
             saga_type: "binding_test".into(),

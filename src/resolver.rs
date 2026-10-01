@@ -1922,6 +1922,8 @@ mod tests {
     }
 
     fn ctx(step: &str) -> SagaContext {
+        static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let base = *BASE.get_or_init(SagaContext::now_millis);
         SagaContext {
             saga_id: SagaId::new(9),
             saga_type: "order_lifecycle".into(),
@@ -1932,8 +1934,8 @@ mod tests {
             step_index: 0,
             attempt: 0,
             initiator_peer_id: [0; 32],
-            saga_started_at_millis: SagaContext::now_millis(),
-            event_timestamp_millis: SagaContext::now_millis(),
+            saga_started_at_millis: base,
+            event_timestamp_millis: base,
         }
     }
 

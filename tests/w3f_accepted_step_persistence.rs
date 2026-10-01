@@ -75,7 +75,10 @@ fn actor() -> (Actor, Journal) {
 }
 
 fn ctx() -> SagaContext {
-    let now = SagaContext::now_millis();
+    let now = {
+        static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *BASE.get_or_init(SagaContext::now_millis)
+    };
     SagaContext {
         saga_id: SagaId::new(3),
         saga_type: TYPE.into(),

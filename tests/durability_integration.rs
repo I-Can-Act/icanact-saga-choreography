@@ -132,7 +132,7 @@ impl SagaParticipant for TestParticipant {
 }
 
 fn context(saga_id: u64, saga_type: &'static str, step_name: &'static str) -> SagaContext {
-    let now = SagaContext::now_millis();
+    let now = run_start_millis();
     SagaContext {
         saga_id: SagaId::new(saga_id),
         saga_type: saga_type.into(),
@@ -895,8 +895,14 @@ fn base_state(
         saga_id.get(),
         saga_id.get(),
         [0; 32],
-        SagaContext::now_millis(),
+        run_start_millis(),
     )
+}
+
+/// One start time per process, so every context/state built for a saga lands in the same run.
+fn run_start_millis() -> u64 {
+    static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BASE.get_or_init(SagaContext::now_millis)
 }
 
 fn completed_entry(saga_id: SagaId, saga_type: &str, step_name: &str) -> SagaStateEntry {

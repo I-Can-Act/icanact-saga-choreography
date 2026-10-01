@@ -321,7 +321,10 @@ impl SagaParticipant for ConfigurableParticipant {
 // ---------------------------------------------------------------------------
 
 fn context_for(saga_id: u64) -> SagaContext {
-    let now = SagaContext::now_millis();
+    let now = {
+        static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *BASE.get_or_init(SagaContext::now_millis)
+    };
     SagaContext {
         saga_id: SagaId::new(saga_id),
         saga_type: SAGA_TYPE.into(),
