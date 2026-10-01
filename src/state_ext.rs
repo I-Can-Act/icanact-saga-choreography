@@ -208,6 +208,10 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
             .map_err(SagaStateStoreError::Dedupe)
     }
 
+    /// Maps a dedupe store error to `false` ("duplicate"), which silently drops work.
+    #[deprecated(
+        note = "maps dedupe errors to 'duplicate'; use `check_dedupe_strict` (or `check_dedupe_run_strict`) and handle the error"
+    )]
     fn check_dedupe(&self, saga_id: SagaId, key: &str) -> bool {
         match self.saga_dedupe().check_and_mark(saga_id, key) {
             Ok(value) => value,
@@ -854,8 +858,16 @@ mod tests {
             1
         );
 
-        assert!(participant.check_dedupe(saga_id, "step_started"));
-        assert!(!participant.check_dedupe(saga_id, "step_started"));
+        assert!(
+            participant
+                .check_dedupe_strict(saga_id, "step_started")
+                .expect("dedupe should check")
+        );
+        assert!(
+            !participant
+                .check_dedupe_strict(saga_id, "step_started")
+                .expect("dedupe should check")
+        );
         assert_eq!(participant.active_saga_count(), 0);
     }
 }
