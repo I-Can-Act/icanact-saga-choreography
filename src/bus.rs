@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -530,6 +530,52 @@ impl SyncActor for TerminalResolverActor {
     }
 }
 
+/// Test-only callback run between resolver subscribe and registry register.
+#[cfg(test)]
+type AttachHook = Arc<std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
+
+thread_local! {
+    /// Addresses of attach locks the current thread holds (re-entrancy guard).
+    static HELD_ATTACH_LOCKS: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Holds `resolver_attach_lock` unless this thread already holds it.
+struct AttachLockGuard<'a> {
+    key: usize,
+    _guard: Option<std::sync::MutexGuard<'a, ()>>,
+}
+
+impl<'a> AttachLockGuard<'a> {
+    fn acquire(lock: &'a Arc<std::sync::Mutex<()>>) -> Self {
+        let key = Arc::as_ptr(lock) as usize;
+        if HELD_ATTACH_LOCKS.with(|held| held.borrow().contains(&key)) {
+            return Self { key, _guard: None };
+        }
+        let guard = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        HELD_ATTACH_LOCKS.with(|held| held.borrow_mut().push(key));
+        Self {
+            key,
+            _guard: Some(guard),
+        }
+    }
+}
+
+impl Drop for AttachLockGuard<'_> {
+    fn drop(&mut self) {
+        if self._guard.is_some() {
+            HELD_ATTACH_LOCKS.with(|held| {
+                let mut held = held.borrow_mut();
+                if let Some(pos) = held.iter().rposition(|k| *k == self.key) {
+                    held.remove(pos);
+                }
+            });
+        }
+    }
+}
+
 pub struct SagaChoreographyBus {
     bus: FirehosePubSub<SagaChoreographyEvent>,
     pending_replies: CorrelationRegistry<RunKey, SagaReplyToResult>,
@@ -539,6 +585,13 @@ pub struct SagaChoreographyBus {
     terminal_resolver_registry_ref: local_sync::SyncActorRef<TerminalResolverRegistryActor>,
     /// Serializes resolver attach so setup/commit is atomic per bus.
     resolver_attach_lock: Arc<std::sync::Mutex<()>>,
+    /// Per saga type: count of `SagaAbortRequested` events the attached
+    /// resolver's own subscription successfully handed to the resolver actor.
+    /// Short-held; never locked across a publish and never asks the registry
+    /// actor, so the resolver thread can consult it without deadlock risk.
+    resolver_abort_ingest: Arc<std::sync::Mutex<HashMap<Box<str>, Arc<AtomicU64>>>>,
+    #[cfg(test)]
+    attach_hook: AttachHook,
     _lifecycle: Arc<BusActorLifecycle>,
 }
 
@@ -668,6 +721,9 @@ impl SagaChoreographyBus {
             state_ref,
             terminal_resolver_registry_ref,
             resolver_attach_lock: Arc::new(std::sync::Mutex::new(())),
+            resolver_abort_ingest: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            attach_hook: Arc::new(std::sync::Mutex::new(None)),
             _lifecycle: lifecycle,
         }
     }
@@ -805,19 +861,27 @@ impl SagaChoreographyBus {
         self.publish_abort_event(abort).0
     }
 
-    fn has_attached_resolver(&self, saga_type: &str) -> bool {
-        matches!(
-            self.terminal_resolver_registry_ref
-                .ask(TerminalResolverRegistryAsk::Existing(saga_type.into())),
-            Ok(TerminalResolverRegistryReply::Existing(Some(_)))
-        )
+    /// Abort-ingest counter of the attached resolver for `saga_type`, if any.
+    fn resolver_abort_counter(&self, saga_type: &str) -> Option<Arc<AtomicU64>> {
+        self.resolver_abort_ingest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(saga_type)
+            .cloned()
     }
 
     /// Publishes a `SagaAbortRequested`. The abort only counts as delivered
-    /// when an attached resolver for the saga type received it (ADR-0004
-    /// §2.6); otherwise an `error!` is logged and the only safe event left, a
-    /// terminal `SagaFailed`, is published. The `bool` is whether the abort
-    /// reached a resolver.
+    /// when the attached resolver's own subscription handed it to the resolver
+    /// actor (ADR-0004 §2.6); otherwise an `error!` is logged and the only
+    /// safe event left, a terminal `SagaFailed`, is published. The `bool` is
+    /// whether the abort reached a resolver.
+    ///
+    /// `resolver_attach_lock` is held across the attached check and the abort
+    /// publish, so a concurrent attach (subscribe -> register) is either fully
+    /// before or fully after the abort: exactly one authority (resolver or
+    /// fallback) sees it. Attach never publishes while holding the lock; the
+    /// lock is skipped when this thread already holds it (a subscriber that
+    /// publishes an abort re-entrantly).
     fn publish_abort_event(&self, abort: SagaChoreographyEvent) -> (PublishStats, bool) {
         let context = abort.context().clone();
         let (reason, source) = match &abort {
@@ -826,9 +890,18 @@ impl SagaChoreographyBus {
             }
             _ => (Box::<str>::from("abort"), AbortSource::DeliveryShortfall),
         };
-        let resolver_attached = self.has_attached_resolver(context.saga_type.as_ref());
-        let stats = self.publish_event(abort);
-        if resolver_attached && stats.delivered > 0 {
+        let (stats, resolver_attached, reached) = {
+            let _guard = AttachLockGuard::acquire(&self.resolver_attach_lock);
+            let counter = self.resolver_abort_counter(context.saga_type.as_ref());
+            let before = counter.as_ref().map(|c| c.load(Ordering::Acquire));
+            let stats = self.publish_event(abort);
+            let reached = match (&counter, before) {
+                (Some(counter), Some(before)) => counter.load(Ordering::Acquire) != before,
+                _ => false,
+            };
+            (stats, counter.is_some(), reached)
+        };
+        if reached {
             return (stats, true);
         }
         tracing::error!(
@@ -838,6 +911,7 @@ impl SagaChoreographyBus {
             source = ?source,
             reason = %reason,
             resolver_attached,
+            resolver_received = reached,
             delivered = stats.delivered,
             "abort request reached no resolver; publishing terminal SagaFailed"
         );
@@ -1165,6 +1239,13 @@ impl SagaChoreographyBus {
         self.attach_terminal_resolver_inner(policy, responder, None)
     }
 
+    /// Attaches a durable resolver restored from `journal`.
+    ///
+    /// Durable resolvers must be attached **before** participants run startup
+    /// recovery. A `SagaAbortRequested` published while no resolver is
+    /// attached is answered with a fallback terminal `SagaFailed` that the
+    /// resolver never journals; a durable resolver attached later could then
+    /// emit a second, contradicting outcome for the same run (ADR-0004 §2.6).
     pub fn attach_durable_terminal_resolver<J: TerminalResolverJournal>(
         &self,
         policy: TerminalPolicy,
@@ -1195,10 +1276,7 @@ impl SagaChoreographyBus {
             ));
         }
         // One attach at a time: reserve -> setup -> commit is atomic for publishers.
-        let _attach_guard = self
-            .resolver_attach_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _attach_guard = AttachLockGuard::acquire(&self.resolver_attach_lock);
         let saga_type_topic = policy.saga_type.clone();
         let requested = ResolverAttachConfig::new(&policy, journal.as_ref());
         let existing =
@@ -1235,6 +1313,9 @@ impl SagaChoreographyBus {
             };
         if let Some((subscription, attached)) = existing {
             if attached == requested {
+                // A previous attach may have failed after registering the
+                // runtime but before readiness; make the retry commit it.
+                self.register_terminal_policy(&policy)?;
                 return Ok(subscription);
             }
             tracing::error!(
@@ -1294,6 +1375,8 @@ impl SagaChoreographyBus {
         }
         let subscription_saga_type = policy.saga_type.clone();
         let subscription_resolver_ref = resolver_ref.clone();
+        let abort_ingested = Arc::new(AtomicU64::new(0));
+        let subscription_abort_ingested = Arc::clone(&abort_ingested);
         let subscription = self.subscribe_fn(saga_type_topic.as_ref(), move |event| {
             if !subscription_resolver_ref
                 .tell(TerminalResolverTell::Ingest(Box::new(event.clone())))
@@ -1301,11 +1384,28 @@ impl SagaChoreographyBus {
                 tracing::error!(
                     target: "core::saga",
                     event = "terminal_resolver_ingest_failed",
-                    saga_type = subscription_saga_type.as_ref()
+                    saga_type = subscription_saga_type.as_ref(),
+                    run = ?event.context().run_key(),
+                    "resolver subscription could not hand the event to the resolver actor"
                 );
+                return false;
+            }
+            if matches!(event, SagaChoreographyEvent::SagaAbortRequested { .. }) {
+                subscription_abort_ingested.fetch_add(1, Ordering::AcqRel);
             }
             true
         });
+        #[cfg(test)]
+        {
+            let hook = self
+                .attach_hook
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let rollback_shutdown = Arc::clone(&shutdown);
         let rollback_subscription = subscription.clone();
         let runtime = Box::new(TerminalResolverRuntime {
@@ -1319,7 +1419,7 @@ impl SagaChoreographyBus {
             match self
                 .terminal_resolver_registry_ref
                 .ask(TerminalResolverRegistryAsk::Register {
-                    saga_type: saga_type_topic,
+                    saga_type: saga_type_topic.clone(),
                     runtime,
                 }) {
                 Ok(TerminalResolverRegistryReply::Registered(subscription)) => subscription,
@@ -1339,6 +1439,10 @@ impl SagaChoreographyBus {
                     });
                 }
             };
+        self.resolver_abort_ingest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(saga_type_topic, abort_ingested);
         // Readiness is committed only now that the resolver is fully registered.
         self.register_terminal_policy(&policy)?;
         Ok(registered)
@@ -1659,6 +1763,9 @@ impl Clone for SagaChoreographyBus {
             state_ref: self.state_ref.clone(),
             terminal_resolver_registry_ref: self.terminal_resolver_registry_ref.clone(),
             resolver_attach_lock: Arc::clone(&self.resolver_attach_lock),
+            resolver_abort_ingest: Arc::clone(&self.resolver_abort_ingest),
+            #[cfg(test)]
+            attach_hook: Arc::clone(&self.attach_hook),
             _lifecycle: Arc::clone(&self._lifecycle),
         }
     }
@@ -2451,6 +2558,160 @@ mod tests {
             "terminal-resolver",
         );
         assert!(result.is_err(), "attach without readiness must be Err");
+    }
+
+    /// P1-1: an abort published between the resolver's subscribe and its
+    /// registry registration must reach exactly one authority.
+    #[test]
+    fn abort_during_attach_window_has_exactly_one_authority() {
+        use std::sync::mpsc;
+        let bus = SagaChoreographyBus::new();
+        // Threads that delivered a SagaFailed; delivery is synchronous on the
+        // publishing thread, so the fallback shows up as the publisher's id.
+        let failed_on = Arc::new(std::sync::Mutex::new(Vec::<thread::ThreadId>::new()));
+        let _capture = bus.subscribe_saga_type_fn("order_lifecycle", {
+            let failed_on = Arc::clone(&failed_on);
+            move |event: &SagaChoreographyEvent| {
+                if matches!(event, SagaChoreographyEvent::SagaFailed { .. }) {
+                    failed_on
+                        .lock()
+                        .expect("failed_on")
+                        .push(thread::current().id());
+                }
+                true
+            }
+        });
+        let (subscribed_tx, subscribed_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let go_rx = std::sync::Mutex::new(go_rx);
+        let subscribed_tx = std::sync::Mutex::new(subscribed_tx);
+        *bus.attach_hook.lock().expect("hook") = Some(Arc::new(move || {
+            let _ = subscribed_tx.lock().expect("tx").send(());
+            let _ = go_rx.lock().expect("rx").recv();
+        }));
+        let attacher = {
+            let bus = bus.clone();
+            thread::spawn(move || {
+                bus.attach_terminal_resolver(
+                    TerminalPolicy::order_lifecycle_default(),
+                    "terminal-resolver",
+                )
+                .map(|_| ())
+            })
+        };
+        subscribed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("attach reached subscribe/register window");
+        let (done_tx, done_rx) = mpsc::channel();
+        let publisher = {
+            let bus = bus.clone();
+            thread::spawn(move || {
+                let result = bus.publish_strict(abort_event(8201));
+                let _ = done_tx.send(());
+                (result, thread::current().id())
+            })
+        };
+        // Fixed code: the publisher is parked on the attach lock and cannot
+        // finish until the attach is released. Buggy code finishes at once.
+        let finished_inside_window = done_rx.recv_timeout(Duration::from_millis(500)).is_ok();
+        go_tx.send(()).expect("release attach");
+        attacher
+            .join()
+            .expect("attach thread")
+            .expect("attach succeeds");
+        let (result, publisher_id) = publisher.join().expect("publisher thread");
+        assert!(
+            !finished_inside_window,
+            "abort published inside the attach window must wait for the attach"
+        );
+        assert!(result.is_ok(), "resolver is the authority: {result:?}");
+        assert!(
+            !failed_on.lock().expect("failed_on").contains(&publisher_id),
+            "no fallback SagaFailed may be published by the abort publisher"
+        );
+    }
+
+    /// P2-1: unsubscribing the resolver's subscription means it no longer
+    /// receives aborts; the abort must not count as delivered.
+    #[test]
+    fn abort_after_resolver_unsubscribed_is_not_delivered() {
+        let bus = SagaChoreographyBus::new();
+        let resolver_sub = bus
+            .attach_terminal_resolver(
+                TerminalPolicy::order_lifecycle_default(),
+                "terminal-resolver",
+            )
+            .expect("attach");
+        let failed = Arc::new(AtomicUsize::new(0));
+        let _participant = bus.subscribe_saga_type_fn("order_lifecycle", {
+            let failed = Arc::clone(&failed);
+            move |event: &SagaChoreographyEvent| {
+                if matches!(event, SagaChoreographyEvent::SagaFailed { .. }) {
+                    failed.fetch_add(1, Ordering::SeqCst);
+                }
+                true
+            }
+        });
+        assert!(bus.unsubscribe(resolver_sub));
+        let result = bus.publish_strict(abort_event(8202));
+        assert!(
+            matches!(
+                result,
+                Err(super::SagaBusPublishError::AbortNotDelivered { .. })
+            ),
+            "abort lost with the resolver unsubscribed must be AbortNotDelivered: {result:?}"
+        );
+        assert_eq!(failed.load(Ordering::SeqCst), 1, "fallback SagaFailed");
+    }
+
+    /// P2-6: a retried attach that finds the runtime already registered must
+    /// still commit readiness.
+    #[test]
+    fn retried_attach_registers_missing_readiness() {
+        let bus = SagaChoreographyBus::new();
+        bus.attach_terminal_resolver(
+            TerminalPolicy::order_lifecycle_default(),
+            "terminal-resolver",
+        )
+        .expect("first attach");
+        // Model a first attempt that registered the runtime but failed
+        // readiness: same registry, readiness state that never saw it.
+        let mut retry_bus = bus.clone();
+        let (fresh_state, _fresh_handle) = local_sync::spawn(super::BusStateActor::default());
+        retry_bus.state_ref = fresh_state;
+        assert!(!retry_bus.has_terminal_policy_for_saga_type("order_lifecycle"));
+        retry_bus
+            .attach_terminal_resolver(
+                TerminalPolicy::order_lifecycle_default(),
+                "terminal-resolver",
+            )
+            .expect("retry attach");
+        assert!(
+            retry_bus.has_terminal_policy_for_saga_type("order_lifecycle"),
+            "retry returned Ok so readiness must be present"
+        );
+    }
+
+    /// Deadlock check: the resolver thread publishes aborts through the bus
+    /// (`publish_strict` partial delivery); dropping the last user handle
+    /// while that is possible must not hang.
+    #[test]
+    fn dropping_bus_with_resolver_does_not_hang() {
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let bus = SagaChoreographyBus::new();
+            bus.attach_terminal_resolver(
+                TerminalPolicy::order_lifecycle_default(),
+                "terminal-resolver",
+            )
+            .expect("attach");
+            let _ = bus.publish_strict(abort_event(8203));
+            drop(bus);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("bus drop with an attached resolver must not hang");
     }
 
     #[test]
