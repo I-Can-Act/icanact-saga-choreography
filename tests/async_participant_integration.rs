@@ -245,13 +245,10 @@ async fn async_ingress_non_ambiguous_compensation_failure_keeps_local_failed_sta
         .read(SagaId::new(1))
         .expect("journal read should succeed");
     assert!(matches!(
-        entries.last(),
-        Some(icanact_saga_choreography::JournalEntry {
-            event: ParticipantEvent::CompensationFailed {
-                error,
-                is_ambiguous: false,
-                ..
-            },
+        entries.last().map(|entry| entry.event.transition()),
+        Some(ParticipantEvent::CompensationFailed {
+            error,
+            is_ambiguous: false,
             ..
         }) if error.as_ref() == "undo failed"
     ));

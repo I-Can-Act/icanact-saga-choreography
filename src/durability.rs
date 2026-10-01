@@ -86,7 +86,7 @@ pub fn panic_message_from_payload(payload: &(dyn std::any::Any + Send)) -> Box<s
 
 pub fn panic_quarantine_reason_from_entries(entries: &[JournalEntry]) -> Option<Box<str>> {
     let last = entries.last()?;
-    let ParticipantEvent::Quarantined { reason, .. } = &last.event else {
+    let ParticipantEvent::Quarantined { reason, .. } = last.event.transition() else {
         return None;
     };
     if is_panic_quarantine_reason(reason.as_ref()) {

@@ -4,8 +4,9 @@ use std::sync::{
 };
 
 use icanact_saga_choreography::{
-    DedupeError, JournalEntry, JournalError, ParticipantDedupeStore, ParticipantEvent,
-    ParticipantJournal, RunIncarnation, RunKey, RunTombstone, SagaId,
+    DedupeError, InboxTxn, JournalEntry, JournalError, OutboxRecord, ParticipantDedupeStore,
+    ParticipantEvent, ParticipantJournal, RunIncarnation, RunKey, RunTombstone,
+    SagaChoreographyEvent, SagaId,
 };
 
 /// Named crash/fault points in the participant pipeline.
@@ -242,6 +243,26 @@ impl<J: ParticipantJournal> ParticipantJournal for FaultJournal<J> {
     fn prune_expired_tombstones(&self, cutoff: RunIncarnation) -> Result<u64, JournalError> {
         self.check(JournalOp::Prune, None)?;
         self.inner.prune_expired_tombstones(cutoff)
+    }
+
+    fn commit_inbox(&self, run: &RunKey, txn: InboxTxn) -> Result<u64, JournalError> {
+        self.check(JournalOp::Append, Some("InboxCommitted"))?;
+        self.inner.commit_inbox(run, txn)
+    }
+
+    fn commit_with_outbox(
+        &self,
+        run: &RunKey,
+        event: ParticipantEvent,
+        outbox: Vec<SagaChoreographyEvent>,
+    ) -> Result<u64, JournalError> {
+        self.check(JournalOp::Append, Some(&event_kind(&event)))?;
+        self.inner.commit_with_outbox(run, event, outbox)
+    }
+
+    fn outbox_for_replay(&self, cutoff: RunIncarnation) -> Result<Vec<OutboxRecord>, JournalError> {
+        self.check(JournalOp::Read, None)?;
+        self.inner.outbox_for_replay(cutoff)
     }
 }
 

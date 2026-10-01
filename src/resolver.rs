@@ -124,6 +124,7 @@ pub struct TerminalPolicy {
 }
 
 impl TerminalPolicy {
+    /// Builds a terminal policy for one saga type from its workflow contract (ADR-0004).
     pub fn new(
         saga_type: Box<str>,
         policy_id: Box<str>,

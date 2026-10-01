@@ -789,18 +789,15 @@ fn accept_failure_on_metadata_append_does_not_orphan_accepted_metadata() {
         .journal
         .read(ctx.saga_id)
         .expect("journal read should succeed");
+    assert_eq!(entries.len(), 1);
     assert!(matches!(
-        entries.as_slice(),
-        [icanact_saga_choreography::JournalEntry {
-            event: ParticipantEvent::StepExecutionStarted { .. },
-            ..
-        }]
+        entries[0].event.transition(),
+        ParticipantEvent::StepExecutionStarted { .. }
     ));
-    assert!(
-        !entries
-            .iter()
-            .any(|entry| matches!(entry.event, ParticipantEvent::AcceptedStepRecorded { .. }))
-    );
+    assert!(!entries.iter().any(|entry| matches!(
+        entry.event.transition(),
+        ParticipantEvent::AcceptedStepRecorded { .. }
+    )));
 }
 
 #[test]
@@ -878,7 +875,7 @@ fn accepted_step_metadata_persistence_failure_quarantines_external_effect() {
         .read(ctx.saga_id)
         .expect("quarantine evidence should remain readable");
     assert!(matches!(
-        journal.last().map(|entry| &entry.event),
+        journal.last().map(|entry| entry.event.transition()),
         Some(ParticipantEvent::Quarantined { reason, .. })
             if reason.contains("accepted step persistence failed")
     ));
@@ -1714,13 +1711,13 @@ fn accepted_compensation_failure_leaves_no_compensating_state() {
             .expect("compensation failure should be durable");
         if is_ambiguous {
             assert!(matches!(
-                journal.last().map(|entry| &entry.event),
+                journal.last().map(|entry| entry.event.transition()),
                 Some(ParticipantEvent::Quarantined { reason, .. })
                     if reason.as_ref() == "authoritative cancel failure"
             ));
         } else {
             assert!(matches!(
-                journal.last().map(|entry| &entry.event),
+                journal.last().map(|entry| entry.event.transition()),
                 Some(ParticipantEvent::CompensationFailed {
                     error,
                     is_ambiguous: false,
@@ -1892,7 +1889,7 @@ fn accepted_step_completion_records_actual_completion_time() {
         .expect("journal read should succeed");
     assert!(entries.iter().any(|entry| {
         matches!(
-            &entry.event,
+            entry.event.transition(),
             ParticipantEvent::StepExecutionCompleted {
                 completed_at_millis: observed,
                 ..
