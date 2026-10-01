@@ -292,6 +292,11 @@ struct SagaResolutionState {
     phase: ResolverPhase,
     /// Effects that completed during rollback and cannot be undone.
     unresolved: Vec<Box<str>>,
+    /// Set for internal aborts (timeouts, `SagaAbortRequested`): the settled
+    /// `SagaFailed` carries this reason and no step failure.
+    abort_reason: Option<Box<str>>,
+    /// When rollback began; rollback timeouts are measured from here.
+    aborting_since_millis: Option<u64>,
     started_steps: HashSet<Box<str>>,
     acked_steps: HashSet<Box<str>>,
     completed_steps: HashSet<Box<str>>,
@@ -340,6 +345,8 @@ impl SagaResolutionState {
             compensable_steps: Vec::new(),
             phase: ResolverPhase::Running,
             unresolved: Vec::new(),
+            abort_reason: None,
+            aborting_since_millis: None,
             pending_compensation_steps: HashSet::new(),
             completed_compensation_steps: HashSet::new(),
             pending_failure: None,
@@ -684,17 +691,23 @@ impl TerminalResolver {
                         });
                         state.terminal_latched = true;
                     } else if state.pending_compensation_steps.is_empty() {
-                        let failure = state.pending_failure.clone();
-                        let reason: Box<str> = failure
-                            .as_ref()
-                            .map(|f| {
-                                format!(
-                                    "compensation finished after failure at step={}",
-                                    f.step_name
-                                )
-                            })
-                            .unwrap_or_else(|| "compensation finished".to_string())
-                            .into();
+                        let (failure, reason) = match state.abort_reason.clone() {
+                            Some(reason) => (None, reason),
+                            None => {
+                                let failure = state.pending_failure.clone();
+                                let reason: Box<str> = failure
+                                    .as_ref()
+                                    .map(|f| {
+                                        format!(
+                                            "compensation finished after failure at step={}",
+                                            f.step_name
+                                        )
+                                    })
+                                    .unwrap_or_else(|| "compensation finished".to_string())
+                                    .into();
+                                (failure, reason)
+                            }
+                        };
                         out.push(SagaChoreographyEvent::SagaFailed {
                             context: terminal_context(context),
                             reason,
@@ -750,6 +763,7 @@ impl TerminalResolver {
                     state.pending_compensation_steps = newly_pending.into_iter().collect();
                 }
                 state.phase = ResolverPhase::Aborting;
+                state.aborting_since_millis.get_or_insert(now_millis);
                 state.pending_failure = Some(failure.clone());
             }
             SagaChoreographyEvent::SagaCompleted { .. }
@@ -763,14 +777,27 @@ impl TerminalResolver {
             SagaChoreographyEvent::CompensationStarted { .. }
             | SagaChoreographyEvent::SagaEffectsRetained { .. } => {}
             SagaChoreographyEvent::SagaAbortRequested {
-                context, reason, ..
+                context,
+                reason,
+                source,
             } => {
-                out.push(SagaChoreographyEvent::SagaFailed {
-                    context: terminal_context(context),
-                    reason: reason.clone(),
-                    failure: None,
-                });
-                state.terminal_latched = true;
+                if state.phase == ResolverPhase::Running {
+                    begin_internal_abort(
+                        state,
+                        terminal_context_at(context, now_millis),
+                        &format!("{source:?}"),
+                        reason.clone(),
+                        now_millis,
+                        &mut out,
+                    );
+                } else {
+                    warn!(
+                        event = "saga_abort_requested_while_rolling_back",
+                        run = %context.run_key(),
+                        reason = %reason,
+                        "abort request recorded; rollback already in progress"
+                    );
+                }
             }
             SagaChoreographyEvent::CompensationFailedRetryable { context, error, .. } => {
                 state
@@ -1033,11 +1060,7 @@ fn timeout_events(
         }
         return Vec::new();
     }
-    if let Some(timeout_event) = timeout_terminal_event(policy, state, now_millis) {
-        state.terminal_latched = true;
-        return vec![timeout_event];
-    }
-    Vec::new()
+    timeout_abort_events(policy, state, now_millis)
 }
 
 fn accepted_compensation_overall_timeout_event(
@@ -1256,6 +1279,9 @@ fn apply_step_failure(
             }
             state.pending_compensation_steps = steps_to_compensate.iter().cloned().collect();
             state.phase = ResolverPhase::Aborting;
+            state
+                .aborting_since_millis
+                .get_or_insert(context.event_timestamp_millis);
 
             out.push(SagaChoreographyEvent::CompensationRequested {
                 context: terminal_context(context),
@@ -1496,44 +1522,177 @@ fn emit_timeout_diagnostic(
     );
 }
 
-fn timeout_terminal_event(
+/// Overall/stalled timeouts are infrastructure aborts (ADR-0004 §2.2): in
+/// `Running` they begin a rollback; while already rolling back they quarantine
+/// the run with whatever is still owed.
+fn timeout_abort_events(
     policy: &TerminalPolicy,
-    state: &SagaResolutionState,
+    state: &mut SagaResolutionState,
     now_millis: u64,
-) -> Option<SagaChoreographyEvent> {
-    let elapsed_ms = now_millis.saturating_sub(state.started_at_millis);
+) -> Vec<SagaChoreographyEvent> {
+    let rolling_back = state.phase == ResolverPhase::Aborting;
+    // Rollback gets its own budget, measured from when it began.
+    let since = match (rolling_back, state.aborting_since_millis) {
+        (true, Some(since)) => since,
+        _ => state.started_at_millis,
+    };
+    let elapsed_ms = now_millis.saturating_sub(since);
     let overall_timeout_ms = policy.overall_timeout.as_millis() as u64;
-    if elapsed_ms > overall_timeout_ms {
-        let diagnostic = timeout_diagnostics(policy, state);
-        emit_timeout_diagnostic(policy, state, "overall_timeout", &diagnostic);
-        let reason = diagnostic.reason(
-            format!("overall_timeout after {overall_timeout_ms}ms"),
-            &policy.policy_id,
-        );
-        return Some(SagaChoreographyEvent::SagaFailed {
-            context: terminal_context_at(&state.last_context, now_millis),
-            reason: reason.into(),
-            failure: None,
-        });
-    }
-
     let stalled_ms = now_millis.saturating_sub(state.last_progress_at_millis);
     let stalled_timeout_ms = policy.stalled_timeout.as_millis() as u64;
-    if stalled_ms > stalled_timeout_ms {
-        let diagnostic = timeout_diagnostics(policy, state);
-        emit_timeout_diagnostic(policy, state, "stalled_timeout", &diagnostic);
-        let reason = diagnostic.reason(
+    let (code, prefix) = if elapsed_ms > overall_timeout_ms {
+        (
+            "overall_timeout",
+            format!("overall_timeout after {overall_timeout_ms}ms"),
+        )
+    } else if stalled_ms > stalled_timeout_ms {
+        (
+            "stalled_timeout",
             format!("stalled_timeout after {stalled_timeout_ms}ms without progress"),
-            &policy.policy_id,
-        );
-        return Some(SagaChoreographyEvent::SagaFailed {
-            context: terminal_context_at(&state.last_context, now_millis),
-            reason: reason.into(),
-            failure: None,
-        });
+        )
+    } else {
+        return Vec::new();
+    };
+    let diagnostic = timeout_diagnostics(policy, state);
+    emit_timeout_diagnostic(policy, state, code, &diagnostic);
+    let reason: Box<str> = diagnostic.reason(prefix, &policy.policy_id).into();
+    let context = terminal_context_at(&state.last_context, now_millis);
+    let mut out = Vec::new();
+    match state.phase {
+        ResolverPhase::Running => {
+            begin_internal_abort(state, context, code, reason, now_millis, &mut out);
+        }
+        ResolverPhase::Aborting => {
+            let mut stuck: Vec<Box<str>> = state
+                .pending_compensation_steps
+                .iter()
+                .cloned()
+                .chain(state.unresolved.iter().cloned())
+                .collect();
+            stuck.sort();
+            stuck.dedup();
+            error!(
+                event = "saga_quarantined_rollback_timeout",
+                run = %state.last_context.run_key(),
+                steps = %stuck.join(", "),
+                "rollback timed out with undo outstanding"
+            );
+            let step = stuck
+                .first()
+                .cloned()
+                .unwrap_or_else(|| TERMINAL_RESOLVER_STEP.into());
+            latch_event(
+                state,
+                &mut out,
+                SagaChoreographyEvent::SagaQuarantined {
+                    context,
+                    reason: format!("{reason}; rollback incomplete: {}", stuck.join(", ")).into(),
+                    step,
+                    participant_id: TERMINAL_RESOLVER_STEP.into(),
+                },
+            );
+        }
+        ResolverPhase::Terminal | ResolverPhase::Quarantined => {}
+    }
+    out
+}
+
+fn latch_event(
+    state: &mut SagaResolutionState,
+    out: &mut Vec<SagaChoreographyEvent>,
+    event: SagaChoreographyEvent,
+) {
+    state.terminal_latched = true;
+    state.terminal_outcome = Some(event.event_type());
+    out.push(event);
+    sync_terminal_phase(state);
+}
+
+/// Begin an internal abort (timeout / `SagaAbortRequested`): undo every known
+/// compensable effect, then fail only at clean settlement. Nothing owed and
+/// nothing in flight fails directly; unknown in-flight effects quarantine.
+fn begin_internal_abort(
+    state: &mut SagaResolutionState,
+    context: SagaContext,
+    code: &str,
+    reason: Box<str>,
+    now_millis: u64,
+    out: &mut Vec<SagaChoreographyEvent>,
+) {
+    let owed: Vec<Box<str>> = state.compensable_steps.iter().rev().cloned().collect();
+    let mut in_flight: Vec<Box<str>> = state
+        .started_steps
+        .iter()
+        .filter(|step| {
+            !state.completed_steps.contains(*step)
+                && !state.failed_steps.contains(*step)
+                && !state.compensable_steps.contains(*step)
+        })
+        .cloned()
+        .collect();
+    in_flight.sort();
+
+    if owed.is_empty() {
+        if in_flight.is_empty() {
+            latch_event(
+                state,
+                out,
+                SagaChoreographyEvent::SagaFailed {
+                    context,
+                    reason,
+                    failure: None,
+                },
+            );
+        } else {
+            error!(
+                event = "saga_quarantined_in_flight_at_abort",
+                run = %context.run_key(),
+                steps = %in_flight.join(", "),
+                "abort with in-flight steps of unknown outcome"
+            );
+            let step = in_flight[0].clone();
+            latch_event(
+                state,
+                out,
+                SagaChoreographyEvent::SagaQuarantined {
+                    context,
+                    reason: format!("{reason}; in-flight: {}", in_flight.join(", ")).into(),
+                    step,
+                    participant_id: TERMINAL_RESOLVER_STEP.into(),
+                },
+            );
+        }
+        return;
     }
 
-    None
+    for step in &owed {
+        state.accepted_steps.remove(step.as_ref());
+    }
+    for step in in_flight {
+        if !state.unresolved.contains(&step) {
+            state.unresolved.push(step);
+        }
+    }
+    let failure = SagaFailureDetails {
+        step_name: TERMINAL_RESOLVER_STEP.into(),
+        participant_id: TERMINAL_RESOLVER_STEP.into(),
+        error_code: Some(code.into()),
+        error_message: reason.clone(),
+        at_millis: now_millis,
+    };
+    state.pending_failure = Some(failure.clone());
+    state.abort_reason = Some(reason.clone());
+    state.pending_compensation_steps = owed.iter().cloned().collect();
+    state.phase = ResolverPhase::Aborting;
+    state.aborting_since_millis = Some(now_millis);
+    state.last_progress_at_millis = now_millis;
+    out.push(SagaChoreographyEvent::CompensationRequested {
+        context,
+        failed_step: TERMINAL_RESOLVER_STEP.into(),
+        reason,
+        failure,
+        steps_to_compensate: owed,
+    });
 }
 
 #[cfg(test)]
@@ -2325,10 +2484,10 @@ mod tests {
         assert!(
             matches!(
                 timed_out.first(),
-                Some(SagaChoreographyEvent::SagaFailed { reason, .. })
+                Some(SagaChoreographyEvent::SagaQuarantined { reason, .. })
                 if reason.as_ref().contains("stalled_timeout")
             ),
-            "expected stalled-timeout failure, got: {timed_out:?}"
+            "expected stalled-timeout quarantine (positions_check in flight), got: {timed_out:?}"
         );
     }
 
@@ -2361,7 +2520,7 @@ mod tests {
 
         let timed_out = resolver.poll_timeouts_at(1_121);
         let Some(SagaChoreographyEvent::SagaFailed { reason, .. }) = timed_out.first() else {
-            panic!("expected stalled timeout, got: {timed_out:?}");
+            panic!("expected stalled timeout failure, got: {timed_out:?}");
         };
         assert!(
             reason.contains("missing_steps=create_order"),
@@ -2405,8 +2564,8 @@ mod tests {
         );
 
         let timed_out = resolver.poll_timeouts_at(1_111);
-        let Some(SagaChoreographyEvent::SagaFailed { reason, .. }) = timed_out.first() else {
-            panic!("expected stalled timeout, got: {timed_out:?}");
+        let Some(SagaChoreographyEvent::SagaQuarantined { reason, .. }) = timed_out.first() else {
+            panic!("expected stalled timeout quarantine (in-flight step), got: {timed_out:?}");
         };
         assert!(
             reason.contains("started_not_completed=risk_check(account-balance)"),
@@ -2585,6 +2744,107 @@ mod tests {
                 [SagaChoreographyEvent::SagaQuarantined { step, .. }] if step.as_ref() == "B"
             ),
             "B must stay unresolved in quarantine: {end:?}"
+        );
+    }
+
+    fn timeout_policy(overall_ms: u64, stalled_ms: u64) -> TerminalPolicy {
+        let mut policy = rollback_policy();
+        policy.overall_timeout = Duration::from_millis(overall_ms);
+        policy.stalled_timeout = Duration::from_millis(stalled_ms);
+        policy
+    }
+
+    fn assert_timeout_rolls_back(policy: TerminalPolicy, fire_at: u64, needle: &str) {
+        let mut resolver = TerminalResolver::new(policy);
+        assert!(
+            resolver
+                .ingest_at(&completed("A", 1_010, true), 1_010)
+                .is_empty()
+        );
+        let out = resolver.poll_timeouts_at(fire_at);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [SagaChoreographyEvent::CompensationRequested { steps_to_compensate, reason, .. }]
+                    if steps_to_compensate.as_slice() == [Box::<str>::from("A")]
+                        && reason.contains(needle)
+            ),
+            "{needle} must request A's undo, not fail directly: {out:?}"
+        );
+        // Not re-quarantined by the very next poll while the undo is in flight.
+        assert!(resolver.poll_timeouts_at(fire_at + 1).is_empty());
+        let end = resolver.ingest_at(&undo_ack("A", fire_at + 2), fire_at + 2);
+        assert!(
+            matches!(
+                end.as_slice(),
+                [SagaChoreographyEvent::SagaFailed { reason, failure: None, .. }]
+                    if reason.contains(needle)
+            ),
+            "clean settlement fails the saga: {end:?}"
+        );
+    }
+
+    #[test]
+    fn infrastructure_abort_compensates_known_effects_before_terminal_failure() {
+        assert_timeout_rolls_back(timeout_policy(500, 3_600_000), 1_600, "overall_timeout");
+        assert_timeout_rolls_back(timeout_policy(3_600_000, 500), 1_600, "stalled_timeout");
+    }
+
+    #[test]
+    fn abort_request_compensates_known_effects_before_terminal_failure() {
+        let mut resolver = TerminalResolver::new(rollback_policy());
+        resolver.ingest_at(&completed("A", 1_010, true), 1_010);
+        let out = resolver.ingest_at(
+            &SagaChoreographyEvent::SagaAbortRequested {
+                context: ctx_at("bus", 51, 1_000, 1_020),
+                reason: "delivery shortfall".into(),
+                source: crate::AbortSource::DeliveryShortfall,
+            },
+            1_020,
+        );
+        assert!(
+            matches!(
+                out.as_slice(),
+                [SagaChoreographyEvent::CompensationRequested { steps_to_compensate, .. }]
+                    if steps_to_compensate.as_slice() == [Box::<str>::from("A")]
+            ),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn abort_with_nothing_owed_fails_and_unknown_in_flight_quarantines() {
+        let mut resolver = TerminalResolver::new(timeout_policy(500, 3_600_000));
+        resolver.ingest_at(&completed("A", 1_010, false), 1_010);
+        let out = resolver.poll_timeouts_at(1_600);
+        assert!(
+            matches!(out.as_slice(), [SagaChoreographyEvent::SagaFailed { .. }]),
+            "{out:?}"
+        );
+
+        let mut resolver = TerminalResolver::new(timeout_policy(500, 3_600_000));
+        resolver.ingest_at(
+            &SagaChoreographyEvent::StepStarted {
+                context: ctx_at("B", 52, 1_000, 1_010),
+            },
+            1_010,
+        );
+        let out = resolver.poll_timeouts_at(1_600);
+        assert!(
+            matches!(out.as_slice(), [SagaChoreographyEvent::SagaQuarantined { step, .. }] if step.as_ref() == "B"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn timeout_while_rolling_back_quarantines_owed_steps() {
+        let mut resolver = TerminalResolver::new(timeout_policy(500, 3_600_000));
+        resolver.ingest_at(&completed("A", 1_010, true), 1_010);
+        resolver.poll_timeouts_at(1_600);
+        let out = resolver.poll_timeouts_at(2_200);
+        assert!(
+            matches!(out.as_slice(), [SagaChoreographyEvent::SagaQuarantined { step, .. }] if step.as_ref() == "A"),
+            "{out:?}"
         );
     }
 }
