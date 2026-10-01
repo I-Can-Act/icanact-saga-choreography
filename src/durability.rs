@@ -2309,10 +2309,17 @@ where
         crate::StepOutput::CompletedWithEffect {
             output,
             compensation_data,
-            ..
+            effect,
         } => {
-            let compensation_available = !compensation_data.is_empty();
-            (output, compensation_data, compensation_available)
+            return quarantine_workflow_unsupported_effect(
+                actor,
+                workflow,
+                context,
+                (output, compensation_data),
+                effect,
+                now,
+                emit,
+            );
         }
         StepOutput::Accepted { .. } => unreachable!("accepted output returned above"),
     };
@@ -2354,6 +2361,57 @@ where
     }
     emit(completed);
     IngressOutcome::Applied
+}
+
+/// R21 / ADR-0002 §2.2: `CompletedWithEffect` has no dispatcher yet, so the promised effect cannot
+/// be delivered. The completion is committed as evidence (no outbox, nothing acknowledged), the
+/// step is quarantined and the outcome is `ReconciliationNeeded { UnsupportedEffect }`.
+fn quarantine_workflow_unsupported_effect<A, F>(
+    actor: &mut A,
+    workflow: &'static dyn SagaWorkflowParticipant<A>,
+    context: &SagaContext,
+    (output, compensation_data): (Vec<u8>, Vec<u8>),
+    effect: Box<str>,
+    now: u64,
+    emit: &mut F,
+) -> IngressOutcome
+where
+    A: HasSagaParticipantSupport,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let run = context.run_key();
+    if let Err(source) = actor.commit_transition(
+        &run,
+        ParticipantEvent::StepExecutionCompleted {
+            output,
+            compensation_data: compensation_data.clone(),
+            completed_at_millis: now,
+        },
+    ) {
+        return reconcile_workflow_result_commit_failure(
+            actor,
+            workflow,
+            context,
+            source,
+            compensation_data,
+            now,
+            emit,
+        );
+    }
+    let reason: Box<str> = format!("reconciliation_needed: unsupported_effect: {effect}").into();
+    tracing::error!(
+        target: "core::saga",
+        event = "workflow_unsupported_effect",
+        run = %run,
+        effect = %effect
+    );
+    quarantine_workflow_step_persistence_failure(actor, workflow, context, reason, now, emit);
+    IngressOutcome::ReconciliationNeeded(ReconciliationNeeded {
+        run,
+        step: workflow.step_name().into(),
+        cause: ReconciliationCause::UnsupportedEffect { effect },
+        compensation_data,
+    })
 }
 
 /// The step's result row failed to commit after the effect may have run (ADR-0002 §2.2, Q6):
