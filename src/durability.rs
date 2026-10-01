@@ -847,8 +847,9 @@ fn record_accepted_step_metadata<A>(
 where
     A: SagaStateExt,
 {
-    actor.record_event_strict(
-        accepted.context.saga_id,
+    // Run-scoped so `finalize_run` removes the row with the rest of the run's evidence.
+    actor.record_event_run_strict(
+        &accepted.context.run_key(),
         ParticipantEvent::AcceptedStepRecorded {
             context: accepted.context.clone(),
             participant_id: accepted.participant_id.clone(),
