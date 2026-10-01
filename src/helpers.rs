@@ -278,25 +278,13 @@ where
 
 /// Run admission followed by run-scoped dedupe (ADR-0001 §2.2/§2.3).
 ///
-/// `Ok(false)` means the event must not be processed. Idempotency is marked before
+/// Idempotency is marked before
 /// execution so replayed upstream events do not duplicate business side effects. With
 /// persistent dedupe, a crash between this mark and the `StepExecutionStarted` journal entry is
 /// fail-loud rather than resumed: startup recovery has no durable execution intent and the
 /// terminal resolver must eventually fail/quarantine the saga. `Err` means a status, tombstone or
 /// dedupe lookup failed; the caller quarantines the run (ADR-0001 §2.7).
-pub(crate) fn admit_and_dedupe<A>(
-    actor: &mut A,
-    event: &SagaChoreographyEvent,
-    run: &RunKey,
-    identity: &str,
-) -> Result<bool, SagaStateStoreError>
-where
-    A: SagaStateExt,
-{
-    admit_for_ingress(actor, event, run, identity).map(|skip| skip.is_none())
-}
-
-/// Like [`admit_and_dedupe`], but a skipped event carries its typed [`IngressOutcome`]:
+/// A skipped event carries its typed [`IngressOutcome`]:
 /// `Ok(None)` = process, `Ok(Some(outcome))` = do not process, `Err` = lookup failed.
 pub(crate) fn admit_for_ingress<A>(
     actor: &mut A,
@@ -358,11 +346,7 @@ pub(crate) fn quarantine_admission_lookup_failure<A, F>(
         run = %run,
         reason = %reason
     );
-    // Later events of this run are ignored as terminal rather than re-admitted, unless the run
-    // already has non-quarantinable state (e.g. `Completed`) that must stay reachable.
-    if quarantine_preserving_state(actor, context, &step, label, &reason, now) {
-        actor.latch_terminal_saga(&run);
-    }
+    quarantine_preserving_state(actor, context, &step, label, &reason, now);
     actor.record_event_run(
         &run,
         ParticipantEvent::Quarantined {

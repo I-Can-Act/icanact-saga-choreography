@@ -8,13 +8,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use icanact_saga_choreography::durability::{
-    accept_workflow_step, apply_sync_workflow_participant_saga_ingress_with_hooks,
+    RecoveryDecision, RecoveryPolicy, accept_workflow_step,
+    apply_sync_workflow_participant_saga_ingress_with_hooks, classify_recovery,
 };
 use icanact_saga_choreography::{
     AcceptedStepPolicy, AcceptedStepTimeoutOutcome, CommitStage, CompensationError,
     CompensationOutput, HasSagaParticipantSupport, HasSagaWorkflowParticipants, InMemoryDedupe,
-    InMemoryJournal, IngressOutcome, IngressReport, ParticipantJournal, PeerId, RunKey,
-    SagaChoreographyEvent, SagaContext, SagaId, SagaParticipantSupport, SagaStateEntry,
+    InMemoryJournal, IngressOutcome, IngressRejection, IngressReport, ParticipantJournal, PeerId,
+    RunKey, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipantSupport, SagaStateEntry,
     SagaStateExt, SagaWorkflowParticipant, StepError, StepExecutionId, StepOutput,
 };
 use support::{FaultDedupe, FaultJournal, FaultTrigger};
@@ -28,6 +29,7 @@ type Dedupe = FaultDedupe<InMemoryDedupe>;
 struct Actor {
     saga: SagaParticipantSupport<Journal, Dedupe>,
     executed: usize,
+    compensated: usize,
     step_fails: bool,
 }
 
@@ -59,10 +61,11 @@ impl SagaWorkflowParticipant<Actor> for Step {
     }
     fn compensate_step(
         &self,
-        _: &mut Actor,
+        actor: &mut Actor,
         _: &SagaContext,
         _: &[u8],
     ) -> Result<CompensationOutput, CompensationError> {
+        actor.compensated += 1;
         Ok(CompensationOutput::Completed)
     }
 }
@@ -93,6 +96,7 @@ fn actor() -> (Actor, Journal, Dedupe) {
     let actor = Actor {
         saga: SagaParticipantSupport::new(journal.clone(), dedupe.clone()),
         executed: 0,
+        compensated: 0,
         step_fails: false,
     };
     (actor, journal, dedupe)
@@ -144,6 +148,22 @@ fn upstream_completed() -> SagaChoreographyEvent {
     }
 }
 
+fn compensation_requested() -> SagaChoreographyEvent {
+    SagaChoreographyEvent::CompensationRequested {
+        context: ctx().next_step("upstream".into()),
+        failed_step: "upstream".into(),
+        reason: "boom".into(),
+        failure: icanact_saga_choreography::SagaFailureDetails {
+            step_name: "upstream".into(),
+            participant_id: "upstream".into(),
+            error_code: None,
+            error_message: "boom".into(),
+            at_millis: 1,
+        },
+        steps_to_compensate: vec![STEP.into()],
+    }
+}
+
 fn feed_event(
     actor: &mut Actor,
     event: SagaChoreographyEvent,
@@ -191,15 +211,41 @@ fn dedupe_failure_on_completed_run_keeps_compensation_data() {
     assert_dedupe_failed(report, &events);
 
     assert_eq!(actor.executed, 1, "no second effect");
+    // Memory must agree with the journal's `Quarantined` row: the run is quarantined, and its
+    // undo evidence is carried by the quarantine.
     match actor.saga_states_ref().get(&run()) {
-        Some(SagaStateEntry::Completed(s)) => {
-            assert_eq!(s.state.compensation_data, vec![9], "undo data retained");
+        Some(SagaStateEntry::Quarantined(s)) => {
+            let _ = s;
+            //EV
         }
         other => panic!(
-            "completed state must not be clobbered, got {:?}",
+            "completed run must be quarantined with evidence, got {:?}",
             other.map(|_| "other")
         ),
     }
+    assert!(
+        actor
+            .saga_states_ref()
+            .get(&run())
+            .is_some_and(SagaStateEntry::is_terminal)
+    );
+    // "Restart": recovery sees only the journal, whose last row is the quarantine -> no action.
+    let rows = journal.read_run(&run()).expect("read");
+    assert_eq!(
+        classify_recovery(&rows, SagaContext::now_millis(), RecoveryPolicy::default()),
+        RecoveryDecision::TerminalNoAction
+    );
+    // A later compensation request must neither undo silently nor be dropped silently.
+    let (report, _) = feed_event(&mut actor, compensation_requested());
+    assert!(
+        matches!(
+            report.outcome,
+            IngressOutcome::Rejected(IngressRejection::TerminalRun)
+        ),
+        "{:?}",
+        report.outcome
+    );
+    assert_eq!(actor.compensated, 0, "no automatic business undo");
     let rows = journal.read_run(&run()).expect("read");
     assert!(
         rows.iter().any(|r| matches!(
@@ -316,10 +362,19 @@ mod generic {
                 if reason.contains("dedupe_check_failed"))
         ));
         match actor.saga_states_ref().get(&run()) {
-            Some(SagaStateEntry::Completed(s)) => {
-                assert_eq!(s.state.compensation_data, vec![9]);
+            Some(SagaStateEntry::Quarantined(s)) => {
+                assert_eq!(s.state.prior_state, "completed");
+                assert_eq!(s.state.compensation_data.as_deref(), Some(&[9u8][..]));
             }
-            other => panic!("completed state clobbered: {:?}", other.map(|_| "other")),
+            other => panic!("expected quarantined: {:?}", other.map(|_| "other")),
         }
+        let outcome = handle_saga_event_with_emit(&mut actor, compensation_requested(), |_| {});
+        assert!(
+            matches!(
+                outcome,
+                IngressOutcome::Rejected(IngressRejection::TerminalRun)
+            ),
+            "{outcome:?}"
+        );
     }
 }

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::helpers::{admit_and_dedupe, quarantine_admission_lookup_failure};
+use crate::helpers::{admit_for_ingress, quarantine_admission_lookup_failure};
 use crate::state_ext::{SagaStateStoreError, finalize_terminal_run};
 use crate::support::{AcceptedWorkflowCompensation, AcceptedWorkflowStep};
 use crate::{
@@ -2003,9 +2003,9 @@ where
     // a crash between this mark and the StepExecutionStarted journal entry is
     // fail-loud rather than resumed: startup recovery has no durable execution
     // intent and the terminal resolver must eventually fail/quarantine the saga.
-    match admit_and_dedupe(actor, &event, &run, &identity) {
-        Ok(true) => {}
-        Ok(false) => return IngressOutcome::Duplicate,
+    match admit_for_ingress(actor, &event, &run, &identity) {
+        Ok(None) => {}
+        Ok(Some(outcome)) => return outcome,
         Err(err) => {
             let step: Box<str> = workflow.step_name().into();
             // No effect ran: quarantining (not failing) the run is non-contradictory (ADR-0002 §2.2).
