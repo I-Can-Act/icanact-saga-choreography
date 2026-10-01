@@ -9,6 +9,8 @@
 //! panics, idempotency, dependency gating, and terminal latch.
 
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use icanact_core::local_sync;
@@ -1175,6 +1177,14 @@ fn order_panics_after_both_succeed() {
         .attach_terminal_resolver(test_policy(), "e2e-resolver")
         .expect("terminal resolver should attach");
     let (terminal_ref, terminal_h) = spawn_terminal_probe(&world, &bus);
+    let aborted = Arc::new(AtomicBool::new(false));
+    let aborted_probe = Arc::clone(&aborted);
+    let _observer = bus.subscribe_saga_type_fn(SAGA_TYPE, move |event| {
+        if matches!(event, SagaChoreographyEvent::SagaAbortRequested { .. }) {
+            aborted_probe.store(true, Ordering::SeqCst);
+        }
+        true
+    });
 
     let (p_ref, p_h) = spawn_and_subscribe(
         &world,
@@ -1222,6 +1232,10 @@ fn order_panics_after_both_succeed() {
     wait_until(TIMEOUT, || {
         query_terminal_counts(&terminal_ref).quarantined >= 1
     });
+    assert!(
+        !aborted.load(Ordering::SeqCst),
+        "setup must not trigger a delivery-shortfall abort: it races step completion and makes the resolver compensate"
+    );
     assert_eq!(
         query_state(&p_ref).compensated_count,
         0,
