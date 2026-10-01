@@ -6,15 +6,15 @@ use crate::helpers::{admit_and_dedupe, quarantine_admission_lookup_failure};
 use crate::state_ext::{SagaStateStoreError, finalize_terminal_run};
 use crate::support::{AcceptedWorkflowCompensation, AcceptedWorkflowStep};
 use crate::{
-    AcceptedCompensationCompletion, AcceptedCompensationFailure, AcceptedStepCompletion,
-    AcceptedStepError, AcceptedStepFailure, AcceptedStepPolicy, AcceptedStepTimeoutOutcome,
-    AsyncSagaParticipant, CommitStage, CompensationOutput, DedupeError, HasSagaParticipantSupport,
-    HasSagaWorkflowParticipants, IngressFailure, IngressOutcome, IngressReport, JournalEntry,
-    JournalError, ParticipantDedupeStore, ParticipantEvent, ParticipantJournal,
-    ReconciliationCause, ReconciliationNeeded, RunKey, RunTerminalOutcome, SagaChoreographyEvent,
-    SagaContext, SagaId, SagaParticipant, SagaParticipantSupport, SagaStateEntry, SagaStateExt,
-    SagaWorkflowParticipant, StepExecutionId, StepOutput, event_identity,
-    handle_async_saga_event_with_emit, handle_saga_event_with_emit,
+    AbortSource, AcceptedCompensationCompletion, AcceptedCompensationFailure,
+    AcceptedStepCompletion, AcceptedStepError, AcceptedStepFailure, AcceptedStepPolicy,
+    AcceptedStepTimeoutOutcome, AsyncSagaParticipant, CommitStage, CompensationOutput, DedupeError,
+    HasSagaParticipantSupport, HasSagaWorkflowParticipants, IngressFailure, IngressOutcome,
+    IngressReport, JournalEntry, JournalError, ParticipantDedupeStore, ParticipantEvent,
+    ParticipantJournal, ReconciliationCause, ReconciliationNeeded, RunKey, RunTerminalOutcome,
+    SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant, SagaParticipantSupport,
+    SagaStateEntry, SagaStateExt, SagaWorkflowParticipant, StepExecutionId, StepOutput,
+    event_identity, handle_async_saga_event_with_emit, handle_saga_event_with_emit,
 };
 
 pub const PANIC_QUARANTINE_REASON_PREFIX: &str = "panic_during_active_";
@@ -3295,10 +3295,21 @@ fn collect_startup_recovery_events_for_saga_type_inner<
         }
         match classify_recovery(&entries, now, policy) {
             RecoveryDecision::QuarantineStale => {
-                out.push(SagaChoreographyEvent::saga_failed_default(
-                    recovery_context_for_run(&run, step_name),
-                    Box::<str>::from("startup recovery quarantined stale saga"),
-                ));
+                // ADR-0004 §2.6: request an abort so the resolver rolls back known effects;
+                // never publish a terminal SagaFailed from here.
+                tracing::error!(
+                    target: "core::saga",
+                    event = "saga_startup_recovery_stale_abort_requested",
+                    saga_type = run.saga_type(),
+                    saga_id = saga_id.get(),
+                    incarnation = run.incarnation().get(),
+                    step = step_name
+                );
+                out.push(SagaChoreographyEvent::SagaAbortRequested {
+                    context: stored_recovery_context(&run, &entries, step_name),
+                    reason: Box::<str>::from("startup recovery found stale saga"),
+                    source: AbortSource::StaleRecovery,
+                });
             }
             RecoveryDecision::ReplayPanicQuarantine => {
                 let should_emit =
@@ -3411,6 +3422,33 @@ fn startup_accepted_compensation_timeout_event(
         )
         .into(),
     })
+}
+
+/// Recovery context from the stored context rows when present (they carry the original start
+/// time and initiator), otherwise from the stored `RunKey`.
+fn stored_recovery_context(
+    run: &RunKey,
+    entries: &[JournalEntry],
+    step_name: &'static str,
+) -> SagaContext {
+    let stored = entries
+        .iter()
+        .rev()
+        .find_map(|entry| match entry.event.transition() {
+            ParticipantEvent::AcceptedStepRecorded { context, .. }
+            | ParticipantEvent::AcceptedCompensationRecorded { context, .. }
+                if run.is_run_of(context) =>
+            {
+                Some(context)
+            }
+            _ => None,
+        });
+    let Some(stored) = stored else {
+        return recovery_context_for_run(run, step_name);
+    };
+    let mut context = stored.clone();
+    context.event_timestamp_millis = SagaContext::now_millis();
+    context
 }
 
 /// Context for a framework-originated recovery event, built from the stored run identity.

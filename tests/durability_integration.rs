@@ -1290,10 +1290,11 @@ fn startup_recovery_collectors_cover_default_and_stale_paths() {
     assert_eq!(stale_events.len(), 1);
     assert!(matches!(
         &stale_events[0],
-        SagaChoreographyEvent::SagaFailed { context, reason, .. }
+        SagaChoreographyEvent::SagaAbortRequested { context, reason, source }
             if context.saga_type.as_ref() == "mature_pool_refresh"
                 && context.saga_id == stale_saga
-                && reason.as_ref().contains("startup recovery quarantined stale saga")
+                && *source == icanact_saga_choreography::AbortSource::StaleRecovery
+                && reason.as_ref().contains("stale saga")
     ));
 
     let default_saga = SagaId::new(89);
