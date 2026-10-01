@@ -11,10 +11,10 @@ use icanact_core::local_sync::{self, SyncActor};
 use crate::reply_registry::{SagaReplyToHandle, SagaReplyToResult};
 use crate::workflow_contract::required_path_steps_from_success_criteria;
 use crate::{
-    HasSagaWorkflowParticipants, SagaChoreographyEvent, SagaId, SagaReplyTo, SagaTerminalOutcome,
-    SagaWorkflowContract, SagaWorkflowStepContract, TERMINAL_RESOLVER_STEP, TerminalPolicy,
-    TerminalResolver, TerminalResolverJournal, required_steps_from_success_criteria,
-    validate_workflow_contract,
+    HasSagaWorkflowParticipants, RunIncarnation, RunKey, SagaChoreographyEvent, SagaContext,
+    SagaId, SagaReplyTo, SagaTerminalOutcome, SagaWorkflowContract, SagaWorkflowStepContract,
+    TERMINAL_RESOLVER_STEP, TerminalPolicy, TerminalResolver, TerminalResolverJournal,
+    required_steps_from_success_criteria, validate_workflow_contract,
 };
 
 #[derive(Clone, Debug)]
@@ -27,9 +27,9 @@ struct WorkflowContractState {
 
 #[derive(Default)]
 struct BusStateActor {
-    terminal_replies: HashMap<SagaId, SagaReplyTo>,
-    terminal_outcomes: HashMap<SagaId, SagaTerminalOutcome>,
-    terminal_order: VecDeque<SagaId>,
+    terminal_replies: HashMap<RunKey, SagaReplyTo>,
+    terminal_outcomes: HashMap<RunKey, SagaTerminalOutcome>,
+    terminal_order: VecDeque<RunKey>,
     terminal_policies_by_saga_type: HashMap<Box<str>, Box<str>>,
     workflow_contracts_by_saga_type: HashMap<Box<str>, WorkflowContractState>,
     bound_steps_by_saga_type: HashMap<Box<str>, HashSet<Box<str>>>,
@@ -69,20 +69,32 @@ enum BusStateAsk {
         saga_type: Box<str>,
     },
     StoreTerminalReply {
-        saga_id: SagaId,
+        run: RunKey,
         reply: SagaReplyTo,
         retention_limit: usize,
     },
     StoreTerminalOutcome {
-        saga_id: SagaId,
+        run: RunKey,
         outcome: SagaTerminalOutcome,
         retention_limit: usize,
     },
     TakeTerminalReply {
-        saga_id: SagaId,
+        run: RunKey,
     },
     TakeTerminalOutcome {
+        run: RunKey,
+    },
+    /// `SagaId` wrapper: resolves the newest cached incarnation (ADR-0001).
+    TakeNewestTerminalReply {
         saga_id: SagaId,
+    },
+    /// `SagaId` wrapper: resolves the newest cached incarnation (ADR-0001).
+    TakeNewestTerminalOutcome {
+        saga_id: SagaId,
+    },
+    /// Is a strictly newer incarnation of the same `SagaId` cached?
+    HasNewerTerminal {
+        run: RunKey,
     },
 }
 
@@ -99,21 +111,47 @@ enum BusStateReply {
 }
 
 impl BusStateActor {
+    fn newest_cached_run(&self, saga_id: SagaId) -> Option<RunKey> {
+        self.terminal_outcomes
+            .keys()
+            .chain(self.terminal_replies.keys())
+            .filter(|run| run.saga_id() == saga_id)
+            .max_by(|a, b| a.incarnation().cmp(&b.incarnation()).then_with(|| a.cmp(b)))
+            .cloned()
+    }
+
+    fn take_reply(&mut self, run: &RunKey) -> Option<SagaReplyTo> {
+        let reply = self.terminal_replies.remove(run);
+        if reply.is_some() {
+            self.terminal_outcomes.remove(run);
+        }
+        reply
+    }
+
+    fn take_outcome(&mut self, run: &RunKey) -> Option<SagaTerminalOutcome> {
+        let reply = self.terminal_replies.remove(run).map(|reply| reply.outcome);
+        let direct = self.terminal_outcomes.remove(run);
+        reply.or(direct)
+    }
+
     fn insert_terminal_outcome(
         &mut self,
-        saga_id: SagaId,
+        run: RunKey,
         outcome: SagaTerminalOutcome,
         retention_limit: usize,
     ) {
-        let inserted_new = self.terminal_outcomes.insert(saga_id, outcome).is_none();
+        let inserted_new = self
+            .terminal_outcomes
+            .insert(run.clone(), outcome)
+            .is_none();
         if inserted_new {
-            self.terminal_order.push_back(saga_id);
+            self.terminal_order.push_back(run.clone());
         }
         while self.terminal_order.len() > retention_limit {
             let Some(candidate) = self.terminal_order.pop_front() else {
                 break;
             };
-            if candidate != saga_id {
+            if candidate != run {
                 self.terminal_outcomes.remove(&candidate);
                 self.terminal_replies.remove(&candidate);
                 break;
@@ -212,38 +250,45 @@ impl SyncActor for BusStateActor {
                 BusStateReply::OptionalU32(expected)
             }
             BusStateAsk::StoreTerminalReply {
-                saga_id,
+                run,
                 reply,
                 retention_limit,
             } => {
                 let outcome = reply.outcome.clone();
-                self.terminal_replies.insert(saga_id, reply);
-                self.insert_terminal_outcome(saga_id, outcome, retention_limit);
+                self.terminal_replies.insert(run.clone(), reply);
+                self.insert_terminal_outcome(run, outcome, retention_limit);
                 BusStateReply::Unit
             }
             BusStateAsk::StoreTerminalOutcome {
-                saga_id,
+                run,
                 outcome,
                 retention_limit,
             } => {
-                self.insert_terminal_outcome(saga_id, outcome, retention_limit);
+                self.insert_terminal_outcome(run, outcome, retention_limit);
                 BusStateReply::Unit
             }
-            BusStateAsk::TakeTerminalReply { saga_id } => {
-                let reply = self.terminal_replies.remove(&saga_id);
-                if reply.is_some() {
-                    self.terminal_outcomes.remove(&saga_id);
-                }
+            BusStateAsk::TakeTerminalReply { run } => {
+                BusStateReply::TerminalReply(self.take_reply(&run))
+            }
+            BusStateAsk::TakeTerminalOutcome { run } => {
+                BusStateReply::TerminalOutcome(self.take_outcome(&run))
+            }
+            BusStateAsk::TakeNewestTerminalReply { saga_id } => {
+                let reply = self
+                    .newest_cached_run(saga_id)
+                    .and_then(|run| self.take_reply(&run));
                 BusStateReply::TerminalReply(reply)
             }
-            BusStateAsk::TakeTerminalOutcome { saga_id } => {
-                let reply = self
-                    .terminal_replies
-                    .remove(&saga_id)
-                    .map(|reply| reply.outcome);
-                let direct = self.terminal_outcomes.remove(&saga_id);
-                BusStateReply::TerminalOutcome(reply.or(direct))
+            BusStateAsk::TakeNewestTerminalOutcome { saga_id } => {
+                let outcome = self
+                    .newest_cached_run(saga_id)
+                    .and_then(|run| self.take_outcome(&run));
+                BusStateReply::TerminalOutcome(outcome)
             }
+            BusStateAsk::HasNewerTerminal { run } => BusStateReply::Bool(
+                self.newest_cached_run(run.saga_id())
+                    .is_some_and(|newest| newest.incarnation() > run.incarnation()),
+            ),
         }
     }
 }
@@ -403,7 +448,21 @@ impl SyncActor for TerminalResolverActor {
                     }
                     return;
                 }
-                self.resolver.ingest(&event)
+                match self
+                    .resolver
+                    .try_ingest_at(&event, SagaContext::now_millis())
+                {
+                    Ok(events) => events,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "core::saga",
+                            event = "terminal_resolver_run_identity_rejected",
+                            run = %event.context().run_key(),
+                            error = ?error
+                        );
+                        return;
+                    }
+                }
             }
             TerminalResolverTell::ActivateRecovery => {
                 let recovery_events = std::mem::take(&mut self.recovery_events);
@@ -418,14 +477,17 @@ impl SyncActor for TerminalResolverActor {
 
 pub struct SagaChoreographyBus {
     bus: FirehosePubSub<SagaChoreographyEvent>,
-    pending_replies: CorrelationRegistry<SagaId, SagaReplyToResult>,
+    pending_replies: CorrelationRegistry<RunKey, SagaReplyToResult>,
+    /// Waiters registered by bare `SagaId` (no run known); see `complete_terminal_reply_for_run`.
+    legacy_pending_replies: CorrelationRegistry<SagaId, SagaReplyToResult>,
     state_ref: local_sync::SyncActorRef<BusStateActor>,
     terminal_resolver_registry_ref: local_sync::SyncActorRef<TerminalResolverRegistryActor>,
     _lifecycle: Arc<BusActorLifecycle>,
 }
 
 struct BusActorLifecycle {
-    pending_replies: CorrelationRegistry<SagaId, SagaReplyToResult>,
+    pending_replies: CorrelationRegistry<RunKey, SagaReplyToResult>,
+    legacy_pending_replies: CorrelationRegistry<SagaId, SagaReplyToResult>,
     state_handle: Option<local_sync::ActorHandle>,
     terminal_resolver_registry_ref: local_sync::SyncActorRef<TerminalResolverRegistryActor>,
     terminal_resolver_registry_handle: Option<local_sync::ActorHandle>,
@@ -444,6 +506,9 @@ impl Drop for BusActorLifecycle {
         }
 
         for (_, reply) in self.pending_replies.drain() {
+            let _ = reply.reply(Err("saga bus dropped".to_string()));
+        }
+        for (_, reply) in self.legacy_pending_replies.drain() {
             let _ = reply.reply(Err("saga bus dropped".to_string()));
         }
     }
@@ -523,8 +588,10 @@ impl SagaChoreographyBus {
         let (terminal_resolver_registry_ref, terminal_resolver_registry_handle) =
             local_sync::spawn(TerminalResolverRegistryActor::default());
         let pending_replies = CorrelationRegistry::new();
+        let legacy_pending_replies = CorrelationRegistry::new();
         let lifecycle = Arc::new(BusActorLifecycle {
             pending_replies: pending_replies.clone(),
+            legacy_pending_replies: legacy_pending_replies.clone(),
             state_handle: Some(state_handle),
             terminal_resolver_registry_ref: terminal_resolver_registry_ref.clone(),
             terminal_resolver_registry_handle: Some(terminal_resolver_registry_handle),
@@ -532,6 +599,7 @@ impl SagaChoreographyBus {
         Self {
             bus: FirehosePubSub::new(),
             pending_replies,
+            legacy_pending_replies,
             state_ref,
             terminal_resolver_registry_ref,
             _lifecycle: lifecycle,
@@ -598,7 +666,7 @@ impl SagaChoreographyBus {
                     failure: None,
                 };
                 if let Some(outcome) = terminal.terminal_outcome() {
-                    self.store_terminal_outcome(terminal.context().saga_id, outcome);
+                    self.store_terminal_outcome(terminal.context().run_key(), outcome);
                 }
                 return (self.publish_event(terminal), Some(reason));
             }
@@ -610,7 +678,7 @@ impl SagaChoreographyBus {
                     failure: None,
                 };
                 if let Some(outcome) = terminal.terminal_outcome() {
-                    self.store_terminal_outcome(terminal.context().saga_id, outcome);
+                    self.store_terminal_outcome(terminal.context().run_key(), outcome);
                 }
                 return (self.publish_event(terminal), Some(reason));
             }
@@ -630,7 +698,7 @@ impl SagaChoreographyBus {
             expected_context = Some(event.context().clone());
         }
         if let Some(outcome) = event.terminal_outcome() {
-            self.store_terminal_outcome(event.context().saga_id, outcome);
+            self.store_terminal_outcome(event.context().run_key(), outcome);
         }
         let stats = self.publish_event(event);
         if let (Some(required_min_delivery), Some(context)) =
@@ -653,7 +721,7 @@ impl SagaChoreographyBus {
                     failure: None,
                 };
             if let Some(outcome) = terminal.terminal_outcome() {
-                self.store_terminal_outcome(terminal.context().saga_id, outcome);
+                self.store_terminal_outcome(terminal.context().run_key(), outcome);
             }
             let _ = self.publish_event(terminal);
         }
@@ -870,12 +938,36 @@ impl SagaChoreographyBus {
         self.subscribe_fn(saga_type, f)
     }
 
+    /// Registers a waiter for the terminal reply of the exact `run` (ADR-0001).
+    pub fn register_terminal_reply_for_run(
+        &self,
+        run: &RunKey,
+        reply: SagaReplyToHandle,
+    ) -> Result<(), Box<str>> {
+        match self.pending_replies.register(run.clone(), reply) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let reply = err.into_reply();
+                let _ = reply.reply(Err("terminal reply already registered for run".into()));
+                tracing::warn!(
+                    target: "core::saga",
+                    event = "terminal_reply_already_registered",
+                    run = %run
+                );
+                Err("terminal reply already registered for run".into())
+            }
+        }
+    }
+
+    /// `SagaId` wrapper: the run is unknown at registration, so the waiter resolves with the
+    /// first terminal event of any incarnation of `saga_id` that is not superseded by a newer
+    /// cached terminal. Prefer [`Self::register_terminal_reply_for_run`].
     pub fn register_terminal_reply(
         &self,
         saga_id: SagaId,
         reply: SagaReplyToHandle,
     ) -> Result<(), Box<str>> {
-        match self.pending_replies.register(saga_id, reply) {
+        match self.legacy_pending_replies.register(saga_id, reply) {
             Ok(()) => Ok(()),
             Err(err) => {
                 let reply = err.into_reply();
@@ -885,13 +977,41 @@ impl SagaChoreographyBus {
         }
     }
 
+    /// Caches and delivers `reply` for the exact `run` only (ADR-0001).
+    pub fn complete_terminal_reply_for_run(&self, run: &RunKey, reply: SagaReplyTo) -> bool {
+        self.store_terminal_reply(run.clone(), reply.clone());
+        let exact = self.pending_replies.resolve(run, Ok(reply.clone())).is_ok();
+        // Unscoped waiters never receive a reply from an older incarnation once a newer
+        // incarnation has a cached terminal.
+        let superseded = matches!(
+            self.ask_state(BusStateAsk::HasNewerTerminal { run: run.clone() }),
+            Some(BusStateReply::Bool(true))
+        );
+        let legacy = !superseded
+            && self
+                .legacy_pending_replies
+                .resolve(&run.saga_id(), Ok(reply))
+                .is_ok();
+        exact || legacy
+    }
+
+    /// `SagaId` wrapper: delivers to unscoped waiters and caches under an unscoped key that
+    /// sorts below every real incarnation.
     pub fn complete_terminal_reply(&self, saga_id: SagaId, reply: SagaReplyTo) -> bool {
-        self.store_terminal_reply(saga_id, reply.clone());
-        self.pending_replies.resolve(&saga_id, Ok(reply)).is_ok()
+        self.store_terminal_reply(unscoped_run(saga_id), reply.clone());
+        self.legacy_pending_replies
+            .resolve(&saga_id, Ok(reply))
+            .is_ok()
+    }
+
+    pub fn reject_terminal_reply_for_run(&self, run: &RunKey, reason: impl Into<String>) -> bool {
+        self.pending_replies
+            .resolve(run, Err(reason.into()))
+            .is_ok()
     }
 
     pub fn reject_terminal_reply(&self, saga_id: SagaId, reason: impl Into<String>) -> bool {
-        self.pending_replies
+        self.legacy_pending_replies
             .resolve(&saga_id, Err(reason.into()))
             .is_ok()
     }
@@ -1082,15 +1202,34 @@ impl SagaChoreographyBus {
         self.activate_terminal_resolver_recovery(C::saga_type())
     }
 
+    /// `SagaId` wrapper: takes the newest cached incarnation's reply.
     pub fn take_terminal_reply(&self, saga_id: SagaId) -> Option<SagaReplyTo> {
-        match self.ask_state(BusStateAsk::TakeTerminalReply { saga_id }) {
+        match self.ask_state(BusStateAsk::TakeNewestTerminalReply { saga_id }) {
             Some(BusStateReply::TerminalReply(reply)) => reply,
             _ => None,
         }
     }
 
+    pub fn take_terminal_reply_for_run(&self, run: &RunKey) -> Option<SagaReplyTo> {
+        match self.ask_state(BusStateAsk::TakeTerminalReply { run: run.clone() }) {
+            Some(BusStateReply::TerminalReply(reply)) => reply,
+            _ => None,
+        }
+    }
+
+    /// `SagaId` wrapper: takes the newest cached incarnation's outcome.
     pub fn take_terminal_outcome(&self, saga_id: SagaId) -> Option<crate::SagaTerminalOutcome> {
-        match self.ask_state(BusStateAsk::TakeTerminalOutcome { saga_id }) {
+        match self.ask_state(BusStateAsk::TakeNewestTerminalOutcome { saga_id }) {
+            Some(BusStateReply::TerminalOutcome(outcome)) => outcome,
+            _ => None,
+        }
+    }
+
+    pub fn take_terminal_outcome_for_run(
+        &self,
+        run: &RunKey,
+    ) -> Option<crate::SagaTerminalOutcome> {
+        match self.ask_state(BusStateAsk::TakeTerminalOutcome { run: run.clone() }) {
             Some(BusStateReply::TerminalOutcome(outcome)) => outcome,
             _ => None,
         }
@@ -1115,8 +1254,8 @@ impl SagaChoreographyBus {
         let Some(outcome) = event.terminal_outcome() else {
             return false;
         };
-        self.complete_terminal_reply(
-            event.context().saga_id,
+        self.complete_terminal_reply_for_run(
+            &event.context().run_key(),
             SagaReplyTo {
                 responder: responder.into(),
                 outcome,
@@ -1245,23 +1384,28 @@ impl SagaChoreographyBus {
         }
     }
 
-    fn store_terminal_reply(&self, saga_id: SagaId, reply: SagaReplyTo) {
+    fn store_terminal_reply(&self, run: RunKey, reply: SagaReplyTo) {
         let retention_limit = self.terminal_retention_limit();
         let _ = self.ask_state(BusStateAsk::StoreTerminalReply {
-            saga_id,
+            run,
             reply,
             retention_limit,
         });
     }
 
-    fn store_terminal_outcome(&self, saga_id: SagaId, outcome: SagaTerminalOutcome) {
+    fn store_terminal_outcome(&self, run: RunKey, outcome: SagaTerminalOutcome) {
         let retention_limit = self.terminal_retention_limit();
         let _ = self.ask_state(BusStateAsk::StoreTerminalOutcome {
-            saga_id,
+            run,
             outcome,
             retention_limit,
         });
     }
+}
+
+/// Cache key for `SagaId`-only completions: empty type, incarnation 0 (below any real run).
+fn unscoped_run(saga_id: SagaId) -> RunKey {
+    RunKey::new("", saga_id, RunIncarnation::new(0))
 }
 
 fn terminal_watchdog_tick_interval() -> Duration {
@@ -1327,6 +1471,7 @@ impl Clone for SagaChoreographyBus {
         Self {
             bus: self.bus.clone(),
             pending_replies: self.pending_replies.clone(),
+            legacy_pending_replies: self.legacy_pending_replies.clone(),
             state_ref: self.state_ref.clone(),
             terminal_resolver_registry_ref: self.terminal_resolver_registry_ref.clone(),
             _lifecycle: Arc::clone(&self._lifecycle),
@@ -1398,6 +1543,11 @@ mod tests {
             saga_id: SagaId,
             reply: super::SagaReplyToHandle,
         },
+        RegisterRun {
+            bus: SagaChoreographyBus,
+            run: crate::RunKey,
+            reply: super::SagaReplyToHandle,
+        },
     }
 
     fn register_pending_reply(
@@ -1415,6 +1565,9 @@ mod tests {
             } => {
                 let _ = bus.register_terminal_reply(saga_id, reply);
             }
+            ProbeMsg::RegisterRun { bus, run, reply } => {
+                let _ = bus.register_terminal_reply_for_run(&run, reply);
+            }
         });
         let pending = probe_addr
             .ask_delegated(|reply| ProbeMsg::Register {
@@ -1424,6 +1577,81 @@ mod tests {
             })
             .expect("pending reply should be registered");
         (pending, probe_handle)
+    }
+
+    fn register_pending_reply_for_run(
+        bus: SagaChoreographyBus,
+        run: crate::RunKey,
+    ) -> (
+        local_sync::PendingAsk<SagaReplyToResult>,
+        local_sync::mpsc::ActorHandle,
+    ) {
+        let (probe_addr, probe_handle) = local_sync::mpsc::spawn(8, |msg: ProbeMsg| {
+            if let ProbeMsg::RegisterRun { bus, run, reply } = msg {
+                let _ = bus.register_terminal_reply_for_run(&run, reply);
+            }
+        });
+        let pending = probe_addr
+            .ask_delegated(|reply| ProbeMsg::RegisterRun { bus, run, reply })
+            .expect("pending reply should be registered");
+        (pending, probe_handle)
+    }
+
+    fn run_terminal_event(saga_id: u64, incarnation: u64, failed: bool) -> SagaChoreographyEvent {
+        let context = SagaContext {
+            saga_started_at_millis: incarnation,
+            step_name: TERMINAL_RESOLVER_STEP.into(),
+            ..context("create_order", saga_id)
+        };
+        if failed {
+            SagaChoreographyEvent::SagaFailed {
+                context,
+                reason: "run failed".into(),
+                failure: None,
+            }
+        } else {
+            SagaChoreographyEvent::SagaCompleted { context }
+        }
+    }
+
+    #[test]
+    fn reply_for_old_run_not_delivered_to_new_run() {
+        let bus = SagaChoreographyBus::new();
+        let old_event = run_terminal_event(4242, 1_000, false);
+        let new_event = run_terminal_event(4242, 2_000, true);
+        let old_run = old_event.context().run_key();
+        let new_run = new_event.context().run_key();
+        let (pending_old, probe_old) = register_pending_reply_for_run(bus.clone(), old_run.clone());
+        let (pending_new, probe_new) = register_pending_reply_for_run(bus.clone(), new_run.clone());
+        thread::sleep(Duration::from_millis(20));
+
+        // Old run terminates first: only its own waiter and cache entry may see it.
+        assert!(bus.complete_terminal_reply_from_event(&old_event, "resolver"));
+        let old_reply = pending_old
+            .wait_timeout(Duration::from_secs(2))
+            .expect("old run waiter resolves")
+            .expect("old run reply ok");
+        assert!(matches!(
+            old_reply.outcome,
+            SagaTerminalOutcome::Completed { .. }
+        ));
+        assert!(
+            bus.take_terminal_outcome_for_run(&new_run).is_none(),
+            "old run's terminal outcome must not be cached for the new run"
+        );
+
+        assert!(bus.complete_terminal_reply_from_event(&new_event, "resolver"));
+        let new_reply = pending_new
+            .wait_timeout(Duration::from_secs(2))
+            .expect("new run waiter resolves")
+            .expect("new run reply ok");
+        assert!(
+            matches!(new_reply.outcome, SagaTerminalOutcome::Failed { .. }),
+            "new run waiter must get its own outcome, got {:?}",
+            new_reply.outcome
+        );
+        probe_old.shutdown();
+        probe_new.shutdown();
     }
 
     struct RejectingTerminalResolverJournal;
