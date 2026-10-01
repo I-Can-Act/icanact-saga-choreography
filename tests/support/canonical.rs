@@ -122,11 +122,11 @@ impl IngressReport {
             && self.publish_errors.is_empty()
     }
 
-    pub fn into_result(self) -> Result<usize, Self> {
+    pub fn into_result(self) -> Result<usize, Box<Self>> {
         if self.is_clean() {
             Ok(self.published)
         } else {
-            Err(self)
+            Err(Box::new(self))
         }
     }
 }

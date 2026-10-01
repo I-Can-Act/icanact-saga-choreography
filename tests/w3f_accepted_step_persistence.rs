@@ -165,7 +165,7 @@ fn finalize_run_removes_accepted_step_rows_so_restart_cannot_resurrect_it() {
 }
 
 #[test]
-fn poll_outcome_with_errors_is_not_empty() {
+fn poll_outcome_with_errors_is_not_clean() {
     use icanact_saga_choreography::durability::poll_accepted_workflow_step_timeouts;
     let (mut actor, journal) = actor();
     let context = ctx();
@@ -181,7 +181,7 @@ fn poll_outcome_with_errors_is_not_empty() {
     assert!(polled.has_no_events());
     assert!(!polled.is_clean());
     assert!(
-        !polled.is_empty(),
-        "a poll that failed is not empty: {polled:?}"
+        !(polled.has_no_events() && polled.is_clean()),
+        "a poll that failed is not 'nothing happened': {polled:?}"
     );
 }
