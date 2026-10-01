@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
+use tracing::warn;
+
 use crate::{
-    AcceptedStepTimeoutOutcome, ReplayHorizon, RunIdentityError, SagaChoreographyEvent,
-    SagaContext, SagaFailureDetails, SagaId, SagaWorkflowStepContract, StepExecutionId,
-    WorkflowDependencySpec,
+    AcceptedStepTimeoutOutcome, KnownRuns, ReplayHorizon, RunAdmission, RunIdentityError, RunKey,
+    RunStatus, SagaChoreographyEvent, SagaContext, SagaFailureDetails, SagaWorkflowStepContract,
+    StepExecutionId, WorkflowDependencySpec, admit_run,
 };
 
 pub const TERMINAL_RESOLVER_STEP: &str = "terminal_resolver";
@@ -342,9 +344,9 @@ impl SagaResolutionState {
 #[derive(Debug)]
 pub struct TerminalResolver {
     policy: TerminalPolicy,
-    states: HashMap<SagaId, SagaResolutionState>,
-    terminal_latched_order: VecDeque<SagaId>,
-    terminal_latched_set: HashSet<SagaId>,
+    states: HashMap<RunKey, SagaResolutionState>,
+    terminal_latched_order: VecDeque<RunKey>,
+    terminal_latched_set: HashSet<RunKey>,
     terminal_latch_retention: usize,
 }
 
@@ -390,34 +392,104 @@ impl TerminalResolver {
         (resolver, unpublished)
     }
 
-    /// Checked ingress: `Err` for a stale or expired run (ADR-0004 §2.9). W1: never `Err`.
-    pub fn try_ingest_at(
-        &mut self,
-        event: &SagaChoreographyEvent,
-        now_millis: u64,
-    ) -> Result<Vec<SagaChoreographyEvent>, RunIdentityError> {
-        Ok(self.ingest_at(event, now_millis))
-    }
-
+    /// Wrapper over [`Self::try_ingest_at`]: a rejected run is logged with its
+    /// `RunKey` and produces no events (no event is safe for a stale/expired run).
     fn ingest_at(
         &mut self,
         event: &SagaChoreographyEvent,
         now_millis: u64,
     ) -> Vec<SagaChoreographyEvent> {
+        match self.try_ingest_at(event, now_millis) {
+            Ok(events) => events,
+            Err(error) => {
+                warn!(
+                    event = "saga_run_identity_rejected",
+                    run = %event.context().run_key(),
+                    %error,
+                    "terminal resolver rejected event"
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    fn run_status(&self, run: &RunKey) -> RunStatus {
+        if self.terminal_latched_set.contains(run) {
+            return RunStatus::Terminal;
+        }
+        match self.states.get(run) {
+            Some(state) if state.terminal_latched => RunStatus::Terminal,
+            Some(_) => RunStatus::Active,
+            None => RunStatus::Unknown,
+        }
+    }
+
+    fn known_runs(&self, run: &RunKey) -> KnownRuns {
+        let mut known = KnownRuns::default();
+        let latched = self.terminal_latched_set.iter().map(|key| (key, true));
+        let live = self
+            .states
+            .iter()
+            .map(|(key, state)| (key, !state.terminal_latched));
+        for (key, active) in latched.chain(live) {
+            if key == run || key.saga_id() != run.saga_id() {
+                continue;
+            }
+            known.newest = known.newest.max(Some(key.incarnation()));
+            if active && !self.terminal_latched_set.contains(key) {
+                known.other_active += 1;
+            }
+        }
+        known
+    }
+
+    /// Checked ingress (ADR-0001 §2.2): `Err` for a stale or expired run.
+    pub fn try_ingest_at(
+        &mut self,
+        event: &SagaChoreographyEvent,
+        now_millis: u64,
+    ) -> Result<Vec<SagaChoreographyEvent>, RunIdentityError> {
         if event.context().saga_type.as_ref() != self.policy.saga_type.as_ref() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
-        let saga_id = event.context().saga_id;
-        if self.terminal_latched_set.contains(&saga_id) {
-            warn_if_contradictory_terminal(self.states.get(&saga_id), event);
-            return Vec::new();
+        let run = event.context().run_key();
+        let exact = self.run_status(&run);
+        let known = if exact == RunStatus::Unknown {
+            self.known_runs(&run)
+        } else {
+            KnownRuns::default()
+        };
+        let cutoff = self.policy.replay_horizon().cutoff(now_millis);
+        let is_start = matches!(event, SagaChoreographyEvent::SagaStarted { .. });
+        match admit_run(exact, known, &run, is_start, cutoff)? {
+            RunAdmission::NewRun { concurrent: true } => warn!(
+                event = "saga_concurrent_run_admitted",
+                run = %run,
+                other_active = known.other_active,
+                "admitted a newer run while another run of the saga id is active"
+            ),
+            RunAdmission::DuplicateStart => return Ok(Vec::new()),
+            RunAdmission::TerminalRun => {
+                warn_if_contradictory_terminal(self.states.get(&run), event);
+                return Ok(Vec::new());
+            }
+            RunAdmission::NewRun { .. } | RunAdmission::CurrentRun => {}
         }
+        Ok(self.apply_event(run, event, now_millis))
+    }
+
+    fn apply_event(
+        &mut self,
+        run: RunKey,
+        event: &SagaChoreographyEvent,
+        now_millis: u64,
+    ) -> Vec<SagaChoreographyEvent> {
         let mut out = Vec::new();
         let mut should_latch_terminal = false;
         let state = self
             .states
-            .entry(saga_id)
+            .entry(run.clone())
             .or_insert_with(|| SagaResolutionState::new(event.context(), now_millis));
 
         if state.terminal_latched {
@@ -682,7 +754,7 @@ impl TerminalResolver {
         }
 
         if should_latch_terminal {
-            self.latch_terminal(saga_id);
+            self.latch_terminal(run);
         }
 
         out
@@ -691,7 +763,7 @@ impl TerminalResolver {
     fn poll_timeouts_at(&mut self, now_millis: u64) -> Vec<SagaChoreographyEvent> {
         let mut out = Vec::new();
         let mut newly_latched = Vec::new();
-        for (saga_id, state) in self.states.iter_mut() {
+        for (run, state) in self.states.iter_mut() {
             if state.terminal_latched {
                 continue;
             }
@@ -702,21 +774,21 @@ impl TerminalResolver {
                     .iter()
                     .find(|e| is_terminal_event(e))
                     .map(SagaChoreographyEvent::event_type);
-                newly_latched.push(*saga_id);
+                newly_latched.push(run.clone());
             }
         }
-        for saga_id in newly_latched {
-            self.latch_terminal(saga_id);
+        for run in newly_latched {
+            self.latch_terminal(run);
         }
         out
     }
 
-    fn latch_terminal(&mut self, saga_id: SagaId) {
-        if !self.terminal_latched_set.insert(saga_id) {
+    fn latch_terminal(&mut self, run: RunKey) {
+        if !self.terminal_latched_set.insert(run.clone()) {
             return;
         }
 
-        self.terminal_latched_order.push_back(saga_id);
+        self.terminal_latched_order.push_back(run);
         while self.terminal_latched_order.len() > self.terminal_latch_retention {
             let Some(evicted) = self.terminal_latched_order.pop_front() else {
                 break;
@@ -1367,11 +1439,13 @@ mod tests {
     use std::time::Duration;
 
     use crate::{
-        AcceptedStepTimeoutOutcome, SagaChoreographyEvent, SagaContext, SagaId,
+        AcceptedStepTimeoutOutcome, RunIdentityError, SagaChoreographyEvent, SagaContext, SagaId,
         SagaWorkflowStepContract, StepExecutionId, WorkflowDependencySpec,
     };
 
-    use super::{FailureAuthority, SuccessCriteria, TerminalPolicy, TerminalResolver};
+    use super::{
+        FailureAuthority, SuccessCriteria, TerminalPolicy, TerminalResolver, is_terminal_event,
+    };
 
     static OPEN_POSITION_STEPS: &[SagaWorkflowStepContract] = &[
         SagaWorkflowStepContract {
@@ -1417,6 +1491,16 @@ mod tests {
             stalled_timeout,
             OPEN_POSITION_STEPS,
         )
+    }
+
+    fn run_key(saga_id: u64, started_at_millis: u64) -> crate::RunKey {
+        ctx_at(
+            "create_order",
+            saga_id,
+            started_at_millis,
+            started_at_millis,
+        )
+        .run_key()
     }
 
     fn ctx(step: &str) -> SagaContext {
@@ -1796,6 +1880,68 @@ mod tests {
     }
 
     #[test]
+    fn old_run_timeout_cannot_mutate_new_incarnation() {
+        let mut resolver = TerminalResolver::new(open_position_policy(Duration::from_secs(5)));
+        let start = |incarnation: u64| SagaChoreographyEvent::SagaStarted {
+            context: ctx_at("create_order", 31, incarnation, incarnation),
+            payload: Vec::new(),
+        };
+        assert!(resolver.try_ingest_at(&start(1_000), 1_000).is_ok());
+        // Newer incarnation coexists with the still-active older one (ADR-0001 §2.2).
+        assert!(resolver.try_ingest_at(&start(5_000), 5_000).is_ok());
+
+        // Only the old run is past its overall deadline.
+        let timeouts = resolver.poll_timeouts_at(6_500);
+        assert!(
+            timeouts
+                .iter()
+                .all(|event| event.context().saga_started_at_millis == 1_000),
+            "timeout must carry only the old incarnation: {timeouts:?}"
+        );
+        assert!(
+            timeouts.iter().any(is_terminal_event),
+            "old run must time out: {timeouts:?}"
+        );
+
+        let completed = resolver.ingest_at(
+            &SagaChoreographyEvent::StepCompleted {
+                context: ctx_at("create_order", 31, 5_000, 7_000),
+                output: Vec::new(),
+                saga_input: Vec::new(),
+                compensation_available: false,
+            },
+            7_000,
+        );
+        assert!(
+            matches!(
+                completed.as_slice(),
+                [SagaChoreographyEvent::SagaCompleted { context }]
+                    if context.saga_started_at_millis == 5_000
+            ),
+            "new incarnation must resolve independently: {completed:?}"
+        );
+    }
+
+    #[test]
+    fn stale_start_is_rejected_by_try_ingest_at() {
+        let mut resolver = TerminalResolver::new(open_position_policy(Duration::from_secs(5)));
+        let start = |incarnation: u64| SagaChoreographyEvent::SagaStarted {
+            context: ctx_at("create_order", 32, incarnation, incarnation),
+            payload: Vec::new(),
+        };
+        assert!(resolver.try_ingest_at(&start(2_000), 2_000).is_ok());
+        let result = resolver.try_ingest_at(&start(1_000), 2_001);
+        assert!(
+            matches!(result, Err(RunIdentityError::StaleIncarnation { .. })),
+            "stale start must be rejected: {result:?}"
+        );
+        assert!(
+            resolver.ingest_at(&start(1_000), 2_002).is_empty(),
+            "ingest_at wrapper yields no events on rejection"
+        );
+    }
+
+    #[test]
     fn evicted_terminal_state_keeps_latch_tombstone() {
         let mut resolver = TerminalResolver::new(open_position_policy(Duration::from_secs(5)));
         resolver.terminal_latch_retention = 1;
@@ -1838,7 +1984,7 @@ mod tests {
             2_010,
         );
         assert!(
-            !resolver.states.contains_key(&SagaId::new(21)),
+            !resolver.states.contains_key(&run_key(21, 1_000)),
             "retention should evict detailed state for the oldest terminal saga"
         );
 
@@ -1856,7 +2002,7 @@ mod tests {
             "late events for evicted terminal sagas must stay latched"
         );
         assert!(
-            !resolver.states.contains_key(&SagaId::new(21)),
+            !resolver.states.contains_key(&run_key(21, 1_000)),
             "late event must not resurrect evicted terminal saga state"
         );
     }
