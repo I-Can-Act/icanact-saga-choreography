@@ -1800,6 +1800,48 @@ where
     }
 }
 
+/// Events emitted while an ingress handler runs. `StepStarted` is published to the bus at once, so
+/// subscribers (the terminal resolver's in-flight tracking) see the step before its business effect
+/// runs; the durable execution intent is already committed at that point (ADR-0002), so a publish
+/// failure is logged and reported in `IngressReport::publish_failures` and execution proceeds.
+/// Every other event stays buffered until the handler returns (its state transition must be
+/// validated against the final state first).
+struct EmitBuffer {
+    bus: Option<crate::SagaChoreographyBus>,
+    /// Emitted events in order; the flag marks one that was already published.
+    events: Vec<(SagaChoreographyEvent, bool)>,
+    publish_failures: Vec<crate::SagaBusPublishError>,
+}
+
+impl EmitBuffer {
+    fn new(bus: Option<crate::SagaChoreographyBus>) -> Self {
+        Self {
+            bus,
+            events: Vec::new(),
+            publish_failures: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, event: SagaChoreographyEvent) {
+        let mut published = false;
+        if matches!(event, SagaChoreographyEvent::StepStarted { .. })
+            && let Some(bus) = &self.bus
+        {
+            published = true;
+            if let Err(err) = bus.publish_strict(event.clone()) {
+                tracing::error!(
+                    target: "core::saga",
+                    event = "participant_step_started_publish_failed",
+                    run = %event.context().run_key(),
+                    error = ?err
+                );
+                self.publish_failures.push(err);
+            }
+        }
+        self.events.push((event, published));
+    }
+}
+
 pub fn apply_sync_participant_saga_ingress<P, FApplyTerminal, FOnInvalid>(
     participant: &mut P,
     event: SagaChoreographyEvent,
@@ -1836,13 +1878,15 @@ where
     apply_terminal_side_effects(participant, &event);
     mark_matching_accepted_step_failed(participant, &event);
 
-    let mut emitted = Vec::new();
+    let mut buffer = EmitBuffer::new(participant.saga_support().bus.clone());
     let outcome =
-        handle_saga_event_with_emit(participant, event, |next_event| emitted.push(next_event));
-    let mut publish_failures = Vec::new();
-
-    let saga_bus = participant.saga_support().bus.clone();
-    for next_event in emitted {
+        handle_saga_event_with_emit(participant, event, |next_event| buffer.push(next_event));
+    let EmitBuffer {
+        bus: saga_bus,
+        events: emitted,
+        mut publish_failures,
+    } = buffer;
+    for (next_event, already_published) in emitted {
         if !is_valid_emitted_transition(
             participant
                 .saga_states_ref()
@@ -1855,7 +1899,8 @@ where
 
         on_emitted_transition(participant, &next_event);
 
-        if let Some(bus) = &saga_bus
+        if !already_published
+            && let Some(bus) = &saga_bus
             && let Err(err) = bus.publish_strict(next_event)
         {
             tracing::error!(
@@ -1959,14 +2004,16 @@ where
 
     apply_terminal_side_effects(actor, &event);
 
-    let mut emitted = Vec::new();
+    let mut buffer = EmitBuffer::new(actor.saga_support().bus.clone());
     let outcome = handle_workflow_saga_event_with_emit(actor, workflow, event, |next_event| {
-        emitted.push(next_event)
+        buffer.push(next_event)
     });
-    let mut publish_failures = Vec::new();
-
-    let saga_bus = actor.saga_support().bus.clone();
-    for next_event in emitted {
+    let EmitBuffer {
+        bus: saga_bus,
+        events: emitted,
+        mut publish_failures,
+    } = buffer;
+    for (next_event, already_published) in emitted {
         if !is_valid_emitted_transition(
             actor.saga_states_ref().get(&next_event.context().run_key()),
             &next_event,
@@ -1977,7 +2024,8 @@ where
 
         on_emitted_transition(actor, &next_event);
 
-        if let Some(bus) = &saga_bus
+        if !already_published
+            && let Some(bus) = &saga_bus
             && let Err(err) = bus.publish_strict(next_event)
         {
             tracing::error!(
@@ -2859,15 +2907,16 @@ where
     apply_terminal_side_effects(participant, &event);
     mark_matching_accepted_step_failed(participant, &event);
 
-    let mut emitted = Vec::new();
-    let outcome = handle_async_saga_event_with_emit(participant, event, |next_event| {
-        emitted.push(next_event)
-    })
-    .await;
-    let mut publish_failures = Vec::new();
-
-    let saga_bus = participant.saga_support().bus.clone();
-    for next_event in emitted {
+    let mut buffer = EmitBuffer::new(participant.saga_support().bus.clone());
+    let outcome =
+        handle_async_saga_event_with_emit(participant, event, |next_event| buffer.push(next_event))
+            .await;
+    let EmitBuffer {
+        bus: saga_bus,
+        events: emitted,
+        mut publish_failures,
+    } = buffer;
+    for (next_event, already_published) in emitted {
         if !is_valid_emitted_transition(
             participant
                 .saga_states_ref()
@@ -2880,7 +2929,8 @@ where
 
         on_emitted_transition(participant, &next_event);
 
-        if let Some(bus) = &saga_bus
+        if !already_published
+            && let Some(bus) = &saga_bus
             && let Err(err) = bus.publish_strict(next_event)
         {
             tracing::error!(
