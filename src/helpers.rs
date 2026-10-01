@@ -2,7 +2,7 @@
 
 use crate::ReconciliationNeeded;
 use crate::state_ext::{
-    EventAdmission, admit_event, finalize_terminal_run, quarantine_preserving_state,
+    EventAdmission, admit_event, finalize_terminal_run, quarantine_run_with_evidence,
 };
 use crate::{
     AsyncSagaParticipant, CompensationError, CompensationOutput, DependencySpec, ParticipantEvent,
@@ -346,20 +346,14 @@ pub(crate) fn quarantine_admission_lookup_failure<A, F>(
         run = %run,
         reason = %reason
     );
-    quarantine_preserving_state(actor, context, &step, label, &reason, now);
-    actor.record_event_run(
-        &run,
-        ParticipantEvent::Quarantined {
-            reason: reason.clone(),
-            quarantined_at_millis: now,
-        },
+    quarantine_run_with_evidence(
+        actor,
+        context,
+        (step, participant_id),
+        (label, reason),
+        now,
+        emit,
     );
-    emit(SagaChoreographyEvent::SagaQuarantined {
-        context: context.next_step(step.clone()),
-        reason,
-        step,
-        participant_id,
-    });
 }
 
 fn dependency_should_fire<P>(
@@ -633,8 +627,8 @@ where
     })
 }
 
-/// Moves an `Executing`/`Compensating` state to `Quarantined`, writes the best-effort evidence
-/// row and emits `SagaQuarantined`. Used only after a failed post-effect commit.
+/// Post-effect commit failure: routes through the single shared quarantine path
+/// ([`quarantine_run_with_evidence`]) so the run is un-admitted, latched and keeps its evidence.
 fn quarantine_after_commit_failure<A, F>(
     actor: &mut A,
     context: &SagaContext,
@@ -647,39 +641,14 @@ fn quarantine_after_commit_failure<A, F>(
     A: SagaStateExt,
     F: FnMut(SagaChoreographyEvent),
 {
-    let run = context.run_key();
-    match actor.saga_states().remove(&run) {
-        Some(SagaStateEntry::Executing(state)) => {
-            actor.saga_states().insert(
-                run.clone(),
-                SagaStateEntry::Quarantined(state.quarantine(Box::<str>::from(reason), now)),
-            );
-        }
-        Some(SagaStateEntry::Compensating(state)) => {
-            actor.saga_states().insert(
-                run.clone(),
-                SagaStateEntry::Quarantined(state.quarantine(Box::<str>::from(reason), now)),
-            );
-        }
-        Some(other) => {
-            actor.saga_states().insert(run.clone(), other);
-        }
-        None => {}
-    }
-    // Best-effort evidence only: the journal is the thing that just failed.
-    actor.record_event_run(
-        &run,
-        ParticipantEvent::Quarantined {
-            reason: Box::<str>::from(reason),
-            quarantined_at_millis: now,
-        },
+    quarantine_run_with_evidence(
+        actor,
+        context,
+        (step, participant_id),
+        ("commit_failed", Box::<str>::from(reason)),
+        now,
+        emit,
     );
-    emit(SagaChoreographyEvent::SagaQuarantined {
-        context: context.next_step(step.clone()),
-        reason: Box::<str>::from(reason),
-        step,
-        participant_id,
-    });
 }
 
 /// Complete a step with state transition
@@ -1045,28 +1014,18 @@ fn quarantine_accepted_step_persistence_failure<A, F>(
     A: SagaStateExt,
     F: FnMut(SagaChoreographyEvent),
 {
-    let run = context.run_key();
-    if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&run) {
-        actor.saga_states().insert(
-            run.clone(),
-            SagaStateEntry::Quarantined(state.quarantine(reason.clone(), now)),
-        );
-    }
-    actor.record_event_run(
-        &run,
-        ParticipantEvent::Quarantined {
-            reason: reason.clone(),
-            quarantined_at_millis: now,
-        },
+    quarantine_run_with_evidence(
+        actor,
+        context,
+        (step, participant_id),
+        ("accepted_step_persistence_failed", reason),
+        now,
+        emit,
     );
-    emit(SagaChoreographyEvent::SagaQuarantined {
-        context: context.next_step(step.clone()),
-        reason,
-        step,
-        participant_id,
-    });
 }
 
+/// A failed compensation-request commit keeps the run's undo data in memory (`Completed` goes
+/// through `Completed::quarantine`, W3 review LOW 2) and quarantines through the shared path.
 fn quarantine_compensation_request_persistence_failure<A, F>(
     actor: &mut A,
     context: &SagaContext,
@@ -1079,40 +1038,14 @@ fn quarantine_compensation_request_persistence_failure<A, F>(
     A: SagaStateExt,
     F: FnMut(SagaChoreographyEvent),
 {
-    let run = context.run_key();
-    let state_entry = actor.saga_states().remove(&run);
-    let quarantined = match state_entry {
-        Some(SagaStateEntry::Executing(state)) => Some(state.quarantine(reason.clone(), now)),
-        Some(SagaStateEntry::Completed(state)) => Some(
-            state
-                .start_compensation(now)
-                .quarantine(reason.clone(), now),
-        ),
-        Some(SagaStateEntry::Compensating(state)) => Some(state.quarantine(reason.clone(), now)),
-        Some(other) => {
-            actor.saga_states().insert(run.clone(), other);
-            None
-        }
-        None => None,
-    };
-    if let Some(state) = quarantined {
-        actor
-            .saga_states()
-            .insert(run.clone(), SagaStateEntry::Quarantined(state));
-    }
-    actor.record_event_run(
-        &run,
-        ParticipantEvent::Quarantined {
-            reason: reason.clone(),
-            quarantined_at_millis: now,
-        },
+    quarantine_run_with_evidence(
+        actor,
+        context,
+        (step, participant_id),
+        ("compensation_request_persistence_failed", reason),
+        now,
+        emit,
     );
-    emit(SagaChoreographyEvent::SagaQuarantined {
-        context: context.next_step(step.clone()),
-        reason,
-        step,
-        participant_id,
-    });
 }
 
 /// Fail a step with state transition
@@ -1465,7 +1398,7 @@ where
 /// ADR-0002 §2.2 `CompensationStart`: `CompensationStarted` could not be committed, so the undo
 /// was not invoked and nothing changed. The `Completed` state (with its undo data) is kept and a
 /// `CompensationFailedRetryable` is emitted so the resolver can re-request.
-fn fail_compensation_start_commit<F>(
+pub(crate) fn fail_compensation_start_commit<F>(
     context: &SagaContext,
     step: Box<str>,
     participant_id: Box<str>,
@@ -1539,7 +1472,7 @@ where
 /// Commits `CompensationCompleted` with its obligation, then `Compensating -> Compensated`, then
 /// emits. A failed commit quarantines; the caller runs `on_compensation_completed` only on
 /// `Applied`.
-fn commit_compensation_completed<A, F>(
+pub(crate) fn commit_compensation_completed<A, F>(
     actor: &mut A,
     context: &SagaContext,
     step: Box<str>,
@@ -1584,7 +1517,7 @@ where
 
 /// Commits the compensation failure (or quarantine) row with the events it obliges, then moves
 /// the state and emits. A failed commit quarantines with `CompensationResultCommitFailed`.
-fn commit_compensation_failed<A, F>(
+pub(crate) fn commit_compensation_failed<A, F>(
     actor: &mut A,
     context: &SagaContext,
     step: Box<str>,
@@ -1642,7 +1575,11 @@ where
         } else {
             SagaStateEntry::Failed(state.fail(reason, false, now))
         };
-        actor.saga_states().insert(run, entry);
+        let quarantined = matches!(entry, SagaStateEntry::Quarantined(_));
+        actor.saga_states().insert(run.clone(), entry);
+        if quarantined {
+            crate::state_ext::un_admit_and_latch_quarantined(actor, &run);
+        }
     }
     for event in outbox {
         emit(event);

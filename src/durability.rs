@@ -142,8 +142,13 @@ pub fn is_valid_emitted_transition(
         SagaChoreographyEvent::SagaQuarantined { .. } => {
             matches!(entry, Some(SagaStateEntry::Quarantined(_)))
         }
+        // ADR-0002: a failed `CompensationStarted` commit leaves `Completed` (undo data kept) and
+        // emits this event; an undo that started and was refused leaves `Compensating`.
         SagaChoreographyEvent::CompensationFailedRetryable { .. } => {
-            matches!(entry, Some(SagaStateEntry::Compensating(_)))
+            matches!(
+                entry,
+                Some(SagaStateEntry::Compensating(_) | SagaStateEntry::Completed(_))
+            )
         }
         _ => true,
     }
@@ -690,6 +695,7 @@ where
                     state.quarantine(failure.reason.clone(), failure.failed_at_millis),
                 ),
             );
+            crate::state_ext::un_admit_and_latch_quarantined(actor, &run);
         }
         Some(SagaStateEntry::Compensating(state)) => {
             actor.saga_states().insert(
@@ -1637,6 +1643,7 @@ where
                 actor
                     .saga_states()
                     .insert(run.clone(), SagaStateEntry::Quarantined(new_state));
+                crate::state_ext::un_admit_and_latch_quarantined(actor, &run);
             }
             let step = accepted.context.step_name.clone();
             let mut context = accepted.context;
@@ -2469,27 +2476,14 @@ fn quarantine_workflow_dedupe_failure<A, F>(
         run = %run,
         reason = %reason
     );
-    crate::state_ext::quarantine_preserving_state(
+    crate::state_ext::quarantine_run_with_evidence(
         actor,
         context,
-        workflow.step_name(),
-        "dedupe_check_failed",
-        &reason,
+        (workflow.step_name().into(), workflow.participant_id_owned()),
+        ("dedupe_check_failed", reason),
         now,
+        emit,
     );
-    actor.record_event_run(
-        &run,
-        ParticipantEvent::Quarantined {
-            reason: reason.clone(),
-            quarantined_at_millis: now,
-        },
-    );
-    emit(SagaChoreographyEvent::SagaQuarantined {
-        context: context.next_step(workflow.step_name().into()),
-        reason,
-        step: workflow.step_name().into(),
-        participant_id: workflow.participant_id_owned(),
-    });
 }
 
 fn quarantine_workflow_step_persistence_failure<A, F>(
@@ -2503,28 +2497,18 @@ fn quarantine_workflow_step_persistence_failure<A, F>(
     A: HasSagaParticipantSupport,
     F: FnMut(SagaChoreographyEvent),
 {
-    let run = context.run_key();
-    if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&run) {
-        actor.saga_states().insert(
-            run.clone(),
-            SagaStateEntry::Quarantined(state.quarantine(reason.clone(), now)),
-        );
-    }
-    actor.record_event_run(
-        &run,
-        ParticipantEvent::Quarantined {
-            reason: reason.clone(),
-            quarantined_at_millis: now,
-        },
+    crate::state_ext::quarantine_run_with_evidence(
+        actor,
+        context,
+        (workflow.step_name().into(), workflow.participant_id_owned()),
+        ("step_persistence_failed", reason),
+        now,
+        emit,
     );
-    emit(SagaChoreographyEvent::SagaQuarantined {
-        context: context.next_step(workflow.step_name().into()),
-        reason,
-        step: workflow.step_name().into(),
-        participant_id: workflow.participant_id_owned(),
-    });
 }
 
+/// Keeps `Completed` undo data in memory (`Completed::quarantine`) and quarantines through the
+/// shared path that un-admits and latches the run.
 fn quarantine_workflow_compensation_request_persistence_failure<A, F>(
     actor: &mut A,
     workflow: &'static dyn SagaWorkflowParticipant<A>,
@@ -2536,40 +2520,14 @@ fn quarantine_workflow_compensation_request_persistence_failure<A, F>(
     A: HasSagaParticipantSupport,
     F: FnMut(SagaChoreographyEvent),
 {
-    let run = context.run_key();
-    let state_entry = actor.saga_states().remove(&run);
-    let quarantined = match state_entry {
-        Some(SagaStateEntry::Executing(state)) => Some(state.quarantine(reason.clone(), now)),
-        Some(SagaStateEntry::Completed(state)) => Some(
-            state
-                .start_compensation(now)
-                .quarantine(reason.clone(), now),
-        ),
-        Some(SagaStateEntry::Compensating(state)) => Some(state.quarantine(reason.clone(), now)),
-        Some(other) => {
-            actor.saga_states().insert(run.clone(), other);
-            None
-        }
-        None => None,
-    };
-    if let Some(state) = quarantined {
-        actor
-            .saga_states()
-            .insert(run.clone(), SagaStateEntry::Quarantined(state));
-    }
-    actor.record_event_run(
-        &run,
-        ParticipantEvent::Quarantined {
-            reason: reason.clone(),
-            quarantined_at_millis: now,
-        },
+    crate::state_ext::quarantine_run_with_evidence(
+        actor,
+        context,
+        (workflow.step_name().into(), workflow.participant_id_owned()),
+        ("compensation_request_persistence_failed", reason),
+        now,
+        emit,
     );
-    emit(SagaChoreographyEvent::SagaQuarantined {
-        context: context.next_step(workflow.step_name().into()),
-        reason,
-        step: workflow.step_name().into(),
-        participant_id: workflow.participant_id_owned(),
-    });
 }
 
 fn fail_workflow_step<A, F>(
@@ -2686,6 +2644,29 @@ where
                     accepted.compensation_data.clone(),
                 )
             });
+    let will_compensate = match actor.saga_states_ref().get(&run) {
+        Some(SagaStateEntry::Completed(_)) => true,
+        Some(SagaStateEntry::Executing(_)) => accepted_recovery_data.is_some(),
+        _ => false,
+    };
+    // The undo must not run without a durable start (ADR-0002 `CompensationStart`).
+    if will_compensate
+        && let Err(err) = actor.commit_transition(
+            &run,
+            ParticipantEvent::CompensationStarted {
+                attempt: 1,
+                started_at_millis: now,
+            },
+        )
+    {
+        return crate::helpers::fail_compensation_start_commit(
+            context,
+            workflow.step_name().into(),
+            workflow.participant_id_owned(),
+            err,
+            emit,
+        );
+    }
     let state_entry = actor.saga_states().remove(&run);
     let (saga_input, comp_data, compensating_state) = match state_entry {
         Some(SagaStateEntry::Completed(state)) => {
@@ -2719,14 +2700,6 @@ where
         mark_accepted_step_resolved(actor, &run, accepted.execution_id);
     }
 
-    actor.record_event_run(
-        &run,
-        ParticipantEvent::CompensationStarted {
-            attempt: 1,
-            started_at_millis: now,
-        },
-    );
-
     match workflow.compensate_step(actor, context, &comp_data) {
         Ok(CompensationOutput::Completed) => {
             complete_workflow_compensation(actor, workflow, context, now, emit)
@@ -2743,7 +2716,10 @@ where
             saga_input,
             comp_data,
         ) {
-            Ok(event) => emit(event),
+            Ok(event) => {
+                emit(event);
+                IngressOutcome::Applied
+            }
             Err(error) => fail_workflow_compensation(
                 actor,
                 workflow,
@@ -2757,7 +2733,6 @@ where
         },
         Err(error) => fail_workflow_compensation(actor, workflow, context, error, now, emit),
     }
-    IngressOutcome::Applied
 }
 
 fn complete_workflow_compensation<A, F>(
@@ -2766,31 +2741,24 @@ fn complete_workflow_compensation<A, F>(
     context: &SagaContext,
     now: u64,
     emit: &mut F,
-) where
+) -> IngressOutcome
+where
     A: HasSagaParticipantSupport,
     F: FnMut(SagaChoreographyEvent),
 {
-    let run = context.run_key();
-
-    if let Some(SagaStateEntry::Compensating(state)) = actor.saga_states().remove(&run) {
-        let new_state = state.complete_compensation(now);
-        actor
-            .saga_states()
-            .insert(run.clone(), SagaStateEntry::Compensated(new_state));
-    }
-
-    actor.record_event_run(
-        &run,
-        ParticipantEvent::CompensationCompleted {
-            completed_at_millis: now,
-        },
+    let outcome = crate::helpers::commit_compensation_completed(
+        actor,
+        context,
+        workflow.step_name().into(),
+        workflow.participant_id_owned(),
+        now,
+        emit,
     );
-
-    emit(SagaChoreographyEvent::CompensationCompleted {
-        context: context.next_step(workflow.step_name().into()),
-    });
-
-    workflow.on_compensation_completed(actor, context);
+    // Hooks run only once the result is durable (R11).
+    if matches!(outcome, IngressOutcome::Applied) {
+        workflow.on_compensation_completed(actor, context);
+    }
+    outcome
 }
 
 fn fail_workflow_compensation<A, F>(
@@ -2800,67 +2768,29 @@ fn fail_workflow_compensation<A, F>(
     error: crate::CompensationError,
     now: u64,
     emit: &mut F,
-) where
+) -> IngressOutcome
+where
     A: HasSagaParticipantSupport,
     F: FnMut(SagaChoreographyEvent),
 {
-    let run = context.run_key();
     let (reason, is_ambiguous) = match error {
         crate::CompensationError::SafeToRetry { reason } => (reason, false),
         crate::CompensationError::Ambiguous { reason } => (reason, true),
         crate::CompensationError::Terminal { reason } => (reason, false),
     };
-
-    if let Some(SagaStateEntry::Compensating(state)) = actor.saga_states().remove(&run) {
-        if is_ambiguous {
-            let new_state = state.quarantine(reason.clone(), now);
-            actor
-                .saga_states()
-                .insert(run.clone(), SagaStateEntry::Quarantined(new_state));
-        } else {
-            let new_state = state.fail(reason.clone(), false, now);
-            actor
-                .saga_states()
-                .insert(run.clone(), SagaStateEntry::Failed(new_state));
-        }
+    let outcome = crate::helpers::commit_compensation_failed(
+        actor,
+        context,
+        workflow.step_name().into(),
+        workflow.participant_id_owned(),
+        (reason.clone(), is_ambiguous),
+        now,
+        emit,
+    );
+    if matches!(outcome, IngressOutcome::Applied) {
+        workflow.on_quarantined(actor, context, &reason);
     }
-
-    if is_ambiguous {
-        actor.record_event_run(
-            &run,
-            ParticipantEvent::Quarantined {
-                reason: reason.clone(),
-                quarantined_at_millis: now,
-            },
-        );
-    } else {
-        actor.record_event_run(
-            &run,
-            ParticipantEvent::CompensationFailed {
-                error: reason.clone(),
-                is_ambiguous,
-                failed_at_millis: now,
-            },
-        );
-    }
-
-    let event_context = context.next_step(workflow.step_name().into());
-    emit(SagaChoreographyEvent::CompensationFailed {
-        context: event_context.clone(),
-        participant_id: workflow.participant_id_owned(),
-        error: reason.clone(),
-        is_ambiguous,
-    });
-    if is_ambiguous {
-        emit(SagaChoreographyEvent::SagaQuarantined {
-            context: event_context,
-            reason: reason.clone(),
-            step: workflow.step_name().into(),
-            participant_id: workflow.participant_id_owned(),
-        });
-    }
-
-    workflow.on_quarantined(actor, context, &reason);
+    outcome
 }
 
 pub async fn apply_async_participant_saga_ingress<P, FApplyTerminal, FOnInvalid>(

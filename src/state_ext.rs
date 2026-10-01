@@ -616,8 +616,10 @@ pub(crate) fn admit_event<A: SagaStateExt + ?Sized>(
 /// run gets a fresh `Quarantined` entry (`prior_state` `"none"`); `Executing`, `Compensating`,
 /// `Completed` (keeping its compensation data) and `Failed` move through their typestate
 /// transition. An already `Quarantined` entry keeps its original reason and evidence; a
-/// `Compensated` run is finished and left as is. Returns whether the run is now `Quarantined`; if so it is also un-admitted and latched terminal
-/// (identically for both engines and the workflow adapter).
+/// `Compensated` run is finished and left as is (the only case returning `false`). `Idle` and
+/// `Triggered` entries (never executed) are quarantined like a missing run. Returns whether the run
+/// is now `Quarantined`; if so it is also un-admitted and latched terminal (identically for both
+/// engines and the workflow adapter).
 pub(crate) fn quarantine_preserving_state<A: SagaStateExt + ?Sized>(
     actor: &mut A,
     context: &SagaContext,
@@ -657,17 +659,84 @@ pub(crate) fn quarantine_preserving_state<A: SagaStateExt + ?Sized>(
         Some(SagaStateEntry::Failed(state)) => {
             SagaStateEntry::Quarantined(state.quarantine(reason, now))
         }
+        // Never executed: no effect and no undo data, so the same fresh-style transition applies.
+        Some(SagaStateEntry::Idle(state)) => SagaStateEntry::Quarantined(
+            state
+                .trigger(trigger, now)
+                .start_execution(now)
+                .quarantine(reason, now),
+        ),
+        Some(SagaStateEntry::Triggered(state)) => {
+            SagaStateEntry::Quarantined(state.start_execution(now).quarantine(reason, now))
+        }
         Some(other) => other,
     };
     let quarantined = matches!(entry, SagaStateEntry::Quarantined(_));
     actor.saga_states().insert(run.clone(), entry);
     if quarantined {
-        // Terminal latch (checked after `admitted_runs`, so un-admit): later events of this run are
-        // rejected as `TerminalRun` instead of running effects (owner decision Q6).
-        actor.saga_support_mut().admitted_runs.remove(&run);
-        actor.latch_terminal_saga(&run);
+        un_admit_and_latch_quarantined(actor, &run);
     }
     quarantined
+}
+
+/// Terminal latch for a run whose memory state just became `Quarantined` (checked after
+/// `admitted_runs`, so un-admit): later events of this run are rejected as `TerminalRun` instead of
+/// running effects or finalizing the evidence away (owner decision Q6). Every quarantine that does
+/// not go through [`quarantine_preserving_state`] must call this.
+pub(crate) fn un_admit_and_latch_quarantined<A: SagaStateExt + ?Sized>(
+    actor: &mut A,
+    run: &RunKey,
+) {
+    actor.saga_support_mut().admitted_runs.remove(run);
+    actor.latch_terminal_saga(run);
+}
+
+/// The single post-effect (or lookup-failure) quarantine path shared by the generic helpers and
+/// the workflow adapter (ADR-0002 §2.2, W3 review HIGH 4): moves the state through
+/// [`quarantine_preserving_state`] (keeps undo data, un-admits, latches terminal), writes the
+/// best-effort `Quarantined` evidence row and emits `SagaQuarantined`.
+///
+/// A `Compensated` run cannot be quarantined (it is finished): the refusal is logged with the run
+/// key and neither the row nor the event is produced, so memory, journal and the bus never disagree.
+/// Returns whether the run is now `Quarantined`.
+pub(crate) fn quarantine_run_with_evidence<A, F>(
+    actor: &mut A,
+    context: &SagaContext,
+    (step, participant_id): (Box<str>, Box<str>),
+    (trigger, reason): (&str, Box<str>),
+    now: u64,
+    emit: &mut F,
+) -> bool
+where
+    A: SagaStateExt + ?Sized,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let run = context.run_key();
+    if !quarantine_preserving_state(actor, context, &step, trigger, &reason, now) {
+        tracing::error!(
+            target: "core::saga",
+            event = "saga_quarantine_refused",
+            run = %run,
+            step = %step,
+            reason = %reason
+        );
+        return false;
+    }
+    // Best-effort evidence only: the journal may be the thing that just failed.
+    actor.record_event_run(
+        &run,
+        ParticipantEvent::Quarantined {
+            reason: reason.clone(),
+            quarantined_at_millis: now,
+        },
+    );
+    emit(SagaChoreographyEvent::SagaQuarantined {
+        context: context.next_step(step.clone()),
+        reason,
+        step,
+        participant_id,
+    });
+    true
 }
 
 /// Finalizes a `Completed`/`Failed` run after its terminal event (ADR-0001 §2.5, §2.7).
@@ -681,6 +750,19 @@ pub(crate) fn finalize_terminal_run<A: SagaStateExt + ?Sized>(
     outcome: RunTerminalOutcome,
     terminal_identity: &str,
 ) {
+    // A quarantined run keeps its journal rows and dedupe marks as evidence (owner decision Q6).
+    if matches!(
+        actor.saga_states_ref().get(run),
+        Some(SagaStateEntry::Quarantined(_))
+    ) {
+        tracing::error!(
+            target: "core::saga",
+            event = "saga_finalize_refused_quarantined",
+            run = %run,
+            outcome = ?outcome
+        );
+        return;
+    }
     let tombstone = RunTombstone::new(run.clone(), outcome, actor.now_millis());
     let cutoff = actor.replay_cutoff();
     let Err(err) = actor.finalize_run_strict(&tombstone, cutoff) else {
