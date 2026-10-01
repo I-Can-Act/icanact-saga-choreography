@@ -103,8 +103,8 @@ fn test_context(saga_id: u64) -> SagaContext {
         step_index: 0,
         attempt: 0,
         initiator_peer_id: PeerId::default(),
-        saga_started_at_millis: 1_700_000_000_000,
-        event_timestamp_millis: 1_700_000_000_000,
+        saga_started_at_millis: fixture_millis(0),
+        event_timestamp_millis: fixture_millis(0),
     }
 }
 
@@ -315,4 +315,11 @@ async fn async_ingress_tombstones_an_accepted_step_after_terminal_timeout() {
         late,
         Err(AcceptedStepError::AlreadyResolved { .. })
     ));
+}
+
+/// Process-constant, recent base for run fixtures: the resolver admits runs against the real
+/// clock, so fixture incarnations must be recent and constant across one run.
+fn fixture_millis(offset: u64) -> u64 {
+    static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BASE.get_or_init(SagaContext::now_millis) + offset
 }

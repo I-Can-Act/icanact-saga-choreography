@@ -1360,8 +1360,14 @@ mod tests {
 
     use super::{DEFAULT_TERMINAL_RETENTION_LIMIT, SagaChoreographyBus};
 
+    /// Process-constant recent incarnation: all events of one saga must share one run.
+    fn run_start_millis() -> u64 {
+        static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *BASE.get_or_init(SagaContext::now_millis)
+    }
+
     fn context_for(saga_type: &str, step_name: &str, saga_id: u64) -> SagaContext {
-        let now = SagaContext::now_millis();
+        let now = run_start_millis();
         SagaContext {
             saga_id: SagaId::new(saga_id),
             saga_type: saga_type.into(),
