@@ -486,6 +486,11 @@ fn required_path_description(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SagaBusPublishError {
+    AdmissionRejected {
+        saga_id: SagaId,
+        saga_type: Box<str>,
+        reason: Box<str>,
+    },
     PartialDelivery {
         saga_id: SagaId,
         saga_type: Box<str>,
@@ -566,37 +571,48 @@ impl SagaChoreographyBus {
     }
 
     pub fn publish(&self, event: SagaChoreographyEvent) -> PublishStats {
+        self.publish_with_admission(event).0
+    }
+
+    /// Publishes `event`; the second value is the rejection reason when a
+    /// `SagaStarted` was refused and replaced by a diagnostic `SagaFailed`.
+    fn publish_with_admission(
+        &self,
+        event: SagaChoreographyEvent,
+    ) -> (PublishStats, Option<Box<str>>) {
         let event_type = event.event_type();
         let mut expected_min_delivery: Option<u32> = None;
         let mut expected_required_path: Box<str> = "".into();
         let mut expected_context: Option<crate::SagaContext> = None;
         if let SagaChoreographyEvent::SagaStarted { context, .. } = &event {
             if !self.has_terminal_policy_for_saga_type(context.saga_type.as_ref()) {
+                let reason: Box<str> = format!(
+                    "terminal policy is required before saga start; saga_type={} saga_id={}",
+                    context.saga_type,
+                    context.saga_id.get()
+                )
+                .into();
                 let terminal = SagaChoreographyEvent::SagaFailed {
                     context: context.next_step(TERMINAL_RESOLVER_STEP.into()),
-                    reason: format!(
-                        "terminal policy is required before saga start; saga_type={} saga_id={}",
-                        context.saga_type,
-                        context.saga_id.get()
-                    )
-                    .into(),
+                    reason: reason.clone(),
                     failure: None,
                 };
                 if let Some(outcome) = terminal.terminal_outcome() {
                     self.store_terminal_outcome(terminal.context().saga_id, outcome);
                 }
-                return self.publish_event(terminal);
+                return (self.publish_event(terminal), Some(reason));
             }
             if let Some(reason) = self.saga_start_contract_violation_reason(context) {
+                let reason: Box<str> = reason.into();
                 let terminal = SagaChoreographyEvent::SagaFailed {
                     context: context.next_step(TERMINAL_RESOLVER_STEP.into()),
-                    reason: reason.into(),
+                    reason: reason.clone(),
                     failure: None,
                 };
                 if let Some(outcome) = terminal.terminal_outcome() {
                     self.store_terminal_outcome(terminal.context().saga_id, outcome);
                 }
-                return self.publish_event(terminal);
+                return (self.publish_event(terminal), Some(reason));
             }
             expected_min_delivery =
                 self.saga_start_expected_min_delivery(context.saga_type.as_ref());
@@ -641,14 +657,24 @@ impl SagaChoreographyBus {
             }
             let _ = self.publish_event(terminal);
         }
-        stats
+        (stats, None)
     }
 
     pub fn publish_strict(
         &self,
         event: SagaChoreographyEvent,
     ) -> Result<PublishStats, SagaBusPublishError> {
-        let stats = self.publish(event.clone());
+        let (stats, rejected) = self.publish_with_admission(event.clone());
+        if let Some(reason) = rejected {
+            // The diagnostic SagaFailed was already published; the start itself
+            // was not admitted, so the caller must not see success.
+            let context = event.context();
+            return Err(SagaBusPublishError::AdmissionRejected {
+                saga_id: context.saga_id,
+                saga_type: context.saga_type.clone(),
+                reason,
+            });
+        }
         if let Some(required_min_delivery) =
             self.required_path_expected_min_delivery_for_event(&event)
             && stats.delivered < required_min_delivery
@@ -1492,20 +1518,20 @@ mod tests {
     #[test]
     fn durable_resolver_restart_preserves_complete_compensation_scope() {
         let journal = Arc::new(InMemoryTerminalResolverJournal::default());
-        let mut required = HashSet::new();
-        required.insert(Box::<str>::from("finalize"));
-        let policy = TerminalPolicy::new(
-            "durable_multi_step".into(),
-            "durable_multi_step/test".into(),
-            FailureAuthority::AnyParticipant,
-            SuccessCriteria::AllOf(required),
-            Duration::from_secs(60),
-            Duration::from_secs(60),
-            &[],
-        );
+        let policy = DurableMultiStepContract::terminal_policy();
 
         {
             let bus = SagaChoreographyBus::new();
+            bus.register_workflow_contract_provider::<DurableMultiStepContract>()
+                .expect("workflow contract registration should succeed");
+            for step in ["first_effect", "second_effect", "finalize"] {
+                bus.register_bound_workflow_step("durable_multi_step", step)
+                    .expect("step binding should succeed");
+            }
+            // Live participant lanes so the strict start meets its required delivery.
+            let _participants: Vec<_> = (0..3)
+                .map(|_| bus.subscribe_saga_type_fn("durable_multi_step", |_event| true))
+                .collect();
             let _resolver = bus
                 .attach_durable_terminal_resolver(
                     policy.clone(),
@@ -1518,7 +1544,7 @@ mod tests {
                 context: start.clone(),
                 payload: Vec::new(),
             })
-            .expect("saga start should publish");
+            .expect("saga start should be admitted");
             bus.publish_strict(SagaChoreographyEvent::StepCompleted {
                 context: start.next_step("first_effect".into()),
                 output: Vec::new(),
@@ -1912,6 +1938,52 @@ mod tests {
 
         fn terminal_policy() -> TerminalPolicy {
             TerminalPolicy::order_lifecycle_default()
+        }
+    }
+
+    struct DurableMultiStepContract;
+
+    impl SagaWorkflowContract for DurableMultiStepContract {
+        fn saga_type() -> &'static str {
+            "durable_multi_step"
+        }
+
+        fn first_step() -> &'static str {
+            "first_effect"
+        }
+
+        fn steps() -> &'static [SagaWorkflowStepContract] {
+            &[
+                SagaWorkflowStepContract {
+                    step_name: "first_effect",
+                    participant_id: "first-participant",
+                    depends_on: WorkflowDependencySpec::OnSagaStart,
+                },
+                SagaWorkflowStepContract {
+                    step_name: "second_effect",
+                    participant_id: "second-participant",
+                    depends_on: WorkflowDependencySpec::After("first_effect"),
+                },
+                SagaWorkflowStepContract {
+                    step_name: "finalize",
+                    participant_id: "finalizer",
+                    depends_on: WorkflowDependencySpec::After("second_effect"),
+                },
+            ]
+        }
+
+        fn terminal_policy() -> TerminalPolicy {
+            let mut required = HashSet::new();
+            required.insert(Box::<str>::from("finalize"));
+            TerminalPolicy::new(
+                "durable_multi_step".into(),
+                "durable_multi_step/test".into(),
+                FailureAuthority::AnyParticipant,
+                SuccessCriteria::AllOf(required),
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+                &[],
+            )
         }
     }
 
@@ -2321,6 +2393,52 @@ mod tests {
             reason.contains("required_path=create_order(order-manager),risk_check(risk-engine)"),
             "expected required path participants in reason, got: {reason}"
         );
+    }
+
+    #[test]
+    fn strict_start_rejection_is_err_even_when_failure_notification_delivers() {
+        // (1) no terminal policy registered for the saga type
+        let bus = SagaChoreographyBus::new();
+        let sub = bus.subscribe_saga_type_fn("order_lifecycle", |_event| true);
+        let saga_id = SagaId::new(90061);
+        let res = bus.publish_strict(SagaChoreographyEvent::SagaStarted {
+            context: context("risk_check", saga_id.get()),
+            payload: Vec::new(),
+        });
+        assert!(
+            matches!(
+                res,
+                Err(super::SagaBusPublishError::AdmissionRejected { .. })
+            ),
+            "start without terminal policy must be Err, got {res:?}"
+        );
+        assert!(matches!(
+            bus.take_terminal_outcome(saga_id),
+            Some(SagaTerminalOutcome::Failed { .. })
+        ));
+        assert!(bus.unsubscribe(sub));
+
+        // (2) start contract invalid (wrong first step)
+        let bus = SagaChoreographyBus::new();
+        bus.register_workflow_contract_provider::<OrderLifecycleContract>()
+            .expect("workflow contract registration should succeed");
+        let _sub = bus.subscribe_saga_type_fn("order_lifecycle", |_event| true);
+        let saga_id = SagaId::new(90062);
+        let res = bus.publish_strict(SagaChoreographyEvent::SagaStarted {
+            context: context("not_the_first_step", saga_id.get()),
+            payload: Vec::new(),
+        });
+        assert!(
+            matches!(
+                res,
+                Err(super::SagaBusPublishError::AdmissionRejected { .. })
+            ),
+            "start violating contract must be Err, got {res:?}"
+        );
+        assert!(matches!(
+            bus.take_terminal_outcome(saga_id),
+            Some(SagaTerminalOutcome::Failed { .. })
+        ));
     }
 
     #[test]

@@ -894,6 +894,9 @@ mod tests {
         let bus = SagaChoreographyBus::new();
         bus.register_workflow_contract_provider::<BindingWorkflowContract>()
             .expect("workflow contract registration should succeed");
+        let _resolver = bus
+            .attach_terminal_resolver_for_contract::<BindingWorkflowContract>("binding-resolver")
+            .expect("terminal resolver should attach");
         let actor_ref = icanact_core::SyncActorRef::<BindingActor>::new_unset();
         let subs = bind_sync_workflow_participant_channel_lazy_strict::<BindingActor, ()>(
             &bus, &actor_ref, "saga", 1,
@@ -910,12 +913,13 @@ mod tests {
         assert!(
             matches!(
                 err,
-                crate::SagaBusPublishError::RequiredPathDeliveryShortfall { delivered: 0, .. }
-                    | crate::SagaBusPublishError::PartialDelivery { delivered: 0, .. }
-                    | crate::SagaBusPublishError::TerminalEscalationPartialDelivery {
-                        delivered: 0,
-                        ..
-                    }
+                // The terminal resolver (needed for start admission) is the one
+                // delivery; the unset lazy participant channel must not count.
+                crate::SagaBusPublishError::RequiredPathDeliveryShortfall {
+                    delivered: 1,
+                    required_min_delivered: 2,
+                    ..
+                }
             ),
             "unexpected strict publish error: {err:?}"
         );
