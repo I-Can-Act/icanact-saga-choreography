@@ -5,15 +5,17 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use super::FaultJournal;
+
 use icanact_saga_choreography::durability::{
     ActiveSagaExecution, HasActiveSagaExecution, apply_sync_participant_saga_ingress_with_hooks,
 };
 use icanact_saga_choreography::{
     CompensationError, CompensationOutput, DependencySpec, FailureAuthority,
-    HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal, SagaBusPublishError,
-    SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant,
-    SagaParticipantSupport, SagaWorkflowContract, SagaWorkflowStepContract, StepError, StepOutput,
-    SuccessCriteria, TerminalPolicy, WorkflowDependencySpec,
+    HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal, IngressOutcome,
+    SagaBusPublishError, SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId,
+    SagaParticipant, SagaParticipantSupport, SagaWorkflowContract, SagaWorkflowStepContract,
+    StepError, StepOutput, SuccessCriteria, TerminalPolicy, WorkflowDependencySpec,
 };
 
 pub const SAGA_TYPE: &str = "canonical_fixture";
@@ -101,8 +103,10 @@ pub fn canonical_context(saga_id: u64) -> SagaContext {
 }
 
 /// Faults the fixture observed while ingesting one event.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct IngressReport {
+    /// Typed outcome the ingress returned (ADR-0002); `Applied` is the only clean one.
+    pub outcome: IngressOutcome,
     /// Emitted events the ingress rejected as invalid transitions.
     pub invalid_emissions: Vec<&'static str>,
     /// Emitted events whose strict publish failed.
@@ -113,7 +117,9 @@ pub struct IngressReport {
 
 impl IngressReport {
     pub fn is_clean(&self) -> bool {
-        self.invalid_emissions.is_empty() && self.publish_errors.is_empty()
+        matches!(self.outcome, IngressOutcome::Applied)
+            && self.invalid_emissions.is_empty()
+            && self.publish_errors.is_empty()
     }
 
     pub fn into_result(self) -> Result<usize, Self> {
@@ -128,7 +134,8 @@ impl IngressReport {
 pub struct CanonicalParticipant {
     step_name: &'static str,
     depends: DependencySpec,
-    saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
+    saga: SagaParticipantSupport<FaultJournal<InMemoryJournal>, InMemoryDedupe>,
+    journal: FaultJournal<InMemoryJournal>,
     active: Option<ActiveSagaExecution>,
     bus: Option<SagaChoreographyBus>,
     pub executed: usize,
@@ -136,14 +143,21 @@ pub struct CanonicalParticipant {
 
 impl CanonicalParticipant {
     pub fn new(step_name: &'static str, depends: DependencySpec) -> Self {
+        let journal = FaultJournal::new(InMemoryJournal::new());
         Self {
             step_name,
             depends,
-            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+            saga: SagaParticipantSupport::new(journal.clone(), InMemoryDedupe::new()),
+            journal,
             active: None,
             bus: None,
             executed: 0,
         }
+    }
+
+    /// Fault-injection handle onto this participant's journal.
+    pub fn journal(&self) -> &FaultJournal<InMemoryJournal> {
+        &self.journal
     }
 
     /// The fixture owns publication (the support is left bus-less) so every
@@ -158,7 +172,7 @@ impl CanonicalParticipant {
         let mut publish_errors = Vec::new();
         let mut published = 0usize;
         let bus = self.bus.clone();
-        apply_sync_participant_saga_ingress_with_hooks(
+        let ingress = apply_sync_participant_saga_ingress_with_hooks(
             self,
             event,
             |_p, _e| {},
@@ -181,6 +195,7 @@ impl CanonicalParticipant {
             },
         );
         IngressReport {
+            outcome: ingress.outcome,
             invalid_emissions: invalid,
             publish_errors,
             published,
@@ -189,7 +204,7 @@ impl CanonicalParticipant {
 }
 
 impl HasSagaParticipantSupport for CanonicalParticipant {
-    type Journal = InMemoryJournal;
+    type Journal = FaultJournal<InMemoryJournal>;
     type Dedupe = InMemoryDedupe;
     fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
         &self.saga

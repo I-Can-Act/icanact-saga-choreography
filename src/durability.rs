@@ -1792,7 +1792,8 @@ pub fn apply_sync_participant_saga_ingress<P, FApplyTerminal, FOnInvalid>(
     event: SagaChoreographyEvent,
     apply_terminal_side_effects: FApplyTerminal,
     on_invalid_transition: FOnInvalid,
-) where
+) -> IngressReport
+where
     P: SagaParticipant + SagaStateExt,
     FApplyTerminal: FnMut(&mut P, &SagaChoreographyEvent),
     FOnInvalid: FnMut(&SagaChoreographyEvent),
@@ -1803,7 +1804,7 @@ pub fn apply_sync_participant_saga_ingress<P, FApplyTerminal, FOnInvalid>(
         apply_terminal_side_effects,
         on_invalid_transition,
         |_participant, _event| {},
-    );
+    )
 }
 
 pub fn apply_sync_participant_saga_ingress_with_hooks<P, FApplyTerminal, FOnInvalid, FOnEmitted>(
@@ -1812,7 +1813,8 @@ pub fn apply_sync_participant_saga_ingress_with_hooks<P, FApplyTerminal, FOnInva
     mut apply_terminal_side_effects: FApplyTerminal,
     mut on_invalid_transition: FOnInvalid,
     mut on_emitted_transition: FOnEmitted,
-) where
+) -> IngressReport
+where
     P: SagaParticipant + SagaStateExt,
     FApplyTerminal: FnMut(&mut P, &SagaChoreographyEvent),
     FOnInvalid: FnMut(&SagaChoreographyEvent),
@@ -1822,7 +1824,9 @@ pub fn apply_sync_participant_saga_ingress_with_hooks<P, FApplyTerminal, FOnInva
     mark_matching_accepted_step_failed(participant, &event);
 
     let mut emitted = Vec::new();
-    handle_saga_event_with_emit(participant, event, |next_event| emitted.push(next_event));
+    let outcome =
+        handle_saga_event_with_emit(participant, event, |next_event| emitted.push(next_event));
+    let mut publish_failures = Vec::new();
 
     let saga_bus = participant.saga_support().bus.clone();
     for next_event in emitted {
@@ -1846,8 +1850,10 @@ pub fn apply_sync_participant_saga_ingress_with_hooks<P, FApplyTerminal, FOnInva
                 event = "participant_ingress_emit_publish_failed",
                 error = ?err
             );
+            publish_failures.push(err);
         }
     }
+    report(outcome, publish_failures)
 }
 
 fn workflow_for_event<A>(
@@ -2798,7 +2804,8 @@ pub async fn apply_async_participant_saga_ingress<P, FApplyTerminal, FOnInvalid>
     event: SagaChoreographyEvent,
     apply_terminal_side_effects: FApplyTerminal,
     on_invalid_transition: FOnInvalid,
-) where
+) -> IngressReport
+where
     P: AsyncSagaParticipant + SagaStateExt,
     FApplyTerminal: FnMut(&mut P, &SagaChoreographyEvent),
     FOnInvalid: FnMut(&SagaChoreographyEvent),
@@ -2810,7 +2817,7 @@ pub async fn apply_async_participant_saga_ingress<P, FApplyTerminal, FOnInvalid>
         on_invalid_transition,
         |_participant, _event| {},
     )
-    .await;
+    .await
 }
 
 pub async fn apply_async_participant_saga_ingress_with_hooks<
@@ -2824,7 +2831,8 @@ pub async fn apply_async_participant_saga_ingress_with_hooks<
     mut apply_terminal_side_effects: FApplyTerminal,
     mut on_invalid_transition: FOnInvalid,
     mut on_emitted_transition: FOnEmitted,
-) where
+) -> IngressReport
+where
     P: AsyncSagaParticipant + SagaStateExt,
     FApplyTerminal: FnMut(&mut P, &SagaChoreographyEvent),
     FOnInvalid: FnMut(&SagaChoreographyEvent),
@@ -2834,8 +2842,11 @@ pub async fn apply_async_participant_saga_ingress_with_hooks<
     mark_matching_accepted_step_failed(participant, &event);
 
     let mut emitted = Vec::new();
-    handle_async_saga_event_with_emit(participant, event, |next_event| emitted.push(next_event))
-        .await;
+    let outcome = handle_async_saga_event_with_emit(participant, event, |next_event| {
+        emitted.push(next_event)
+    })
+    .await;
+    let mut publish_failures = Vec::new();
 
     let saga_bus = participant.saga_support().bus.clone();
     for next_event in emitted {
@@ -2859,8 +2870,10 @@ pub async fn apply_async_participant_saga_ingress_with_hooks<
                 event = "async_participant_ingress_emit_publish_failed",
                 error = ?err
             );
+            publish_failures.push(err);
         }
     }
+    report(outcome, publish_failures)
 }
 
 pub fn run_participant_phase_with_panic_quarantine<A, R, F>(

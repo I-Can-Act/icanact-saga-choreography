@@ -37,6 +37,28 @@ fn canonical_fixture_surfaces_publish_failure() {
 }
 
 #[test]
+fn canonical_fixture_surfaces_commit_failure_outcome() {
+    use icanact_saga_choreography::{CommitStage, IngressOutcome};
+    use support::{FaultTrigger, JournalOp};
+    let bus = canonical_bus(&[]);
+    let mut p = participant(&bus);
+    p.journal().fail_once(
+        JournalOp::Append,
+        FaultTrigger::EventKind("StepExecutionStarted"),
+    );
+    let report = p.ingest(started(4));
+    assert_eq!(
+        p.executed, 0,
+        "callback must not run without a durable intent"
+    );
+    assert!(
+        matches!(&report.outcome, IngressOutcome::Failed(f) if f.stage == CommitStage::Intent),
+        "intent commit failure must surface as a typed outcome, got {report:?}"
+    );
+    assert!(!report.is_clean());
+}
+
+#[test]
 fn legacy_low_level_path_hides_the_same_failure() {
     let (bus, _sub) = canonical_bus_with_rejecting_recipient();
     let mut p = participant(&bus);
