@@ -126,6 +126,70 @@ impl TerminalPolicy {
     }
 }
 
+/// Reasons a [`TerminalPolicy`] can never resolve (or resolves vacuously).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalPolicyError {
+    EmptyAllOf,
+    EmptyAnyOf,
+    EmptyQuorumGroup,
+    ZeroQuorum,
+    QuorumExceedsGroup,
+    ZeroOverallTimeout,
+    ZeroStalledTimeout,
+}
+
+impl std::fmt::Display for TerminalPolicyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::EmptyAllOf => "AllOf success criteria has no steps",
+            Self::EmptyAnyOf => "AnyOf success criteria has no steps",
+            Self::EmptyQuorumGroup => "Quorum success criteria has an empty group",
+            Self::ZeroQuorum => "Quorum success criteria requires zero steps",
+            Self::QuorumExceedsGroup => "Quorum required_count exceeds group size",
+            Self::ZeroOverallTimeout => "overall_timeout is zero",
+            Self::ZeroStalledTimeout => "stalled_timeout is zero",
+        })
+    }
+}
+
+impl std::error::Error for TerminalPolicyError {}
+
+impl TerminalPolicy {
+    /// Rejects policies that are vacuous or can never be satisfied.
+    pub fn validate(&self) -> Result<(), TerminalPolicyError> {
+        match &self.success_criteria {
+            SuccessCriteria::AllOf(steps) if steps.is_empty() => {
+                return Err(TerminalPolicyError::EmptyAllOf);
+            }
+            SuccessCriteria::AnyOf(steps) if steps.is_empty() => {
+                return Err(TerminalPolicyError::EmptyAnyOf);
+            }
+            SuccessCriteria::Quorum { group_steps, .. } if group_steps.is_empty() => {
+                return Err(TerminalPolicyError::EmptyQuorumGroup);
+            }
+            SuccessCriteria::Quorum {
+                required_count: 0, ..
+            } => {
+                return Err(TerminalPolicyError::ZeroQuorum);
+            }
+            SuccessCriteria::Quorum {
+                group_steps,
+                required_count,
+            } if *required_count > group_steps.len() => {
+                return Err(TerminalPolicyError::QuorumExceedsGroup);
+            }
+            _ => {}
+        }
+        if self.overall_timeout.is_zero() {
+            return Err(TerminalPolicyError::ZeroOverallTimeout);
+        }
+        if self.stalled_timeout.is_zero() {
+            return Err(TerminalPolicyError::ZeroStalledTimeout);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 impl TerminalPolicy {
     pub fn order_lifecycle_default() -> Self {
@@ -160,6 +224,8 @@ struct SagaResolutionState {
     last_progress_at_millis: u64,
     last_context: SagaContext,
     terminal_latched: bool,
+    /// Event type of the first terminal outcome latched for this saga.
+    terminal_outcome: Option<&'static str>,
 }
 
 #[derive(Clone, Debug)]
@@ -200,6 +266,7 @@ impl SagaResolutionState {
             last_progress_at_millis: progress_at_millis,
             last_context: seed_context.clone(),
             terminal_latched: false,
+            terminal_outcome: None,
         }
     }
 }
@@ -266,6 +333,7 @@ impl TerminalResolver {
 
         let saga_id = event.context().saga_id;
         if self.terminal_latched_set.contains(&saga_id) {
+            warn_if_contradictory_terminal(self.states.get(&saga_id), event);
             return Vec::new();
         }
         let mut out = Vec::new();
@@ -276,6 +344,7 @@ impl TerminalResolver {
             .or_insert_with(|| SagaResolutionState::new(event.context(), now_millis));
 
         if state.terminal_latched {
+            warn_if_contradictory_terminal(Some(state), event);
             return Vec::new();
         }
 
@@ -488,8 +557,20 @@ impl TerminalResolver {
             }
             SagaChoreographyEvent::SagaCompleted { .. }
             | SagaChoreographyEvent::SagaFailed { .. }
-            | SagaChoreographyEvent::SagaQuarantined { .. }
-            | SagaChoreographyEvent::CompensationStarted { .. } => {}
+            | SagaChoreographyEvent::SagaQuarantined { .. } => {
+                // An authoritative terminal event is absorbing: latch before
+                // any timeout evaluation can emit a competing outcome.
+                state.terminal_latched = true;
+                state.terminal_outcome = Some(event.event_type());
+            }
+            SagaChoreographyEvent::CompensationStarted { .. } => {}
+        }
+
+        if state.terminal_latched && state.terminal_outcome.is_none() {
+            state.terminal_outcome = out
+                .iter()
+                .find(|e| is_terminal_event(e))
+                .map(SagaChoreographyEvent::event_type);
         }
 
         if !state.terminal_latched {
@@ -514,8 +595,13 @@ impl TerminalResolver {
             if state.terminal_latched {
                 continue;
             }
+            let before = out.len();
             out.extend(timeout_events(&self.policy, state, now_millis));
             if state.terminal_latched {
+                state.terminal_outcome = out[before..]
+                    .iter()
+                    .find(|e| is_terminal_event(e))
+                    .map(SagaChoreographyEvent::event_type);
                 newly_latched.push(*saga_id);
             }
         }
@@ -537,6 +623,36 @@ impl TerminalResolver {
             };
             self.states.remove(&evicted);
         }
+    }
+}
+
+fn is_terminal_event(event: &SagaChoreographyEvent) -> bool {
+    matches!(
+        event,
+        SagaChoreographyEvent::SagaCompleted { .. }
+            | SagaChoreographyEvent::SagaFailed { .. }
+            | SagaChoreographyEvent::SagaQuarantined { .. }
+    )
+}
+
+fn warn_if_contradictory_terminal(
+    state: Option<&SagaResolutionState>,
+    event: &SagaChoreographyEvent,
+) {
+    if !is_terminal_event(event) {
+        return;
+    }
+    let Some(latched) = state.and_then(|state| state.terminal_outcome) else {
+        return;
+    };
+    if latched != event.event_type() {
+        tracing::warn!(
+            event = "saga_contradictory_terminal_ignored",
+            saga_id = %event.context().saga_id,
+            latched,
+            incoming = event.event_type(),
+            "ignoring contradictory terminal event after terminal latch"
+        );
     }
 }
 
@@ -1313,6 +1429,57 @@ mod tests {
             requires_compensation: false,
         });
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn authoritative_quarantine_is_absorbing_live_and_after_restore() {
+        let mut required_steps = HashSet::new();
+        required_steps.insert("create_order".into());
+        let policy = TerminalPolicy {
+            saga_type: "order_lifecycle".into(),
+            policy_id: "absorbing".into(),
+            failure_authority: FailureAuthority::AnyParticipant,
+            success_criteria: SuccessCriteria::AllOf(required_steps),
+            overall_timeout: Duration::from_millis(100),
+            stalled_timeout: Duration::from_secs(60),
+            workflow_steps: &[],
+        };
+        let started = SagaChoreographyEvent::SagaStarted {
+            context: ctx_at("risk_check", 9, 1_000, 1_000),
+            payload: Vec::new(),
+        };
+        let quarantined = SagaChoreographyEvent::SagaQuarantined {
+            context: ctx_at("participant", 9, 1_000, 1_010),
+            reason: "ambiguous".into(),
+            step: "create_order".into(),
+            participant_id: "order-manager".into(),
+        };
+        let late_completed = SagaChoreographyEvent::StepCompleted {
+            context: ctx_at("create_order", 9, 1_000, 1_020),
+            output: vec![],
+            saga_input: vec![],
+            compensation_available: false,
+        };
+
+        let mut resolver = TerminalResolver::new(policy.clone());
+        assert!(resolver.ingest_at(&started, 1_000).is_empty());
+        assert!(resolver.ingest_at(&quarantined, 1_010).is_empty());
+        let late = resolver.ingest_at(&late_completed, 1_020);
+        assert!(
+            late.is_empty(),
+            "late completion after quarantine: {late:?}"
+        );
+        let timed_out = resolver.poll_timeouts_at(5_000);
+        assert!(
+            timed_out.is_empty(),
+            "timeout after quarantine: {timed_out:?}"
+        );
+
+        let (mut restored, unpublished) =
+            TerminalResolver::restore_from_events(policy, std::slice::from_ref(&quarantined));
+        assert!(unpublished.is_empty(), "restore emitted: {unpublished:?}");
+        assert!(restored.poll_timeouts_at(5_000).is_empty());
+        assert!(restored.ingest_at(&late_completed, 5_000).is_empty());
     }
 
     #[test]

@@ -104,7 +104,20 @@ pub fn validate_workflow_contract(
         ));
     }
 
+    policy.validate().map_err(|err| {
+        format!("workflow contract invalid terminal policy: saga_type={saga_type} error={err}")
+    })?;
+
     for step in steps {
+        if matches!(
+            step.depends_on,
+            WorkflowDependencySpec::AnyOf([]) | WorkflowDependencySpec::AllOf([])
+        ) {
+            return Err(format!(
+                "workflow contract step has empty dependency group: saga_type={} step={}",
+                saga_type, step.step_name
+            ));
+        }
         for dependency in dependency_steps(step.depends_on) {
             if !by_step.contains_key(dependency) {
                 return Err(format!(
@@ -612,5 +625,91 @@ mod tests {
         });
         assert!(full_quorum_required.contains("q1"));
         assert!(full_quorum_required.contains("q2"));
+    }
+
+    #[test]
+    fn workflow_validation_rejects_empty_groups_and_impossible_quorum() {
+        use crate::resolver::TerminalPolicyError as E;
+
+        fn set(items: &[&str]) -> HashSet<Box<str>> {
+            items.iter().map(|s| (*s).into()).collect()
+        }
+        let with = |criteria: SuccessCriteria, overall: u64, stalled: u64| {
+            let mut p = policy_all_of("wf", &["a"]);
+            p.success_criteria = criteria;
+            p.overall_timeout = Duration::from_secs(overall);
+            p.stalled_timeout = Duration::from_secs(stalled);
+            p
+        };
+        let quorum = |items: &[&str], required_count: usize| SuccessCriteria::Quorum {
+            group_steps: set(items),
+            required_count,
+        };
+
+        let invalid = [
+            (
+                with(SuccessCriteria::AllOf(set(&[])), 30, 10),
+                E::EmptyAllOf,
+            ),
+            (
+                with(SuccessCriteria::AnyOf(set(&[])), 30, 10),
+                E::EmptyAnyOf,
+            ),
+            (with(quorum(&[], 1), 30, 10), E::EmptyQuorumGroup),
+            (with(quorum(&["a"], 0), 30, 10), E::ZeroQuorum),
+            (with(quorum(&["a", "b"], 3), 30, 10), E::QuorumExceedsGroup),
+            (
+                with(SuccessCriteria::AllOf(set(&["a"])), 0, 10),
+                E::ZeroOverallTimeout,
+            ),
+            (
+                with(SuccessCriteria::AllOf(set(&["a"])), 30, 0),
+                E::ZeroStalledTimeout,
+            ),
+        ];
+        for (policy, expected) in &invalid {
+            assert_eq!(policy.validate(), Err(*expected));
+        }
+
+        let valid = [
+            with(SuccessCriteria::AllOf(set(&["a"])), 30, 10),
+            with(SuccessCriteria::AnyOf(set(&["a", "b"])), 30, 10),
+            with(quorum(&["a", "b"], 2), 30, 10),
+            with(quorum(&["a", "b", "c"], 1), 30, 10),
+        ];
+        for policy in &valid {
+            assert_eq!(policy.validate(), Ok(()));
+        }
+
+        // Workflow registration rejects the same policies and empty dependency groups.
+        let step = |name: &'static str, depends_on| SagaWorkflowStepContract {
+            step_name: name,
+            participant_id: "p",
+            depends_on,
+        };
+        let good_steps = [step("a", WorkflowDependencySpec::OnSagaStart)];
+        for (policy, _) in &invalid {
+            let mut policy = policy.clone();
+            policy.saga_type = "wf".into();
+            assert!(
+                validate_workflow_contract("wf", "a", &good_steps, &policy).is_err(),
+                "invalid policy accepted: {policy:?}"
+            );
+        }
+        let ok_policy = policy_all_of("wf", &["a"]);
+        for depends_on in [
+            WorkflowDependencySpec::AnyOf(&[]),
+            WorkflowDependencySpec::AllOf(&[]),
+        ] {
+            let steps = [
+                step("a", WorkflowDependencySpec::OnSagaStart),
+                step("b", depends_on),
+            ];
+            assert!(
+                validate_workflow_contract("wf", "a", &steps, &ok_policy).is_err(),
+                "empty dependency group accepted: {depends_on:?}"
+            );
+        }
+        assert!(validate_workflow_contract("wf", "a", &good_steps, &ok_policy).is_ok());
     }
 }
