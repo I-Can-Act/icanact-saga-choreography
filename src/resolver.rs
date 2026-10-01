@@ -701,6 +701,8 @@ impl TerminalResolver {
                 state
                     .completed_compensation_steps
                     .insert(context.step_name.clone());
+                // A successful (retried) undo resolves an earlier retryable failure.
+                state.unresolved.retain(|step| step != &context.step_name);
                 if state.phase == ResolverPhase::Aborting {
                     state
                         .pending_compensation_steps
@@ -3251,6 +3253,22 @@ mod tests {
                 [SagaChoreographyEvent::SagaQuarantined { step, .. }] if step.as_ref() == "A"
             ),
             "undo never ran: {out:?}"
+        );
+    }
+
+    #[test]
+    fn successful_retried_undo_clears_unresolved_and_settles_failed() {
+        let (mut resolver, _) = rolling_back();
+        // B completes late and is owed an undo, so the run keeps rolling back.
+        let late = resolver.ingest_at(&completed("B", 1_030, true), 1_030);
+        assert_eq!(late.len(), 1, "late B owed an undo: {late:?}");
+        assert!(resolver.ingest_at(&retryable("A", 1_040), 1_040).is_empty());
+        // A's undo is retried and succeeds: no longer unresolved.
+        assert!(resolver.ingest_at(&undo_ack("A", 1_050), 1_050).is_empty());
+        let end = resolver.ingest_at(&undo_ack("B", 1_060), 1_060);
+        assert!(
+            matches!(end.as_slice(), [SagaChoreographyEvent::SagaFailed { .. }]),
+            "clean rollback must not quarantine: {end:?}"
         );
     }
 
