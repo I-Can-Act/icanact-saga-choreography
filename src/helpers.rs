@@ -689,8 +689,7 @@ where
                 quarantine_accepted_step_persistence_failure(
                     participant,
                     context,
-                    step,
-                    participant_id,
+                    (step, participant_id),
                     format!("accepted step persistence failed: {error:?}").into(),
                     &compensation_data,
                     now,
@@ -781,8 +780,7 @@ where
                 quarantine_accepted_step_persistence_failure(
                     participant,
                     context,
-                    step,
-                    participant_id,
+                    (step, participant_id),
                     format!("accepted async step persistence failed: {error:?}").into(),
                     &compensation_data,
                     now,
@@ -1039,8 +1037,7 @@ fn accepted_step_reconciliation(
 fn quarantine_accepted_step_persistence_failure<A, F>(
     actor: &mut A,
     context: &SagaContext,
-    step: Box<str>,
-    participant_id: Box<str>,
+    (step, participant_id): (Box<str>, Box<str>),
     reason: Box<str>,
     compensation_data: &[u8],
     now: u64,
