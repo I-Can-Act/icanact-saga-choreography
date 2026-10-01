@@ -876,9 +876,20 @@ pub struct PollOutcome {
 }
 
 impl PollOutcome {
-    /// `true` when no outcome was committed; resolution failures are in [`PollOutcome::errors`].
-    pub fn is_empty(&self) -> bool {
+    /// `true` when no outcome was committed. Says nothing about failed resolutions, which are in
+    /// [`PollOutcome::errors`]; use [`PollOutcome::is_clean`] for "nothing happened at all".
+    pub fn has_no_events(&self) -> bool {
         self.events.is_empty()
+    }
+
+    /// `true` when every resolution succeeded (no errors).
+    pub fn is_clean(&self) -> bool {
+        self.errors.is_empty()
+    }
+
+    /// `true` only when nothing was committed AND nothing failed: errors are never hidden.
+    pub fn is_empty(&self) -> bool {
+        self.has_no_events() && self.is_clean()
     }
 
     pub fn as_slice(&self) -> &[SagaChoreographyEvent] {
@@ -896,9 +907,9 @@ where
         .iter()
         .filter_map(|(run, accepted)| {
             if now_millis > accepted.hard_deadline_at_millis {
-                Some((run.saga_id(), accepted.execution_id.clone(), true))
+                Some((run.clone(), accepted.execution_id.clone(), true))
             } else if now_millis > accepted.deadline_at_millis {
-                Some((run.saga_id(), accepted.execution_id.clone(), false))
+                Some((run.clone(), accepted.execution_id.clone(), false))
             } else {
                 None
             }
@@ -906,14 +917,15 @@ where
         .collect::<Vec<_>>();
 
     let mut outcome = PollOutcome::default();
-    for (saga_id, execution_id, hard_timeout) in expired {
-        match resolve_accepted_timeout(actor, saga_id, execution_id, hard_timeout, now_millis) {
+    for (run, execution_id, hard_timeout) in expired {
+        match resolve_accepted_timeout(actor, run.saga_id(), execution_id, hard_timeout, now_millis)
+        {
             Ok(event) => outcome.events.push(event),
             Err(error) => {
                 tracing::error!(
                     target: "core::saga",
                     event = "accepted_step_timeout_resolution_failed",
-                    saga_id = saga_id.get(),
+                    run = %run,
                     error = ?error
                 );
                 outcome.errors.push(error);

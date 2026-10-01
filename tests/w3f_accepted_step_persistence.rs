@@ -163,3 +163,25 @@ fn finalize_run_removes_accepted_step_rows_so_restart_cannot_resurrect_it() {
         "a finalized run must not recover anything: {events:?}"
     );
 }
+
+#[test]
+fn poll_outcome_with_errors_is_not_empty() {
+    use icanact_saga_choreography::durability::poll_accepted_workflow_step_timeouts;
+    let (mut actor, journal) = actor();
+    let context = ctx();
+    let mut emitted = Vec::new();
+    handle_saga_event_with_emit(&mut actor, started(&context), |e| emitted.push(e));
+    journal.fail_always(JournalOp::Append, FaultTrigger::EventKind("Quarantined"));
+    let polled = poll_accepted_workflow_step_timeouts(&mut actor, u64::MAX);
+    assert_eq!(
+        polled.errors.len(),
+        1,
+        "resolution failure reported: {polled:?}"
+    );
+    assert!(polled.has_no_events());
+    assert!(!polled.is_clean());
+    assert!(
+        !polled.is_empty(),
+        "a poll that failed is not empty: {polled:?}"
+    );
+}
