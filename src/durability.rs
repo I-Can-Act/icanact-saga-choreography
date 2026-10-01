@@ -1007,26 +1007,24 @@ fn recover_compensation_request_from_entries(
 ) -> Option<SagaChoreographyEvent> {
     let mut request = None;
     for entry in entries {
-        match &entry.event {
-            ParticipantEvent::CompensationRequestRecorded {
+        if let ParticipantEvent::CompensationRequestRecorded {
+            context,
+            failed_step,
+            reason,
+            failure,
+            steps_to_compensate,
+            requested_at_millis,
+        } = &entry.event
+        {
+            let mut context = context.clone();
+            context.event_timestamp_millis = *requested_at_millis;
+            request = Some(SagaChoreographyEvent::CompensationRequested {
                 context,
-                failed_step,
-                reason,
-                failure,
-                steps_to_compensate,
-                requested_at_millis,
-            } => {
-                let mut context = context.clone();
-                context.event_timestamp_millis = *requested_at_millis;
-                request = Some(SagaChoreographyEvent::CompensationRequested {
-                    context,
-                    failed_step: failed_step.clone(),
-                    reason: reason.clone(),
-                    failure: failure.clone(),
-                    steps_to_compensate: steps_to_compensate.clone(),
-                });
-            }
-            _ => {}
+                failed_step: failed_step.clone(),
+                reason: reason.clone(),
+                failure: failure.clone(),
+                steps_to_compensate: steps_to_compensate.clone(),
+            });
         }
     }
     request
@@ -2191,6 +2189,7 @@ fn fail_workflow_step<A, F>(
     });
 }
 
+#[allow(clippy::too_many_arguments)] // signature refactor deferred to W6 R23
 fn compensate_workflow_with_emit<A, F>(
     actor: &mut A,
     workflow: &'static dyn SagaWorkflowParticipant<A>,
@@ -4301,11 +4300,12 @@ mod loom_dedupe_model {
         fn check_and_mark(&self, saga_id: u64, key: &str) -> bool {
             let mut guard = self.seen.lock().unwrap();
             let entry = (saga_id, key.to_string());
-            if guard.contains_key(&entry) {
-                false
-            } else {
-                guard.insert(entry, ());
-                true
+            match guard.entry(entry) {
+                std::collections::hash_map::Entry::Occupied(_) => false,
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(());
+                    true
+                }
             }
         }
     }
