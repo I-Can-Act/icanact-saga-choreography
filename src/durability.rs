@@ -887,11 +887,9 @@ impl PollOutcome {
         self.errors.is_empty()
     }
 
-    /// Same as [`PollOutcome::has_no_events`]: it does NOT look at [`PollOutcome::errors`].
-    /// Kept only so existing callers compile; prefer `has_no_events()` / `is_clean()`.
-    // TODO(W3-review LOW 6): remove once tests/async_workflow_lifecycle_e2e.rs moves off it.
+    /// `true` only when nothing happened at all: no events AND no errors.
     pub fn is_empty(&self) -> bool {
-        self.has_no_events()
+        self.has_no_events() && self.is_clean()
     }
 
     pub fn as_slice(&self) -> &[SagaChoreographyEvent] {
