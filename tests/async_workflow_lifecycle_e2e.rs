@@ -406,8 +406,8 @@ fn context(step_name: &str, saga_id: u64) -> SagaContext {
         step_index: 0,
         attempt: 0,
         initiator_peer_id: [0; 32],
-        saga_started_at_millis: 1_700_000_000_000,
-        event_timestamp_millis: 1_700_000_000_000,
+        saga_started_at_millis: fixture_millis(0),
+        event_timestamp_millis: fixture_millis(0),
     }
 }
 
@@ -589,7 +589,7 @@ fn accepted_step_does_not_complete_saga_until_late_completion() {
         ctx.saga_id,
         execution_id,
         completion(
-            1_700_000_000_050,
+            fixture_millis(50),
             b"created",
             b"ignored-completion-input",
             Vec::new(),
@@ -833,7 +833,7 @@ fn accepted_completion_append_failure_keeps_step_pending_for_retry() {
             &mut actor,
             ctx.saga_id,
             execution_id.clone(),
-            completion(1_700_000_000_060, b"created", b"input", b"undo"),
+            completion(fixture_millis(60), b"created", b"input", b"undo"),
         ),
         Err(AcceptedStepError::Durability { .. })
     ));
@@ -844,7 +844,7 @@ fn accepted_completion_append_failure_keeps_step_pending_for_retry() {
         &mut actor,
         ctx.saga_id,
         execution_id,
-        completion(1_700_000_000_070, b"created", b"input", b"undo"),
+        completion(fixture_millis(70), b"created", b"input", b"undo"),
     )
     .expect("retry should append terminal record and complete");
     assert_eq!(actor.saga.accepted_workflow_step_count(), 0);
@@ -914,7 +914,7 @@ fn accepted_failure_append_failure_keeps_step_pending_for_retry() {
             &mut actor,
             ctx.saga_id,
             execution_id.clone(),
-            failure(1_700_000_000_060, "dispatch failed", false),
+            failure(fixture_millis(60), "dispatch failed", false),
         ),
         Err(AcceptedStepError::Durability { .. })
     ));
@@ -925,7 +925,7 @@ fn accepted_failure_append_failure_keeps_step_pending_for_retry() {
         &mut actor,
         ctx.saga_id,
         execution_id,
-        failure(1_700_000_000_070, "dispatch failed", false),
+        failure(fixture_millis(70), "dispatch failed", false),
     )
     .expect("retry should append terminal record and fail");
     assert_eq!(actor.saga.accepted_workflow_step_count(), 0);
@@ -954,7 +954,7 @@ fn compensating_failure_tombstones_forward_execution_but_keeps_compensation_data
         &mut actor,
         ctx.saga_id,
         execution_id.clone(),
-        failure(1_700_000_000_080, "authoritative create failure", true),
+        failure(fixture_millis(80), "authoritative create failure", true),
     )
     .expect("compensating failure should resolve the forward execution");
 
@@ -975,7 +975,7 @@ fn compensating_failure_tombstones_forward_execution_but_keeps_compensation_data
             ctx.saga_id,
             execution_id,
             completion(
-                1_700_000_000_090,
+                fixture_millis(90),
                 b"stale-success",
                 b"create-order-input",
                 b"cancel-order-38",
@@ -1063,7 +1063,7 @@ fn compensating_failure_restart_keeps_forward_execution_tombstoned() {
         &mut actor,
         ctx.saga_id,
         execution_id.clone(),
-        failure(1_700_000_000_100, "authoritative create failure", true),
+        failure(fixture_millis(100), "authoritative create failure", true),
     )
     .expect("compensating failure should be durable");
 
@@ -1126,7 +1126,7 @@ fn compensating_failure_restart_keeps_forward_execution_tombstoned() {
             ctx.saga_id,
             execution_id,
             completion(
-                1_700_000_000_110,
+                fixture_millis(110),
                 b"stale-success",
                 b"create-order-input",
                 b"cancel-order-39",
@@ -1236,7 +1236,7 @@ fn saga_run_tracking_reset_allows_same_saga_id_to_accept_again() {
         &mut actor,
         ctx.saga_id,
         execution_id.clone(),
-        failure(1_700_000_000_175, "late participant failure", false),
+        failure(fixture_millis(175), "late participant failure", false),
     )
     .expect("first run should resolve step");
     assert!(matches!(failed, SagaChoreographyEvent::StepFailed { .. }));
@@ -1292,7 +1292,7 @@ fn accepted_step_can_complete_after_participant_restart() {
         ctx.saga_id,
         execution_id,
         completion(
-            1_700_000_000_230,
+            fixture_millis(230),
             b"created-after-restart",
             b"input",
             Vec::new(),
@@ -1306,7 +1306,7 @@ fn accepted_step_can_complete_after_participant_restart() {
             ref output,
             ..
         } if context.saga_id == ctx.saga_id
-            && context.event_timestamp_millis == 1_700_000_000_230
+            && context.event_timestamp_millis == fixture_millis(230)
             && output == b"created-after-restart"
     ));
 }
@@ -1430,7 +1430,7 @@ fn unstarted_compensation_request_replays_and_rearms_its_dedupe_key() {
             ctx.saga_id,
             ParticipantEvent::StepExecutionStarted {
                 attempt: 1,
-                started_at_millis: 1_700_000_000_050,
+                started_at_millis: fixture_millis(50),
             },
         )
         .expect("forward execution start should persist");
@@ -1440,7 +1440,7 @@ fn unstarted_compensation_request_replays_and_rearms_its_dedupe_key() {
             ParticipantEvent::StepExecutionCompleted {
                 output: b"created-order".to_vec(),
                 compensation_data: b"cancel-order-43".to_vec(),
-                completed_at_millis: 1_700_000_000_090,
+                completed_at_millis: fixture_millis(90),
             },
         )
         .expect("forward effect and compensation payload should persist");
@@ -1455,10 +1455,10 @@ fn unstarted_compensation_request_replays_and_rearms_its_dedupe_key() {
             participant_id: "order-manager".into(),
             error_code: Some("exchange_rejected".into()),
             error_message: "authoritative create failure".into(),
-            at_millis: 1_700_000_000_100,
+            at_millis: fixture_millis(100),
         },
         steps_to_compensate: vec!["create_order".into()],
-        requested_at_millis: 1_700_000_000_100,
+        requested_at_millis: fixture_millis(100),
     };
     journal
         .append(ctx.saga_id, request)
@@ -1517,7 +1517,7 @@ fn unstarted_compensation_request_replays_and_rearms_its_dedupe_key() {
             ctx.saga_id,
             ParticipantEvent::CompensationStarted {
                 attempt: 1,
-                started_at_millis: 1_700_000_000_110,
+                started_at_millis: fixture_millis(110),
             },
         )
         .expect("compensation start should persist");
@@ -1545,7 +1545,7 @@ fn unstarted_compensation_request_replays_and_rearms_its_dedupe_key() {
 fn completed_accepted_compensation_replays_terminal_resolution_after_restart() {
     let journal = InMemoryJournal::new();
     let ctx = context("create_order", 44);
-    let accepted_at_millis = 1_700_000_000_200;
+    let accepted_at_millis = fixture_millis(200);
     journal
         .append(
             ctx.saga_id,
@@ -1622,7 +1622,7 @@ fn accepted_compensation_failure_leaves_no_compensating_state() {
         } else {
             "cancel-order-request-40"
         });
-        let accepted_at_millis = 1_700_000_000_000;
+        let accepted_at_millis = fixture_millis(0);
         actor
             .saga
             .journal
@@ -1847,7 +1847,7 @@ fn accepted_step_late_completion_completes_saga_once() {
         &mut actor,
         ctx.saga_id,
         execution_id.clone(),
-        completion(1_700_000_000_050, b"created", b"input", Vec::new()),
+        completion(fixture_millis(50), b"created", b"input", Vec::new()),
     )
     .expect("late completion should resolve accepted step");
     let terminal = resolver.ingest(&completed);
@@ -1865,7 +1865,7 @@ fn accepted_step_late_completion_completes_saga_once() {
             &mut actor,
             ctx.saga_id,
             execution_id,
-            completion(1_700_000_000_060, b"created-again", Vec::new(), Vec::new()),
+            completion(fixture_millis(60), b"created-again", Vec::new(), Vec::new()),
         ),
         Err(AcceptedStepError::AlreadyResolved { .. })
     ));
@@ -1876,7 +1876,7 @@ fn accepted_step_completion_records_actual_completion_time() {
     let mut actor = HarnessActor::default();
     let ctx = context("create_order", 21);
     let execution_id = StepExecutionId::new("effect-21");
-    let completed_at_millis = 1_700_000_000_175;
+    let completed_at_millis = fixture_millis(175);
 
     accept_workflow_step(
         &mut actor,
@@ -1938,7 +1938,7 @@ fn prune_clears_accepted_and_resolved_workflow_step_state() {
         &mut actor,
         ctx.saga_id,
         execution_id.clone(),
-        completion(1_700_000_000_050, b"created", b"input", Vec::new()),
+        completion(fixture_millis(50), b"created", b"input", Vec::new()),
     )
     .expect("accepted step should complete");
 
@@ -1989,7 +1989,7 @@ fn duplicate_accept_for_same_saga_is_rejected_without_losing_original_step() {
         &mut actor,
         ctx.saga_id,
         original,
-        failure(1_700_000_000_060, "original execution failed later", false),
+        failure(fixture_millis(60), "original execution failed later", false),
     )
     .expect("original execution should remain pending after duplicate rejection");
 }
@@ -2017,7 +2017,7 @@ fn accepted_step_late_failure_fails_saga_with_authority() {
         &mut actor,
         ctx.saga_id,
         execution_id,
-        failure(1_700_000_000_070, "transport dispatch failed", false),
+        failure(fixture_millis(70), "transport dispatch failed", false),
     )
     .expect("late failure should resolve accepted step");
     let terminal = resolver.ingest(&failed);
@@ -2034,7 +2034,7 @@ fn accepted_step_late_failure_fails_saga_with_authority() {
     assert!(matches!(
     failed,
     SagaChoreographyEvent::StepFailed { ref context, .. }
-    if context.event_timestamp_millis == 1_700_000_000_070
+    if context.event_timestamp_millis == fixture_millis(70)
     ));
     assert!(matches!(
     terminal.as_slice(),
@@ -2154,7 +2154,7 @@ fn accepted_step_progress_extends_idle_deadline_but_not_hard_deadline() {
             &mut actor,
             ctx.saga_id,
             execution_id,
-            completion(1_700_000_000_260, b"too-late", Vec::new(), Vec::new()),
+            completion(fixture_millis(260), b"too-late", Vec::new(), Vec::new()),
         ),
         Err(AcceptedStepError::AlreadyResolved { .. })
     ));
@@ -2180,12 +2180,16 @@ fn resolver_timeout_step_failure_blocks_late_accepted_completion() {
         panic!("expected accepted step");
     }
     let mut timeout_context = ctx.next_step("create_order".into());
-    timeout_context.event_timestamp_millis = 1_700_000_000_101;
+    timeout_context.event_timestamp_millis = fixture_millis(101);
     let timeout_event = SagaChoreographyEvent::StepFailed {
         context: timeout_context,
         participant_id: "order-manager".into(),
         error_code: Some("idle".into()),
-        error: "accepted step idle timeout: step=create_order execution_id=effect-7 deadline_at_millis=1700000000100 hard_deadline_at_millis=1700000000250".into(),
+        error: format!(
+            "accepted step idle timeout: step=create_order execution_id=effect-7 deadline_at_millis={} hard_deadline_at_millis={}",
+            fixture_millis(100),
+            fixture_millis(250)
+        ).into(),
         requires_compensation: false,
     };
 
@@ -2201,7 +2205,7 @@ fn resolver_timeout_step_failure_blocks_late_accepted_completion() {
             &mut actor,
             ctx.saga_id,
             execution_id,
-            completion(1_700_000_000_260, b"too-late", Vec::new(), Vec::new()),
+            completion(fixture_millis(260), b"too-late", Vec::new(), Vec::new()),
         ),
         Err(AcceptedStepError::AlreadyResolved { .. })
     ));
@@ -2244,7 +2248,7 @@ fn saga_test_world_waits_for_and_resolves_accepted_steps() {
             &mut actor,
             ctx.saga_id,
             execution_id,
-            completion(1_700_000_000_050, b"created", b"input", Vec::new()),
+            completion(fixture_millis(50), b"created", b"input", Vec::new()),
         )
         .expect("testkit helper should publish late completion");
 
@@ -2353,4 +2357,11 @@ fn saga_test_world_progress_helper_publishes_resolver_heartbeat() {
         world.wait_for_terminal(ctx.saga_id, Duration::from_secs(1)),
         SagaTerminalOutcome::Completed { .. }
     ));
+}
+
+/// Process-constant, recent base for run fixtures: the resolver admits runs against the real
+/// clock, so fixture incarnations must be recent and constant across one run.
+fn fixture_millis(offset: u64) -> u64 {
+    static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BASE.get_or_init(SagaContext::now_millis) + offset
 }

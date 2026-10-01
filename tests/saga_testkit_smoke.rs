@@ -76,12 +76,18 @@ impl SyncParticipant {
                     .len()
             })
             .unwrap_or(0);
+        let start_key = format!(
+            "1:{}:saga_started:start",
+            DeterministicContextBuilder::default()
+                .build()
+                .saga_started_at_millis
+        );
         let start_dedupe_present = self
             .last_saga_id
             .map(|saga_id| {
                 self.saga
                     .dedupe
-                    .contains(saga_id, "1:1700000000000:saga_started:start")
+                    .contains(saga_id, &start_key)
                     .expect("dedupe contains should succeed")
             })
             .unwrap_or(false);
