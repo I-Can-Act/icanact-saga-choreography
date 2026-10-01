@@ -706,10 +706,10 @@ where
 {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if let Ok(reply) = actor_ref.ask(()) {
-            if predicate(&reply) {
-                return reply;
-            }
+        if let Ok(reply) = actor_ref.ask(())
+            && predicate(&reply)
+        {
+            return reply;
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -732,10 +732,10 @@ where
 {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if let Ok(reply) = actor_ref.ask(()).await {
-            if predicate(&reply) {
-                return reply;
-            }
+        if let Ok(reply) = actor_ref.ask(()).await
+            && predicate(&reply)
+        {
+            return reply;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
