@@ -3284,17 +3284,40 @@ pub mod lmdb {
         }
 
         fn next_sequence(
+            rows: &Database<Str, Bytes>,
             meta: &Database<Str, Str>,
             wtxn: &mut heed::RwTxn<'_>,
         ) -> Result<u64, JournalError> {
-            let next = meta
+            let storage = |msg: String| JournalError::Storage(msg.into());
+            let stored = meta
                 .get(wtxn, "next_sequence")
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(1);
-            let after = next.saturating_add(1);
+                .map_err(|err| storage(err.to_string()))?;
+            let next = match stored {
+                Some(raw) => raw.parse::<u64>().map_err(|err| {
+                    storage(format!("corrupt journal next_sequence {raw:?}: {err}"))
+                })?,
+                None => {
+                    let has_rows = rows
+                        .iter(wtxn)
+                        .map_err(|err| storage(err.to_string()))?
+                        .next()
+                        .is_some();
+                    if has_rows {
+                        return Err(storage(
+                            "journal next_sequence metadata missing while rows exist".to_owned(),
+                        ));
+                    }
+                    1
+                }
+            };
+            if next == 0 {
+                return Err(storage("journal next_sequence is zero".to_owned()));
+            }
+            let after = next
+                .checked_add(1)
+                .ok_or_else(|| storage("journal sequence space exhausted".to_owned()))?;
             meta.put(wtxn, "next_sequence", &after.to_string())
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
+                .map_err(|err| storage(err.to_string()))?;
             Ok(next)
         }
     }
@@ -3305,7 +3328,7 @@ pub mod lmdb {
                 .env
                 .write_txn()
                 .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            let sequence = Self::next_sequence(&self.meta, &mut wtxn)?;
+            let sequence = Self::next_sequence(&self.rows, &self.meta, &mut wtxn)?;
             let entry = JournalEntry {
                 sequence,
                 recorded_at_millis: now_millis(),
@@ -3314,8 +3337,9 @@ pub mod lmdb {
             let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&entry)
                 .map_err(|err| JournalError::Storage(err.to_string().into()))?;
             self.rows
-                .put(
+                .put_with_flags(
                     &mut wtxn,
+                    heed::PutFlags::NO_OVERWRITE,
                     &key_saga_seq(saga_id, sequence),
                     encoded.as_ref(),
                 )
