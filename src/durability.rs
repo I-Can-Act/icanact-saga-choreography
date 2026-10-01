@@ -791,22 +791,37 @@ where
     }
     let next_idle_deadline =
         now_millis.saturating_add(accepted.policy.idle_timeout.as_millis() as u64);
-    accepted.deadline_at_millis = next_idle_deadline.min(accepted.hard_deadline_at_millis);
+    let deadline_at_millis = next_idle_deadline.min(accepted.hard_deadline_at_millis);
+    let hard_deadline_at_millis = accepted.hard_deadline_at_millis;
     let mut context = accepted.context.clone();
     context.event_timestamp_millis = now_millis;
     let mut accepted_snapshot = accepted.clone();
     accepted_snapshot.context = context.clone();
+    accepted_snapshot.deadline_at_millis = deadline_at_millis;
     let participant_id = accepted_snapshot.participant_id.clone();
-    let deadline_at_millis = accepted.deadline_at_millis;
-    let hard_deadline_at_millis = accepted.hard_deadline_at_millis;
     let timeout_outcome = accepted_snapshot.policy.timeout_outcome.clone();
-    record_accepted_step_metadata(actor, &accepted_snapshot).map_err(|source| {
-        AcceptedStepError::Durability {
+    // Commit first; the in-memory deadline moves only after the journal accepted the heartbeat.
+    if let Err(source) = record_accepted_step_metadata(actor, &accepted_snapshot) {
+        tracing::warn!(
+            target: "core::saga",
+            event = "accepted_step_heartbeat_commit_failed",
+            run = %run,
+            execution_id = %execution_id,
+            error = %source
+        );
+        return Err(AcceptedStepError::Durability {
             saga_id,
-            execution_id: execution_id.clone(),
+            execution_id,
             error: format!("{source:?}").into(),
-        }
-    })?;
+        });
+    }
+    if let Some(accepted) = actor
+        .saga_support_mut()
+        .accepted_workflow_steps
+        .get_mut(&run)
+    {
+        accepted.deadline_at_millis = deadline_at_millis;
+    }
     Ok(SagaChoreographyEvent::StepAccepted {
         context,
         participant_id,
@@ -844,10 +859,27 @@ where
     )
 }
 
-pub fn poll_accepted_workflow_step_timeouts<A>(
-    actor: &mut A,
-    now_millis: u64,
-) -> Vec<SagaChoreographyEvent>
+/// Result of one timeout poll: committed outcomes plus every resolution that failed (ADR-0002 R19).
+/// Failed resolutions keep their accepted step pending so the next poll retries them.
+#[derive(Debug, Default)]
+#[non_exhaustive]
+pub struct PollOutcome {
+    pub events: Vec<SagaChoreographyEvent>,
+    pub errors: Vec<AcceptedStepError>,
+}
+
+impl PollOutcome {
+    /// `true` when no outcome was committed; resolution failures are in [`PollOutcome::errors`].
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    pub fn as_slice(&self) -> &[SagaChoreographyEvent] {
+        &self.events
+    }
+}
+
+pub fn poll_accepted_workflow_step_timeouts<A>(actor: &mut A, now_millis: u64) -> PollOutcome
 where
     A: SagaStateExt,
 {
@@ -866,23 +898,22 @@ where
         })
         .collect::<Vec<_>>();
 
-    expired
-        .into_iter()
-        .filter_map(|(saga_id, execution_id, hard_timeout)| {
-            match resolve_accepted_timeout(actor, saga_id, execution_id, hard_timeout, now_millis) {
-                Ok(event) => Some(event),
-                Err(error) => {
-                    tracing::error!(
-                        target: "core::saga",
-                        event = "accepted_step_timeout_resolution_failed",
-                        saga_id = saga_id.get(),
-                        error = ?error
-                    );
-                    None
-                }
+    let mut outcome = PollOutcome::default();
+    for (saga_id, execution_id, hard_timeout) in expired {
+        match resolve_accepted_timeout(actor, saga_id, execution_id, hard_timeout, now_millis) {
+            Ok(event) => outcome.events.push(event),
+            Err(error) => {
+                tracing::error!(
+                    target: "core::saga",
+                    event = "accepted_step_timeout_resolution_failed",
+                    saga_id = saga_id.get(),
+                    error = ?error
+                );
+                outcome.errors.push(error);
             }
-        })
-        .collect()
+        }
+    }
+    outcome
 }
 
 /// One journaled run to recover; its identity comes from the stored `RunKey` (ADR-0001).
