@@ -2918,13 +2918,12 @@ where
         Err(panic_payload) => {
             let step_name = actor.step_name().to_string();
             let participant_id = actor.participant_id_owned();
-            publish_active_saga_panic_quarantine(
-                actor.saga_support_mut(),
+            quarantine_active_saga_on_panic(
+                actor,
                 context,
                 phase,
                 panic_payload.as_ref(),
-                step_name.as_str(),
-                participant_id,
+                (step_name.as_str(), participant_id),
             );
             std::panic::resume_unwind(panic_payload);
         }
@@ -2955,19 +2954,62 @@ where
     match result {
         Ok(out) => out,
         Err(panic_payload) => {
-            publish_active_saga_panic_quarantine(
-                actor.saga_support_mut(),
+            quarantine_active_saga_on_panic(
+                actor,
                 context,
                 phase,
                 panic_payload.as_ref(),
-                workflow.step_name(),
-                workflow.participant_id_owned(),
+                (workflow.step_name(), workflow.participant_id_owned()),
             );
             std::panic::resume_unwind(panic_payload);
         }
     }
 }
 
+/// Panic quarantine through the shared quarantine path ([`quarantine_run_with_evidence`]): the run
+/// is quarantined and latched terminal in memory, the `Quarantined` evidence row is appended to the
+/// run's own partition, and `SagaQuarantined` is published (W3 review2 P2-7).
+fn quarantine_active_saga_on_panic<A>(
+    actor: &mut A,
+    context: &SagaContext,
+    phase: ActiveSagaExecutionPhase,
+    panic_payload: &(dyn std::any::Any + Send),
+    (step_name, participant_id): (&str, Box<str>),
+) where
+    A: HasSagaParticipantSupport,
+{
+    let message = panic_message_from_payload(panic_payload);
+    let reason = panic_quarantine_reason(phase, message.as_ref());
+    let now = SagaContext::now_millis();
+    let mut emitted = None;
+    let quarantined = crate::state_ext::quarantine_run_with_evidence(
+        actor,
+        context,
+        (step_name.into(), participant_id.clone()),
+        ("panic", reason.clone()),
+        now,
+        &mut |event| emitted = Some(event),
+    );
+    if !quarantined {
+        // The run is already finished (`Compensated`): the refusal was logged with the run key;
+        // still tell the bus about the panic so it is never silent.
+        tracing::error!(
+            target: "core::saga",
+            event = "panic_quarantine_refused_publishing_anyway",
+            run = %context.run_key()
+        );
+    }
+    let event = emitted.unwrap_or_else(|| SagaChoreographyEvent::SagaQuarantined {
+        context: context.next_step(step_name.into()),
+        reason,
+        step: step_name.into(),
+        participant_id,
+    });
+    publish_panic_quarantine_event(actor.saga_support(), context, event);
+}
+
+/// Legacy support-level entry point (no actor, hence no in-memory state): appends the evidence row
+/// to the run's partition and publishes. Prefer the phase wrappers, which also quarantine memory.
 pub fn publish_active_saga_panic_quarantine<J, D>(
     saga: &mut SagaParticipantSupport<J, D>,
     context: &SagaContext,
@@ -2983,8 +3025,8 @@ pub fn publish_active_saga_panic_quarantine<J, D>(
     let reason = panic_quarantine_reason(phase, message.as_ref());
     let now = SagaContext::now_millis();
 
-    if let Err(err) = saga.journal.append(
-        context.saga_id,
+    if let Err(err) = saga.journal.append_run(
+        &context.run_key(),
         ParticipantEvent::Quarantined {
             reason: reason.clone(),
             quarantined_at_millis: now,
@@ -2993,7 +3035,7 @@ pub fn publish_active_saga_panic_quarantine<J, D>(
         tracing::error!(
             target: "core::saga",
             event = "panic_quarantine_journal_append_failed",
-            saga_id = context.saga_id.get(),
+            run = %context.run_key(),
             error = %err
         );
     }
@@ -3004,31 +3046,42 @@ pub fn publish_active_saga_panic_quarantine<J, D>(
         step: step_name.to_string().into_boxed_str(),
         participant_id,
     };
+    publish_panic_quarantine_event(saga, context, emitted);
+}
 
-    if let Some(bus) = &saga.bus {
-        match bus.publish_strict(emitted) {
-            Ok(stats) => {
-                if stats.delivered > 0
-                    && let Err(err) = saga
-                        .dedupe
-                        .mark_processed(context.saga_id, PANIC_QUARANTINE_PUBLISH_KEY)
-                {
-                    tracing::error!(
-                        target: "core::saga",
-                        event = "panic_quarantine_dedupe_mark_failed",
-                        saga_id = context.saga_id.get(),
-                        error = %err
-                    );
-                }
-            }
-            Err(err) => {
+fn publish_panic_quarantine_event<J, D>(
+    saga: &SagaParticipantSupport<J, D>,
+    context: &SagaContext,
+    emitted: SagaChoreographyEvent,
+) where
+    J: ParticipantJournal,
+    D: ParticipantDedupeStore,
+{
+    let Some(bus) = &saga.bus else {
+        return;
+    };
+    match bus.publish_strict(emitted) {
+        Ok(stats) => {
+            if stats.delivered > 0
+                && let Err(err) = saga
+                    .dedupe
+                    .mark_processed(context.saga_id, PANIC_QUARANTINE_PUBLISH_KEY)
+            {
                 tracing::error!(
                     target: "core::saga",
-                    event = "panic_quarantine_publish_failed",
-                    saga_id = context.saga_id.get(),
-                    error = ?err
+                    event = "panic_quarantine_dedupe_mark_failed",
+                    run = %context.run_key(),
+                    error = %err
                 );
             }
+        }
+        Err(err) => {
+            tracing::error!(
+                target: "core::saga",
+                event = "panic_quarantine_publish_failed",
+                run = %context.run_key(),
+                error = ?err
+            );
         }
     }
 }
