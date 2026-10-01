@@ -12,6 +12,8 @@ pub struct TerminalResolverJournalEntry {
 pub enum TerminalResolverJournalError {
     #[error("terminal resolver journal storage error: {0}")]
     Storage(Box<str>),
+    #[error("terminal resolver journal sequence space exhausted")]
+    SequenceExhausted,
 }
 
 pub trait TerminalResolverJournal: Send + Sync + 'static {
@@ -39,7 +41,10 @@ impl TerminalResolverJournal for InMemoryTerminalResolverJournal {
             )
         })?;
         let sequence = state.next_sequence;
-        state.next_sequence = state.next_sequence.saturating_add(1);
+        let next = sequence
+            .checked_add(1)
+            .ok_or(TerminalResolverJournalError::SequenceExhausted)?;
+        state.next_sequence = next;
         state
             .entries
             .push(TerminalResolverJournalEntry { sequence, event });
@@ -117,6 +122,38 @@ pub mod lmdb {
             Ok(Self { env, rows, meta })
         }
 
+        #[cfg(test)]
+        pub(super) fn seed_next_sequence_for_test(&self, value: u64) {
+            let mut wtxn = self.env.write_txn().unwrap();
+            self.meta
+                .put(&mut wtxn, "next_sequence", &value.to_string())
+                .unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        #[cfg(test)]
+        pub(super) fn next_sequence_for_test(&self) -> String {
+            let rtxn = self.env.read_txn().unwrap();
+            self.meta
+                .get(&rtxn, "next_sequence")
+                .unwrap()
+                .unwrap()
+                .to_owned()
+        }
+
+        #[cfg(test)]
+        pub(super) fn raw_rows_for_test(&self) -> Vec<(String, Vec<u8>)> {
+            let rtxn = self.env.read_txn().unwrap();
+            self.rows
+                .iter(&rtxn)
+                .unwrap()
+                .map(|row| {
+                    let (k, v) = row.unwrap();
+                    (k.to_owned(), v.to_vec())
+                })
+                .collect()
+        }
+
         fn next_sequence(
             meta: &Database<Str, Str>,
             wtxn: &mut heed::RwTxn<'_>,
@@ -127,7 +164,10 @@ pub mod lmdb {
                 ));
             };
             let sequence = raw.parse::<u64>().map_err(storage_error)?;
-            let next = sequence.saturating_add(1).to_string();
+            let next = sequence
+                .checked_add(1)
+                .ok_or(TerminalResolverJournalError::SequenceExhausted)?
+                .to_string();
             meta.put(wtxn, "next_sequence", &next)
                 .map_err(storage_error)?;
             Ok(sequence)
@@ -144,6 +184,12 @@ pub mod lmdb {
             let entry = TerminalResolverJournalEntry { sequence, event };
             let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&entry).map_err(storage_error)?;
             let key = format!("{sequence:020}");
+            if self.rows.get(&wtxn, &key).map_err(storage_error)?.is_some() {
+                return Err(TerminalResolverJournalError::Storage(
+                    format!("terminal resolver journal row already exists for sequence {sequence}")
+                        .into(),
+                ));
+            }
             self.rows
                 .put(&mut wtxn, &key, encoded.as_ref())
                 .map_err(storage_error)?;
@@ -171,5 +217,55 @@ pub mod lmdb {
 
     fn storage_error(error: impl std::fmt::Display) -> TerminalResolverJournalError {
         TerminalResolverJournalError::Storage(error.to_string().into())
+    }
+}
+
+#[cfg(all(test, feature = "lmdb"))]
+mod tests {
+    use super::lmdb::LmdbTerminalResolverJournal;
+    use super::{TerminalResolverJournal, TerminalResolverJournalError};
+    use crate::{DeterministicContextBuilder, saga_started};
+
+    fn event(saga_id: u64) -> crate::SagaChoreographyEvent {
+        saga_started(
+            DeterministicContextBuilder::default()
+                .with_saga_id(saga_id)
+                .build(),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn resolver_journal_sequence_exhaustion_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = LmdbTerminalResolverJournal::open(dir.path()).unwrap();
+        journal.seed_next_sequence_for_test(u64::MAX);
+        // Land a row at the maximum key so an overwrite would be observable.
+        let before = journal.raw_rows_for_test();
+
+        let result = journal.append(event(2));
+        assert!(
+            matches!(result, Err(TerminalResolverJournalError::SequenceExhausted)),
+            "append at u64::MAX must fail, got {result:?}"
+        );
+        assert_eq!(before, journal.raw_rows_for_test());
+        assert_eq!(
+            journal.next_sequence_for_test(),
+            u64::MAX.to_string(),
+            "metadata must be left untouched"
+        );
+    }
+
+    #[test]
+    fn resolver_journal_refuses_to_overwrite_existing_sequence_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = LmdbTerminalResolverJournal::open(dir.path()).unwrap();
+        assert_eq!(journal.append(event(1)).unwrap(), 1);
+        let before = journal.raw_rows_for_test();
+        journal.seed_next_sequence_for_test(1);
+
+        let result = journal.append(event(2));
+        assert!(result.is_err(), "existing key must not be overwritten");
+        assert_eq!(before, journal.raw_rows_for_test());
     }
 }
