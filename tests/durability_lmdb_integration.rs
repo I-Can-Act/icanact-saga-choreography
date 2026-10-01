@@ -9,7 +9,8 @@ use icanact_saga_choreography::durability::lmdb::{
 use icanact_saga_choreography::durability::{ActiveSagaExecutionPhase, panic_quarantine_reason};
 use icanact_saga_choreography::{
     HasSagaParticipantSupport, ParticipantDedupeStore, ParticipantEvent, ParticipantJournal,
-    SagaChoreographyEvent, SagaContext, SagaId, SagaParticipantSupport, SagaStateExt,
+    RunIncarnation, RunKey, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipantSupport,
+    SagaStateExt,
 };
 
 #[test]
@@ -47,7 +48,7 @@ fn lmdb_journal_and_dedupe_roundtrip() {
     let read_a = journal.read(saga_a).expect("read saga_a should succeed");
     assert_eq!(read_a.len(), 1);
     assert!(matches!(
-        read_a[0].event,
+        read_a[0].event.transition(),
         ParticipantEvent::StepExecutionStarted { .. }
     ));
 
@@ -194,8 +195,12 @@ fn open_support_replays_panic_quarantine_once() {
     let journal = LmdbJournal::open(&base.join("journal")).expect("journal should open");
     let saga_id = SagaId::new(202);
     journal
-        .append(
-            saga_id,
+        .append_run(
+            &RunKey::new(
+                "mature_pool_refresh",
+                saga_id,
+                RunIncarnation::new(SagaContext::now_millis()),
+            ),
             ParticipantEvent::Quarantined {
                 reason: panic_quarantine_reason(ActiveSagaExecutionPhase::StepExecution, "boom"),
                 quarantined_at_millis: SagaContext::now_millis(),

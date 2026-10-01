@@ -58,6 +58,18 @@ pub struct ParticipantStats {
     /// Number of sagas that have been quarantined by this participant.
     /// Quarantined sagas are paused and require manual intervention.
     pub quarantined_sagas: AtomicU64,
+
+    /// Second active run of the same saga id admitted (ADR-0001).
+    pub concurrent_runs_admitted: AtomicU64,
+
+    /// Runs rejected because a newer incarnation is known (ADR-0001).
+    pub runs_rejected_stale: AtomicU64,
+
+    /// Runs rejected because they are older than the replay horizon (ADR-0001).
+    pub runs_rejected_expired: AtomicU64,
+
+    /// Failed finalize/GC passes (ADR-0001).
+    pub gc_failures: AtomicU64,
 }
 
 impl ParticipantStats {
@@ -73,6 +85,10 @@ impl ParticipantStats {
             compensations_started: AtomicU64::new(0),
             compensations_completed: AtomicU64::new(0),
             quarantined_sagas: AtomicU64::new(0),
+            concurrent_runs_admitted: AtomicU64::new(0),
+            runs_rejected_stale: AtomicU64::new(0),
+            runs_rejected_expired: AtomicU64::new(0),
+            gc_failures: AtomicU64::new(0),
         }
     }
 
@@ -92,6 +108,10 @@ impl ParticipantStats {
             compensations_started: self.compensations_started.load(Ordering::Relaxed),
             compensations_completed: self.compensations_completed.load(Ordering::Relaxed),
             quarantined_sagas: self.quarantined_sagas.load(Ordering::Relaxed),
+            concurrent_runs_admitted: self.concurrent_runs_admitted.load(Ordering::Relaxed),
+            runs_rejected_stale: self.runs_rejected_stale.load(Ordering::Relaxed),
+            runs_rejected_expired: self.runs_rejected_expired.load(Ordering::Relaxed),
+            gc_failures: self.gc_failures.load(Ordering::Relaxed),
         }
     }
 }
@@ -135,4 +155,16 @@ pub struct ParticipantStatsSnapshot {
 
     /// Number of sagas that have been quarantined.
     pub quarantined_sagas: u64,
+
+    /// Second active run of the same saga id admitted (ADR-0001).
+    pub concurrent_runs_admitted: u64,
+
+    /// Runs rejected because a newer incarnation is known (ADR-0001).
+    pub runs_rejected_stale: u64,
+
+    /// Runs rejected because they are older than the replay horizon (ADR-0001).
+    pub runs_rejected_expired: u64,
+
+    /// Failed finalize/GC passes (ADR-0001).
+    pub gc_failures: u64,
 }

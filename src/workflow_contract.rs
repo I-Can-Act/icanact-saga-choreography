@@ -366,15 +366,15 @@ macro_rules! define_saga_workflow_contract {
             }
 
             fn terminal_policy() -> $crate::TerminalPolicy {
-                $crate::TerminalPolicy {
-                    saga_type: Self::saga_type().into(),
-                    policy_id: format!("{}/default", Self::saga_type()).into(),
-                    failure_authority: $crate::__saga_contract_failure_authority!($failure_authority $failure_arg),
-                    success_criteria: $crate::__saga_contract_required_steps_allof!([$($required_step),+]),
-                    overall_timeout: std::time::Duration::from_millis($overall_timeout_ms as u64),
-                    stalled_timeout: std::time::Duration::from_millis($stalled_timeout_ms as u64),
-                    workflow_steps: Self::steps(),
-                }
+                $crate::TerminalPolicy::new(
+Self::saga_type().into(),
+format!("{}/default", Self::saga_type()).into(),
+$crate::__saga_contract_failure_authority!($failure_authority $failure_arg),
+$crate::__saga_contract_required_steps_allof!([$($required_step),+]),
+std::time::Duration::from_millis($overall_timeout_ms as u64),
+std::time::Duration::from_millis($stalled_timeout_ms as u64),
+Self::steps(),
+)
             }
         }
     };
@@ -397,15 +397,15 @@ mod tests {
         for step in required_steps {
             required.insert((*step).into());
         }
-        crate::TerminalPolicy {
-            saga_type: saga_type.into(),
-            policy_id: format!("{saga_type}/default").into(),
-            failure_authority: FailureAuthority::AnyParticipant,
-            success_criteria: SuccessCriteria::AllOf(required),
-            overall_timeout: Duration::from_secs(30),
-            stalled_timeout: Duration::from_secs(10),
-            workflow_steps: &[],
-        }
+        crate::TerminalPolicy::new(
+            saga_type.into(),
+            format!("{saga_type}/default").into(),
+            FailureAuthority::AnyParticipant,
+            SuccessCriteria::AllOf(required),
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            &[],
+        )
     }
 
     #[test]

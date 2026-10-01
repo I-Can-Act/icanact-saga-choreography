@@ -14,6 +14,14 @@ use icanact_saga_choreography::{
     StepOutput, SuccessCriteria, TerminalPolicy, define_saga_workflow_contract,
 };
 
+/// Fixtures use fixed 2023 timestamps; a horizon this long keeps them inside the replay window.
+fn fixture_horizon() -> icanact_saga_choreography::ReplayHorizon {
+    icanact_saga_choreography::ReplayHorizon::new(std::time::Duration::from_secs(
+        100 * 365 * 24 * 3600,
+    ))
+    .expect("horizon above the floor")
+}
+
 #[derive(Clone, Debug)]
 enum SyncCmd {
     AddBusinessFlag(&'static str),
@@ -45,7 +53,8 @@ struct SyncParticipant {
 impl SyncParticipant {
     fn new(step_name: &'static str, dependency: DependencySpec) -> Self {
         Self {
-            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new())
+                .with_replay_horizon(fixture_horizon()),
             step_name,
             dependency,
             fail_on_execute: false,
@@ -67,12 +76,18 @@ impl SyncParticipant {
                     .len()
             })
             .unwrap_or(0);
+        let start_key = format!(
+            "1:{}:saga_started:start",
+            DeterministicContextBuilder::default()
+                .build()
+                .saga_started_at_millis
+        );
         let start_dedupe_present = self
             .last_saga_id
             .map(|saga_id| {
                 self.saga
                     .dedupe
-                    .contains(saga_id, "1:1700000000000:saga_started:start")
+                    .contains(saga_id, &start_key)
                     .expect("dedupe contains should succeed")
             })
             .unwrap_or(false);
@@ -195,7 +210,8 @@ struct AsyncParticipant {
 impl Default for AsyncParticipant {
     fn default() -> Self {
         Self {
-            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new())
+                .with_replay_horizon(fixture_horizon()),
             executed_inputs: Vec::new(),
         }
     }
@@ -308,29 +324,29 @@ impl AsyncActor for AsyncParticipant {
 fn test_terminal_policy() -> TerminalPolicy {
     let mut required = HashSet::new();
     required.insert("step_b".into());
-    TerminalPolicy {
-        saga_type: "order_lifecycle".into(),
-        policy_id: "order_lifecycle/test".into(),
-        failure_authority: FailureAuthority::AnyParticipant,
-        success_criteria: SuccessCriteria::AllOf(required),
-        overall_timeout: Duration::from_secs(60),
-        stalled_timeout: Duration::from_secs(60),
-        workflow_steps: &[],
-    }
+    TerminalPolicy::new(
+        "order_lifecycle".into(),
+        "order_lifecycle/test".into(),
+        FailureAuthority::AnyParticipant,
+        SuccessCriteria::AllOf(required),
+        Duration::from_secs(60),
+        Duration::from_secs(60),
+        &[],
+    )
 }
 
 fn workflow_terminal_policy() -> TerminalPolicy {
     let mut required = HashSet::new();
     required.insert("beta_step".into());
-    TerminalPolicy {
-        saga_type: "workflow_beta".into(),
-        policy_id: "workflow_beta/test".into(),
-        failure_authority: FailureAuthority::AnyParticipant,
-        success_criteria: SuccessCriteria::AllOf(required),
-        overall_timeout: Duration::from_secs(60),
-        stalled_timeout: Duration::from_secs(60),
-        workflow_steps: WorkflowBetaTestContract::steps(),
-    }
+    TerminalPolicy::new(
+        "workflow_beta".into(),
+        "workflow_beta/test".into(),
+        FailureAuthority::AnyParticipant,
+        SuccessCriteria::AllOf(required),
+        Duration::from_secs(60),
+        Duration::from_secs(60),
+        WorkflowBetaTestContract::steps(),
+    )
 }
 
 define_saga_workflow_contract! {
@@ -445,7 +461,8 @@ struct WorkflowActor {
 impl Default for WorkflowActor {
     fn default() -> Self {
         Self {
-            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new())
+                .with_replay_horizon(fixture_horizon()),
             alpha_inputs: Vec::new(),
             beta_inputs: Vec::new(),
         }
@@ -583,7 +600,8 @@ struct DuplicateWorkflowActor {
 impl Default for DuplicateWorkflowActor {
     fn default() -> Self {
         Self {
-            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new())
+                .with_replay_horizon(fixture_horizon()),
         }
     }
 }
