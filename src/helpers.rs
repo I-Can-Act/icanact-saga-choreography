@@ -836,6 +836,7 @@ fn fail_step_async<P, F>(
     });
 }
 
+#[allow(clippy::too_many_arguments)] // signature refactor deferred to W6 R23
 fn compensate_wrapper_with_emit<P, F>(
     participant: &mut P,
     context: &SagaContext,
@@ -962,6 +963,7 @@ fn compensate_wrapper_with_emit<P, F>(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // signature refactor deferred to W6 R23
 async fn compensate_wrapper_with_emit_async<P, F>(
     participant: &mut P,
     context: &SagaContext,

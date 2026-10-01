@@ -367,6 +367,7 @@ impl SagaTestWorld {
         Ok(self.publish(event))
     }
 
+    #[allow(clippy::too_many_arguments)] // signature refactor deferred to W6 R23
     pub fn accept_step<A>(
         &self,
         actor: &mut A,
