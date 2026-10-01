@@ -4300,11 +4300,12 @@ mod loom_dedupe_model {
         fn check_and_mark(&self, saga_id: u64, key: &str) -> bool {
             let mut guard = self.seen.lock().unwrap();
             let entry = (saga_id, key.to_string());
-            if guard.contains_key(&entry) {
-                false
-            } else {
-                guard.insert(entry, ());
-                true
+            match guard.entry(entry) {
+                std::collections::hash_map::Entry::Occupied(_) => false,
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(());
+                    true
+                }
             }
         }
     }
