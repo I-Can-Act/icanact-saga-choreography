@@ -479,6 +479,14 @@ fn run_status<A: SagaStateExt + ?Sized>(
     if support.terminal_sagas.contains(run) {
         return Ok((RunStatus::Terminal, KnownRuns::default()));
     }
+    // Q6: a participant-local quarantine fences its run even after the bounded terminal latch
+    // evicted it; only an operator release (not yet available) may lift it.
+    if matches!(
+        support.saga_states.get(run),
+        Some(SagaStateEntry::Quarantined(_))
+    ) {
+        return Ok((RunStatus::Terminal, KnownRuns::default()));
+    }
     let tombstones = support
         .journal
         .run_tombstones(run.saga_type(), run.saga_id())
