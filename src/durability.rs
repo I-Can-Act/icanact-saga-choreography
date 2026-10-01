@@ -3361,10 +3361,30 @@ pub mod lmdb {
         Ok(keys.len() as u64)
     }
 
+    /// Copies LMDB mmap bytes (no alignment guarantee) into a 16-byte aligned
+    /// buffer, then decodes; failures are logged and returned typed.
+    fn decode_aligned<T>(raw: &[u8], what: &'static str) -> Result<T, JournalError>
+    where
+        T: rkyv::Archive,
+        T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
+            + for<'a> rkyv::bytecheck::CheckBytes<
+                rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>,
+            >,
+    {
+        let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(raw.len());
+        aligned.extend_from_slice(raw);
+        rkyv::from_bytes::<T, rkyv::rancor::Error>(&aligned).map_err(|err| {
+            tracing::error!(what, error = %err, "failed to decode LMDB participant row");
+            jerr(err)
+        })
+    }
+
     fn decode_entry(raw: &[u8]) -> Result<JournalEntry, JournalError> {
-        // Copy to an aligned buffer before validation.
-        let owned = raw.to_vec();
-        rkyv::from_bytes::<JournalEntry, rkyv::rancor::Error>(&owned).map_err(jerr)
+        decode_aligned(raw, "journal entry")
+    }
+
+    fn decode_tombstone(raw: &[u8]) -> Result<RunTombstone, JournalError> {
+        decode_aligned(raw, "run tombstone")
     }
 
     /// Parses a run-index/tombstone key; a malformed key is storage corruption, never skipped.
@@ -3724,10 +3744,7 @@ pub mod lmdb {
                 .prefix_iter(&rtxn, &RunKey::saga_prefix(saga_type, saga_id))
                 .map_err(jerr)?
             {
-                let owned = row.map_err(jerr)?.1.to_vec();
-                out.push(
-                    rkyv::from_bytes::<RunTombstone, rkyv::rancor::Error>(&owned).map_err(jerr)?,
-                );
+                out.push(decode_tombstone(row.map_err(jerr)?.1)?);
             }
             Ok(out)
         }
@@ -4002,6 +4019,57 @@ pub mod lmdb {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::RunTerminalOutcome;
+
+        fn at_offset(offset: usize, encoded: &[u8]) -> rkyv::util::AlignedVec<16> {
+            let mut backing = rkyv::util::AlignedVec::<16>::new();
+            backing.resize(offset + encoded.len(), 0);
+            backing[offset..].copy_from_slice(encoded);
+            backing
+        }
+
+        fn sample_entry() -> JournalEntry {
+            JournalEntry {
+                sequence: 9,
+                recorded_at_millis: 77,
+                event: ParticipantEvent::StepTriggered {
+                    triggering_event: "e".into(),
+                    triggered_at_millis: 5,
+                },
+            }
+        }
+
+        fn sample_tombstone() -> RunTombstone {
+            RunTombstone::new(
+                RunKey::new("pt", SagaId::new(3), RunIncarnation::new(11)),
+                RunTerminalOutcome::Completed,
+                12,
+            )
+        }
+
+        #[test]
+        fn decode_accepts_misaligned_lmdb_bytes() {
+            let entry = rkyv::to_bytes::<rkyv::rancor::Error>(&sample_entry()).unwrap();
+            let tomb = rkyv::to_bytes::<rkyv::rancor::Error>(&sample_tombstone()).unwrap();
+            for offset in 1..8 {
+                let backing = at_offset(offset, &entry);
+                let decoded = decode_entry(&backing[offset..])
+                    .unwrap_or_else(|e| panic!("entry offset {offset}: {e:?}"));
+                assert_eq!(decoded.sequence, 9);
+                let backing = at_offset(offset, &tomb);
+                let decoded = decode_tombstone(&backing[offset..])
+                    .unwrap_or_else(|e| panic!("tombstone offset {offset}: {e:?}"));
+                assert_eq!(decoded, sample_tombstone());
+            }
+        }
+
+        #[test]
+        fn decode_rejects_garbage_with_typed_error() {
+            assert!(matches!(
+                decode_entry(&[1, 2, 3]),
+                Err(JournalError::Storage(_))
+            ));
+        }
 
         #[test]
         fn contains_returns_error_when_reader_slots_are_exhausted() {
