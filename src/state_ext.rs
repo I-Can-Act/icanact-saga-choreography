@@ -13,6 +13,7 @@ use crate::{
     RunIncarnation, RunKey, RunStatus, RunTerminalOutcome, RunTombstone, SagaChoreographyEvent,
     SagaId, SagaStateEntry, admit_run,
 };
+use crate::{IngressOutcome, IngressRejection};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::Ordering;
 
@@ -457,7 +458,7 @@ pub(crate) enum EventAdmission {
     /// Process the event (new run, or the event belongs to the active run).
     Proceed,
     /// Duplicate start, terminal run, or a rejected incarnation; already logged and counted.
-    Skip,
+    Skip(IngressOutcome),
     /// The run status or tombstone lookup failed; the caller must quarantine (ADR-0001 §2.7).
     LookupFailed(SagaStateStoreError),
 }
@@ -543,7 +544,7 @@ pub(crate) fn admit_event<A: SagaStateExt + ?Sized>(
             EventAdmission::Proceed
         }
         Ok(RunAdmission::CurrentRun) => EventAdmission::Proceed,
-        Ok(RunAdmission::DuplicateStart | RunAdmission::TerminalRun) => {
+        Ok(admission @ (RunAdmission::DuplicateStart | RunAdmission::TerminalRun)) => {
             tracing::debug!(
                 target: "core::saga",
                 event = "saga_known_run_event_ignored",
@@ -555,35 +556,41 @@ pub(crate) fn admit_event<A: SagaStateExt + ?Sized>(
                 .stats
                 .duplicate_events
                 .fetch_add(1, Ordering::Relaxed);
-            EventAdmission::Skip
+            EventAdmission::Skip(match admission {
+                RunAdmission::DuplicateStart => IngressOutcome::Duplicate,
+                _ => IngressOutcome::Rejected(IngressRejection::TerminalRun),
+            })
         }
-        Err(RunIdentityError::StaleIncarnation { newest_known, .. }) => {
-            tracing::warn!(
-                target: "core::saga",
-                event = "saga_stale_incarnation_rejected",
-                run = %run,
-                newest_known = %newest_known
-            );
-            actor
-                .saga_support()
-                .stats
-                .runs_rejected_stale
-                .fetch_add(1, Ordering::Relaxed);
-            EventAdmission::Skip
-        }
-        Err(RunIdentityError::ExpiredIncarnation { cutoff, .. }) => {
-            tracing::warn!(
-                target: "core::saga",
-                event = "saga_expired_incarnation_rejected",
-                run = %run,
-                cutoff = %cutoff
-            );
-            actor
-                .saga_support()
-                .stats
-                .runs_rejected_expired
-                .fetch_add(1, Ordering::Relaxed);
-            EventAdmission::Skip
+        Err(err) => {
+            match &err {
+                RunIdentityError::StaleIncarnation { newest_known, .. } => {
+                    tracing::warn!(
+                        target: "core::saga",
+                        event = "saga_stale_incarnation_rejected",
+                        run = %run,
+                        newest_known = %newest_known
+                    );
+                    actor
+                        .saga_support()
+                        .stats
+                        .runs_rejected_stale
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                RunIdentityError::ExpiredIncarnation { cutoff, .. } => {
+                    tracing::warn!(
+                        target: "core::saga",
+                        event = "saga_expired_incarnation_rejected",
+                        run = %run,
+                        cutoff = %cutoff
+                    );
+                    actor
+                        .saga_support()
+                        .stats
+                        .runs_rejected_expired
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            EventAdmission::Skip(IngressOutcome::Rejected(IngressRejection::RunIdentity(err)))
         }
     }
 }

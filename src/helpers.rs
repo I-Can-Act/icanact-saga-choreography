@@ -1,5 +1,6 @@
 //! Helper functions for saga handling
 
+use crate::ReconciliationNeeded;
 use crate::state_ext::{EventAdmission, admit_event, finalize_terminal_run};
 use crate::{
     AsyncSagaParticipant, CompensationError, CompensationOutput, DependencySpec, ParticipantEvent,
@@ -7,13 +8,15 @@ use crate::{
     SagaParticipantState, SagaStateEntry, SagaStateExt, SagaStateStoreError, StepError, StepOutput,
     event_identity,
 };
+use crate::{CommitStage, IngressFailure, IngressOutcome, IngressRejection, ReconciliationCause};
 
 /// Saga event handler with an explicit emit sink for produced choreography events.
 pub fn handle_saga_event_with_emit<P, F>(
     participant: &mut P,
     event: SagaChoreographyEvent,
     mut emit: F,
-) where
+) -> IngressOutcome
+where
     P: SagaParticipant + SagaStateExt,
     F: FnMut(SagaChoreographyEvent),
 {
@@ -26,14 +29,14 @@ pub fn handle_saga_event_with_emit<P, F>(
         .iter()
         .any(|t| *t == context.saga_type.as_ref())
     {
-        return;
+        return IngressOutcome::Rejected(IngressRejection::NotParticipant);
     }
 
     let run = context.run_key();
     let identity = event_identity(&event);
-    match admit_and_dedupe(participant, &event, &run, &identity) {
-        Ok(true) => {}
-        Ok(false) => return,
+    match admit_for_ingress(participant, &event, &run, &identity) {
+        Ok(None) => {}
+        Ok(Some(outcome)) => return outcome,
         Err(err) => {
             let step = participant.step_name().into();
             let participant_id = participant.participant_id_owned();
@@ -46,7 +49,11 @@ pub fn handle_saga_event_with_emit<P, F>(
                 now,
                 &mut emit,
             );
-            return;
+            return IngressOutcome::Failed(IngressFailure {
+                run,
+                stage: admission_stage(&err),
+                source: err,
+            });
         }
     }
 
@@ -54,11 +61,11 @@ pub fn handle_saga_event_with_emit<P, F>(
         SagaChoreographyEvent::SagaStarted { payload, .. }
             if participant.depends_on().is_on_saga_start() =>
         {
-            execute_step_wrapper_with_emit(participant, context.clone(), payload, now, &mut emit);
+            execute_step_wrapper_with_emit(participant, context.clone(), payload, now, &mut emit)
         }
 
         // A start for a run that does not execute on saga start only registers the run.
-        SagaChoreographyEvent::SagaStarted { .. } => {}
+        SagaChoreographyEvent::SagaStarted { .. } => IngressOutcome::Applied,
 
         SagaChoreographyEvent::StepCompleted {
             context: step_ctx,
@@ -76,7 +83,9 @@ pub fn handle_saga_event_with_emit<P, F>(
                 } else {
                     output
                 };
-                execute_step_wrapper_with_emit(participant, next_context, input, now, &mut emit);
+                execute_step_wrapper_with_emit(participant, next_context, input, now, &mut emit)
+            } else {
+                IngressOutcome::Applied
             }
         }
 
@@ -97,7 +106,9 @@ pub fn handle_saga_event_with_emit<P, F>(
                     steps_to_compensate,
                     now,
                     &mut emit,
-                );
+                )
+            } else {
+                IngressOutcome::Applied
             }
         }
 
@@ -105,12 +116,14 @@ pub fn handle_saga_event_with_emit<P, F>(
             participant.latch_terminal_saga(&run);
             participant.on_saga_completed(&context);
             finalize_terminal_run(participant, &run, RunTerminalOutcome::Completed, &identity);
+            IngressOutcome::Applied
         }
 
         SagaChoreographyEvent::SagaFailed { reason, .. } => {
             participant.latch_terminal_saga(&run);
             participant.on_saga_failed(&context, &reason);
             finalize_terminal_run(participant, &run, RunTerminalOutcome::Failed, &identity);
+            IngressOutcome::Applied
         }
 
         // Quarantined runs are never finalized: journal rows and dedupe marks stay as evidence.
@@ -118,9 +131,10 @@ pub fn handle_saga_event_with_emit<P, F>(
             participant.latch_terminal_saga(&run);
             participant.on_quarantined(&context, &reason);
             participant.clear_in_memory_saga_run_tracking(&run);
+            IngressOutcome::Applied
         }
 
-        _ => {}
+        _ => IngressOutcome::Applied,
     }
 }
 
@@ -128,7 +142,8 @@ pub async fn handle_async_saga_event_with_emit<P, F>(
     participant: &mut P,
     event: SagaChoreographyEvent,
     mut emit: F,
-) where
+) -> IngressOutcome
+where
     P: AsyncSagaParticipant + SagaStateExt,
     F: FnMut(SagaChoreographyEvent),
 {
@@ -140,14 +155,14 @@ pub async fn handle_async_saga_event_with_emit<P, F>(
         .iter()
         .any(|t| *t == context.saga_type.as_ref())
     {
-        return;
+        return IngressOutcome::Rejected(IngressRejection::NotParticipant);
     }
 
     let run = context.run_key();
     let identity = event_identity(&event);
-    match admit_and_dedupe(participant, &event, &run, &identity) {
-        Ok(true) => {}
-        Ok(false) => return,
+    match admit_for_ingress(participant, &event, &run, &identity) {
+        Ok(None) => {}
+        Ok(Some(outcome)) => return outcome,
         Err(err) => {
             let step = participant.step_name().into();
             let participant_id = participant.participant_id_owned();
@@ -160,7 +175,11 @@ pub async fn handle_async_saga_event_with_emit<P, F>(
                 now,
                 &mut emit,
             );
-            return;
+            return IngressOutcome::Failed(IngressFailure {
+                run,
+                stage: admission_stage(&err),
+                source: err,
+            });
         }
     }
 
@@ -175,9 +194,9 @@ pub async fn handle_async_saga_event_with_emit<P, F>(
                 now,
                 &mut emit,
             )
-            .await;
+            .await
         }
-        SagaChoreographyEvent::SagaStarted { .. } => {}
+        SagaChoreographyEvent::SagaStarted { .. } => IngressOutcome::Applied,
         SagaChoreographyEvent::StepCompleted {
             context: step_ctx,
             output,
@@ -205,7 +224,9 @@ pub async fn handle_async_saga_event_with_emit<P, F>(
                     now,
                     &mut emit,
                 )
-                .await;
+                .await
+            } else {
+                IngressOutcome::Applied
             }
         }
         SagaChoreographyEvent::CompensationRequested {
@@ -226,25 +247,30 @@ pub async fn handle_async_saga_event_with_emit<P, F>(
                     now,
                     &mut emit,
                 )
-                .await;
+                .await
+            } else {
+                IngressOutcome::Applied
             }
         }
         SagaChoreographyEvent::SagaCompleted { .. } => {
             participant.latch_terminal_saga(&run);
             participant.on_saga_completed(&context);
             finalize_terminal_run(participant, &run, RunTerminalOutcome::Completed, &identity);
+            IngressOutcome::Applied
         }
         SagaChoreographyEvent::SagaFailed { reason, .. } => {
             participant.latch_terminal_saga(&run);
             participant.on_saga_failed(&context, &reason);
             finalize_terminal_run(participant, &run, RunTerminalOutcome::Failed, &identity);
+            IngressOutcome::Applied
         }
         SagaChoreographyEvent::SagaQuarantined { reason, .. } => {
             participant.latch_terminal_saga(&run);
             participant.on_quarantined(&context, &reason);
             participant.clear_in_memory_saga_run_tracking(&run);
+            IngressOutcome::Applied
         }
-        _ => {}
+        _ => IngressOutcome::Applied,
     }
 }
 
@@ -265,12 +291,26 @@ pub(crate) fn admit_and_dedupe<A>(
 where
     A: SagaStateExt,
 {
+    admit_for_ingress(actor, event, run, identity).map(|skip| skip.is_none())
+}
+
+/// Like [`admit_and_dedupe`], but a skipped event carries its typed [`IngressOutcome`]:
+/// `Ok(None)` = process, `Ok(Some(outcome))` = do not process, `Err` = lookup failed.
+pub(crate) fn admit_for_ingress<A>(
+    actor: &mut A,
+    event: &SagaChoreographyEvent,
+    run: &RunKey,
+    identity: &str,
+) -> Result<Option<IngressOutcome>, SagaStateStoreError>
+where
+    A: SagaStateExt,
+{
     match admit_event(actor, event) {
         EventAdmission::Proceed => {}
-        EventAdmission::Skip => return Ok(false),
+        EventAdmission::Skip(outcome) => return Ok(Some(outcome)),
         EventAdmission::LookupFailed(err) => return Err(err),
     }
-    actor
+    let is_new = actor
         .check_dedupe_run_strict(run, identity)
         .inspect_err(|err| {
             tracing::error!(
@@ -279,7 +319,15 @@ where
                 run = %run,
                 error = ?err
             );
-        })
+        })?;
+    Ok((!is_new).then_some(IngressOutcome::Duplicate))
+}
+
+fn admission_stage(err: &SagaStateStoreError) -> CommitStage {
+    match err {
+        SagaStateStoreError::Dedupe(_) => CommitStage::Dedupe,
+        SagaStateStoreError::Journal(_) => CommitStage::Admission,
+    }
 }
 
 /// ADR-0001 §2.7: admission/dedupe lookup failed. No effect ran, so quarantining the run in
@@ -409,11 +457,25 @@ fn execute_step_wrapper_with_emit<P, F>(
     input: Vec<u8>,
     now: u64,
     emit: &mut F,
-) where
+) -> IngressOutcome
+where
     P: SagaParticipant + SagaStateExt,
     F: FnMut(SagaChoreographyEvent),
 {
     let run = context.run_key();
+
+    // Commit the execution intent before the callback may run (ADR-0002, Q5).
+    if let Err(err) = participant.commit_transition(
+        &run,
+        ParticipantEvent::StepExecutionStarted {
+            attempt: 1,
+            started_at_millis: now,
+        },
+    ) {
+        let step = participant.step_name().into();
+        let participant_id = participant.participant_id_owned();
+        return fail_intent_commit(participant, &context, step, participant_id, err, now, emit);
+    }
 
     // Build state: Idle -> Triggered -> Executing
     let state = SagaParticipantState::new(
@@ -428,15 +490,6 @@ fn execute_step_wrapper_with_emit<P, F>(
     .trigger("dependency_satisfied", now)
     .start_execution(now);
 
-    // Persist
-    participant.record_event_run(
-        &run,
-        ParticipantEvent::StepExecutionStarted {
-            attempt: 1,
-            started_at_millis: now,
-        },
-    );
-
     // Store state
     participant
         .saga_states()
@@ -448,12 +501,8 @@ fn execute_step_wrapper_with_emit<P, F>(
 
     // Execute
     match participant.execute_step(&context, &input) {
-        Ok(output) => {
-            complete_step(participant, &context, input, output, now, emit);
-        }
-        Err(error) => {
-            fail_step(participant, &context, error, now, emit);
-        }
+        Ok(output) => complete_step(participant, &context, input, output, now, emit),
+        Err(error) => fail_step(participant, &context, error, now, emit),
     }
 }
 
@@ -463,11 +512,24 @@ async fn execute_step_wrapper_with_emit_async<P, F>(
     input: Vec<u8>,
     now: u64,
     emit: &mut F,
-) where
+) -> IngressOutcome
+where
     P: AsyncSagaParticipant + SagaStateExt,
     F: FnMut(SagaChoreographyEvent),
 {
     let run = context.run_key();
+
+    if let Err(err) = participant.commit_transition(
+        &run,
+        ParticipantEvent::StepExecutionStarted {
+            attempt: 1,
+            started_at_millis: now,
+        },
+    ) {
+        let step = participant.step_name().into();
+        let participant_id = participant.participant_id_owned();
+        return fail_intent_commit(participant, &context, step, participant_id, err, now, emit);
+    }
 
     let state = SagaParticipantState::new(
         context.saga_id,
@@ -480,14 +542,6 @@ async fn execute_step_wrapper_with_emit_async<P, F>(
     )
     .trigger("dependency_satisfied", now)
     .start_execution(now);
-
-    participant.record_event_run(
-        &run,
-        ParticipantEvent::StepExecutionStarted {
-            attempt: 1,
-            started_at_millis: now,
-        },
-    );
 
     participant
         .saga_states()
@@ -503,6 +557,154 @@ async fn execute_step_wrapper_with_emit_async<P, F>(
     }
 }
 
+/// ADR-0002 §2.2 `Intent` (Q5): the execution intent could not be committed, so the callback was
+/// not invoked. Nothing ran, so a non-ambiguous `StepFailed { requires_compensation: true }` is
+/// safe and lets the resolver roll back other completed steps. The dedupe mark is kept, so an
+/// in-process redelivery is `Duplicate`.
+fn fail_intent_commit<A, F>(
+    actor: &mut A,
+    context: &SagaContext,
+    step: Box<str>,
+    participant_id: Box<str>,
+    err: SagaStateStoreError,
+    now: u64,
+    emit: &mut F,
+) -> IngressOutcome
+where
+    A: SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let run = context.run_key();
+    tracing::error!(
+        target: "core::saga",
+        event = "saga_intent_commit_failed",
+        run = %run,
+        step = %step,
+        error = ?err
+    );
+    let reason: Box<str> = format!("intent commit failed: {err}").into();
+    let failed = SagaParticipantState::new(
+        context.saga_id,
+        context.saga_type.clone(),
+        step.clone(),
+        context.correlation_id,
+        context.trace_id,
+        context.initiator_peer_id,
+        context.saga_started_at_millis,
+    )
+    .trigger("dependency_satisfied", now)
+    .start_execution(now)
+    .fail(reason.clone(), true, now);
+    actor
+        .saga_states()
+        .insert(run.clone(), SagaStateEntry::Failed(failed));
+    emit(SagaChoreographyEvent::StepFailed {
+        context: context.next_step(step),
+        participant_id,
+        error_code: Some("intent_commit_failed".into()),
+        error: reason,
+        requires_compensation: true,
+    });
+    IngressOutcome::Failed(IngressFailure {
+        run,
+        stage: CommitStage::Intent,
+        source: err,
+    })
+}
+
+/// ADR-0002 §2.2 `Result` (Q6): the step callback ran (or may have) but its outcome could not be
+/// committed. The success/failure is never acknowledged: the step is quarantined, `SagaQuarantined`
+/// is emitted, and the outcome carries the compensation data as evidence.
+#[allow(clippy::too_many_arguments)] // shared by sync/async engines; signature refactor deferred to W6 R23
+fn quarantine_result_commit_failure<A, F>(
+    actor: &mut A,
+    context: &SagaContext,
+    step: Box<str>,
+    participant_id: Box<str>,
+    err: SagaStateStoreError,
+    compensation_data: Vec<u8>,
+    now: u64,
+    emit: &mut F,
+) -> IngressOutcome
+where
+    A: SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let run = context.run_key();
+    let reason: Box<str> = format!("reconciliation_needed: result_commit_failed: {err}").into();
+    tracing::error!(
+        target: "core::saga",
+        event = "saga_result_commit_failed",
+        run = %run,
+        step = %step,
+        error = ?err
+    );
+    quarantine_after_commit_failure(
+        actor,
+        context,
+        step.clone(),
+        participant_id,
+        &reason,
+        now,
+        emit,
+    );
+    IngressOutcome::ReconciliationNeeded(ReconciliationNeeded {
+        run,
+        step,
+        cause: ReconciliationCause::ResultCommitFailed(err),
+        compensation_data,
+    })
+}
+
+/// Moves an `Executing`/`Compensating` state to `Quarantined`, writes the best-effort evidence
+/// row and emits `SagaQuarantined`. Used only after a failed post-effect commit.
+fn quarantine_after_commit_failure<A, F>(
+    actor: &mut A,
+    context: &SagaContext,
+    step: Box<str>,
+    participant_id: Box<str>,
+    reason: &str,
+    now: u64,
+    emit: &mut F,
+) where
+    A: SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let run = context.run_key();
+    match actor.saga_states().remove(&run) {
+        Some(SagaStateEntry::Executing(state)) => {
+            actor.saga_states().insert(
+                run.clone(),
+                SagaStateEntry::Quarantined(state.quarantine(Box::<str>::from(reason), now)),
+            );
+        }
+        Some(SagaStateEntry::Compensating(state)) => {
+            actor.saga_states().insert(
+                run.clone(),
+                SagaStateEntry::Quarantined(state.quarantine(Box::<str>::from(reason), now)),
+            );
+        }
+        Some(other) => {
+            actor.saga_states().insert(run.clone(), other);
+        }
+        None => {}
+    }
+    // Best-effort evidence only: the journal is the thing that just failed.
+    actor.record_event_run(
+        &run,
+        ParticipantEvent::Quarantined {
+            reason: Box::<str>::from(reason),
+            quarantined_at_millis: now,
+        },
+    );
+    emit(SagaChoreographyEvent::SagaQuarantined {
+        context: context.next_step(step.clone()),
+        reason: Box::<str>::from(reason),
+        step,
+        participant_id,
+    });
+}
+
 /// Complete a step with state transition
 fn complete_step<P, F>(
     participant: &mut P,
@@ -511,11 +713,11 @@ fn complete_step<P, F>(
     output: StepOutput,
     now: u64,
     emit: &mut F,
-) where
+) -> IngressOutcome
+where
     P: SagaParticipant + SagaStateExt,
     F: FnMut(SagaChoreographyEvent),
 {
-    let run = context.run_key();
     if let StepOutput::Accepted {
         execution_id,
         policy,
@@ -546,7 +748,7 @@ fn complete_step<P, F>(
                 );
             }
         }
-        return;
+        return IngressOutcome::Applied;
     }
     let (out_data, comp_data, compensation_available) = match output {
         StepOutput::Completed {
@@ -567,31 +769,19 @@ fn complete_step<P, F>(
         StepOutput::Accepted { .. } => unreachable!("accepted output returned above"),
     };
 
-    // State: Executing -> Completed
-    if let Some(SagaStateEntry::Executing(state)) = participant.saga_states().remove(&run) {
-        let new_state = state.complete(out_data.clone(), comp_data.clone(), now);
-        participant
-            .saga_states()
-            .insert(run.clone(), SagaStateEntry::Completed(new_state));
-    }
-
-    // Persist
-    let emitted_output = out_data.clone();
-    participant.record_event_run(
-        &run,
-        ParticipantEvent::StepExecutionCompleted {
-            output: out_data,
-            compensation_data: comp_data,
-            completed_at_millis: now,
-        },
-    );
-
-    emit(SagaChoreographyEvent::StepCompleted {
-        context: context.next_step(participant.step_name().into()),
-        output: emitted_output,
+    let step = participant.step_name().into();
+    let participant_id = participant.participant_id_owned();
+    commit_step_completed(
+        participant,
+        context,
+        step,
+        participant_id,
         saga_input,
+        (out_data, comp_data),
         compensation_available,
-    });
+        now,
+        emit,
+    )
 }
 
 fn complete_step_async<P, F>(
@@ -601,11 +791,11 @@ fn complete_step_async<P, F>(
     output: StepOutput,
     now: u64,
     emit: &mut F,
-) where
+) -> IngressOutcome
+where
     P: AsyncSagaParticipant + SagaStateExt,
     F: FnMut(SagaChoreographyEvent),
 {
-    let run = context.run_key();
     if let StepOutput::Accepted {
         execution_id,
         policy,
@@ -636,7 +826,7 @@ fn complete_step_async<P, F>(
                 );
             }
         }
-        return;
+        return IngressOutcome::Applied;
     }
     let (out_data, comp_data, compensation_available) = match output {
         StepOutput::Completed {
@@ -657,29 +847,129 @@ fn complete_step_async<P, F>(
         StepOutput::Accepted { .. } => unreachable!("accepted output returned above"),
     };
 
-    if let Some(SagaStateEntry::Executing(state)) = participant.saga_states().remove(&run) {
-        let new_state = state.complete(out_data.clone(), comp_data.clone(), now);
-        participant
-            .saga_states()
-            .insert(run.clone(), SagaStateEntry::Completed(new_state));
-    }
+    let step = participant.step_name().into();
+    let participant_id = participant.participant_id_owned();
+    commit_step_completed(
+        participant,
+        context,
+        step,
+        participant_id,
+        saga_input,
+        (out_data, comp_data),
+        compensation_available,
+        now,
+        emit,
+    )
+}
 
-    let emitted_output = out_data.clone();
-    participant.record_event_run(
-        &run,
-        ParticipantEvent::StepExecutionCompleted {
-            output: out_data,
-            compensation_data: comp_data,
-            completed_at_millis: now,
-        },
-    );
-
-    emit(SagaChoreographyEvent::StepCompleted {
-        context: context.next_step(participant.step_name().into()),
-        output: emitted_output,
+/// Commits `StepExecutionCompleted` together with its `StepCompleted` obligation (ADR-0003), and
+/// only then moves `Executing -> Completed` and emits. A failed commit quarantines (Q6).
+#[allow(clippy::too_many_arguments)] // shared by sync/async engines; signature refactor deferred to W6 R23
+fn commit_step_completed<A, F>(
+    actor: &mut A,
+    context: &SagaContext,
+    step: Box<str>,
+    participant_id: Box<str>,
+    saga_input: Vec<u8>,
+    (out_data, comp_data): (Vec<u8>, Vec<u8>),
+    compensation_available: bool,
+    now: u64,
+    emit: &mut F,
+) -> IngressOutcome
+where
+    A: SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let run = context.run_key();
+    let completed = SagaChoreographyEvent::StepCompleted {
+        context: context.next_step(step.clone()),
+        output: out_data.clone(),
         saga_input,
         compensation_available,
-    });
+    };
+    if let Err(err) = actor.commit_transition_with_outbox(
+        &run,
+        ParticipantEvent::StepExecutionCompleted {
+            output: out_data.clone(),
+            compensation_data: comp_data.clone(),
+            completed_at_millis: now,
+        },
+        vec![completed.clone()],
+    ) {
+        return quarantine_result_commit_failure(
+            actor,
+            context,
+            step,
+            participant_id,
+            err,
+            comp_data,
+            now,
+            emit,
+        );
+    }
+    if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&run) {
+        actor.saga_states().insert(
+            run,
+            SagaStateEntry::Completed(state.complete(out_data, comp_data, now)),
+        );
+    }
+    emit(completed);
+    IngressOutcome::Applied
+}
+
+/// Commits `StepExecutionFailed` together with its `StepFailed` obligation, and only then moves
+/// `Executing -> Failed` and emits. A failed commit quarantines (Q6): the callback ran.
+#[allow(clippy::too_many_arguments)] // shared by sync/async engines; signature refactor deferred to W6 R23
+fn commit_step_failed<A, F>(
+    actor: &mut A,
+    context: &SagaContext,
+    step: Box<str>,
+    participant_id: Box<str>,
+    reason: Box<str>,
+    requires_comp: bool,
+    now: u64,
+    emit: &mut F,
+) -> IngressOutcome
+where
+    A: SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let run = context.run_key();
+    let failed = SagaChoreographyEvent::StepFailed {
+        context: context.next_step(step.clone()),
+        participant_id: participant_id.clone(),
+        error_code: None,
+        error: reason.clone(),
+        requires_compensation: requires_comp,
+    };
+    if let Err(err) = actor.commit_transition_with_outbox(
+        &run,
+        ParticipantEvent::StepExecutionFailed {
+            error: reason.clone(),
+            requires_compensation: requires_comp,
+            failed_at_millis: now,
+        },
+        vec![failed.clone()],
+    ) {
+        return quarantine_result_commit_failure(
+            actor,
+            context,
+            step,
+            participant_id,
+            err,
+            Vec::new(),
+            now,
+            emit,
+        );
+    }
+    if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&run) {
+        actor.saga_states().insert(
+            run,
+            SagaStateEntry::Failed(state.fail(reason, requires_comp, now)),
+        );
+    }
+    emit(failed);
+    IngressOutcome::Applied
 }
 
 fn quarantine_accepted_step_persistence_failure<A, F>(
@@ -771,41 +1061,28 @@ fn fail_step<P, F>(
     error: StepError,
     now: u64,
     emit: &mut F,
-) where
+) -> IngressOutcome
+where
     P: SagaParticipant + SagaStateExt,
     F: FnMut(SagaChoreographyEvent),
 {
-    let run = context.run_key();
     let (reason, requires_comp) = match error {
         StepError::Terminal { reason } => (reason, false),
         StepError::RequireCompensation { reason } => (reason, true),
     };
 
-    // State: Executing -> Failed
-    if let Some(SagaStateEntry::Executing(state)) = participant.saga_states().remove(&run) {
-        let new_state = state.fail(reason.clone(), requires_comp, now);
-        participant
-            .saga_states()
-            .insert(run.clone(), SagaStateEntry::Failed(new_state));
-    }
-
-    // Persist
-    participant.record_event_run(
-        &run,
-        ParticipantEvent::StepExecutionFailed {
-            error: reason.clone(),
-            requires_compensation: requires_comp,
-            failed_at_millis: now,
-        },
-    );
-
-    emit(SagaChoreographyEvent::StepFailed {
-        context: context.next_step(participant.step_name().into()),
-        participant_id: participant.participant_id_owned(),
-        error_code: None,
-        error: reason,
-        requires_compensation: requires_comp,
-    });
+    let step = participant.step_name().into();
+    let participant_id = participant.participant_id_owned();
+    commit_step_failed(
+        participant,
+        context,
+        step,
+        participant_id,
+        reason,
+        requires_comp,
+        now,
+        emit,
+    )
 }
 
 fn fail_step_async<P, F>(
@@ -814,39 +1091,28 @@ fn fail_step_async<P, F>(
     error: StepError,
     now: u64,
     emit: &mut F,
-) where
+) -> IngressOutcome
+where
     P: AsyncSagaParticipant + SagaStateExt,
     F: FnMut(SagaChoreographyEvent),
 {
-    let run = context.run_key();
     let (reason, requires_comp) = match error {
         StepError::Terminal { reason } => (reason, false),
         StepError::RequireCompensation { reason } => (reason, true),
     };
 
-    if let Some(SagaStateEntry::Executing(state)) = participant.saga_states().remove(&run) {
-        let new_state = state.fail(reason.clone(), requires_comp, now);
-        participant
-            .saga_states()
-            .insert(run.clone(), SagaStateEntry::Failed(new_state));
-    }
-
-    participant.record_event_run(
-        &run,
-        ParticipantEvent::StepExecutionFailed {
-            error: reason.clone(),
-            requires_compensation: requires_comp,
-            failed_at_millis: now,
-        },
-    );
-
-    emit(SagaChoreographyEvent::StepFailed {
-        context: context.next_step(participant.step_name().into()),
-        participant_id: participant.participant_id_owned(),
-        error_code: None,
-        error: reason,
-        requires_compensation: requires_comp,
-    });
+    let step = participant.step_name().into();
+    let participant_id = participant.participant_id_owned();
+    commit_step_failed(
+        participant,
+        context,
+        step,
+        participant_id,
+        reason,
+        requires_comp,
+        now,
+        emit,
+    )
 }
 
 #[allow(clippy::too_many_arguments)] // signature refactor deferred to W6 R23
@@ -859,7 +1125,8 @@ fn compensate_wrapper_with_emit<P, F>(
     steps_to_compensate: Vec<Box<str>>,
     now: u64,
     emit: &mut F,
-) where
+) -> IngressOutcome
+where
     P: SagaParticipant + SagaStateExt,
     F: FnMut(SagaChoreographyEvent),
 {
@@ -886,7 +1153,11 @@ fn compensate_wrapper_with_emit<P, F>(
             now,
             emit,
         );
-        return;
+        return IngressOutcome::Failed(IngressFailure {
+            run,
+            stage: CommitStage::CompensationRequest,
+            source: error,
+        });
     }
 
     let accepted_recovery_data = participant
@@ -899,6 +1170,24 @@ fn compensate_wrapper_with_emit<P, F>(
                 accepted.compensation_data.clone(),
             )
         });
+    let will_compensate = match participant.saga_states_ref().get(&run) {
+        Some(SagaStateEntry::Completed(_)) => true,
+        Some(SagaStateEntry::Executing(_)) => accepted_recovery_data.is_some(),
+        _ => false,
+    };
+    if will_compensate
+        && let Err(err) = participant.commit_transition(
+            &run,
+            ParticipantEvent::CompensationStarted {
+                attempt: 1,
+                started_at_millis: now,
+            },
+        )
+    {
+        let step = participant.step_name().into();
+        let participant_id = participant.participant_id_owned();
+        return fail_compensation_start_commit(context, step, participant_id, err, emit);
+    }
     let state_entry = participant.saga_states().remove(&run);
     let (saga_input, comp_data, new_state) = match state_entry {
         Some(SagaStateEntry::Completed(state)) => {
@@ -910,15 +1199,15 @@ fn compensate_wrapper_with_emit<P, F>(
                 participant
                     .saga_states()
                     .insert(run.clone(), SagaStateEntry::Executing(state));
-                return;
+                return IngressOutcome::Applied;
             };
             (saga_input, comp_data, state.start_compensation(now))
         }
         Some(other) => {
             participant.saga_states().insert(run.clone(), other);
-            return;
+            return IngressOutcome::Applied;
         }
-        None => return,
+        None => return IngressOutcome::Applied,
     };
     participant
         .saga_states()
@@ -931,18 +1220,8 @@ fn compensate_wrapper_with_emit<P, F>(
         crate::durability::mark_accepted_step_resolved(participant, &run, accepted.execution_id);
     }
 
-    participant.record_event_run(
-        &run,
-        ParticipantEvent::CompensationStarted {
-            attempt: 1,
-            started_at_millis: now,
-        },
-    );
-
     match participant.compensate_step(context, &comp_data) {
-        Ok(CompensationOutput::Completed) => {
-            complete_compensation(participant, context, now, emit);
-        }
+        Ok(CompensationOutput::Completed) => complete_compensation(participant, context, now, emit),
         Ok(CompensationOutput::Accepted {
             execution_id,
             policy,
@@ -957,7 +1236,10 @@ fn compensate_wrapper_with_emit<P, F>(
                 saga_input,
                 comp_data,
             ) {
-                Ok(event) => emit(event),
+                Ok(event) => {
+                    emit(event);
+                    IngressOutcome::Applied
+                }
                 Err(error) => fail_compensation(
                     participant,
                     context,
@@ -970,9 +1252,7 @@ fn compensate_wrapper_with_emit<P, F>(
                 ),
             }
         }
-        Err(error) => {
-            fail_compensation(participant, context, error, now, emit);
-        }
+        Err(error) => fail_compensation(participant, context, error, now, emit),
     }
 }
 
@@ -986,7 +1266,8 @@ async fn compensate_wrapper_with_emit_async<P, F>(
     steps_to_compensate: Vec<Box<str>>,
     now: u64,
     emit: &mut F,
-) where
+) -> IngressOutcome
+where
     P: AsyncSagaParticipant + SagaStateExt,
     F: FnMut(SagaChoreographyEvent),
 {
@@ -1013,7 +1294,11 @@ async fn compensate_wrapper_with_emit_async<P, F>(
             now,
             emit,
         );
-        return;
+        return IngressOutcome::Failed(IngressFailure {
+            run,
+            stage: CommitStage::CompensationRequest,
+            source: error,
+        });
     }
 
     let accepted_recovery_data = participant
@@ -1026,6 +1311,24 @@ async fn compensate_wrapper_with_emit_async<P, F>(
                 accepted.compensation_data.clone(),
             )
         });
+    let will_compensate = match participant.saga_states_ref().get(&run) {
+        Some(SagaStateEntry::Completed(_)) => true,
+        Some(SagaStateEntry::Executing(_)) => accepted_recovery_data.is_some(),
+        _ => false,
+    };
+    if will_compensate
+        && let Err(err) = participant.commit_transition(
+            &run,
+            ParticipantEvent::CompensationStarted {
+                attempt: 1,
+                started_at_millis: now,
+            },
+        )
+    {
+        let step = participant.step_name().into();
+        let participant_id = participant.participant_id_owned();
+        return fail_compensation_start_commit(context, step, participant_id, err, emit);
+    }
     let state_entry = participant.saga_states().remove(&run);
     let (saga_input, comp_data, new_state) = match state_entry {
         Some(SagaStateEntry::Completed(state)) => {
@@ -1037,15 +1340,15 @@ async fn compensate_wrapper_with_emit_async<P, F>(
                 participant
                     .saga_states()
                     .insert(run.clone(), SagaStateEntry::Executing(state));
-                return;
+                return IngressOutcome::Applied;
             };
             (saga_input, comp_data, state.start_compensation(now))
         }
         Some(other) => {
             participant.saga_states().insert(run.clone(), other);
-            return;
+            return IngressOutcome::Applied;
         }
-        None => return,
+        None => return IngressOutcome::Applied,
     };
     participant
         .saga_states()
@@ -1057,14 +1360,6 @@ async fn compensate_wrapper_with_emit_async<P, F>(
     {
         crate::durability::mark_accepted_step_resolved(participant, &run, accepted.execution_id);
     }
-
-    participant.record_event_run(
-        &run,
-        ParticipantEvent::CompensationStarted {
-            attempt: 1,
-            started_at_millis: now,
-        },
-    );
 
     match participant.compensate_step(context, &comp_data).await {
         Ok(CompensationOutput::Completed) => {
@@ -1084,7 +1379,10 @@ async fn compensate_wrapper_with_emit_async<P, F>(
                 saga_input,
                 comp_data,
             ) {
-                Ok(event) => emit(event),
+                Ok(event) => {
+                    emit(event);
+                    IngressOutcome::Applied
+                }
                 Err(error) => fail_compensation_async(
                     participant,
                     context,
@@ -1103,36 +1401,213 @@ async fn compensate_wrapper_with_emit_async<P, F>(
     }
 }
 
-/// Complete compensation
-fn complete_compensation<P, F>(participant: &mut P, context: &SagaContext, now: u64, emit: &mut F)
+/// ADR-0002 §2.2 `CompensationStart`: `CompensationStarted` could not be committed, so the undo
+/// was not invoked and nothing changed. The `Completed` state (with its undo data) is kept and a
+/// `CompensationFailedRetryable` is emitted so the resolver can re-request.
+fn fail_compensation_start_commit<F>(
+    context: &SagaContext,
+    step: Box<str>,
+    participant_id: Box<str>,
+    err: SagaStateStoreError,
+    emit: &mut F,
+) -> IngressOutcome
 where
-    P: SagaParticipant + SagaStateExt,
     F: FnMut(SagaChoreographyEvent),
 {
     let run = context.run_key();
+    tracing::error!(
+        target: "core::saga",
+        event = "saga_compensation_start_commit_failed",
+        run = %run,
+        error = ?err
+    );
+    emit(SagaChoreographyEvent::CompensationFailedRetryable {
+        context: context.next_step(step),
+        participant_id,
+        error: format!("compensation start commit failed: {err}").into(),
+    });
+    IngressOutcome::Failed(IngressFailure {
+        run,
+        stage: CommitStage::CompensationStart,
+        source: err,
+    })
+}
 
-    // State: Compensating -> Compensated
-    if let Some(SagaStateEntry::Compensating(state)) = participant.saga_states().remove(&run) {
-        let new_state = state.complete_compensation(now);
-        participant
-            .saga_states()
-            .insert(run.clone(), SagaStateEntry::Compensated(new_state));
-    }
+/// ADR-0002 §2.2 `CompensationResult` (Q6): the undo ran (or may have) but its outcome could not
+/// be committed. Never acknowledged: `Compensating -> Quarantined`, `SagaQuarantined` emitted.
+fn quarantine_compensation_result_commit_failure<A, F>(
+    actor: &mut A,
+    context: &SagaContext,
+    step: Box<str>,
+    participant_id: Box<str>,
+    err: SagaStateStoreError,
+    now: u64,
+    emit: &mut F,
+) -> IngressOutcome
+where
+    A: SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let run = context.run_key();
+    let reason: Box<str> =
+        format!("reconciliation_needed: compensation_result_commit_failed: {err}").into();
+    tracing::error!(
+        target: "core::saga",
+        event = "saga_compensation_result_commit_failed",
+        run = %run,
+        step = %step,
+        error = ?err
+    );
+    quarantine_after_commit_failure(
+        actor,
+        context,
+        step.clone(),
+        participant_id,
+        &reason,
+        now,
+        emit,
+    );
+    IngressOutcome::ReconciliationNeeded(ReconciliationNeeded {
+        run,
+        step,
+        cause: ReconciliationCause::CompensationResultCommitFailed(err),
+        compensation_data: Vec::new(),
+    })
+}
 
-    // Persist
-    participant.record_event_run(
+/// Commits `CompensationCompleted` with its obligation, then `Compensating -> Compensated`, then
+/// emits. A failed commit quarantines; the caller runs `on_compensation_completed` only on
+/// `Applied`.
+fn commit_compensation_completed<A, F>(
+    actor: &mut A,
+    context: &SagaContext,
+    step: Box<str>,
+    participant_id: Box<str>,
+    now: u64,
+    emit: &mut F,
+) -> IngressOutcome
+where
+    A: SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let run = context.run_key();
+    let completed = SagaChoreographyEvent::CompensationCompleted {
+        context: context.next_step(step.clone()),
+    };
+    if let Err(err) = actor.commit_transition_with_outbox(
         &run,
         ParticipantEvent::CompensationCompleted {
             completed_at_millis: now,
         },
-    );
+        vec![completed.clone()],
+    ) {
+        return quarantine_compensation_result_commit_failure(
+            actor,
+            context,
+            step,
+            participant_id,
+            err,
+            now,
+            emit,
+        );
+    }
+    if let Some(SagaStateEntry::Compensating(state)) = actor.saga_states().remove(&run) {
+        actor.saga_states().insert(
+            run,
+            SagaStateEntry::Compensated(state.complete_compensation(now)),
+        );
+    }
+    emit(completed);
+    IngressOutcome::Applied
+}
 
-    emit(SagaChoreographyEvent::CompensationCompleted {
-        context: context.next_step(participant.step_name().into()),
-    });
+/// Commits the compensation failure (or quarantine) row with the events it obliges, then moves
+/// the state and emits. A failed commit quarantines with `CompensationResultCommitFailed`.
+fn commit_compensation_failed<A, F>(
+    actor: &mut A,
+    context: &SagaContext,
+    step: Box<str>,
+    participant_id: Box<str>,
+    (reason, is_ambiguous): (Box<str>, bool),
+    now: u64,
+    emit: &mut F,
+) -> IngressOutcome
+where
+    A: SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let run = context.run_key();
+    let event_context = context.next_step(step.clone());
+    let mut outbox = vec![SagaChoreographyEvent::CompensationFailed {
+        context: event_context.clone(),
+        participant_id: participant_id.clone(),
+        error: reason.clone(),
+        is_ambiguous,
+    }];
+    if is_ambiguous {
+        outbox.push(SagaChoreographyEvent::SagaQuarantined {
+            context: event_context,
+            reason: reason.clone(),
+            step: step.clone(),
+            participant_id: participant_id.clone(),
+        });
+    }
+    let row = if is_ambiguous {
+        ParticipantEvent::Quarantined {
+            reason: reason.clone(),
+            quarantined_at_millis: now,
+        }
+    } else {
+        ParticipantEvent::CompensationFailed {
+            error: reason.clone(),
+            is_ambiguous,
+            failed_at_millis: now,
+        }
+    };
+    if let Err(err) = actor.commit_transition_with_outbox(&run, row, outbox.clone()) {
+        return quarantine_compensation_result_commit_failure(
+            actor,
+            context,
+            step,
+            participant_id,
+            err,
+            now,
+            emit,
+        );
+    }
+    if let Some(SagaStateEntry::Compensating(state)) = actor.saga_states().remove(&run) {
+        let entry = if is_ambiguous {
+            SagaStateEntry::Quarantined(state.quarantine(reason, now))
+        } else {
+            SagaStateEntry::Failed(state.fail(reason, false, now))
+        };
+        actor.saga_states().insert(run, entry);
+    }
+    for event in outbox {
+        emit(event);
+    }
+    IngressOutcome::Applied
+}
 
-    // Notify
-    participant.on_compensation_completed(context);
+/// Complete compensation
+fn complete_compensation<P, F>(
+    participant: &mut P,
+    context: &SagaContext,
+    now: u64,
+    emit: &mut F,
+) -> IngressOutcome
+where
+    P: SagaParticipant + SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let step = participant.step_name().into();
+    let participant_id = participant.participant_id_owned();
+    let outcome =
+        commit_compensation_completed(participant, context, step, participant_id, now, emit);
+    if matches!(outcome, IngressOutcome::Applied) {
+        participant.on_compensation_completed(context);
+    }
+    outcome
 }
 
 fn complete_compensation_async<P, F>(
@@ -1140,31 +1615,19 @@ fn complete_compensation_async<P, F>(
     context: &SagaContext,
     now: u64,
     emit: &mut F,
-) where
+) -> IngressOutcome
+where
     P: AsyncSagaParticipant + SagaStateExt,
     F: FnMut(SagaChoreographyEvent),
 {
-    let run = context.run_key();
-
-    if let Some(SagaStateEntry::Compensating(state)) = participant.saga_states().remove(&run) {
-        let new_state = state.complete_compensation(now);
-        participant
-            .saga_states()
-            .insert(run.clone(), SagaStateEntry::Compensated(new_state));
+    let step = participant.step_name().into();
+    let participant_id = participant.participant_id_owned();
+    let outcome =
+        commit_compensation_completed(participant, context, step, participant_id, now, emit);
+    if matches!(outcome, IngressOutcome::Applied) {
+        participant.on_compensation_completed(context);
     }
-
-    participant.record_event_run(
-        &run,
-        ParticipantEvent::CompensationCompleted {
-            completed_at_millis: now,
-        },
-    );
-
-    emit(SagaChoreographyEvent::CompensationCompleted {
-        context: context.next_step(participant.step_name().into()),
-    });
-
-    participant.on_compensation_completed(context);
+    outcome
 }
 
 /// Fail compensation (quarantine)
@@ -1174,68 +1637,31 @@ fn fail_compensation<P, F>(
     error: CompensationError,
     now: u64,
     emit: &mut F,
-) where
+) -> IngressOutcome
+where
     P: SagaParticipant + SagaStateExt,
     F: FnMut(SagaChoreographyEvent),
 {
-    let run = context.run_key();
     let (reason, is_ambiguous) = match error {
         CompensationError::SafeToRetry { reason } => (reason, false),
         CompensationError::Ambiguous { reason } => (reason, true),
         CompensationError::Terminal { reason } => (reason, false),
     };
-
-    if let Some(SagaStateEntry::Compensating(state)) = participant.saga_states().remove(&run) {
-        if is_ambiguous {
-            let new_state = state.quarantine(reason.clone(), now);
-            participant
-                .saga_states()
-                .insert(run.clone(), SagaStateEntry::Quarantined(new_state));
-        } else {
-            let new_state = state.fail(reason.clone(), false, now);
-            participant
-                .saga_states()
-                .insert(run.clone(), SagaStateEntry::Failed(new_state));
-        }
+    let step = participant.step_name().into();
+    let participant_id = participant.participant_id_owned();
+    let outcome = commit_compensation_failed(
+        participant,
+        context,
+        step,
+        participant_id,
+        (reason.clone(), is_ambiguous),
+        now,
+        emit,
+    );
+    if matches!(outcome, IngressOutcome::Applied) {
+        participant.on_quarantined(context, &reason);
     }
-
-    if is_ambiguous {
-        participant.record_event_run(
-            &run,
-            ParticipantEvent::Quarantined {
-                reason: reason.clone(),
-                quarantined_at_millis: now,
-            },
-        );
-    } else {
-        participant.record_event_run(
-            &run,
-            ParticipantEvent::CompensationFailed {
-                error: reason.clone(),
-                is_ambiguous,
-                failed_at_millis: now,
-            },
-        );
-    }
-
-    let event_context = context.next_step(participant.step_name().into());
-    emit(SagaChoreographyEvent::CompensationFailed {
-        context: event_context.clone(),
-        participant_id: participant.participant_id_owned(),
-        error: reason.clone(),
-        is_ambiguous,
-    });
-    if is_ambiguous {
-        emit(SagaChoreographyEvent::SagaQuarantined {
-            context: event_context,
-            reason: reason.clone(),
-            step: participant.step_name().into(),
-            participant_id: participant.participant_id_owned(),
-        });
-    }
-
-    // Notify
-    participant.on_quarantined(context, &reason);
+    outcome
 }
 
 fn fail_compensation_async<P, F>(
@@ -1244,67 +1670,31 @@ fn fail_compensation_async<P, F>(
     error: CompensationError,
     now: u64,
     emit: &mut F,
-) where
+) -> IngressOutcome
+where
     P: AsyncSagaParticipant + SagaStateExt,
     F: FnMut(SagaChoreographyEvent),
 {
-    let run = context.run_key();
     let (reason, is_ambiguous) = match error {
         CompensationError::SafeToRetry { reason } => (reason, false),
         CompensationError::Ambiguous { reason } => (reason, true),
         CompensationError::Terminal { reason } => (reason, false),
     };
-
-    if let Some(SagaStateEntry::Compensating(state)) = participant.saga_states().remove(&run) {
-        if is_ambiguous {
-            let new_state = state.quarantine(reason.clone(), now);
-            participant
-                .saga_states()
-                .insert(run.clone(), SagaStateEntry::Quarantined(new_state));
-        } else {
-            let new_state = state.fail(reason.clone(), false, now);
-            participant
-                .saga_states()
-                .insert(run.clone(), SagaStateEntry::Failed(new_state));
-        }
+    let step = participant.step_name().into();
+    let participant_id = participant.participant_id_owned();
+    let outcome = commit_compensation_failed(
+        participant,
+        context,
+        step,
+        participant_id,
+        (reason.clone(), is_ambiguous),
+        now,
+        emit,
+    );
+    if matches!(outcome, IngressOutcome::Applied) {
+        participant.on_quarantined(context, &reason);
     }
-
-    if is_ambiguous {
-        participant.record_event_run(
-            &run,
-            ParticipantEvent::Quarantined {
-                reason: reason.clone(),
-                quarantined_at_millis: now,
-            },
-        );
-    } else {
-        participant.record_event_run(
-            &run,
-            ParticipantEvent::CompensationFailed {
-                error: reason.clone(),
-                is_ambiguous,
-                failed_at_millis: now,
-            },
-        );
-    }
-
-    let event_context = context.next_step(participant.step_name().into());
-    emit(SagaChoreographyEvent::CompensationFailed {
-        context: event_context.clone(),
-        participant_id: participant.participant_id_owned(),
-        error: reason.clone(),
-        is_ambiguous,
-    });
-    if is_ambiguous {
-        emit(SagaChoreographyEvent::SagaQuarantined {
-            context: event_context,
-            reason: reason.clone(),
-            step: participant.step_name().into(),
-            participant_id: participant.participant_id_owned(),
-        });
-    }
-
-    participant.on_quarantined(context, &reason);
+    outcome
 }
 
 #[cfg(test)]
@@ -1447,15 +1837,16 @@ mod tests {
             .journal
             .read(SagaId::new(1))
             .expect("journal read should succeed");
+        let rows: Vec<&ParticipantEvent> = entries
+            .iter()
+            .map(|entry| entry.event.transition())
+            .collect();
         assert!(matches!(
-            entries.as_slice(),
+            rows.as_slice(),
             [
                 _,
-                crate::JournalEntry {
-                    event: ParticipantEvent::StepExecutionCompleted {
-                        compensation_data,
-                        ..
-                    },
+                ParticipantEvent::StepExecutionCompleted {
+                    compensation_data,
                     ..
                 }
             ] if compensation_data == &[9]
@@ -1681,14 +2072,15 @@ mod tests {
             .journal
             .read(SagaId::new(1))
             .expect("journal read should succeed");
+        let rows: Vec<&ParticipantEvent> = entries
+            .iter()
+            .map(|entry| entry.event.transition())
+            .collect();
         assert!(matches!(
-            entries.last(),
-            Some(crate::JournalEntry {
-                event: ParticipantEvent::CompensationFailed {
-                    error,
-                    is_ambiguous: false,
-                    ..
-                },
+            rows.last(),
+            Some(ParticipantEvent::CompensationFailed {
+                error,
+                is_ambiguous: false,
                 ..
             }) if error.as_ref() == "cannot compensate"
         ));
@@ -1742,12 +2134,14 @@ mod tests {
             .journal
             .read(SagaId::new(1))
             .expect("journal read should succeed");
+        let rows: Vec<&ParticipantEvent> = entries
+            .iter()
+            .map(|entry| entry.event.transition())
+            .collect();
         assert!(matches!(
-            entries.last(),
-            Some(crate::JournalEntry {
-                event: ParticipantEvent::Quarantined { reason, .. },
-                ..
-            }) if reason.as_ref() == "cannot confirm rollback"
+            rows.last(),
+            Some(ParticipantEvent::Quarantined { reason, .. })
+                if reason.as_ref() == "cannot confirm rollback"
         ));
         assert!(matches!(
             emitted.get(1),
