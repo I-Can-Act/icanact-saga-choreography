@@ -8,6 +8,7 @@ use icanact_core::CorrelationRegistry;
 use icanact_core::local::{FirehosePubSub, FirehoseSubscription, PublishStats};
 use icanact_core::local_sync::{self, SyncActor};
 
+use crate::events::AbortSource;
 use crate::reply_registry::{SagaReplyToHandle, SagaReplyToResult};
 use crate::workflow_contract::required_path_steps_from_success_criteria;
 use crate::{
@@ -705,27 +706,57 @@ impl SagaChoreographyBus {
             (expected_min_delivery, expected_context)
             && stats.delivered < required_min_delivery
         {
-            let terminal = SagaChoreographyEvent::SagaFailed {
-                    context: context.next_step(TERMINAL_RESOLVER_STEP.into()),
-                    reason: format!(
-                        "required_path_delivery_shortfall: saga_type={} event_type={} step={} delivered={} attempted={} required_min_delivered={} required_path={}",
-                        context.saga_type,
-                        event_type,
-                        context.step_name,
-                        stats.delivered,
-                        stats.attempted,
-                        required_min_delivery,
-                        expected_required_path
-                    )
-                    .into(),
-                    failure: None,
-                };
-            if let Some(outcome) = terminal.terminal_outcome() {
-                self.store_terminal_outcome(terminal.context().run_key(), outcome);
-            }
-            let _ = self.publish_event(terminal);
+            let reason: Box<str> = format!(
+                "required_path_delivery_shortfall: saga_type={} event_type={} step={} delivered={} attempted={} required_min_delivered={} required_path={}",
+                context.saga_type,
+                event_type,
+                context.step_name,
+                stats.delivered,
+                stats.attempted,
+                required_min_delivery,
+                expected_required_path
+            )
+            .into();
+            let _ = self.publish_abort_or_fail(&context, reason, AbortSource::DeliveryShortfall);
         }
         (stats, None)
+    }
+
+    /// Requests a resolver-driven abort (ADR-0004 §2.6). If the abort reaches
+    /// no subscriber at all, the only safe event left is a terminal
+    /// `SagaFailed`, which is published after an `error!`.
+    fn publish_abort_or_fail(
+        &self,
+        context: &crate::SagaContext,
+        reason: Box<str>,
+        source: AbortSource,
+    ) -> PublishStats {
+        let abort = SagaChoreographyEvent::SagaAbortRequested {
+            context: context.next_step(TERMINAL_RESOLVER_STEP.into()),
+            reason: reason.clone(),
+            source,
+        };
+        let stats = self.publish_event(abort);
+        if stats.delivered > 0 {
+            return stats;
+        }
+        tracing::error!(
+            target: "core::saga",
+            event = "saga_abort_request_undelivered",
+            run = ?context.run_key(),
+            source = ?source,
+            reason = %reason,
+            "abort request reached no resolver; publishing terminal SagaFailed"
+        );
+        let terminal = SagaChoreographyEvent::SagaFailed {
+            context: context.next_step(TERMINAL_RESOLVER_STEP.into()),
+            reason,
+            failure: None,
+        };
+        if let Some(outcome) = terminal.terminal_outcome() {
+            self.store_terminal_outcome(terminal.context().run_key(), outcome);
+        }
+        self.publish_event(terminal)
     }
 
     pub fn publish_strict(
@@ -781,24 +812,22 @@ impl SagaChoreographyBus {
             SagaChoreographyEvent::SagaCompleted { .. }
                 | SagaChoreographyEvent::SagaFailed { .. }
                 | SagaChoreographyEvent::SagaQuarantined { .. }
+                | SagaChoreographyEvent::SagaAbortRequested { .. }
         );
         if is_terminal {
             return Err(partial);
         }
 
-        let terminal = SagaChoreographyEvent::SagaFailed {
-            context: context.next_step(TERMINAL_RESOLVER_STEP.into()),
-            reason: format!(
-                "publish_partial_delivery attempted={} delivered={} event_type={} step={}",
-                attempted,
-                delivered,
-                event.event_type(),
-                context.step_name
-            )
-            .into(),
-            failure: None,
-        };
-        let terminal_stats = self.publish(terminal);
+        let reason: Box<str> = format!(
+            "publish_partial_delivery attempted={} delivered={} event_type={} step={}",
+            attempted,
+            delivered,
+            event.event_type(),
+            context.step_name
+        )
+        .into();
+        let terminal_stats =
+            self.publish_abort_or_fail(&context, reason, AbortSource::PartialDelivery);
         if terminal_stats.attempted != terminal_stats.delivered {
             return Err(SagaBusPublishError::TerminalEscalationPartialDelivery {
                 saga_id: context.saga_id,
@@ -1367,6 +1396,7 @@ impl SagaChoreographyBus {
             SagaChoreographyEvent::SagaCompleted { .. }
                 | SagaChoreographyEvent::SagaFailed { .. }
                 | SagaChoreographyEvent::SagaQuarantined { .. }
+                | SagaChoreographyEvent::SagaAbortRequested { .. }
         ) {
             return None;
         }
@@ -1504,6 +1534,8 @@ mod tests {
     };
 
     use super::{DEFAULT_TERMINAL_RETENTION_LIMIT, SagaChoreographyBus};
+    use crate::AbortSource;
+    use icanact_core::local::FirehoseSubscription;
 
     /// Process-constant recent incarnation: all events of one saga must share one run.
     fn run_start_millis() -> u64 {
@@ -2523,9 +2555,10 @@ mod tests {
 
         let _ = bus.publish(started);
 
-        let Some(SagaTerminalOutcome::Failed { reason, .. }) = bus.take_terminal_outcome(saga_id)
-        else {
-            panic!("expected immediate terminal failure for live delivery shortfall");
+        // The bus now requests an abort; the resolver authors the terminal.
+        let outcome = take_outcome_eventually(&bus, saga_id);
+        let Some(SagaTerminalOutcome::Failed { reason, .. }) = outcome else {
+            panic!("expected terminal failure for live delivery shortfall");
         };
         assert!(
             reason.contains("required_path_delivery_shortfall"),
@@ -2607,9 +2640,10 @@ mod tests {
             compensation_available: false,
         });
 
-        let Some(SagaTerminalOutcome::Failed { reason, .. }) = bus.take_terminal_outcome(saga_id)
-        else {
-            panic!("expected immediate terminal failure for required dependency route loss");
+        // The bus now requests an abort; the resolver authors the terminal.
+        let outcome = take_outcome_eventually(&bus, saga_id);
+        let Some(SagaTerminalOutcome::Failed { reason, .. }) = outcome else {
+            panic!("expected terminal failure for required dependency route loss");
         };
         assert!(
             reason.contains("required_path_delivery_shortfall"),
@@ -2713,6 +2747,115 @@ mod tests {
             required_path.as_ref(),
             "create_order(order-manager),risk_check(risk-engine)"
         );
+    }
+
+    fn captured_events(
+        bus: &SagaChoreographyBus,
+    ) -> (
+        Arc<std::sync::Mutex<Vec<SagaChoreographyEvent>>>,
+        FirehoseSubscription,
+    ) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sub = bus.subscribe_saga_type_fn("order_lifecycle", {
+            let seen = Arc::clone(&seen);
+            move |event| {
+                seen.lock().expect("capture lock").push(event.clone());
+                true
+            }
+        });
+        (seen, sub)
+    }
+
+    fn take_outcome_eventually(
+        bus: &SagaChoreographyBus,
+        saga_id: SagaId,
+    ) -> Option<SagaTerminalOutcome> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Some(outcome) = bus.take_terminal_outcome(saga_id) {
+                return Some(outcome);
+            }
+            thread::yield_now();
+        }
+        None
+    }
+
+    fn shortfall_bus() -> SagaChoreographyBus {
+        let bus = SagaChoreographyBus::new();
+        bus.register_workflow_contract_provider::<MultiStepOrderLifecycleContract>()
+            .expect("workflow contract registration should succeed");
+        bus.register_bound_workflow_step("order_lifecycle", "risk_check")
+            .expect("risk_check binding should succeed");
+        bus.register_bound_workflow_step("order_lifecycle", "create_order")
+            .expect("create_order binding should succeed");
+        bus
+    }
+
+    fn shortfall_event(saga_id: u64) -> SagaChoreographyEvent {
+        SagaChoreographyEvent::StepCompleted {
+            context: context("risk_check", saga_id),
+            output: Vec::new(),
+            saga_input: Vec::new(),
+            compensation_available: false,
+        }
+    }
+
+    #[test]
+    fn delivery_shortfall_requests_abort_not_terminal_failure() {
+        let bus = shortfall_bus();
+        let _resolver = bus
+            .attach_terminal_resolver_for_contract::<MultiStepOrderLifecycleContract>(
+                "test-resolver",
+            )
+            .expect("terminal resolver should attach");
+        let (seen, _sub) = captured_events(&bus);
+
+        let _ = bus.publish_strict(shortfall_event(90071));
+
+        let events = seen.lock().expect("capture lock");
+        let aborts: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    SagaChoreographyEvent::SagaAbortRequested {
+                        source: AbortSource::DeliveryShortfall,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(aborts.len(), 1, "exactly one abort request, got {events:?}");
+        // The bus itself must not synthesize a terminal failure; any
+        // SagaFailed must come after the abort (resolver-authored).
+        let abort_pos = events
+            .iter()
+            .position(|e| matches!(e, SagaChoreographyEvent::SagaAbortRequested { .. }))
+            .expect("abort present");
+        assert!(
+            !events[..abort_pos]
+                .iter()
+                .any(|e| matches!(e, SagaChoreographyEvent::SagaFailed { .. })),
+            "bus published SagaFailed before/instead of abort: {events:?}"
+        );
+    }
+
+    #[test]
+    fn undelivered_abort_falls_back_to_saga_failed() {
+        let bus = shortfall_bus();
+        let resolver = bus
+            .attach_terminal_resolver_for_contract::<MultiStepOrderLifecycleContract>(
+                "test-resolver",
+            )
+            .expect("terminal resolver should attach");
+        // Policy stays registered but nothing is subscribed: the abort
+        // request reaches no resolver and must fall back to SagaFailed.
+        assert!(bus.unsubscribe(resolver));
+        let _ = bus.publish_strict(shortfall_event(90072));
+        assert!(matches!(
+            bus.take_terminal_outcome(SagaId::new(90072)),
+            Some(SagaTerminalOutcome::Failed { .. })
+        ));
     }
 
     struct DeniedRequiredStepContract;
