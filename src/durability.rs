@@ -3181,8 +3181,10 @@ pub mod lmdb {
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use heed::types::{Bytes, Str};
+    use heed::types::{Bytes, DecodeIgnore, Str};
     use heed::{Database, Env, EnvOpenOptions};
+
+    use crate::journal::reject_nested_transition;
 
     use super::{
         DEFAULT_RECOVERY_SAGA_TYPE, collect_startup_recovery_events_for_saga_type_inner,
@@ -3196,7 +3198,11 @@ pub mod lmdb {
     const DEFAULT_LMDB_MAP_SIZE_BYTES: usize = 1024 * 1024 * 1024;
     const SAGA_LMDB_MAP_SIZE_ENV: &str = "SAGA_LMDB_MAP_SIZE_BYTES";
     const JOURNAL_SCHEMA_KEY: &str = "journal_schema_version";
-    const JOURNAL_SCHEMA_VERSION: &str = "2";
+    const JOURNAL_SCHEMA_VERSION: &str = "3";
+    /// Pre-run-identity schema; refused while it still holds rows (ADR-0001 §2.6).
+    const LEGACY_JOURNAL_SCHEMA_VERSION: &str = "2";
+    const DEDUPE_SCHEMA_KEY: &str = "dedupe_schema_version";
+    const DEDUPE_SCHEMA_VERSION: &str = "3";
 
     fn lmdb_map_size_bytes() -> Result<usize, Box<str>> {
         match std::env::var(SAGA_LMDB_MAP_SIZE_ENV) {
@@ -3229,18 +3235,88 @@ pub mod lmdb {
         format!("{:020}", saga_id.get())
     }
 
+    fn jerr(err: impl std::fmt::Display) -> JournalError {
+        JournalError::Storage(err.to_string().into())
+    }
+
+    fn derr(err: impl std::fmt::Display) -> DedupeError {
+        DedupeError::Storage(err.to_string().into())
+    }
+
+    /// Keys of `db` starting with `prefix`, collected so the caller can delete without unsafe cursors.
+    fn collect_keys<D: 'static>(
+        db: &Database<Str, D>,
+        txn: &heed::RoTxn<'_>,
+        prefix: &str,
+    ) -> Result<Vec<String>, heed::Error> {
+        let mut keys = Vec::new();
+        for row in db
+            .remap_data_type::<DecodeIgnore>()
+            .prefix_iter(txn, prefix)?
+        {
+            keys.push(row?.0.to_owned());
+        }
+        Ok(keys)
+    }
+
+    fn collect_all_keys<D: 'static>(
+        db: &Database<Str, D>,
+        txn: &heed::RoTxn<'_>,
+    ) -> Result<Vec<String>, heed::Error> {
+        let mut keys = Vec::new();
+        for row in db.remap_data_type::<DecodeIgnore>().iter(txn)? {
+            keys.push(row?.0.to_owned());
+        }
+        Ok(keys)
+    }
+
+    fn delete_prefix<D: 'static>(
+        db: &Database<Str, D>,
+        wtxn: &mut heed::RwTxn<'_>,
+        prefix: &str,
+    ) -> Result<u64, heed::Error> {
+        let keys = collect_keys(db, wtxn, prefix)?;
+        for key in &keys {
+            db.delete(wtxn, key)?;
+        }
+        Ok(keys.len() as u64)
+    }
+
+    fn decode_entry(raw: &[u8]) -> Result<JournalEntry, JournalError> {
+        // Copy to an aligned buffer before validation.
+        let owned = raw.to_vec();
+        rkyv::from_bytes::<JournalEntry, rkyv::rancor::Error>(&owned).map_err(jerr)
+    }
+
+    /// Parses a run-index/tombstone key; a malformed key is storage corruption, never skipped.
+    fn parse_run_key(key: &str, expect_empty_rest: bool) -> Result<(RunKey, &str), String> {
+        match RunKey::parse_storage_prefix(key) {
+            Some((run, rest)) if !expect_empty_rest || rest.is_empty() => Ok((run, rest)),
+            _ => {
+                tracing::error!(
+                    target: "core::saga",
+                    event = "lmdb_run_key_corrupt",
+                    key = key
+                );
+                Err(format!("corrupt run-scoped storage key {key:?}"))
+            }
+        }
+    }
+
     #[derive(Debug)]
     pub struct LmdbJournal {
         env: Env,
         rows: Database<Str, Bytes>,
         saga_index: Database<Str, Str>,
         meta: Database<Str, Str>,
+        run_rows: Database<Str, Bytes>,
+        run_index: Database<Str, Str>,
+        tombstones: Database<Str, Bytes>,
     }
 
     impl LmdbJournal {
         pub fn open(path: &Path) -> Result<Self, JournalError> {
-            std::fs::create_dir_all(path)
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
+            std::fs::create_dir_all(path).map_err(jerr)?;
             let map_size = lmdb_map_size_bytes().map_err(JournalError::Storage)?;
             let env = unsafe {
                 EnvOpenOptions::new()
@@ -3248,24 +3324,46 @@ pub mod lmdb {
                     .map_size(map_size)
                     .open(path)
             }
-            .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            let mut wtxn = env
-                .write_txn()
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
+            .map_err(jerr)?;
+            let mut wtxn = env.write_txn().map_err(jerr)?;
             let rows = env
                 .create_database::<Str, Bytes>(&mut wtxn, Some("journal_rows"))
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
+                .map_err(jerr)?;
             let saga_index = env
                 .create_database::<Str, Str>(&mut wtxn, Some("journal_saga_index"))
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
+                .map_err(jerr)?;
             let meta = env
                 .create_database::<Str, Str>(&mut wtxn, Some("journal_meta"))
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
+                .map_err(jerr)?;
+            let run_rows = env
+                .create_database::<Str, Bytes>(&mut wtxn, Some("journal_run_rows"))
+                .map_err(jerr)?;
+            let run_index = env
+                .create_database::<Str, Str>(&mut wtxn, Some("journal_run_index"))
+                .map_err(jerr)?;
+            let tombstones = env
+                .create_database::<Str, Bytes>(&mut wtxn, Some("run_tombstones"))
+                .map_err(jerr)?;
             let stored_schema = meta
                 .get(&wtxn, JOURNAL_SCHEMA_KEY)
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            match stored_schema {
-                Some(version) if version == JOURNAL_SCHEMA_VERSION => {}
+                .map_err(jerr)?
+                .map(str::to_owned);
+            match stored_schema.as_deref() {
+                Some(JOURNAL_SCHEMA_VERSION) => {}
+                Some(LEGACY_JOURNAL_SCHEMA_VERSION) => {
+                    let legacy_rows = rows.len(&wtxn).map_err(jerr)?;
+                    if legacy_rows > 0 {
+                        tracing::error!(
+                            target: "core::saga",
+                            event = "journal_legacy_run_identity",
+                            legacy_rows,
+                            path = %path.display()
+                        );
+                        return Err(JournalError::LegacyRunIdentity { legacy_rows });
+                    }
+                    meta.put(&mut wtxn, JOURNAL_SCHEMA_KEY, JOURNAL_SCHEMA_VERSION)
+                        .map_err(jerr)?;
+                }
                 Some(version) => {
                     return Err(JournalError::Storage(
                         format!(
@@ -3275,19 +3373,7 @@ pub mod lmdb {
                     ));
                 }
                 None => {
-                    let has_unversioned_rows = {
-                        let mut iter = rows
-                            .iter(&wtxn)
-                            .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-                        match iter.next() {
-                            Some(row) => {
-                                row.map_err(|err| JournalError::Storage(err.to_string().into()))?;
-                                true
-                            }
-                            None => false,
-                        }
-                    };
-                    if has_unversioned_rows {
+                    if rows.len(&wtxn).map_err(jerr)? > 0 {
                         return Err(JournalError::Storage(
                             format!(
                                 "unversioned saga journal contains rows incompatible with required schema version {JOURNAL_SCHEMA_VERSION}"
@@ -3296,26 +3382,26 @@ pub mod lmdb {
                         ));
                     }
                     meta.put(&mut wtxn, JOURNAL_SCHEMA_KEY, JOURNAL_SCHEMA_VERSION)
-                        .map_err(|err| JournalError::Storage(err.to_string().into()))?;
+                        .map_err(jerr)?;
                 }
             }
-            wtxn.commit()
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
+            wtxn.commit().map_err(jerr)?;
             Ok(Self {
                 env,
                 rows,
                 saga_index,
                 meta,
+                run_rows,
+                run_index,
+                tombstones,
             })
         }
 
-        fn next_sequence(
-            rows: &Database<Str, Bytes>,
-            meta: &Database<Str, Str>,
-            wtxn: &mut heed::RwTxn<'_>,
-        ) -> Result<u64, JournalError> {
+        /// Checked allocator shared by the legacy and run row databases (R29).
+        fn next_sequence(&self, wtxn: &mut heed::RwTxn<'_>) -> Result<u64, JournalError> {
             let storage = |msg: String| JournalError::Storage(msg.into());
-            let stored = meta
+            let stored = self
+                .meta
                 .get(wtxn, "next_sequence")
                 .map_err(|err| storage(err.to_string()))?;
             let next = match stored {
@@ -3323,11 +3409,16 @@ pub mod lmdb {
                     storage(format!("corrupt journal next_sequence {raw:?}: {err}"))
                 })?,
                 None => {
-                    let has_rows = rows
-                        .iter(wtxn)
+                    let has_rows = self
+                        .rows
+                        .len(wtxn)
                         .map_err(|err| storage(err.to_string()))?
-                        .next()
-                        .is_some();
+                        > 0
+                        || self
+                            .run_rows
+                            .len(wtxn)
+                            .map_err(|err| storage(err.to_string()))?
+                            > 0;
                     if has_rows {
                         return Err(storage(
                             "journal next_sequence metadata missing while rows exist".to_owned(),
@@ -3342,26 +3433,87 @@ pub mod lmdb {
             let after = next
                 .checked_add(1)
                 .ok_or_else(|| storage("journal sequence space exhausted".to_owned()))?;
-            meta.put(wtxn, "next_sequence", &after.to_string())
+            self.meta
+                .put(wtxn, "next_sequence", &after.to_string())
                 .map_err(|err| storage(err.to_string()))?;
             Ok(next)
         }
-    }
 
-    impl ParticipantJournal for LmdbJournal {
-        fn append(&self, saga_id: SagaId, event: ParticipantEvent) -> Result<u64, JournalError> {
-            let mut wtxn = self
-                .env
-                .write_txn()
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            let sequence = Self::next_sequence(&self.rows, &self.meta, &mut wtxn)?;
+        fn encode_row(event: ParticipantEvent, sequence: u64) -> Result<Vec<u8>, JournalError> {
             let entry = JournalEntry {
                 sequence,
                 recorded_at_millis: now_millis(),
                 event,
             };
-            let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&entry)
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
+            rkyv::to_bytes::<rkyv::rancor::Error>(&entry)
+                .map(|bytes| bytes.to_vec())
+                .map_err(jerr)
+        }
+
+        /// Runs that have rows, in index order.
+        fn index_runs(&self, txn: &heed::RoTxn<'_>) -> Result<Vec<RunKey>, JournalError> {
+            let mut runs = Vec::new();
+            for key in collect_all_keys(&self.run_index, txn).map_err(jerr)? {
+                runs.push(
+                    parse_run_key(&key, true)
+                        .map_err(|m| JournalError::Storage(m.into()))?
+                        .0,
+                );
+            }
+            Ok(runs)
+        }
+
+        fn read_run_in(
+            &self,
+            txn: &heed::RoTxn<'_>,
+            run: &RunKey,
+        ) -> Result<Vec<JournalEntry>, JournalError> {
+            let mut entries = Vec::new();
+            for row in self
+                .run_rows
+                .prefix_iter(txn, &run.storage_prefix())
+                .map_err(jerr)?
+            {
+                entries.push(decode_entry(row.map_err(jerr)?.1)?);
+            }
+            entries.sort_by_key(|e| e.sequence);
+            Ok(entries)
+        }
+
+        fn delete_run_in(
+            &self,
+            wtxn: &mut heed::RwTxn<'_>,
+            run: &RunKey,
+        ) -> Result<(), JournalError> {
+            let prefix = run.storage_prefix();
+            delete_prefix(&self.run_rows, wtxn, &prefix).map_err(jerr)?;
+            self.run_index.delete(wtxn, &prefix).map_err(jerr)?;
+            Ok(())
+        }
+
+        fn delete_expired_tombstones_in(
+            &self,
+            wtxn: &mut heed::RwTxn<'_>,
+            cutoff: RunIncarnation,
+        ) -> Result<u64, JournalError> {
+            let mut deleted = 0;
+            for key in collect_all_keys(&self.tombstones, wtxn).map_err(jerr)? {
+                let (run, _) =
+                    parse_run_key(&key, true).map_err(|m| JournalError::Storage(m.into()))?;
+                if run.incarnation() < cutoff {
+                    self.tombstones.delete(wtxn, &key).map_err(jerr)?;
+                    deleted += 1;
+                }
+            }
+            Ok(deleted)
+        }
+    }
+
+    impl ParticipantJournal for LmdbJournal {
+        fn append(&self, saga_id: SagaId, event: ParticipantEvent) -> Result<u64, JournalError> {
+            let mut wtxn = self.env.write_txn().map_err(jerr)?;
+            let sequence = self.next_sequence(&mut wtxn)?;
+            let encoded = Self::encode_row(event, sequence)?;
             self.rows
                 .put_with_flags(
                     &mut wtxn,
@@ -3369,126 +3521,157 @@ pub mod lmdb {
                     &key_saga_seq(saga_id, sequence),
                     encoded.as_ref(),
                 )
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
+                .map_err(jerr)?;
             self.saga_index
                 .put(&mut wtxn, &key_saga_index(saga_id), "1")
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            wtxn.commit()
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
+                .map_err(jerr)?;
+            wtxn.commit().map_err(jerr)?;
             Ok(sequence)
         }
 
+        /// Union of the legacy partition and every run with this id, by sequence (ADR-0001 §2.4).
         fn read(&self, saga_id: SagaId) -> Result<Vec<JournalEntry>, JournalError> {
-            let rtxn = self
-                .env
-                .read_txn()
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            let prefix = key_saga_prefix(saga_id);
+            let rtxn = self.env.read_txn().map_err(jerr)?;
             let mut entries = Vec::new();
-            let iter = self
+            for row in self
                 .rows
-                .prefix_iter(&rtxn, &prefix)
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            for row in iter {
-                let (_, v) = row.map_err(|err| JournalError::Storage(err.to_string().into()))?;
-                let owned = v.to_vec();
-                let decoded: JournalEntry =
-                    rkyv::from_bytes::<JournalEntry, rkyv::rancor::Error>(&owned)
-                        .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-                entries.push(decoded);
+                .prefix_iter(&rtxn, &key_saga_prefix(saga_id))
+                .map_err(jerr)?
+            {
+                entries.push(decode_entry(row.map_err(jerr)?.1)?);
+            }
+            for run in self.index_runs(&rtxn)? {
+                if run.saga_id() == saga_id {
+                    entries.extend(self.read_run_in(&rtxn, &run)?);
+                }
             }
             entries.sort_by_key(|e| e.sequence);
             Ok(entries)
         }
 
         fn list_sagas(&self) -> Result<Vec<SagaId>, JournalError> {
-            let rtxn = self
-                .env
-                .read_txn()
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            let mut out = Vec::new();
-            let iter = self
-                .saga_index
-                .iter(&rtxn)
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            for row in iter {
-                let (k, _) = row.map_err(|err| JournalError::Storage(err.to_string().into()))?;
+            let rtxn = self.env.read_txn().map_err(jerr)?;
+            let mut ids = Vec::new();
+            for row in self.saga_index.iter(&rtxn).map_err(jerr)? {
+                let (k, _) = row.map_err(jerr)?;
                 if let Ok(id) = k.parse::<u64>() {
-                    out.push(SagaId::new(id));
+                    ids.push(id);
                 }
             }
-            out.sort_by_key(|id| id.get());
-            Ok(out)
+            ids.extend(
+                self.index_runs(&rtxn)?
+                    .iter()
+                    .map(|run| run.saga_id().get()),
+            );
+            ids.sort_unstable();
+            ids.dedup();
+            Ok(ids.into_iter().map(SagaId::new).collect())
         }
 
+        /// Deletes the legacy partition and every run with this id; tombstones are kept (ADR-0001 §2.4).
         fn prune(&self, saga_id: SagaId) -> Result<(), JournalError> {
-            let mut wtxn = self
-                .env
-                .write_txn()
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            let prefix = key_saga_prefix(saga_id);
-            let mut iter = self
-                .rows
-                .prefix_iter_mut(&mut wtxn, &prefix)
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            while iter.next().is_some() {
-                unsafe { iter.del_current() }
-                    .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            }
-            drop(iter);
+            let mut wtxn = self.env.write_txn().map_err(jerr)?;
+            delete_prefix(&self.rows, &mut wtxn, &key_saga_prefix(saga_id)).map_err(jerr)?;
             self.saga_index
                 .delete(&mut wtxn, &key_saga_index(saga_id))
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            wtxn.commit()
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            Ok(())
+                .map_err(jerr)?;
+            for run in self.index_runs(&wtxn)? {
+                if run.saga_id() == saga_id {
+                    self.delete_run_in(&mut wtxn, &run)?;
+                }
+            }
+            wtxn.commit().map_err(jerr)
         }
 
         fn append_run(&self, run: &RunKey, event: ParticipantEvent) -> Result<u64, JournalError> {
-            self.append(run.saga_id(), event)
+            reject_nested_transition(run, &event)?;
+            let mut wtxn = self.env.write_txn().map_err(jerr)?;
+            let sequence = self.next_sequence(&mut wtxn)?;
+            let encoded = Self::encode_row(event, sequence)?;
+            let prefix = run.storage_prefix();
+            self.run_rows
+                .put_with_flags(
+                    &mut wtxn,
+                    heed::PutFlags::NO_OVERWRITE,
+                    &format!("{prefix}{sequence:020}"),
+                    encoded.as_ref(),
+                )
+                .map_err(jerr)?;
+            self.run_index.put(&mut wtxn, &prefix, "1").map_err(jerr)?;
+            wtxn.commit().map_err(jerr)?;
+            Ok(sequence)
         }
 
         fn read_run(&self, run: &RunKey) -> Result<Vec<JournalEntry>, JournalError> {
-            self.read(run.saga_id())
+            let rtxn = self.env.read_txn().map_err(jerr)?;
+            self.read_run_in(&rtxn, run)
         }
 
         fn list_runs(&self) -> Result<Vec<RunKey>, JournalError> {
-            Err(JournalError::Storage(
-                "list_runs requires run-scoped storage (ADR-0001, T08D)".into(),
-            ))
+            let rtxn = self.env.read_txn().map_err(jerr)?;
+            let mut runs = self.index_runs(&rtxn)?;
+            runs.sort();
+            Ok(runs)
         }
 
         fn finalize_run(
             &self,
             tombstone: &RunTombstone,
-            _cutoff: RunIncarnation,
+            cutoff: RunIncarnation,
         ) -> Result<(), JournalError> {
-            self.prune(tombstone.run().saga_id())
+            let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(tombstone).map_err(jerr)?;
+            let mut wtxn = self.env.write_txn().map_err(jerr)?;
+            self.delete_run_in(&mut wtxn, tombstone.run())?;
+            self.tombstones
+                .put(
+                    &mut wtxn,
+                    &tombstone.run().storage_prefix(),
+                    encoded.as_ref(),
+                )
+                .map_err(jerr)?;
+            self.delete_expired_tombstones_in(&mut wtxn, cutoff)?;
+            wtxn.commit().map_err(jerr)
         }
 
         fn run_tombstones(
             &self,
-            _saga_type: &str,
-            _saga_id: SagaId,
+            saga_type: &str,
+            saga_id: SagaId,
         ) -> Result<Vec<RunTombstone>, JournalError> {
-            Ok(Vec::new())
+            let rtxn = self.env.read_txn().map_err(jerr)?;
+            let mut out = Vec::new();
+            for row in self
+                .tombstones
+                .prefix_iter(&rtxn, &RunKey::saga_prefix(saga_type, saga_id))
+                .map_err(jerr)?
+            {
+                let owned = row.map_err(jerr)?.1.to_vec();
+                out.push(
+                    rkyv::from_bytes::<RunTombstone, rkyv::rancor::Error>(&owned).map_err(jerr)?,
+                );
+            }
+            Ok(out)
         }
 
-        fn prune_expired_tombstones(&self, _cutoff: RunIncarnation) -> Result<u64, JournalError> {
-            Ok(0)
+        fn prune_expired_tombstones(&self, cutoff: RunIncarnation) -> Result<u64, JournalError> {
+            let mut wtxn = self.env.write_txn().map_err(jerr)?;
+            let deleted = self.delete_expired_tombstones_in(&mut wtxn, cutoff)?;
+            wtxn.commit().map_err(jerr)?;
+            Ok(deleted)
         }
     }
 
     #[derive(Debug)]
     pub struct LmdbDedupe {
         env: Env,
+        /// Legacy `SagaId`-partition marks; inert for run-scoped lookups.
         entries: Database<Str, Str>,
+        run_entries: Database<Str, Str>,
     }
 
     impl LmdbDedupe {
         pub fn open(path: &Path) -> Result<Self, DedupeError> {
-            std::fs::create_dir_all(path)
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
+            std::fs::create_dir_all(path).map_err(derr)?;
             let map_size = lmdb_map_size_bytes().map_err(DedupeError::Storage)?;
             let env = unsafe {
                 EnvOpenOptions::new()
@@ -3496,137 +3679,194 @@ pub mod lmdb {
                     .map_size(map_size)
                     .open(path)
             }
-            .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            let mut wtxn = env
-                .write_txn()
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
+            .map_err(derr)?;
+            let mut wtxn = env.write_txn().map_err(derr)?;
             let entries = env
                 .create_database::<Str, Str>(&mut wtxn, Some("dedupe_entries"))
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            wtxn.commit()
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            Ok(Self { env, entries })
+                .map_err(derr)?;
+            let run_entries = env
+                .create_database::<Str, Str>(&mut wtxn, Some("dedupe_run_entries"))
+                .map_err(derr)?;
+            let meta = env
+                .create_database::<Str, Str>(&mut wtxn, Some("dedupe_meta"))
+                .map_err(derr)?;
+            let stored = meta
+                .get(&wtxn, DEDUPE_SCHEMA_KEY)
+                .map_err(derr)?
+                .map(str::to_owned);
+            match stored.as_deref() {
+                Some(DEDUPE_SCHEMA_VERSION) => {}
+                Some(version) => {
+                    return Err(DedupeError::Storage(
+                        format!(
+                            "incompatible saga dedupe schema version: stored={version} required={DEDUPE_SCHEMA_VERSION}"
+                        )
+                        .into(),
+                    ));
+                }
+                None => {
+                    let legacy_entries = entries.len(&wtxn).map_err(derr)?;
+                    if legacy_entries > 0 {
+                        tracing::warn!(
+                            target: "core::saga",
+                            event = "dedupe_legacy_entries_inert",
+                            legacy_entries,
+                            path = %path.display()
+                        );
+                    }
+                    meta.put(&mut wtxn, DEDUPE_SCHEMA_KEY, DEDUPE_SCHEMA_VERSION)
+                        .map_err(derr)?;
+                }
+            }
+            wtxn.commit().map_err(derr)?;
+            Ok(Self {
+                env,
+                entries,
+                run_entries,
+            })
         }
 
         fn key(saga_id: SagaId, key: &str) -> String {
             format!("{:020}:{key}", saga_id.get())
+        }
+
+        fn run_key(run: &RunKey, key: &str) -> String {
+            format!("{}{key}", run.storage_prefix())
         }
     }
 
     impl ParticipantDedupeStore for LmdbDedupe {
         fn check_and_mark(&self, saga_id: SagaId, key: &str) -> Result<bool, DedupeError> {
             let full_key = Self::key(saga_id, key);
-            let mut wtxn = self
-                .env
-                .write_txn()
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            if self
-                .entries
-                .get(&wtxn, &full_key)
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?
-                .is_some()
-            {
+            let mut wtxn = self.env.write_txn().map_err(derr)?;
+            if self.entries.get(&wtxn, &full_key).map_err(derr)?.is_some() {
                 return Ok(false);
             }
-            self.entries
-                .put(&mut wtxn, &full_key, "1")
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            wtxn.commit()
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
+            self.entries.put(&mut wtxn, &full_key, "1").map_err(derr)?;
+            wtxn.commit().map_err(derr)?;
             Ok(true)
         }
 
         fn contains(&self, saga_id: SagaId, key: &str) -> Result<bool, DedupeError> {
-            let rtxn = self
-                .env
-                .read_txn()
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
+            let rtxn = self.env.read_txn().map_err(derr)?;
             self.entries
                 .get(&rtxn, &Self::key(saga_id, key))
                 .map(|v| v.is_some())
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))
+                .map_err(derr)
         }
 
         fn mark_processed(&self, saga_id: SagaId, key: &str) -> Result<(), DedupeError> {
-            let mut wtxn = self
-                .env
-                .write_txn()
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
+            let mut wtxn = self.env.write_txn().map_err(derr)?;
             self.entries
                 .put(&mut wtxn, &Self::key(saga_id, key), "1")
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            wtxn.commit()
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            Ok(())
+                .map_err(derr)?;
+            wtxn.commit().map_err(derr)
         }
 
         fn remove_processed(&self, saga_id: SagaId, key: &str) -> Result<(), DedupeError> {
-            let mut wtxn = self
-                .env
-                .write_txn()
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
+            let mut wtxn = self.env.write_txn().map_err(derr)?;
             self.entries
                 .delete(&mut wtxn, &Self::key(saga_id, key))
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            wtxn.commit()
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            Ok(())
+                .map_err(derr)?;
+            wtxn.commit().map_err(derr)
         }
 
+        /// Removes the legacy partition and every run with this id (ADR-0001 §2.4).
         fn prune(&self, saga_id: SagaId) -> Result<(), DedupeError> {
-            let mut wtxn = self
-                .env
-                .write_txn()
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            let prefix = key_saga_prefix(saga_id);
-            let mut iter = self
-                .entries
-                .prefix_iter_mut(&mut wtxn, &prefix)
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            while iter.next().is_some() {
-                unsafe { iter.del_current() }
-                    .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
+            let mut wtxn = self.env.write_txn().map_err(derr)?;
+            delete_prefix(&self.entries, &mut wtxn, &key_saga_prefix(saga_id)).map_err(derr)?;
+            for key in collect_all_keys(&self.run_entries, &wtxn).map_err(derr)? {
+                let (run, _) =
+                    parse_run_key(&key, false).map_err(|m| DedupeError::Storage(m.into()))?;
+                if run.saga_id() == saga_id {
+                    self.run_entries.delete(&mut wtxn, &key).map_err(derr)?;
+                }
             }
-            drop(iter);
-            wtxn.commit()
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            Ok(())
+            wtxn.commit().map_err(derr)
         }
 
         fn check_and_mark_run(&self, run: &RunKey, key: &str) -> Result<bool, DedupeError> {
-            self.check_and_mark(run.saga_id(), key)
+            let full_key = Self::run_key(run, key);
+            let mut wtxn = self.env.write_txn().map_err(derr)?;
+            if self
+                .run_entries
+                .get(&wtxn, &full_key)
+                .map_err(derr)?
+                .is_some()
+            {
+                return Ok(false);
+            }
+            self.run_entries
+                .put(&mut wtxn, &full_key, "1")
+                .map_err(derr)?;
+            wtxn.commit().map_err(derr)?;
+            Ok(true)
         }
 
         fn contains_run(&self, run: &RunKey, key: &str) -> Result<bool, DedupeError> {
-            self.contains(run.saga_id(), key)
+            let rtxn = self.env.read_txn().map_err(derr)?;
+            self.run_entries
+                .get(&rtxn, &Self::run_key(run, key))
+                .map(|v| v.is_some())
+                .map_err(derr)
         }
 
         fn mark_processed_run(&self, run: &RunKey, key: &str) -> Result<(), DedupeError> {
-            self.mark_processed(run.saga_id(), key)
+            let mut wtxn = self.env.write_txn().map_err(derr)?;
+            self.run_entries
+                .put(&mut wtxn, &Self::run_key(run, key), "1")
+                .map_err(derr)?;
+            wtxn.commit().map_err(derr)
         }
 
         fn remove_processed_run(&self, run: &RunKey, key: &str) -> Result<(), DedupeError> {
-            self.remove_processed(run.saga_id(), key)
+            let mut wtxn = self.env.write_txn().map_err(derr)?;
+            self.run_entries
+                .delete(&mut wtxn, &Self::run_key(run, key))
+                .map_err(derr)?;
+            wtxn.commit().map_err(derr)
         }
 
         fn prune_run(&self, run: &RunKey) -> Result<(), DedupeError> {
-            self.prune(run.saga_id())
+            let mut wtxn = self.env.write_txn().map_err(derr)?;
+            delete_prefix(&self.run_entries, &mut wtxn, &run.storage_prefix()).map_err(derr)?;
+            wtxn.commit().map_err(derr)
         }
 
         fn list_runs(&self) -> Result<Vec<RunKey>, DedupeError> {
-            Err(DedupeError::Storage(
-                "list_runs requires run-scoped storage (ADR-0001, T08D)".into(),
-            ))
+            let rtxn = self.env.read_txn().map_err(derr)?;
+            let mut runs = std::collections::BTreeSet::new();
+            for key in collect_all_keys(&self.run_entries, &rtxn).map_err(derr)? {
+                let (run, _) =
+                    parse_run_key(&key, false).map_err(|m| DedupeError::Storage(m.into()))?;
+                runs.insert(run);
+            }
+            Ok(runs.into_iter().collect())
         }
 
-        fn keys_run(&self, _run: &RunKey) -> Result<Vec<Box<str>>, DedupeError> {
-            Err(DedupeError::Storage(
-                "keys_run requires run-scoped storage (ADR-0001, T08D)".into(),
-            ))
+        fn keys_run(&self, run: &RunKey) -> Result<Vec<Box<str>>, DedupeError> {
+            let rtxn = self.env.read_txn().map_err(derr)?;
+            let prefix = run.storage_prefix();
+            Ok(collect_keys(&self.run_entries, &rtxn, &prefix)
+                .map_err(derr)?
+                .into_iter()
+                .map(|key| key[prefix.len()..].into())
+                .collect())
         }
 
-        fn prune_expired(&self, _cutoff: RunIncarnation) -> Result<u64, DedupeError> {
-            Ok(0)
+        fn prune_expired(&self, cutoff: RunIncarnation) -> Result<u64, DedupeError> {
+            let mut wtxn = self.env.write_txn().map_err(derr)?;
+            let mut expired = std::collections::BTreeSet::new();
+            for key in collect_all_keys(&self.run_entries, &wtxn).map_err(derr)? {
+                let (run, _) =
+                    parse_run_key(&key, false).map_err(|m| DedupeError::Storage(m.into()))?;
+                if run.incarnation() < cutoff {
+                    self.run_entries.delete(&mut wtxn, &key).map_err(derr)?;
+                    expired.insert(run);
+                }
+            }
+            wtxn.commit().map_err(derr)?;
+            Ok(expired.len() as u64)
         }
     }
 
@@ -3701,11 +3941,15 @@ pub mod lmdb {
             let entries = env
                 .create_database::<Str, Str>(&mut wtxn, Some("dedupe_entries"))
                 .expect("dedupe database should be created");
+            let run_entries = env
+                .create_database::<Str, Str>(&mut wtxn, Some("dedupe_run_entries"))
+                .expect("dedupe run database should be created");
             wtxn.commit().expect("setup write txn should commit");
 
             let dedupe = LmdbDedupe {
                 env: env.clone(),
                 entries,
+                run_entries,
             };
             let saga_id = SagaId::new(404);
             dedupe

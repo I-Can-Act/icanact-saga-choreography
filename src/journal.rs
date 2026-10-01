@@ -15,7 +15,7 @@ use super::{ParticipantEvent, SagaId};
 use crate::{
     InboxTxn, OutboxId, OutboxRecord, RunIncarnation, RunKey, RunTombstone, SagaChoreographyEvent,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 /// A trait for participant journal storage implementations.
@@ -287,30 +287,16 @@ pub struct InMemoryJournal {
 }
 
 struct InMemoryJournalState {
+    /// Legacy `SagaId` partition (`append`).
     entries: HashMap<u64, Vec<JournalEntry>>,
+    /// Run-scoped rows (`append_run`).
+    runs: BTreeMap<RunKey, Vec<JournalEntry>>,
+    tombstones: BTreeMap<RunKey, RunTombstone>,
     next_sequence: u64,
 }
 
-impl InMemoryJournal {
-    /// Creates a new empty in-memory journal.
-    pub fn new() -> Self {
-        Self {
-            state: Mutex::new(InMemoryJournalState {
-                entries: HashMap::new(),
-                next_sequence: 1,
-            }),
-        }
-    }
-
-    fn state(&self) -> Result<std::sync::MutexGuard<'_, InMemoryJournalState>, JournalError> {
-        self.state
-            .lock()
-            .map_err(|_| JournalError::Storage("in-memory journal lock poisoned".into()))
-    }
-}
-
-impl ParticipantJournal for InMemoryJournal {
-    fn append(&self, saga_id: SagaId, event: ParticipantEvent) -> Result<u64, JournalError> {
+impl InMemoryJournalState {
+    fn row(&mut self, event: ParticipantEvent) -> JournalEntry {
         let recorded_at_millis =
             match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
                 Ok(duration) => duration.as_millis() as u64,
@@ -323,77 +309,152 @@ impl ParticipantJournal for InMemoryJournal {
                     0
                 }
             };
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        JournalEntry {
+            sequence,
+            recorded_at_millis,
+            event,
+        }
+    }
+}
+
+impl InMemoryJournal {
+    /// Creates a new empty in-memory journal.
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(InMemoryJournalState {
+                entries: HashMap::new(),
+                runs: BTreeMap::new(),
+                tombstones: BTreeMap::new(),
+                next_sequence: 1,
+            }),
+        }
+    }
+
+    fn state(&self) -> Result<std::sync::MutexGuard<'_, InMemoryJournalState>, JournalError> {
+        self.state
+            .lock()
+            .map_err(|_| JournalError::Storage("in-memory journal lock poisoned".into()))
+    }
+}
+
+/// Rejects a `TransitionCommitted` row that wraps another `TransitionCommitted` (ADR-0003).
+pub(crate) fn reject_nested_transition(
+    run: &RunKey,
+    event: &ParticipantEvent,
+) -> Result<(), JournalError> {
+    if let ParticipantEvent::TransitionCommitted { transition, .. } = event
+        && matches!(
+            transition.as_ref(),
+            ParticipantEvent::TransitionCommitted { .. }
+        )
+    {
+        tracing::error!(
+            target: "core::saga",
+            event = "journal_nested_transition_rejected",
+            run = %run
+        );
+        return Err(JournalError::Storage(
+            format!("append_run: nested TransitionCommitted rejected for {run} (ADR-0003)").into(),
+        ));
+    }
+    Ok(())
+}
+
+impl ParticipantJournal for InMemoryJournal {
+    fn append(&self, saga_id: SagaId, event: ParticipantEvent) -> Result<u64, JournalError> {
         let mut state = self.state()?;
-        let sequence = state.next_sequence;
-        state.next_sequence = state.next_sequence.saturating_add(1);
-        state
-            .entries
-            .entry(saga_id.0)
-            .or_default()
-            .push(JournalEntry {
-                sequence,
-                recorded_at_millis,
-                event,
-            });
+        let entry = state.row(event);
+        let sequence = entry.sequence;
+        state.entries.entry(saga_id.0).or_default().push(entry);
         Ok(sequence)
     }
 
+    /// Union of the legacy partition and every run with this id, by sequence (ADR-0001 §2.4).
     fn read(&self, saga_id: SagaId) -> Result<Vec<JournalEntry>, JournalError> {
-        Ok(self
-            .state()?
-            .entries
-            .get(&saga_id.0)
-            .cloned()
-            .unwrap_or_default())
+        let state = self.state()?;
+        let mut rows = state.entries.get(&saga_id.0).cloned().unwrap_or_default();
+        for (run, run_rows) in &state.runs {
+            if run.saga_id() == saga_id {
+                rows.extend(run_rows.iter().cloned());
+            }
+        }
+        rows.sort_by_key(|row| row.sequence);
+        Ok(rows)
     }
 
     fn list_sagas(&self) -> Result<Vec<SagaId>, JournalError> {
-        Ok(self
-            .state()?
-            .entries
-            .keys()
-            .copied()
-            .map(SagaId::new)
-            .collect())
+        let state = self.state()?;
+        let mut ids: Vec<u64> = state.entries.keys().copied().collect();
+        ids.extend(state.runs.keys().map(|run| run.saga_id().get()));
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids.into_iter().map(SagaId::new).collect())
     }
 
+    /// Deletes the legacy partition and every run with this id; tombstones are kept (ADR-0001 §2.4).
     fn prune(&self, saga_id: SagaId) -> Result<(), JournalError> {
-        self.state()?.entries.remove(&saga_id.0);
+        let mut state = self.state()?;
+        state.entries.remove(&saga_id.0);
+        state.runs.retain(|run, _| run.saga_id() != saga_id);
         Ok(())
     }
 
     fn append_run(&self, run: &RunKey, event: ParticipantEvent) -> Result<u64, JournalError> {
-        self.append(run.saga_id(), event)
+        reject_nested_transition(run, &event)?;
+        let mut state = self.state()?;
+        let entry = state.row(event);
+        let sequence = entry.sequence;
+        state.runs.entry(run.clone()).or_default().push(entry);
+        Ok(sequence)
     }
 
     fn read_run(&self, run: &RunKey) -> Result<Vec<JournalEntry>, JournalError> {
-        self.read(run.saga_id())
+        Ok(self.state()?.runs.get(run).cloned().unwrap_or_default())
     }
 
     fn list_runs(&self) -> Result<Vec<RunKey>, JournalError> {
-        Err(JournalError::Storage(
-            "list_runs requires run-scoped storage (ADR-0001, T08D)".into(),
-        ))
+        Ok(self.state()?.runs.keys().cloned().collect())
     }
 
     fn finalize_run(
         &self,
         tombstone: &RunTombstone,
-        _cutoff: RunIncarnation,
+        cutoff: RunIncarnation,
     ) -> Result<(), JournalError> {
-        self.prune(tombstone.run().saga_id())
+        let mut state = self.state()?;
+        state.runs.remove(tombstone.run());
+        state
+            .tombstones
+            .insert(tombstone.run().clone(), tombstone.clone());
+        state
+            .tombstones
+            .retain(|run, _| run.incarnation() >= cutoff);
+        Ok(())
     }
 
     fn run_tombstones(
         &self,
-        _saga_type: &str,
-        _saga_id: SagaId,
+        saga_type: &str,
+        saga_id: SagaId,
     ) -> Result<Vec<RunTombstone>, JournalError> {
-        Ok(Vec::new())
+        Ok(self
+            .state()?
+            .tombstones
+            .iter()
+            .filter(|(run, _)| run.saga_id() == saga_id && run.saga_type() == saga_type)
+            .map(|(_, tombstone)| tombstone.clone())
+            .collect())
     }
 
-    fn prune_expired_tombstones(&self, _cutoff: RunIncarnation) -> Result<u64, JournalError> {
-        Ok(0)
+    fn prune_expired_tombstones(&self, cutoff: RunIncarnation) -> Result<u64, JournalError> {
+        let mut state = self.state()?;
+        let before = state.tombstones.len();
+        state
+            .tombstones
+            .retain(|run, _| run.incarnation() >= cutoff);
+        Ok((before - state.tombstones.len()) as u64)
     }
 }
 
@@ -496,7 +557,7 @@ mod tests {
             .expect("append_run");
         assert_eq!(journal.read(saga_id).expect("read").len(), 1);
         assert_eq!(journal.read_run(&run).expect("read_run").len(), 1);
-        assert!(journal.list_runs().is_err());
+        assert_eq!(journal.list_runs().expect("list_runs"), vec![run.clone()]);
 
         let completed = || ParticipantEvent::StepExecutionCompleted {
             output: vec![1],
