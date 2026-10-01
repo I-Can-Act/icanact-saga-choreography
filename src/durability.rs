@@ -2290,7 +2290,7 @@ where
             execution_id,
             policy,
             saga_input,
-            compensation_data,
+            compensation_data.clone(),
         ) {
             Ok(event) => {
                 emit(event);
@@ -2311,6 +2311,11 @@ where
                     now,
                     emit,
                 );
+                crate::state_ext::keep_quarantine_compensation_data(
+                    actor,
+                    &run,
+                    &compensation_data,
+                );
                 return IngressOutcome::ReconciliationNeeded(ReconciliationNeeded {
                     run,
                     step: workflow.step_name().into(),
@@ -2319,7 +2324,7 @@ where
                             format!("accepted step persistence failed: {error:?}").into(),
                         ),
                     )),
-                    compensation_data: Vec::new(),
+                    compensation_data,
                 });
             }
         }

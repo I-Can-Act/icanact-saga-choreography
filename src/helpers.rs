@@ -1,7 +1,8 @@
 //! Helper functions for saga handling
 
 use crate::state_ext::{
-    EventAdmission, admit_event, finalize_terminal_run, quarantine_run_with_evidence,
+    EventAdmission, admit_event, finalize_terminal_run, keep_quarantine_compensation_data,
+    quarantine_run_with_evidence,
 };
 use crate::{
     AsyncSagaParticipant, CompensationError, CompensationOutput, DependencySpec, ParticipantEvent,
@@ -677,19 +678,21 @@ where
             execution_id,
             policy,
             saga_input,
-            compensation_data,
+            compensation_data.clone(),
         ) {
             Ok(event) => emit(event),
             Err(error) => {
                 let step: Box<str> = participant.step_name().into();
                 let participant_id = participant.participant_id_owned();
-                let needs_reconciliation = accepted_step_reconciliation(context, &step, &error);
+                let needs_reconciliation =
+                    accepted_step_reconciliation(context, &step, &error, compensation_data.clone());
                 quarantine_accepted_step_persistence_failure(
                     participant,
                     context,
                     step,
                     participant_id,
                     format!("accepted step persistence failed: {error:?}").into(),
+                    &compensation_data,
                     now,
                     emit,
                 );
@@ -767,19 +770,21 @@ where
             execution_id,
             policy,
             saga_input,
-            compensation_data,
+            compensation_data.clone(),
         ) {
             Ok(event) => emit(event),
             Err(error) => {
                 let step: Box<str> = participant.step_name().into();
                 let participant_id = participant.participant_id_owned();
-                let needs_reconciliation = accepted_step_reconciliation(context, &step, &error);
+                let needs_reconciliation =
+                    accepted_step_reconciliation(context, &step, &error, compensation_data.clone());
                 quarantine_accepted_step_persistence_failure(
                     participant,
                     context,
                     step,
                     participant_id,
                     format!("accepted async step persistence failed: {error:?}").into(),
+                    &compensation_data,
                     now,
                     emit,
                 );
@@ -1012,6 +1017,7 @@ fn accepted_step_reconciliation(
     context: &SagaContext,
     step: &str,
     error: &crate::AcceptedStepError,
+    compensation_data: Vec<u8>,
 ) -> IngressOutcome {
     let run = context.run_key();
     tracing::error!(
@@ -1026,7 +1032,7 @@ fn accepted_step_reconciliation(
         cause: ReconciliationCause::ResultCommitFailed(SagaStateStoreError::Journal(
             JournalError::Storage(format!("accepted step persistence failed: {error:?}").into()),
         )),
-        compensation_data: Vec::new(),
+        compensation_data,
     })
 }
 
@@ -1036,12 +1042,14 @@ fn quarantine_accepted_step_persistence_failure<A, F>(
     step: Box<str>,
     participant_id: Box<str>,
     reason: Box<str>,
+    compensation_data: &[u8],
     now: u64,
     emit: &mut F,
 ) where
     A: SagaStateExt,
     F: FnMut(SagaChoreographyEvent),
 {
+    let run = context.run_key();
     quarantine_run_with_evidence(
         actor,
         context,
@@ -1050,6 +1058,7 @@ fn quarantine_accepted_step_persistence_failure<A, F>(
         now,
         emit,
     );
+    keep_quarantine_compensation_data(actor, &run, compensation_data);
 }
 
 /// A failed compensation-request commit keeps the run's undo data in memory (`Completed` goes

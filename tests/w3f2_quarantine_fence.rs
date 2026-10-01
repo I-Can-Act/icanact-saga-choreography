@@ -111,10 +111,16 @@ fn quarantined_run_stays_fenced_after_terminal_latch_eviction() {
         let other = RunKey::new(SAGA, SagaId::new(10_000 + i), RunIncarnation::new(0));
         actor.latch_terminal_saga(&other);
     }
-    assert!(!actor.is_terminal_saga_latched(&run), "latch must be evicted");
+    assert!(
+        !actor.is_terminal_saga_latched(&run),
+        "latch must be evicted"
+    );
 
     let outcome = handle_saga_event_with_emit(&mut actor, upstream_completed(), |_| {});
-    assert_eq!(actor.executed, 0, "a quarantined run runs no business effect");
+    assert_eq!(
+        actor.executed, 0,
+        "a quarantined run runs no business effect"
+    );
     assert!(
         matches!(
             outcome,

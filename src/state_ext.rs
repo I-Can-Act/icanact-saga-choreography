@@ -691,6 +691,24 @@ pub(crate) fn quarantine_preserving_state<A: SagaStateExt + ?Sized>(
     quarantined
 }
 
+/// Keeps undo data that was handed to an accepted step on the run's in-memory `Quarantined` entry
+/// (`Executing::quarantine` has none): the evidence stays available for reconciliation. An empty
+/// slice, or a run that is not `Quarantined`, changes nothing.
+pub(crate) fn keep_quarantine_compensation_data<A: SagaStateExt + ?Sized>(
+    actor: &mut A,
+    run: &RunKey,
+    compensation_data: &[u8],
+) {
+    if compensation_data.is_empty() {
+        return;
+    }
+    if let Some(SagaStateEntry::Quarantined(state)) = actor.saga_states().get_mut(run)
+        && state.state.compensation_data.is_none()
+    {
+        state.state.compensation_data = Some(compensation_data.to_vec());
+    }
+}
+
 /// Terminal latch for a run whose memory state just became `Quarantined` (checked after
 /// `admitted_runs`, so un-admit): later events of this run are rejected as `TerminalRun` instead of
 /// running effects or finalizing the evidence away (owner decision Q6). Every quarantine that does
