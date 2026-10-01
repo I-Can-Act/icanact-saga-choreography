@@ -764,10 +764,20 @@ where
         StepOutput::CompletedWithEffect {
             output,
             compensation_data,
-            ..
+            effect,
         } => {
-            let compensation_available = !compensation_data.is_empty();
-            (output, compensation_data, compensation_available)
+            let step = participant.step_name().into();
+            let participant_id = participant.participant_id_owned();
+            return quarantine_unsupported_effect(
+                participant,
+                context,
+                step,
+                participant_id,
+                (output, compensation_data),
+                effect,
+                now,
+                emit,
+            );
         }
         StepOutput::Accepted { .. } => unreachable!("accepted output returned above"),
     };
@@ -842,10 +852,20 @@ where
         StepOutput::CompletedWithEffect {
             output,
             compensation_data,
-            ..
+            effect,
         } => {
-            let compensation_available = !compensation_data.is_empty();
-            (output, compensation_data, compensation_available)
+            let step = participant.step_name().into();
+            let participant_id = participant.participant_id_owned();
+            return quarantine_unsupported_effect(
+                participant,
+                context,
+                step,
+                participant_id,
+                (output, compensation_data),
+                effect,
+                now,
+                emit,
+            );
         }
         StepOutput::Accepted { .. } => unreachable!("accepted output returned above"),
     };
@@ -863,6 +883,70 @@ where
         now,
         emit,
     )
+}
+
+/// R21 / ADR-0002 §2.2: `CompletedWithEffect` has no dispatcher yet, so the promised effect cannot
+/// be delivered. The step ran, so the completion is committed as evidence (undo data survives a
+/// restart) but never acknowledged: no `StepCompleted` is emitted or put in an outbox. The step is
+/// quarantined and the outcome is `ReconciliationNeeded { UnsupportedEffect }`.
+#[allow(clippy::too_many_arguments)] // shared by sync/async engines; signature refactor deferred to W6 R23
+fn quarantine_unsupported_effect<A, F>(
+    actor: &mut A,
+    context: &SagaContext,
+    step: Box<str>,
+    participant_id: Box<str>,
+    (out_data, comp_data): (Vec<u8>, Vec<u8>),
+    effect: Box<str>,
+    now: u64,
+    emit: &mut F,
+) -> IngressOutcome
+where
+    A: SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let run = context.run_key();
+    if let Err(err) = actor.commit_transition(
+        &run,
+        ParticipantEvent::StepExecutionCompleted {
+            output: out_data,
+            compensation_data: comp_data.clone(),
+            completed_at_millis: now,
+        },
+    ) {
+        return quarantine_result_commit_failure(
+            actor,
+            context,
+            step,
+            participant_id,
+            err,
+            comp_data,
+            now,
+            emit,
+        );
+    }
+    let reason: Box<str> = format!("reconciliation_needed: unsupported_effect: {effect}").into();
+    tracing::error!(
+        target: "core::saga",
+        event = "saga_unsupported_effect",
+        run = %run,
+        step = %step,
+        effect = %effect
+    );
+    quarantine_after_commit_failure(
+        actor,
+        context,
+        step.clone(),
+        participant_id,
+        &reason,
+        now,
+        emit,
+    );
+    IngressOutcome::ReconciliationNeeded(ReconciliationNeeded {
+        run,
+        step,
+        cause: ReconciliationCause::UnsupportedEffect { effect },
+        compensation_data: comp_data,
+    })
 }
 
 /// Commits `StepExecutionCompleted` together with its `StepCompleted` obligation (ADR-0003), and
