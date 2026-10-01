@@ -5,9 +5,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use icanact_core::local::PublishStats;
 
 use crate::{
-    AcceptedStepPolicy, ParticipantDedupeStore, ParticipantJournal, ParticipantStats,
-    SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId, SagaStateEntry,
-    StepExecutionId,
+    AcceptedStepPolicy, InboxState, ParticipantDedupeStore, ParticipantJournal, ParticipantStats,
+    ReplayHorizon, RunKey, SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId,
+    SagaStateEntry, StepExecutionId,
 };
 
 #[derive(Clone, Debug)]
@@ -57,6 +57,8 @@ where
     pub accepted_workflow_steps: HashMap<SagaId, AcceptedWorkflowStep>,
     pub accepted_workflow_compensations: HashMap<SagaId, AcceptedWorkflowCompensation>,
     pub resolved_workflow_steps: HashSet<(SagaId, StepExecutionId)>,
+    pub inbox_states: HashMap<RunKey, InboxState>,
+    pub replay_horizon: ReplayHorizon,
     pub journal: J,
     pub dedupe: D,
     pub stats: ParticipantStats,
@@ -80,12 +82,20 @@ where
             accepted_workflow_steps: HashMap::new(),
             accepted_workflow_compensations: HashMap::new(),
             resolved_workflow_steps: HashSet::new(),
+            inbox_states: HashMap::new(),
+            replay_horizon: ReplayHorizon::PARTICIPANT_DEFAULT,
             journal,
             dedupe,
             stats: ParticipantStats::new(),
             startup_recovery_events: Vec::new(),
             bus: None,
         }
+    }
+
+    /// Replay horizon for this participant's tombstones; must cover every joined saga's policy horizon (ADR-0001).
+    pub fn with_replay_horizon(mut self, horizon: ReplayHorizon) -> Self {
+        self.replay_horizon = horizon;
+        self
     }
 
     pub fn with_startup_recovery_events(mut self, events: Vec<SagaChoreographyEvent>) -> Self {

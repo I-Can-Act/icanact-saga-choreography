@@ -370,7 +370,10 @@ fn dedupe_key_for_event(event: &SagaChoreographyEvent) -> String {
         | SagaChoreographyEvent::SagaQuarantined { .. }
         | SagaChoreographyEvent::StepStarted { .. }
         | SagaChoreographyEvent::StepAccepted { .. }
-        | SagaChoreographyEvent::StepAck { .. } => {
+        | SagaChoreographyEvent::StepAck { .. }
+        | SagaChoreographyEvent::SagaAbortRequested { .. }
+        | SagaChoreographyEvent::CompensationFailedRetryable { .. }
+        | SagaChoreographyEvent::SagaEffectsRetained { .. } => {
             format!(
                 "{}:{}:{}:{}",
                 context.trace_id,

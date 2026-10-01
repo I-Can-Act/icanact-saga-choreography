@@ -8,14 +8,17 @@
 //! provide `SagaStateExt` automatically.
 
 use crate::{
-    DedupeError, HasSagaParticipantSupport, JournalError, ParticipantDedupeStore, ParticipantEvent,
-    ParticipantJournal, SagaId, SagaStateEntry,
+    DedupeError, HasSagaParticipantSupport, InboxState, InboxTxn, JournalError,
+    ParticipantDedupeStore, ParticipantEvent, ParticipantJournal, RunIncarnation, RunKey,
+    RunTombstone, SagaChoreographyEvent, SagaId, SagaStateEntry,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SagaStateStoreError {
+    #[error("saga dedupe store: {0}")]
     Dedupe(DedupeError),
+    #[error("saga journal: {0}")]
     Journal(JournalError),
 }
 
@@ -264,6 +267,77 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
                 error = ?err
             );
         }
+    }
+
+    /// Correctness-relevant journal write; mutate memory only after `Ok` (ADR-0002).
+    fn commit_transition(
+        &self,
+        run: &RunKey,
+        event: ParticipantEvent,
+    ) -> Result<(), SagaStateStoreError> {
+        self.saga_journal()
+            .append_run(run, event)
+            .map(|_| ())
+            .map_err(SagaStateStoreError::Journal)
+    }
+
+    /// `commit_transition` plus the outbound events it obliges, in one row (ADR-0003).
+    fn commit_transition_with_outbox(
+        &self,
+        run: &RunKey,
+        event: ParticipantEvent,
+        outbox: Vec<SagaChoreographyEvent>,
+    ) -> Result<(), SagaStateStoreError> {
+        self.saga_journal()
+            .commit_with_outbox(run, event, outbox)
+            .map(|_| ())
+            .map_err(SagaStateStoreError::Journal)
+    }
+
+    /// Atomic inbox commit (ADR-0005).
+    fn commit_inbox(&self, run: &RunKey, txn: InboxTxn) -> Result<(), SagaStateStoreError> {
+        self.saga_journal()
+            .commit_inbox(run, txn)
+            .map(|_| ())
+            .map_err(SagaStateStoreError::Journal)
+    }
+
+    /// Run-scoped strict dedupe (ADR-0001).
+    fn check_dedupe_run_strict(
+        &self,
+        run: &RunKey,
+        key: &str,
+    ) -> Result<bool, SagaStateStoreError> {
+        self.saga_dedupe()
+            .check_and_mark_run(run, key)
+            .map_err(SagaStateStoreError::Dedupe)
+    }
+
+    /// Finalize a terminal run and prune expired tombstones (ADR-0001); W1 body equals `prune_saga_strict`.
+    fn finalize_run_strict(
+        &mut self,
+        tombstone: &RunTombstone,
+        _cutoff: RunIncarnation,
+    ) -> Result<(), SagaStateStoreError> {
+        self.prune_saga_strict(tombstone.run().saga_id())
+    }
+
+    /// Replay cutoff for this participant now (ADR-0001).
+    fn replay_cutoff(&self) -> RunIncarnation {
+        self.saga_support().replay_horizon.cutoff(self.now_millis())
+    }
+
+    /// Journal-derived inbox state of a run, if loaded (ADR-0005).
+    fn inbox_state(&self, run: &RunKey) -> Option<&InboxState> {
+        self.saga_support().inbox_states.get(run)
+    }
+
+    /// Mutable inbox state of a run, created empty if absent (ADR-0005).
+    fn inbox_state_mut(&mut self, run: &RunKey) -> &mut InboxState {
+        self.saga_support_mut()
+            .inbox_states
+            .entry(run.clone())
+            .or_default()
     }
 
     /// Removes all state associated with a saga.

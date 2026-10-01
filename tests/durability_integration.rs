@@ -1007,6 +1007,55 @@ impl ParticipantJournal for StaticJournal {
     fn prune(&self, _saga_id: SagaId) -> Result<(), icanact_saga_choreography::JournalError> {
         Ok(())
     }
+
+    fn append_run(
+        &self,
+        _run: &icanact_saga_choreography::RunKey,
+        _event: ParticipantEvent,
+    ) -> Result<u64, icanact_saga_choreography::JournalError> {
+        Err(icanact_saga_choreography::JournalError::Storage(
+            "append not supported in StaticJournal".into(),
+        ))
+    }
+
+    fn read_run(
+        &self,
+        run: &icanact_saga_choreography::RunKey,
+    ) -> Result<Vec<JournalEntry>, icanact_saga_choreography::JournalError> {
+        self.read(run.saga_id())
+    }
+
+    fn list_runs(
+        &self,
+    ) -> Result<Vec<icanact_saga_choreography::RunKey>, icanact_saga_choreography::JournalError>
+    {
+        // Holds legacy rows only.
+        Ok(Vec::new())
+    }
+
+    fn finalize_run(
+        &self,
+        _tombstone: &icanact_saga_choreography::RunTombstone,
+        _cutoff: icanact_saga_choreography::RunIncarnation,
+    ) -> Result<(), icanact_saga_choreography::JournalError> {
+        Ok(())
+    }
+
+    fn run_tombstones(
+        &self,
+        _saga_type: &str,
+        _saga_id: SagaId,
+    ) -> Result<Vec<icanact_saga_choreography::RunTombstone>, icanact_saga_choreography::JournalError>
+    {
+        Ok(Vec::new())
+    }
+
+    fn prune_expired_tombstones(
+        &self,
+        _cutoff: icanact_saga_choreography::RunIncarnation,
+    ) -> Result<u64, icanact_saga_choreography::JournalError> {
+        Ok(0)
+    }
 }
 
 #[test]

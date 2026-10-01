@@ -2048,15 +2048,15 @@ mod tests {
             let mut possible_success_steps = HashSet::new();
             possible_success_steps.insert("risk_check".into());
             possible_success_steps.insert("manual_review".into());
-            TerminalPolicy {
-                saga_type: "order_lifecycle".into(),
-                policy_id: "order_lifecycle/any-of".into(),
-                failure_authority: FailureAuthority::AnyParticipant,
-                success_criteria: SuccessCriteria::AnyOf(possible_success_steps),
-                overall_timeout: Duration::from_secs(30),
-                stalled_timeout: Duration::from_secs(5),
-                workflow_steps: Self::steps(),
-            }
+            TerminalPolicy::new(
+                "order_lifecycle".into(),
+                "order_lifecycle/any-of".into(),
+                FailureAuthority::AnyParticipant,
+                SuccessCriteria::AnyOf(possible_success_steps),
+                Duration::from_secs(30),
+                Duration::from_secs(5),
+                Self::steps(),
+            )
         }
     }
 
@@ -2082,15 +2082,15 @@ mod tests {
         fn terminal_policy() -> TerminalPolicy {
             let mut required_steps = HashSet::new();
             required_steps.insert("create_order".into());
-            TerminalPolicy {
-                saga_type: "different_saga_type".into(),
-                policy_id: "different_saga_type/default".into(),
-                failure_authority: FailureAuthority::AnyParticipant,
-                success_criteria: SuccessCriteria::AllOf(required_steps),
-                overall_timeout: Duration::from_secs(30),
-                stalled_timeout: Duration::from_secs(30),
-                workflow_steps: Self::steps(),
-            }
+            TerminalPolicy::new(
+                "different_saga_type".into(),
+                "different_saga_type/default".into(),
+                FailureAuthority::AnyParticipant,
+                SuccessCriteria::AllOf(required_steps),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                Self::steps(),
+            )
         }
     }
 
@@ -2505,15 +2505,15 @@ mod tests {
             denied.insert("create_order".into());
             let mut required_steps = HashSet::new();
             required_steps.insert("create_order".into());
-            TerminalPolicy {
-                saga_type: "order_lifecycle".into(),
-                policy_id: "order_lifecycle/denied-required".into(),
-                failure_authority: FailureAuthority::DenySteps(denied),
-                success_criteria: SuccessCriteria::AllOf(required_steps),
-                overall_timeout: Duration::from_secs(30),
-                stalled_timeout: Duration::from_secs(30),
-                workflow_steps: Self::steps(),
-            }
+            TerminalPolicy::new(
+                "order_lifecycle".into(),
+                "order_lifecycle/denied-required".into(),
+                FailureAuthority::DenySteps(denied),
+                SuccessCriteria::AllOf(required_steps),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                Self::steps(),
+            )
         }
     }
 
@@ -2624,15 +2624,15 @@ mod tests {
             .expect("create_order binding should succeed");
         let mut required_steps = HashSet::new();
         required_steps.insert("create_order".into());
-        let policy = TerminalPolicy {
-            saga_type: "order_lifecycle".into(),
-            policy_id: "watchdog/stall".into(),
-            failure_authority: FailureAuthority::AnyParticipant,
-            success_criteria: SuccessCriteria::AllOf(required_steps),
-            overall_timeout: Duration::from_secs(5),
-            stalled_timeout: Duration::from_millis(120),
-            workflow_steps: MultiStepOrderLifecycleContract::steps(),
-        };
+        let policy = TerminalPolicy::new(
+            "order_lifecycle".into(),
+            "watchdog/stall".into(),
+            FailureAuthority::AnyParticipant,
+            SuccessCriteria::AllOf(required_steps),
+            Duration::from_secs(5),
+            Duration::from_millis(120),
+            MultiStepOrderLifecycleContract::steps(),
+        );
         let _resolver_sub = bus
             .attach_terminal_resolver(policy, "terminal-resolver")
             .expect("terminal resolver should attach");

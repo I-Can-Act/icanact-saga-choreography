@@ -196,6 +196,54 @@ impl ParticipantJournal for FailOnAppendJournal {
     fn prune(&self, saga_id: SagaId) -> Result<(), icanact_saga_choreography::JournalError> {
         self.inner.prune(saga_id)
     }
+
+    fn append_run(
+        &self,
+        run: &icanact_saga_choreography::RunKey,
+        event: ParticipantEvent,
+    ) -> Result<u64, icanact_saga_choreography::JournalError> {
+        // Shares the append failure counter with the legacy path.
+        self.append(run.saga_id(), event)
+    }
+
+    fn read_run(
+        &self,
+        run: &icanact_saga_choreography::RunKey,
+    ) -> Result<Vec<icanact_saga_choreography::JournalEntry>, icanact_saga_choreography::JournalError>
+    {
+        self.inner.read_run(run)
+    }
+
+    fn list_runs(
+        &self,
+    ) -> Result<Vec<icanact_saga_choreography::RunKey>, icanact_saga_choreography::JournalError>
+    {
+        self.inner.list_runs()
+    }
+
+    fn finalize_run(
+        &self,
+        tombstone: &icanact_saga_choreography::RunTombstone,
+        cutoff: icanact_saga_choreography::RunIncarnation,
+    ) -> Result<(), icanact_saga_choreography::JournalError> {
+        self.inner.finalize_run(tombstone, cutoff)
+    }
+
+    fn run_tombstones(
+        &self,
+        saga_type: &str,
+        saga_id: SagaId,
+    ) -> Result<Vec<icanact_saga_choreography::RunTombstone>, icanact_saga_choreography::JournalError>
+    {
+        self.inner.run_tombstones(saga_type, saga_id)
+    }
+
+    fn prune_expired_tombstones(
+        &self,
+        cutoff: icanact_saga_choreography::RunIncarnation,
+    ) -> Result<u64, icanact_saga_choreography::JournalError> {
+        self.inner.prune_expired_tombstones(cutoff)
+    }
 }
 
 struct FailingJournalActor {

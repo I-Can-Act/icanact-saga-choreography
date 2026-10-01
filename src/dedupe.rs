@@ -13,6 +13,7 @@
 //! semantics despite the possibility of duplicate message delivery.
 
 use super::SagaId;
+use crate::{RunIncarnation, RunKey};
 use std::collections::HashSet;
 use std::sync::Mutex;
 
@@ -129,6 +130,30 @@ pub trait ParticipantDedupeStore: Send + Sync + 'static {
     ///
     /// Returns [`DedupeError::Storage`] if the underlying storage fails.
     fn prune(&self, saga_id: SagaId) -> Result<(), DedupeError>;
+
+    /// Run-scoped `check_and_mark` (ADR-0001).
+    fn check_and_mark_run(&self, run: &RunKey, key: &str) -> Result<bool, DedupeError>;
+
+    /// Run-scoped `contains` (ADR-0001).
+    fn contains_run(&self, run: &RunKey, key: &str) -> Result<bool, DedupeError>;
+
+    /// Run-scoped `mark_processed` (ADR-0001).
+    fn mark_processed_run(&self, run: &RunKey, key: &str) -> Result<(), DedupeError>;
+
+    /// Run-scoped `remove_processed` (ADR-0001).
+    fn remove_processed_run(&self, run: &RunKey, key: &str) -> Result<(), DedupeError>;
+
+    /// Delete every mark of one run (ADR-0001).
+    fn prune_run(&self, run: &RunKey) -> Result<(), DedupeError>;
+
+    /// Runs that currently have marks, sorted (ADR-0001).
+    fn list_runs(&self) -> Result<Vec<RunKey>, DedupeError>;
+
+    /// Keys marked for one run (ADR-0005 upgrade scan).
+    fn keys_run(&self, run: &RunKey) -> Result<Vec<Box<str>>, DedupeError>;
+
+    /// Delete all marks of runs with `incarnation < cutoff`; returns how many runs (ADR-0001).
+    fn prune_expired(&self, cutoff: RunIncarnation) -> Result<u64, DedupeError>;
 }
 
 /// Errors that can occur during deduplication operations.
@@ -215,6 +240,42 @@ impl ParticipantDedupeStore for InMemoryDedupe {
         self.seen()?.retain(|(id, _)| *id != saga_id.0);
         Ok(())
     }
+
+    fn check_and_mark_run(&self, run: &RunKey, key: &str) -> Result<bool, DedupeError> {
+        self.check_and_mark(run.saga_id(), key)
+    }
+
+    fn contains_run(&self, run: &RunKey, key: &str) -> Result<bool, DedupeError> {
+        self.contains(run.saga_id(), key)
+    }
+
+    fn mark_processed_run(&self, run: &RunKey, key: &str) -> Result<(), DedupeError> {
+        self.mark_processed(run.saga_id(), key)
+    }
+
+    fn remove_processed_run(&self, run: &RunKey, key: &str) -> Result<(), DedupeError> {
+        self.remove_processed(run.saga_id(), key)
+    }
+
+    fn prune_run(&self, run: &RunKey) -> Result<(), DedupeError> {
+        self.prune(run.saga_id())
+    }
+
+    fn list_runs(&self) -> Result<Vec<RunKey>, DedupeError> {
+        Err(DedupeError::Storage(
+            "list_runs requires run-scoped storage (ADR-0001, T08D)".into(),
+        ))
+    }
+
+    fn keys_run(&self, _run: &RunKey) -> Result<Vec<Box<str>>, DedupeError> {
+        Err(DedupeError::Storage(
+            "keys_run requires run-scoped storage (ADR-0001, T08D)".into(),
+        ))
+    }
+
+    fn prune_expired(&self, _cutoff: RunIncarnation) -> Result<u64, DedupeError> {
+        Ok(0)
+    }
 }
 
 impl Default for InMemoryDedupe {
@@ -245,6 +306,38 @@ where
 
     fn prune(&self, saga_id: SagaId) -> Result<(), DedupeError> {
         (**self).prune(saga_id)
+    }
+
+    fn check_and_mark_run(&self, run: &RunKey, key: &str) -> Result<bool, DedupeError> {
+        (**self).check_and_mark_run(run, key)
+    }
+
+    fn contains_run(&self, run: &RunKey, key: &str) -> Result<bool, DedupeError> {
+        (**self).contains_run(run, key)
+    }
+
+    fn mark_processed_run(&self, run: &RunKey, key: &str) -> Result<(), DedupeError> {
+        (**self).mark_processed_run(run, key)
+    }
+
+    fn remove_processed_run(&self, run: &RunKey, key: &str) -> Result<(), DedupeError> {
+        (**self).remove_processed_run(run, key)
+    }
+
+    fn prune_run(&self, run: &RunKey) -> Result<(), DedupeError> {
+        (**self).prune_run(run)
+    }
+
+    fn list_runs(&self) -> Result<Vec<RunKey>, DedupeError> {
+        (**self).list_runs()
+    }
+
+    fn keys_run(&self, run: &RunKey) -> Result<Vec<Box<str>>, DedupeError> {
+        (**self).keys_run(run)
+    }
+
+    fn prune_expired(&self, cutoff: RunIncarnation) -> Result<u64, DedupeError> {
+        (**self).prune_expired(cutoff)
     }
 }
 

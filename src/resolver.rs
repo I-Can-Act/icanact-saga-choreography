@@ -2,8 +2,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use crate::{
-    AcceptedStepTimeoutOutcome, SagaChoreographyEvent, SagaContext, SagaFailureDetails, SagaId,
-    SagaWorkflowStepContract, StepExecutionId, WorkflowDependencySpec,
+    AcceptedStepTimeoutOutcome, ReplayHorizon, RunIdentityError, SagaChoreographyEvent,
+    SagaContext, SagaFailureDetails, SagaId, SagaWorkflowStepContract, StepExecutionId,
+    WorkflowDependencySpec,
 };
 
 pub const TERMINAL_RESOLVER_STEP: &str = "terminal_resolver";
@@ -89,6 +90,21 @@ impl SuccessCriteria {
     }
 }
 
+/// Default number of re-requests after `CompensationFailedRetryable` (ADR-0004).
+pub const DEFAULT_COMPENSATION_RETRY_LIMIT: u32 = 3;
+
+/// What happens to completed effects of losing AnyOf/Quorum branches (ADR-0004).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LoserPolicy {
+    /// Undo completed compensable losing-branch steps before completion (ADR-0004).
+    #[default]
+    Compensate,
+    /// Keep losing-branch effects and record them (ADR-0004).
+    Keep,
+}
+
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct TerminalPolicy {
     pub saga_type: Box<str>,
@@ -102,6 +118,9 @@ pub struct TerminalPolicy {
     pub stalled_timeout: Duration,
     /// Declared workflow graph used to diagnose stalled required paths.
     pub workflow_steps: &'static [SagaWorkflowStepContract],
+    compensation_retry_limit: u32,
+    replay_horizon: Option<ReplayHorizon>,
+    loser_policy: LoserPolicy,
 }
 
 impl TerminalPolicy {
@@ -122,11 +141,49 @@ impl TerminalPolicy {
             overall_timeout,
             stalled_timeout,
             workflow_steps,
+            compensation_retry_limit: DEFAULT_COMPENSATION_RETRY_LIMIT,
+            replay_horizon: None,
+            loser_policy: LoserPolicy::Compensate,
         }
+    }
+
+    /// Maximum re-requests after `CompensationFailedRetryable` (ADR-0004).
+    pub fn with_compensation_retry_limit(mut self, limit: u32) -> Self {
+        self.compensation_retry_limit = limit;
+        self
+    }
+
+    /// Explicit replay horizon for finalized-run tombstones (ADR-0001).
+    pub fn with_replay_horizon(mut self, horizon: ReplayHorizon) -> Self {
+        self.replay_horizon = Some(horizon);
+        self
+    }
+
+    /// Loser policy for AnyOf/Quorum groups (ADR-0004).
+    pub fn with_loser_policy(mut self, policy: LoserPolicy) -> Self {
+        self.loser_policy = policy;
+        self
+    }
+
+    /// Maximum re-requests after `CompensationFailedRetryable` (ADR-0004).
+    pub fn compensation_retry_limit(&self) -> u32 {
+        self.compensation_retry_limit
+    }
+
+    /// Explicit horizon, else `max(2 × overall_timeout, MIN_REPLAY_HORIZON)` (ADR-0001).
+    pub fn replay_horizon(&self) -> ReplayHorizon {
+        self.replay_horizon
+            .unwrap_or_else(|| ReplayHorizon::for_overall_timeout(self.overall_timeout))
+    }
+
+    /// Loser policy for AnyOf/Quorum groups (ADR-0004).
+    pub fn loser_policy(&self) -> LoserPolicy {
+        self.loser_policy
     }
 }
 
 /// Reasons a [`TerminalPolicy`] can never resolve (or resolves vacuously).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalPolicyError {
     EmptyAllOf,
@@ -136,6 +193,7 @@ pub enum TerminalPolicyError {
     QuorumExceedsGroup,
     ZeroOverallTimeout,
     ZeroStalledTimeout,
+    ReplayHorizonShorterThanOverallTimeout,
 }
 
 impl std::fmt::Display for TerminalPolicyError {
@@ -148,6 +206,9 @@ impl std::fmt::Display for TerminalPolicyError {
             Self::QuorumExceedsGroup => "Quorum required_count exceeds group size",
             Self::ZeroOverallTimeout => "overall_timeout is zero",
             Self::ZeroStalledTimeout => "stalled_timeout is zero",
+            Self::ReplayHorizonShorterThanOverallTimeout => {
+                "replay_horizon is shorter than overall_timeout"
+            }
         })
     }
 }
@@ -185,6 +246,12 @@ impl TerminalPolicy {
         }
         if self.stalled_timeout.is_zero() {
             return Err(TerminalPolicyError::ZeroStalledTimeout);
+        }
+        if self
+            .replay_horizon
+            .is_some_and(|horizon| horizon.get() < self.overall_timeout)
+        {
+            return Err(TerminalPolicyError::ReplayHorizonShorterThanOverallTimeout);
         }
         Ok(())
     }
@@ -320,6 +387,15 @@ impl TerminalResolver {
         }
         unpublished.extend(resolver.poll_timeouts());
         (resolver, unpublished)
+    }
+
+    /// Checked ingress: `Err` for a stale or expired run (ADR-0004 §2.9). W1: never `Err`.
+    pub fn try_ingest_at(
+        &mut self,
+        event: &SagaChoreographyEvent,
+        now_millis: u64,
+    ) -> Result<Vec<SagaChoreographyEvent>, RunIdentityError> {
+        Ok(self.ingest_at(event, now_millis))
     }
 
     fn ingest_at(
@@ -563,7 +639,30 @@ impl TerminalResolver {
                 state.terminal_latched = true;
                 state.terminal_outcome = Some(event.event_type());
             }
-            SagaChoreographyEvent::CompensationStarted { .. } => {}
+            SagaChoreographyEvent::CompensationStarted { .. }
+            | SagaChoreographyEvent::SagaEffectsRetained { .. } => {}
+            SagaChoreographyEvent::SagaAbortRequested {
+                context, reason, ..
+            } => {
+                out.push(SagaChoreographyEvent::SagaFailed {
+                    context: terminal_context(context),
+                    reason: reason.clone(),
+                    failure: None,
+                });
+                state.terminal_latched = true;
+            }
+            SagaChoreographyEvent::CompensationFailedRetryable { context, error, .. } => {
+                state
+                    .accepted_compensations
+                    .remove(context.step_name.as_ref());
+                let failure = state.pending_failure.clone();
+                out.push(SagaChoreographyEvent::SagaFailed {
+                    context: terminal_context(context),
+                    reason: error.clone(),
+                    failure,
+                });
+                state.terminal_latched = true;
+            }
         }
 
         if state.terminal_latched && state.terminal_outcome.is_none() {
@@ -787,6 +886,7 @@ fn is_progress_event(event: &SagaChoreographyEvent) -> bool {
             | SagaChoreographyEvent::CompensationAccepted { .. }
             | SagaChoreographyEvent::CompensationCompleted { .. }
             | SagaChoreographyEvent::CompensationFailed { .. }
+            | SagaChoreographyEvent::CompensationFailedRetryable { .. }
     )
 }
 
@@ -1307,15 +1407,15 @@ mod tests {
     fn open_position_policy(stalled_timeout: Duration) -> TerminalPolicy {
         let mut required_steps = HashSet::new();
         required_steps.insert("create_order".into());
-        TerminalPolicy {
-            saga_type: "order_lifecycle".into(),
-            policy_id: "open_position/default".into(),
-            failure_authority: FailureAuthority::AnyParticipant,
-            success_criteria: SuccessCriteria::AllOf(required_steps),
-            overall_timeout: Duration::from_secs(5),
+        TerminalPolicy::new(
+            "order_lifecycle".into(),
+            "open_position/default".into(),
+            FailureAuthority::AnyParticipant,
+            SuccessCriteria::AllOf(required_steps),
+            Duration::from_secs(5),
             stalled_timeout,
-            workflow_steps: OPEN_POSITION_STEPS,
-        }
+            OPEN_POSITION_STEPS,
+        )
     }
 
     fn ctx(step: &str) -> SagaContext {
@@ -1360,15 +1460,15 @@ mod tests {
         let mut required: HashSet<Box<str>> = HashSet::new();
         required.insert("a".into());
         required.insert("b".into());
-        let policy = TerminalPolicy {
-            saga_type: "order_lifecycle".into(),
-            policy_id: "test".into(),
-            failure_authority: FailureAuthority::AnyParticipant,
-            success_criteria: SuccessCriteria::AllOf(required),
-            overall_timeout: Duration::from_secs(60),
-            stalled_timeout: Duration::from_secs(60),
-            workflow_steps: &[],
-        };
+        let policy = TerminalPolicy::new(
+            "order_lifecycle".into(),
+            "test".into(),
+            FailureAuthority::AnyParticipant,
+            SuccessCriteria::AllOf(required),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            &[],
+        );
         let mut resolver = TerminalResolver::new(policy);
 
         let out1 = resolver.ingest(&SagaChoreographyEvent::StepCompleted {
@@ -1411,15 +1511,15 @@ mod tests {
     fn unauthorized_step_failure_is_ignored() {
         let mut only_steps = HashSet::new();
         only_steps.insert("allowed".into());
-        let policy = TerminalPolicy {
-            saga_type: "order_lifecycle".into(),
-            policy_id: "test".into(),
-            failure_authority: FailureAuthority::OnlySteps(only_steps),
-            success_criteria: SuccessCriteria::AnyOf(HashSet::new()),
-            overall_timeout: Duration::from_secs(30),
-            stalled_timeout: Duration::from_secs(30),
-            workflow_steps: &[],
-        };
+        let policy = TerminalPolicy::new(
+            "order_lifecycle".into(),
+            "test".into(),
+            FailureAuthority::OnlySteps(only_steps),
+            SuccessCriteria::AnyOf(HashSet::new()),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            &[],
+        );
         let mut resolver = TerminalResolver::new(policy);
         let out = resolver.ingest(&SagaChoreographyEvent::StepFailed {
             context: ctx("denied"),
@@ -1435,15 +1535,15 @@ mod tests {
     fn authoritative_quarantine_is_absorbing_live_and_after_restore() {
         let mut required_steps = HashSet::new();
         required_steps.insert("create_order".into());
-        let policy = TerminalPolicy {
-            saga_type: "order_lifecycle".into(),
-            policy_id: "absorbing".into(),
-            failure_authority: FailureAuthority::AnyParticipant,
-            success_criteria: SuccessCriteria::AllOf(required_steps),
-            overall_timeout: Duration::from_millis(100),
-            stalled_timeout: Duration::from_secs(60),
-            workflow_steps: &[],
-        };
+        let policy = TerminalPolicy::new(
+            "order_lifecycle".into(),
+            "absorbing".into(),
+            FailureAuthority::AnyParticipant,
+            SuccessCriteria::AllOf(required_steps),
+            Duration::from_millis(100),
+            Duration::from_secs(60),
+            &[],
+        );
         let started = SagaChoreographyEvent::SagaStarted {
             context: ctx_at("risk_check", 9, 1_000, 1_000),
             payload: Vec::new(),
@@ -1486,15 +1586,15 @@ mod tests {
     fn hard_timeout_triggers_without_new_events() {
         let mut required_steps = HashSet::new();
         required_steps.insert("create_order".into());
-        let policy = TerminalPolicy {
-            saga_type: "order_lifecycle".into(),
-            policy_id: "hard-timeout".into(),
-            failure_authority: FailureAuthority::AnyParticipant,
-            success_criteria: SuccessCriteria::AllOf(required_steps),
-            overall_timeout: Duration::from_millis(100),
-            stalled_timeout: Duration::from_secs(60),
-            workflow_steps: &[],
-        };
+        let policy = TerminalPolicy::new(
+            "order_lifecycle".into(),
+            "hard-timeout".into(),
+            FailureAuthority::AnyParticipant,
+            SuccessCriteria::AllOf(required_steps),
+            Duration::from_millis(100),
+            Duration::from_secs(60),
+            &[],
+        );
         let mut resolver = TerminalResolver::new(policy);
         let start = SagaChoreographyEvent::SagaStarted {
             context: ctx_at("risk_check", 9, 1_000, 1_000),
@@ -1583,15 +1683,15 @@ mod tests {
         denied_steps.insert("create_order".into());
         let mut required_steps = HashSet::new();
         required_steps.insert("create_order".into());
-        let policy = TerminalPolicy {
-            saga_type: "order_lifecycle".into(),
-            policy_id: "accepted-timeout-deny".into(),
-            failure_authority: FailureAuthority::DenySteps(denied_steps),
-            success_criteria: SuccessCriteria::AllOf(required_steps),
-            overall_timeout: Duration::from_secs(5),
-            stalled_timeout: Duration::from_secs(5),
-            workflow_steps: &[],
-        };
+        let policy = TerminalPolicy::new(
+            "order_lifecycle".into(),
+            "accepted-timeout-deny".into(),
+            FailureAuthority::DenySteps(denied_steps),
+            SuccessCriteria::AllOf(required_steps),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            &[],
+        );
         let mut resolver = TerminalResolver::new(policy);
         let start = SagaChoreographyEvent::SagaStarted {
             context: ctx_at("create_order", 9, 1_000, 1_000),
@@ -1625,15 +1725,15 @@ mod tests {
         authorized.insert("create_order".into());
         let mut required = HashSet::new();
         required.insert("create_order".into());
-        let policy = TerminalPolicy {
-            saga_type: "order_lifecycle".into(),
-            policy_id: "accepted-timeout/sibling".into(),
-            failure_authority: FailureAuthority::OnlySteps(authorized),
-            success_criteria: SuccessCriteria::AllOf(required),
-            overall_timeout: Duration::from_secs(5),
-            stalled_timeout: Duration::from_secs(5),
-            workflow_steps: OPEN_POSITION_STEPS,
-        };
+        let policy = TerminalPolicy::new(
+            "order_lifecycle".into(),
+            "accepted-timeout/sibling".into(),
+            FailureAuthority::OnlySteps(authorized),
+            SuccessCriteria::AllOf(required),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            OPEN_POSITION_STEPS,
+        );
         let mut resolver = TerminalResolver::new(policy);
         let _ = resolver.ingest_at(
             &SagaChoreographyEvent::SagaStarted {
@@ -1947,15 +2047,15 @@ mod tests {
     fn progress_timeout_resets_after_progress_event() {
         let mut required_steps = HashSet::new();
         required_steps.insert("create_order".into());
-        let policy = TerminalPolicy {
-            saga_type: "order_lifecycle".into(),
-            policy_id: "progress-timeout".into(),
-            failure_authority: FailureAuthority::AnyParticipant,
-            success_criteria: SuccessCriteria::AllOf(required_steps),
-            overall_timeout: Duration::from_secs(5),
-            stalled_timeout: Duration::from_millis(100),
-            workflow_steps: &[],
-        };
+        let policy = TerminalPolicy::new(
+            "order_lifecycle".into(),
+            "progress-timeout".into(),
+            FailureAuthority::AnyParticipant,
+            SuccessCriteria::AllOf(required_steps),
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+            &[],
+        );
         let mut resolver = TerminalResolver::new(policy);
         let start = SagaChoreographyEvent::SagaStarted {
             context: ctx_at("risk_check", 9, 1_000, 1_000),
