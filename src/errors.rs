@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use crate::{RunIdentityError, RunKey, SagaBusPublishError, SagaStateStoreError};
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct StepExecutionId(Box<str>);
 
@@ -227,4 +229,82 @@ impl CompensationError {
     pub fn is_ambiguous(&self) -> bool {
         matches!(self, Self::Ambiguous { .. })
     }
+}
+
+/// Commit stage at which a participant ingress failed (ADR-0002).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitStage {
+    Admission,
+    Dedupe,
+    Inbox,
+    Intent,
+    Result,
+    CompensationRequest,
+    CompensationStart,
+    CompensationResult,
+    Finalize,
+}
+
+/// Why an ingress event was rejected without being a failure (ADR-0002).
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IngressRejection {
+    /// Saga type / workflow not handled by this participant (not a failure).
+    NotParticipant,
+    /// Non-start event for a run that is already terminal (ADR-0001 `RunAdmission::TerminalRun`).
+    TerminalRun,
+    /// Run-identity fence: stale or expired incarnation (ADR-0001).
+    RunIdentity(RunIdentityError),
+}
+
+/// A durable commit failed before any effect ran (ADR-0002).
+#[derive(Debug)]
+pub struct IngressFailure {
+    pub run: RunKey,
+    pub stage: CommitStage,
+    pub source: SagaStateStoreError,
+}
+
+/// Why a run needs manual or startup reconciliation (ADR-0002).
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum ReconciliationCause {
+    ResultCommitFailed(SagaStateStoreError),
+    CompensationResultCommitFailed(SagaStateStoreError),
+    /// R21.
+    UnsupportedEffect {
+        effect: Box<str>,
+    },
+    /// R02: a required compensation request found no completed state.
+    MissingCompletedState,
+    /// Q14: an active pre-W5 run whose join progress was never journaled (ADR-0005).
+    LegacyJoinStateMissing,
+}
+
+/// An effect may exist in the world without a durable record of it (ADR-0002).
+#[derive(Debug)]
+pub struct ReconciliationNeeded {
+    pub run: RunKey,
+    pub step: Box<str>,
+    pub cause: ReconciliationCause,
+    pub compensation_data: Vec<u8>,
+}
+
+/// Outcome of participant ingress (ADR-0002).
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum IngressOutcome {
+    Applied,
+    Duplicate,
+    Rejected(IngressRejection),
+    Failed(IngressFailure),
+    ReconciliationNeeded(ReconciliationNeeded),
+}
+
+/// Ingress outcome plus publish failures observed while handling it (ADR-0002).
+#[derive(Debug)]
+pub struct IngressReport {
+    pub outcome: IngressOutcome,
+    pub publish_failures: Vec<SagaBusPublishError>,
 }

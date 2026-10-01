@@ -354,15 +354,15 @@ fn test_policy() -> TerminalPolicy {
     required.insert(STEP_POSITION.into());
     required.insert(STEP_BALANCE.into());
     required.insert(STEP_ORDER.into());
-    TerminalPolicy {
-        saga_type: SAGA_TYPE.into(),
-        policy_id: "order_lifecycle/e2e_test".into(),
-        failure_authority: FailureAuthority::AnyParticipant,
-        success_criteria: SuccessCriteria::AllOf(required),
-        overall_timeout: Duration::from_secs(60),
-        stalled_timeout: Duration::from_secs(60),
-        workflow_steps: OrderLifecycleE2eContract::steps(),
-    }
+    TerminalPolicy::new(
+        SAGA_TYPE.into(),
+        "order_lifecycle/e2e_test".into(),
+        FailureAuthority::AnyParticipant,
+        SuccessCriteria::AllOf(required),
+        Duration::from_secs(60),
+        Duration::from_secs(60),
+        OrderLifecycleE2eContract::steps(),
+    )
 }
 
 struct OrderLifecycleE2eContract;

@@ -47,7 +47,7 @@ fn lmdb_journal_and_dedupe_roundtrip() {
     let read_a = journal.read(saga_a).expect("read saga_a should succeed");
     assert_eq!(read_a.len(), 1);
     assert!(matches!(
-        read_a[0].event,
+        read_a[0].event.transition(),
         ParticipantEvent::StepExecutionStarted { .. }
     ));
 

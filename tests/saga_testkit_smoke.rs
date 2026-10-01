@@ -308,29 +308,29 @@ impl AsyncActor for AsyncParticipant {
 fn test_terminal_policy() -> TerminalPolicy {
     let mut required = HashSet::new();
     required.insert("step_b".into());
-    TerminalPolicy {
-        saga_type: "order_lifecycle".into(),
-        policy_id: "order_lifecycle/test".into(),
-        failure_authority: FailureAuthority::AnyParticipant,
-        success_criteria: SuccessCriteria::AllOf(required),
-        overall_timeout: Duration::from_secs(60),
-        stalled_timeout: Duration::from_secs(60),
-        workflow_steps: &[],
-    }
+    TerminalPolicy::new(
+        "order_lifecycle".into(),
+        "order_lifecycle/test".into(),
+        FailureAuthority::AnyParticipant,
+        SuccessCriteria::AllOf(required),
+        Duration::from_secs(60),
+        Duration::from_secs(60),
+        &[],
+    )
 }
 
 fn workflow_terminal_policy() -> TerminalPolicy {
     let mut required = HashSet::new();
     required.insert("beta_step".into());
-    TerminalPolicy {
-        saga_type: "workflow_beta".into(),
-        policy_id: "workflow_beta/test".into(),
-        failure_authority: FailureAuthority::AnyParticipant,
-        success_criteria: SuccessCriteria::AllOf(required),
-        overall_timeout: Duration::from_secs(60),
-        stalled_timeout: Duration::from_secs(60),
-        workflow_steps: WorkflowBetaTestContract::steps(),
-    }
+    TerminalPolicy::new(
+        "workflow_beta".into(),
+        "workflow_beta/test".into(),
+        FailureAuthority::AnyParticipant,
+        SuccessCriteria::AllOf(required),
+        Duration::from_secs(60),
+        Duration::from_secs(60),
+        WorkflowBetaTestContract::steps(),
+    )
 }
 
 define_saga_workflow_contract! {

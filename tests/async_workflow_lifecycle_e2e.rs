@@ -196,6 +196,54 @@ impl ParticipantJournal for FailOnAppendJournal {
     fn prune(&self, saga_id: SagaId) -> Result<(), icanact_saga_choreography::JournalError> {
         self.inner.prune(saga_id)
     }
+
+    fn append_run(
+        &self,
+        run: &icanact_saga_choreography::RunKey,
+        event: ParticipantEvent,
+    ) -> Result<u64, icanact_saga_choreography::JournalError> {
+        // Shares the append failure counter with the legacy path.
+        self.append(run.saga_id(), event)
+    }
+
+    fn read_run(
+        &self,
+        run: &icanact_saga_choreography::RunKey,
+    ) -> Result<Vec<icanact_saga_choreography::JournalEntry>, icanact_saga_choreography::JournalError>
+    {
+        self.inner.read_run(run)
+    }
+
+    fn list_runs(
+        &self,
+    ) -> Result<Vec<icanact_saga_choreography::RunKey>, icanact_saga_choreography::JournalError>
+    {
+        self.inner.list_runs()
+    }
+
+    fn finalize_run(
+        &self,
+        tombstone: &icanact_saga_choreography::RunTombstone,
+        cutoff: icanact_saga_choreography::RunIncarnation,
+    ) -> Result<(), icanact_saga_choreography::JournalError> {
+        self.inner.finalize_run(tombstone, cutoff)
+    }
+
+    fn run_tombstones(
+        &self,
+        saga_type: &str,
+        saga_id: SagaId,
+    ) -> Result<Vec<icanact_saga_choreography::RunTombstone>, icanact_saga_choreography::JournalError>
+    {
+        self.inner.run_tombstones(saga_type, saga_id)
+    }
+
+    fn prune_expired_tombstones(
+        &self,
+        cutoff: icanact_saga_choreography::RunIncarnation,
+    ) -> Result<u64, icanact_saga_choreography::JournalError> {
+        self.inner.prune_expired_tombstones(cutoff)
+    }
 }
 
 struct FailingJournalActor {
@@ -741,18 +789,15 @@ fn accept_failure_on_metadata_append_does_not_orphan_accepted_metadata() {
         .journal
         .read(ctx.saga_id)
         .expect("journal read should succeed");
+    assert_eq!(entries.len(), 1);
     assert!(matches!(
-        entries.as_slice(),
-        [icanact_saga_choreography::JournalEntry {
-            event: ParticipantEvent::StepExecutionStarted { .. },
-            ..
-        }]
+        entries[0].event.transition(),
+        ParticipantEvent::StepExecutionStarted { .. }
     ));
-    assert!(
-        !entries
-            .iter()
-            .any(|entry| matches!(entry.event, ParticipantEvent::AcceptedStepRecorded { .. }))
-    );
+    assert!(!entries.iter().any(|entry| matches!(
+        entry.event.transition(),
+        ParticipantEvent::AcceptedStepRecorded { .. }
+    )));
 }
 
 #[test]
@@ -830,7 +875,7 @@ fn accepted_step_metadata_persistence_failure_quarantines_external_effect() {
         .read(ctx.saga_id)
         .expect("quarantine evidence should remain readable");
     assert!(matches!(
-        journal.last().map(|entry| &entry.event),
+        journal.last().map(|entry| entry.event.transition()),
         Some(ParticipantEvent::Quarantined { reason, .. })
             if reason.contains("accepted step persistence failed")
     ));
@@ -1666,13 +1711,13 @@ fn accepted_compensation_failure_leaves_no_compensating_state() {
             .expect("compensation failure should be durable");
         if is_ambiguous {
             assert!(matches!(
-                journal.last().map(|entry| &entry.event),
+                journal.last().map(|entry| entry.event.transition()),
                 Some(ParticipantEvent::Quarantined { reason, .. })
                     if reason.as_ref() == "authoritative cancel failure"
             ));
         } else {
             assert!(matches!(
-                journal.last().map(|entry| &entry.event),
+                journal.last().map(|entry| entry.event.transition()),
                 Some(ParticipantEvent::CompensationFailed {
                     error,
                     is_ambiguous: false,
@@ -1844,7 +1889,7 @@ fn accepted_step_completion_records_actual_completion_time() {
         .expect("journal read should succeed");
     assert!(entries.iter().any(|entry| {
         matches!(
-            &entry.event,
+            entry.event.transition(),
             ParticipantEvent::StepExecutionCompleted {
                 completed_at_millis: observed,
                 ..

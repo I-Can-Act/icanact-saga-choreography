@@ -86,7 +86,7 @@ pub fn panic_message_from_payload(payload: &(dyn std::any::Any + Send)) -> Box<s
 
 pub fn panic_quarantine_reason_from_entries(entries: &[JournalEntry]) -> Option<Box<str>> {
     let last = entries.last()?;
-    let ParticipantEvent::Quarantined { reason, .. } = &last.event else {
+    let ParticipantEvent::Quarantined { reason, .. } = last.event.transition() else {
         return None;
     };
     if is_panic_quarantine_reason(reason.as_ref()) {
@@ -129,6 +129,9 @@ pub fn is_valid_emitted_transition(
         }
         SagaChoreographyEvent::SagaQuarantined { .. } => {
             matches!(entry, Some(SagaStateEntry::Quarantined(_)))
+        }
+        SagaChoreographyEvent::CompensationFailedRetryable { .. } => {
+            matches!(entry, Some(SagaStateEntry::Compensating(_)))
         }
         _ => true,
     }
@@ -964,7 +967,7 @@ fn recover_accepted_workflow_compensation_from_entries(
 ) -> Option<AcceptedWorkflowCompensation> {
     let mut accepted = None;
     for entry in entries {
-        match &entry.event {
+        match entry.event.transition() {
             ParticipantEvent::AcceptedCompensationRecorded {
                 context,
                 participant_id,
@@ -1014,7 +1017,7 @@ fn recover_compensation_request_from_entries(
             failure,
             steps_to_compensate,
             requested_at_millis,
-        } = &entry.event
+        } = entry.event.transition()
         {
             let mut context = context.clone();
             context.event_timestamp_millis = *requested_at_millis;
@@ -1036,7 +1039,7 @@ fn recover_completed_accepted_compensation_from_entries(
     let mut accepted = None;
     let mut completed = None;
     for entry in entries {
-        match &entry.event {
+        match entry.event.transition() {
             ParticipantEvent::CompensationRequestRecorded { .. } => {
                 accepted = None;
                 completed = None;
@@ -1087,7 +1090,9 @@ fn recover_completed_accepted_compensation_from_entries(
             | ParticipantEvent::StepExecutionCompleted { .. }
             | ParticipantEvent::StepExecutionFailed { .. }
             | ParticipantEvent::CompensationStarted { .. }
-            | ParticipantEvent::AcceptedStepRecorded { .. } => {}
+            | ParticipantEvent::AcceptedStepRecorded { .. }
+            | ParticipantEvent::InboxCommitted { .. }
+            | ParticipantEvent::TransitionCommitted { .. } => {}
         }
     }
     completed
@@ -1099,7 +1104,7 @@ fn recover_failed_accepted_compensation_from_entries(
     let mut accepted = None;
     let mut failed = None;
     for entry in entries {
-        match &entry.event {
+        match entry.event.transition() {
             ParticipantEvent::CompensationRequestRecorded { .. } => {
                 accepted = None;
                 failed = None;
@@ -1160,7 +1165,9 @@ fn recover_failed_accepted_compensation_from_entries(
             | ParticipantEvent::StepExecutionCompleted { .. }
             | ParticipantEvent::StepExecutionFailed { .. }
             | ParticipantEvent::CompensationStarted { .. }
-            | ParticipantEvent::AcceptedStepRecorded { .. } => {}
+            | ParticipantEvent::AcceptedStepRecorded { .. }
+            | ParticipantEvent::InboxCommitted { .. }
+            | ParticipantEvent::TransitionCommitted { .. } => {}
         }
     }
     failed
@@ -1171,7 +1178,7 @@ fn recover_unstarted_compensation_request_from_entries(
 ) -> Option<SagaChoreographyEvent> {
     let mut request = None;
     for entry in entries {
-        match &entry.event {
+        match entry.event.transition() {
             ParticipantEvent::CompensationRequestRecorded {
                 context,
                 failed_step,
@@ -1200,7 +1207,9 @@ fn recover_unstarted_compensation_request_from_entries(
             | ParticipantEvent::StepExecutionStarted { .. }
             | ParticipantEvent::StepExecutionCompleted { .. }
             | ParticipantEvent::StepExecutionFailed { .. }
-            | ParticipantEvent::AcceptedStepRecorded { .. } => {}
+            | ParticipantEvent::AcceptedStepRecorded { .. }
+            | ParticipantEvent::InboxCommitted { .. }
+            | ParticipantEvent::TransitionCommitted { .. } => {}
         }
     }
     request
@@ -1224,8 +1233,12 @@ fn recover_completed_step_effect_for_unstarted_compensation(
     let mut completed = None;
     let mut effect_at_request = None;
     for entry in entries {
-        match &entry.event {
-            ParticipantEvent::StepExecutionStarted { .. } => completed = None,
+        match entry.event.transition() {
+            ParticipantEvent::StepExecutionStarted { .. }
+            | ParticipantEvent::InboxCommitted {
+                execution_intent: Some(_),
+                ..
+            } => completed = None,
             ParticipantEvent::StepExecutionCompleted {
                 output,
                 compensation_data,
@@ -1248,7 +1261,12 @@ fn recover_completed_step_effect_for_unstarted_compensation(
             ParticipantEvent::SagaRegistered { .. }
             | ParticipantEvent::StepTriggered { .. }
             | ParticipantEvent::StepExecutionFailed { .. }
-            | ParticipantEvent::AcceptedStepRecorded { .. } => {}
+            | ParticipantEvent::AcceptedStepRecorded { .. }
+            | ParticipantEvent::InboxCommitted {
+                execution_intent: None,
+                ..
+            }
+            | ParticipantEvent::TransitionCommitted { .. } => {}
         }
     }
     effect_at_request
@@ -1259,7 +1277,7 @@ fn recover_accepted_workflow_step_from_entries(
 ) -> Option<AcceptedWorkflowStep> {
     let mut accepted = None;
     for entry in entries {
-        match &entry.event {
+        match entry.event.transition() {
             ParticipantEvent::AcceptedStepRecorded {
                 context,
                 participant_id,
@@ -1308,7 +1326,9 @@ fn recover_accepted_workflow_step_from_entries(
                 ..
             }
             | ParticipantEvent::CompensationRequestRecorded { .. }
-            | ParticipantEvent::AcceptedCompensationRecorded { .. } => {}
+            | ParticipantEvent::AcceptedCompensationRecorded { .. }
+            | ParticipantEvent::InboxCommitted { .. }
+            | ParticipantEvent::TransitionCommitted { .. } => {}
         }
     }
     accepted
@@ -1319,7 +1339,7 @@ fn accepted_step_failure_requiring_compensation(
 ) -> Option<(Box<str>, u64)> {
     let mut failure = None;
     for entry in entries {
-        match &entry.event {
+        match entry.event.transition() {
             ParticipantEvent::AcceptedStepRecorded { .. } => {
                 failure = None;
             }
@@ -1345,7 +1365,9 @@ fn accepted_step_failure_requiring_compensation(
             | ParticipantEvent::StepTriggered { .. }
             | ParticipantEvent::StepExecutionStarted { .. }
             | ParticipantEvent::CompensationRequestRecorded { .. }
-            | ParticipantEvent::AcceptedCompensationRecorded { .. } => {}
+            | ParticipantEvent::AcceptedCompensationRecorded { .. }
+            | ParticipantEvent::InboxCommitted { .. }
+            | ParticipantEvent::TransitionCommitted { .. } => {}
         }
     }
     failure
@@ -2666,13 +2688,13 @@ pub fn classify_recovery(
         return RecoveryDecision::TerminalNoAction;
     };
     if matches!(
-        &last.event,
+        last.event.transition(),
         ParticipantEvent::Quarantined { reason, .. } if is_panic_quarantine_reason(reason.as_ref())
     ) {
         return RecoveryDecision::ReplayPanicQuarantine;
     }
     let terminal = matches!(
-        last.event,
+        last.event.transition(),
         ParticipantEvent::CompensationCompleted { .. }
             | ParticipantEvent::Quarantined { .. }
             | ParticipantEvent::StepExecutionFailed {
@@ -2684,7 +2706,7 @@ pub fn classify_recovery(
         return RecoveryDecision::TerminalNoAction;
     }
     if matches!(
-        &last.event,
+        last.event.transition(),
         ParticipantEvent::AcceptedStepRecorded {
             hard_deadline_at_millis,
             ..
@@ -2730,22 +2752,27 @@ pub fn collect_startup_recovery_events_for_saga_type<
 }
 
 fn recorded_saga_type(entries: &[JournalEntry]) -> Option<&str> {
-    entries.iter().rev().find_map(|entry| match &entry.event {
-        ParticipantEvent::SagaRegistered { saga_type, .. } => Some(saga_type.as_ref()),
-        ParticipantEvent::CompensationRequestRecorded { context, .. }
-        | ParticipantEvent::AcceptedStepRecorded { context, .. }
-        | ParticipantEvent::AcceptedCompensationRecorded { context, .. } => {
-            Some(context.saga_type.as_ref())
-        }
-        ParticipantEvent::StepTriggered { .. }
-        | ParticipantEvent::StepExecutionStarted { .. }
-        | ParticipantEvent::StepExecutionCompleted { .. }
-        | ParticipantEvent::StepExecutionFailed { .. }
-        | ParticipantEvent::CompensationStarted { .. }
-        | ParticipantEvent::CompensationCompleted { .. }
-        | ParticipantEvent::CompensationFailed { .. }
-        | ParticipantEvent::Quarantined { .. } => None,
-    })
+    entries
+        .iter()
+        .rev()
+        .find_map(|entry| match entry.event.transition() {
+            ParticipantEvent::SagaRegistered { saga_type, .. } => Some(saga_type.as_ref()),
+            ParticipantEvent::CompensationRequestRecorded { context, .. }
+            | ParticipantEvent::AcceptedStepRecorded { context, .. }
+            | ParticipantEvent::AcceptedCompensationRecorded { context, .. } => {
+                Some(context.saga_type.as_ref())
+            }
+            ParticipantEvent::StepTriggered { .. }
+            | ParticipantEvent::StepExecutionStarted { .. }
+            | ParticipantEvent::StepExecutionCompleted { .. }
+            | ParticipantEvent::StepExecutionFailed { .. }
+            | ParticipantEvent::CompensationStarted { .. }
+            | ParticipantEvent::CompensationCompleted { .. }
+            | ParticipantEvent::CompensationFailed { .. }
+            | ParticipantEvent::Quarantined { .. }
+            | ParticipantEvent::InboxCommitted { .. }
+            | ParticipantEvent::TransitionCommitted { .. } => None,
+        })
 }
 
 fn collect_startup_recovery_events_for_saga_type_inner<
@@ -3163,7 +3190,7 @@ pub mod lmdb {
     };
     use crate::{
         DedupeError, JournalEntry, JournalError, ParticipantDedupeStore, ParticipantEvent,
-        ParticipantJournal, SagaId, SagaParticipantSupport,
+        ParticipantJournal, RunIncarnation, RunKey, RunTombstone, SagaId, SagaParticipantSupport,
     };
 
     const DEFAULT_LMDB_MAP_SIZE_BYTES: usize = 1024 * 1024 * 1024;
@@ -3416,6 +3443,40 @@ pub mod lmdb {
                 .map_err(|err| JournalError::Storage(err.to_string().into()))?;
             Ok(())
         }
+
+        fn append_run(&self, run: &RunKey, event: ParticipantEvent) -> Result<u64, JournalError> {
+            self.append(run.saga_id(), event)
+        }
+
+        fn read_run(&self, run: &RunKey) -> Result<Vec<JournalEntry>, JournalError> {
+            self.read(run.saga_id())
+        }
+
+        fn list_runs(&self) -> Result<Vec<RunKey>, JournalError> {
+            Err(JournalError::Storage(
+                "list_runs requires run-scoped storage (ADR-0001, T08D)".into(),
+            ))
+        }
+
+        fn finalize_run(
+            &self,
+            tombstone: &RunTombstone,
+            _cutoff: RunIncarnation,
+        ) -> Result<(), JournalError> {
+            self.prune(tombstone.run().saga_id())
+        }
+
+        fn run_tombstones(
+            &self,
+            _saga_type: &str,
+            _saga_id: SagaId,
+        ) -> Result<Vec<RunTombstone>, JournalError> {
+            Ok(Vec::new())
+        }
+
+        fn prune_expired_tombstones(&self, _cutoff: RunIncarnation) -> Result<u64, JournalError> {
+            Ok(0)
+        }
     }
 
     #[derive(Debug)]
@@ -3530,6 +3591,42 @@ pub mod lmdb {
             wtxn.commit()
                 .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
             Ok(())
+        }
+
+        fn check_and_mark_run(&self, run: &RunKey, key: &str) -> Result<bool, DedupeError> {
+            self.check_and_mark(run.saga_id(), key)
+        }
+
+        fn contains_run(&self, run: &RunKey, key: &str) -> Result<bool, DedupeError> {
+            self.contains(run.saga_id(), key)
+        }
+
+        fn mark_processed_run(&self, run: &RunKey, key: &str) -> Result<(), DedupeError> {
+            self.mark_processed(run.saga_id(), key)
+        }
+
+        fn remove_processed_run(&self, run: &RunKey, key: &str) -> Result<(), DedupeError> {
+            self.remove_processed(run.saga_id(), key)
+        }
+
+        fn prune_run(&self, run: &RunKey) -> Result<(), DedupeError> {
+            self.prune(run.saga_id())
+        }
+
+        fn list_runs(&self) -> Result<Vec<RunKey>, DedupeError> {
+            Err(DedupeError::Storage(
+                "list_runs requires run-scoped storage (ADR-0001, T08D)".into(),
+            ))
+        }
+
+        fn keys_run(&self, _run: &RunKey) -> Result<Vec<Box<str>>, DedupeError> {
+            Err(DedupeError::Storage(
+                "keys_run requires run-scoped storage (ADR-0001, T08D)".into(),
+            ))
+        }
+
+        fn prune_expired(&self, _cutoff: RunIncarnation) -> Result<u64, DedupeError> {
+            Ok(0)
         }
     }
 
