@@ -10,6 +10,7 @@ use icanact_core::local_sync::{self, SyncActor};
 
 use crate::events::AbortSource;
 use crate::reply_registry::{SagaReplyToHandle, SagaReplyToResult};
+use crate::resolver::{FailureAuthority, SuccessCriteria};
 use crate::workflow_contract::required_path_steps_from_success_criteria;
 use crate::{
     HasSagaWorkflowParticipants, RunIncarnation, RunKey, SagaChoreographyEvent, SagaContext,
@@ -305,10 +306,45 @@ struct ResolverAttachConfig {
 impl ResolverAttachConfig {
     fn new(policy: &TerminalPolicy, journal: Option<&Arc<dyn TerminalResolverJournal>>) -> Self {
         Self {
-            policy: format!("{policy:?}"),
+            policy: canonical_policy_fingerprint(policy),
             journal: journal.map(|journal| Arc::as_ptr(journal).cast::<()>() as usize),
         }
     }
+}
+
+fn sorted_steps(steps: &HashSet<Box<str>>) -> Vec<&str> {
+    let mut sorted: Vec<&str> = steps.iter().map(AsRef::as_ref).collect();
+    sorted.sort_unstable();
+    sorted
+}
+
+/// Deterministic rendering of a policy: `HashSet`-backed members are sorted so
+/// two equal policies always fingerprint identically.
+fn canonical_policy_fingerprint(policy: &TerminalPolicy) -> String {
+    let authority = match &policy.failure_authority {
+        FailureAuthority::AnyParticipant => "AnyParticipant".to_string(),
+        FailureAuthority::OnlySteps(steps) => format!("OnlySteps({:?})", sorted_steps(steps)),
+        FailureAuthority::DenySteps(steps) => format!("DenySteps({:?})", sorted_steps(steps)),
+    };
+    let criteria = match &policy.success_criteria {
+        SuccessCriteria::AllOf(steps) => format!("AllOf({:?})", sorted_steps(steps)),
+        SuccessCriteria::AnyOf(steps) => format!("AnyOf({:?})", sorted_steps(steps)),
+        SuccessCriteria::Quorum {
+            group_steps,
+            required_count,
+        } => format!("Quorum({:?},{required_count})", sorted_steps(group_steps)),
+    };
+    format!(
+        "saga_type={} policy_id={} authority={authority} criteria={criteria} overall={:?} stalled={:?} steps={:?} retry={} horizon={:?} loser={:?}",
+        policy.saga_type,
+        policy.policy_id,
+        policy.overall_timeout,
+        policy.stalled_timeout,
+        policy.workflow_steps,
+        policy.compensation_retry_limit(),
+        policy.replay_horizon(),
+        policy.loser_policy(),
+    )
 }
 
 struct TerminalResolverRuntime {
@@ -584,6 +620,14 @@ pub enum SagaBusPublishError {
         attempted: u32,
         delivered: u32,
     },
+    /// A `SagaAbortRequested` reached no attached resolver; a terminal
+    /// `SagaFailed` fallback was published instead.
+    AbortNotDelivered {
+        saga_id: SagaId,
+        saga_type: Box<str>,
+        attempted: u32,
+        delivered: u32,
+    },
     TerminalEscalationPartialDelivery {
         saga_id: SagaId,
         saga_type: Box<str>,
@@ -670,6 +714,9 @@ impl SagaChoreographyBus {
         &self,
         event: SagaChoreographyEvent,
     ) -> (PublishStats, Option<Box<str>>) {
+        if matches!(event, SagaChoreographyEvent::SagaAbortRequested { .. }) {
+            return (self.publish_abort_event(event).0, None);
+        }
         let event_type = event.event_type();
         let mut expected_min_delivery: Option<u32> = None;
         let mut expected_required_path: Box<str> = "".into();
@@ -743,9 +790,7 @@ impl SagaChoreographyBus {
         (stats, None)
     }
 
-    /// Requests a resolver-driven abort (ADR-0004 §2.6). If the abort reaches
-    /// no subscriber at all, the only safe event left is a terminal
-    /// `SagaFailed`, which is published after an `error!`.
+    /// Requests a resolver-driven abort (ADR-0004 §2.6).
     fn publish_abort_or_fail(
         &self,
         context: &crate::SagaContext,
@@ -754,12 +799,37 @@ impl SagaChoreographyBus {
     ) -> PublishStats {
         let abort = SagaChoreographyEvent::SagaAbortRequested {
             context: context.next_step(TERMINAL_RESOLVER_STEP.into()),
-            reason: reason.clone(),
+            reason,
             source,
         };
+        self.publish_abort_event(abort).0
+    }
+
+    fn has_attached_resolver(&self, saga_type: &str) -> bool {
+        matches!(
+            self.terminal_resolver_registry_ref
+                .ask(TerminalResolverRegistryAsk::Existing(saga_type.into())),
+            Ok(TerminalResolverRegistryReply::Existing(Some(_)))
+        )
+    }
+
+    /// Publishes a `SagaAbortRequested`. The abort only counts as delivered
+    /// when an attached resolver for the saga type received it (ADR-0004
+    /// §2.6); otherwise an `error!` is logged and the only safe event left, a
+    /// terminal `SagaFailed`, is published. The `bool` is whether the abort
+    /// reached a resolver.
+    fn publish_abort_event(&self, abort: SagaChoreographyEvent) -> (PublishStats, bool) {
+        let context = abort.context().clone();
+        let (reason, source) = match &abort {
+            SagaChoreographyEvent::SagaAbortRequested { reason, source, .. } => {
+                (reason.clone(), *source)
+            }
+            _ => (Box::<str>::from("abort"), AbortSource::DeliveryShortfall),
+        };
+        let resolver_attached = self.has_attached_resolver(context.saga_type.as_ref());
         let stats = self.publish_event(abort);
-        if stats.delivered > 0 {
-            return stats;
+        if resolver_attached && stats.delivered > 0 {
+            return (stats, true);
         }
         tracing::error!(
             target: "core::saga",
@@ -767,6 +837,8 @@ impl SagaChoreographyBus {
             run = ?context.run_key(),
             source = ?source,
             reason = %reason,
+            resolver_attached,
+            delivered = stats.delivered,
             "abort request reached no resolver; publishing terminal SagaFailed"
         );
         let terminal = SagaChoreographyEvent::SagaFailed {
@@ -777,13 +849,26 @@ impl SagaChoreographyBus {
         if let Some(outcome) = terminal.terminal_outcome() {
             self.store_terminal_outcome(terminal.context().run_key(), outcome);
         }
-        self.publish_event(terminal)
+        (self.publish_event(terminal), false)
     }
 
     pub fn publish_strict(
         &self,
         event: SagaChoreographyEvent,
     ) -> Result<PublishStats, SagaBusPublishError> {
+        if matches!(event, SagaChoreographyEvent::SagaAbortRequested { .. }) {
+            let (stats, resolver_delivered) = self.publish_abort_event(event.clone());
+            if !resolver_delivered {
+                let context = event.context();
+                return Err(SagaBusPublishError::AbortNotDelivered {
+                    saga_id: context.saga_id,
+                    saga_type: context.saga_type.clone(),
+                    attempted: stats.attempted,
+                    delivered: stats.delivered,
+                });
+            }
+            return Ok(stats);
+        }
         let (stats, rejected) = self.publish_with_admission(event.clone());
         if let Some(reason) = rejected {
             // The diagnostic SagaFailed was already published; the start itself
@@ -861,11 +946,17 @@ impl SagaChoreographyBus {
         Err(partial)
     }
 
-    fn register_terminal_policy(&self, policy: &TerminalPolicy) {
-        let _ = self.ask_state(BusStateAsk::RegisterTerminalPolicy {
+    fn register_terminal_policy(&self, policy: &TerminalPolicy) -> Result<(), String> {
+        match self.ask_state(BusStateAsk::RegisterTerminalPolicy {
             saga_type: policy.saga_type.clone(),
             policy_id: policy.policy_id.clone(),
-        });
+        }) {
+            Some(_) => Ok(()),
+            None => Err(format!(
+                "terminal policy readiness not registered: bus state unavailable saga_type={} policy_id={}",
+                policy.saga_type, policy.policy_id
+            )),
+        }
     }
 
     pub fn register_workflow_contract_provider<C: SagaWorkflowContract>(
@@ -1249,7 +1340,7 @@ impl SagaChoreographyBus {
                 }
             };
         // Readiness is committed only now that the resolver is fully registered.
-        self.register_terminal_policy(&policy);
+        self.register_terminal_policy(&policy)?;
         Ok(registered)
     }
 
@@ -1597,7 +1688,7 @@ mod tests {
         TerminalResolverJournalEntry, TerminalResolverJournalError, WorkflowDependencySpec,
     };
 
-    use super::{DEFAULT_TERMINAL_RETENTION_LIMIT, SagaChoreographyBus};
+    use super::{BusStateAsk, DEFAULT_TERMINAL_RETENTION_LIMIT, SagaChoreographyBus};
     use crate::AbortSource;
     use icanact_core::local::FirehoseSubscription;
 
@@ -2240,6 +2331,128 @@ mod tests {
         assert_eq!(delivered.load(Ordering::Relaxed), 1);
     }
 
+    fn many_step_policy(capacity: usize, reverse: bool) -> TerminalPolicy {
+        let names: Vec<String> = (0..24).map(|i| format!("step_{i}")).collect();
+        let mut all_of: HashSet<Box<str>> = HashSet::with_capacity(capacity);
+        let mut only: HashSet<Box<str>> = HashSet::with_capacity(capacity);
+        let iter: Box<dyn Iterator<Item = &String>> = if reverse {
+            Box::new(names.iter().rev())
+        } else {
+            Box::new(names.iter())
+        };
+        for name in iter {
+            all_of.insert(name.as_str().into());
+            only.insert(name.as_str().into());
+        }
+        TerminalPolicy::new(
+            "order_lifecycle".into(),
+            "order_lifecycle/many".into(),
+            FailureAuthority::OnlySteps(only),
+            SuccessCriteria::AllOf(all_of),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            &[],
+        )
+    }
+
+    #[test]
+    fn same_config_reattach_with_multi_step_policy_is_always_ok() {
+        for round in 0..64 {
+            let bus = SagaChoreographyBus::new();
+            let first = bus
+                .attach_terminal_resolver(many_step_policy(round, false), "terminal-resolver")
+                .expect("first attach");
+            let second = bus
+                .attach_terminal_resolver(
+                    many_step_policy(round * 7 + 1, true),
+                    "terminal-resolver",
+                )
+                .expect("same-config reattach must not depend on HashSet iteration order");
+            assert_eq!(first, second);
+        }
+    }
+
+    fn abort_event(saga_id: u64) -> SagaChoreographyEvent {
+        SagaChoreographyEvent::SagaAbortRequested {
+            context: context_for("order_lifecycle", "create_order", saga_id),
+            reason: "participant abort".into(),
+            source: AbortSource::StaleRecovery,
+        }
+    }
+
+    #[test]
+    fn abort_with_no_subscribers_errors_and_falls_back_to_saga_failed() {
+        let bus = SagaChoreographyBus::new();
+        let result = bus.publish_strict(abort_event(8101));
+        assert!(
+            result.is_err(),
+            "undelivered abort must not be Ok: {result:?}"
+        );
+        assert!(
+            matches!(
+                bus.take_terminal_outcome(SagaId::new(8101)),
+                Some(SagaTerminalOutcome::Failed { .. })
+            ),
+            "undelivered abort must fall back to a terminal SagaFailed"
+        );
+    }
+
+    #[test]
+    fn abort_reaching_only_non_resolver_subscriber_errors_and_falls_back() {
+        let bus = SagaChoreographyBus::new();
+        let _sub = bus.subscribe_saga_type_fn("order_lifecycle", |_: &SagaChoreographyEvent| true);
+        let result = bus.publish_strict(abort_event(8102));
+        assert!(
+            result.is_err(),
+            "abort with no resolver must not be Ok: {result:?}"
+        );
+        assert!(
+            matches!(
+                bus.take_terminal_outcome(SagaId::new(8102)),
+                Some(SagaTerminalOutcome::Failed { .. })
+            ),
+            "abort with no attached resolver must fall back to SagaFailed"
+        );
+    }
+
+    #[test]
+    fn abort_with_attached_resolver_is_ok() {
+        let bus = SagaChoreographyBus::new();
+        bus.attach_terminal_resolver(
+            TerminalPolicy::order_lifecycle_default(),
+            "terminal-resolver",
+        )
+        .expect("attach");
+        let result = bus.publish_strict(abort_event(8103));
+        assert!(
+            result.is_ok(),
+            "abort delivered to resolver must be Ok: {result:?}"
+        );
+    }
+
+    #[test]
+    fn attach_fails_when_readiness_cannot_be_registered() {
+        let mut bus = SagaChoreographyBus::new();
+        Arc::get_mut(&mut bus._lifecycle)
+            .expect("sole lifecycle owner")
+            .state_handle
+            .take()
+            .expect("state handle")
+            .shutdown();
+        wait_until(Instant::now() + Duration::from_millis(500), || {
+            bus.state_ref
+                .ask(BusStateAsk::HasTerminalPolicy {
+                    saga_type: "x".into(),
+                })
+                .is_err()
+        });
+        let result = bus.attach_terminal_resolver(
+            TerminalPolicy::order_lifecycle_default(),
+            "terminal-resolver",
+        );
+        assert!(result.is_err(), "attach without readiness must be Err");
+    }
+
     #[test]
     fn terminal_outcome_retention_is_bounded() {
         let bus = SagaChoreographyBus::new();
@@ -2366,7 +2579,8 @@ mod tests {
     #[test]
     fn terminal_policy_without_contract_fails_saga_started() {
         let bus = SagaChoreographyBus::new();
-        bus.register_terminal_policy(&TerminalPolicy::order_lifecycle_default());
+        bus.register_terminal_policy(&TerminalPolicy::order_lifecycle_default())
+            .expect("register policy");
         let saga_id = SagaId::new(9002);
         let started = SagaChoreographyEvent::SagaStarted {
             context: context("create_order", saga_id.get()),
