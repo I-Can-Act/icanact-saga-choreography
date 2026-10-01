@@ -14,6 +14,14 @@ use icanact_saga_choreography::{
     StepOutput, SuccessCriteria, TerminalPolicy, define_saga_workflow_contract,
 };
 
+/// Fixtures use fixed 2023 timestamps; a horizon this long keeps them inside the replay window.
+fn fixture_horizon() -> icanact_saga_choreography::ReplayHorizon {
+    icanact_saga_choreography::ReplayHorizon::new(std::time::Duration::from_secs(
+        100 * 365 * 24 * 3600,
+    ))
+    .expect("horizon above the floor")
+}
+
 #[derive(Clone, Debug)]
 enum SyncCmd {
     AddBusinessFlag(&'static str),
@@ -45,7 +53,8 @@ struct SyncParticipant {
 impl SyncParticipant {
     fn new(step_name: &'static str, dependency: DependencySpec) -> Self {
         Self {
-            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new())
+                .with_replay_horizon(fixture_horizon()),
             step_name,
             dependency,
             fail_on_execute: false,
@@ -195,7 +204,8 @@ struct AsyncParticipant {
 impl Default for AsyncParticipant {
     fn default() -> Self {
         Self {
-            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new())
+                .with_replay_horizon(fixture_horizon()),
             executed_inputs: Vec::new(),
         }
     }
@@ -445,7 +455,8 @@ struct WorkflowActor {
 impl Default for WorkflowActor {
     fn default() -> Self {
         Self {
-            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new())
+                .with_replay_horizon(fixture_horizon()),
             alpha_inputs: Vec::new(),
             beta_inputs: Vec::new(),
         }
@@ -583,7 +594,8 @@ struct DuplicateWorkflowActor {
 impl Default for DuplicateWorkflowActor {
     fn default() -> Self {
         Self {
-            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new())
+                .with_replay_horizon(fixture_horizon()),
         }
     }
 }

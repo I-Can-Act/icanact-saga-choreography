@@ -859,7 +859,14 @@ mod tests {
     impl Default for TestParticipant {
         fn default() -> Self {
             Self {
-                saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+                saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new())
+                    // fixtures use fixed 2023 timestamps; keep them inside the replay window
+                    .with_replay_horizon(
+                        crate::ReplayHorizon::new(std::time::Duration::from_secs(
+                            100 * 365 * 24 * 3600,
+                        ))
+                        .expect("horizon above the floor"),
+                    ),
                 called: false,
             }
         }

@@ -1,16 +1,19 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::state_ext::SagaStateStoreError;
+use crate::helpers::{admit_and_dedupe, quarantine_admission_lookup_failure};
+use crate::state_ext::{SagaStateStoreError, finalize_terminal_run};
 use crate::support::{AcceptedWorkflowCompensation, AcceptedWorkflowStep};
 use crate::{
     AcceptedCompensationCompletion, AcceptedCompensationFailure, AcceptedStepCompletion,
     AcceptedStepError, AcceptedStepFailure, AcceptedStepPolicy, AcceptedStepTimeoutOutcome,
     AsyncSagaParticipant, CompensationOutput, DedupeError, HasSagaParticipantSupport,
     HasSagaWorkflowParticipants, JournalEntry, JournalError, ParticipantDedupeStore,
-    ParticipantEvent, ParticipantJournal, SagaChoreographyEvent, SagaContext, SagaId,
-    SagaParticipant, SagaParticipantSupport, SagaStateEntry, SagaStateExt, SagaWorkflowParticipant,
-    StepExecutionId, StepOutput, handle_async_saga_event_with_emit, handle_saga_event_with_emit,
+    ParticipantEvent, ParticipantJournal, RunKey, RunTerminalOutcome, SagaChoreographyEvent,
+    SagaContext, SagaId, SagaParticipant, SagaParticipantSupport, SagaStateEntry, SagaStateExt,
+    SagaWorkflowParticipant, StepExecutionId, StepOutput, event_identity,
+    handle_async_saga_event_with_emit, handle_saga_event_with_emit,
 };
 
 pub const PANIC_QUARANTINE_REASON_PREFIX: &str = "panic_during_active_";
@@ -33,6 +36,14 @@ pub enum RecoveryCollectionError {
         source: DedupeError,
     },
     MissingCompensationState {
+        saga_id: SagaId,
+    },
+    ReadRun {
+        run: RunKey,
+        source: JournalError,
+    },
+    /// Rows without a stored run identity; drain them on the previous binary (docs/upgrade.md#run-identity).
+    UnattributedLegacyRows {
         saga_id: SagaId,
     },
 }
@@ -150,6 +161,7 @@ where
     A: SagaStateExt,
 {
     let saga_id = context.saga_id;
+    let run = context.run_key();
     policy
         .validate()
         .map_err(|source| AcceptedStepError::InvalidPolicy {
@@ -157,7 +169,7 @@ where
             source,
         })?;
 
-    if actor.saga_support().terminal_sagas.contains(&saga_id) {
+    if actor.saga_support().terminal_sagas.contains(&run) {
         return Err(AcceptedStepError::AlreadyTerminal {
             saga_id,
             execution_id,
@@ -166,7 +178,7 @@ where
     if actor
         .saga_support()
         .resolved_workflow_steps
-        .contains(&(saga_id, execution_id.clone()))
+        .contains(&(run.clone(), execution_id.clone()))
     {
         return Err(AcceptedStepError::AlreadyResolved {
             saga_id,
@@ -176,7 +188,7 @@ where
     if actor
         .saga_support()
         .accepted_workflow_steps
-        .contains_key(&saga_id)
+        .contains_key(&run)
     {
         return Err(AcceptedStepError::AlreadyAccepted {
             saga_id,
@@ -217,8 +229,8 @@ where
     let timeout_outcome = accepted_step.policy.timeout_outcome.clone();
     let compensation_available = !accepted_step.compensation_data.is_empty();
     actor
-        .record_event_strict(
-            saga_id,
+        .record_event_run_strict(
+            &run,
             ParticipantEvent::StepExecutionStarted {
                 attempt: 1,
                 started_at_millis: accepted_at_millis,
@@ -239,11 +251,11 @@ where
 
     actor
         .saga_states()
-        .insert(saga_id, SagaStateEntry::Executing(state));
+        .insert(run.clone(), SagaStateEntry::Executing(state));
     actor
         .saga_support_mut()
         .accepted_workflow_steps
-        .insert(saga_id, accepted_step);
+        .insert(run.clone(), accepted_step);
 
     Ok(SagaChoreographyEvent::StepAccepted {
         context: accepted_context,
@@ -270,13 +282,14 @@ where
     A: SagaStateExt,
 {
     let saga_id = context.saga_id;
+    let run = context.run_key();
     policy
         .validate()
         .map_err(|source| AcceptedStepError::InvalidPolicy {
             execution_id: execution_id.clone(),
             source,
         })?;
-    if actor.saga_support().terminal_sagas.contains(&saga_id) {
+    if actor.saga_support().terminal_sagas.contains(&run) {
         return Err(AcceptedStepError::AlreadyTerminal {
             saga_id,
             execution_id,
@@ -285,7 +298,7 @@ where
     if actor
         .saga_support()
         .accepted_workflow_steps
-        .contains_key(&saga_id)
+        .contains_key(&run)
     {
         return Err(AcceptedStepError::AlreadyAccepted {
             saga_id,
@@ -323,7 +336,7 @@ where
     actor
         .saga_support_mut()
         .accepted_workflow_steps
-        .insert(saga_id, accepted_step);
+        .insert(run.clone(), accepted_step);
 
     Ok(SagaChoreographyEvent::StepAccepted {
         context: accepted_context,
@@ -346,10 +359,10 @@ pub fn complete_accepted_workflow_step<A>(
 where
     A: SagaStateExt,
 {
-    let accepted = accepted_step_for_resolution(actor, saga_id, &execution_id)?;
+    let (run, accepted) = accepted_step_for_resolution(actor, saga_id, &execution_id)?;
     actor
-        .record_event_strict(
-            saga_id,
+        .record_event_run_strict(
+            &run,
             ParticipantEvent::StepExecutionCompleted {
                 output: completion.output.clone(),
                 compensation_data: completion.compensation_data.clone(),
@@ -361,8 +374,8 @@ where
             execution_id: execution_id.clone(),
             error: format!("{source:?}").into(),
         })?;
-    take_accepted_step(actor, saga_id, execution_id.clone())?;
-    if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&saga_id) {
+    take_accepted_step(actor, &run, execution_id.clone())?;
+    if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&run) {
         let new_state = state.complete(
             completion.output.clone(),
             completion.compensation_data.clone(),
@@ -370,9 +383,9 @@ where
         );
         actor
             .saga_states()
-            .insert(saga_id, SagaStateEntry::Completed(new_state));
+            .insert(run.clone(), SagaStateEntry::Completed(new_state));
     }
-    mark_accepted_step_resolved(actor, saga_id, execution_id.clone());
+    mark_accepted_step_resolved(actor, &run, execution_id.clone());
 
     let mut context = accepted.context;
     context.event_timestamp_millis = completion.completed_at_millis;
@@ -394,10 +407,10 @@ pub fn fail_accepted_workflow_step<A>(
 where
     A: SagaStateExt,
 {
-    let accepted = accepted_step_for_resolution(actor, saga_id, &execution_id)?;
+    let (run, accepted) = accepted_step_for_resolution(actor, saga_id, &execution_id)?;
     actor
-        .record_event_strict(
-            saga_id,
+        .record_event_run_strict(
+            &run,
             ParticipantEvent::StepExecutionFailed {
                 error: failure.reason.clone(),
                 requires_compensation: failure.requires_compensation,
@@ -410,16 +423,16 @@ where
             error: format!("{source:?}").into(),
         })?;
     if !failure.requires_compensation {
-        take_accepted_step(actor, saga_id, execution_id.clone())?;
-        if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&saga_id) {
+        take_accepted_step(actor, &run, execution_id.clone())?;
+        if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&run) {
             let new_state = state.fail(failure.reason.clone(), false, failure.failed_at_millis);
             actor
                 .saga_states()
-                .insert(saga_id, SagaStateEntry::Failed(new_state));
+                .insert(run.clone(), SagaStateEntry::Failed(new_state));
         }
-        mark_accepted_step_resolved(actor, saga_id, execution_id);
+        mark_accepted_step_resolved(actor, &run, execution_id);
     } else {
-        mark_accepted_step_resolved(actor, saga_id, execution_id);
+        mark_accepted_step_resolved(actor, &run, execution_id);
     }
 
     let mut context = accepted.context;
@@ -447,6 +460,7 @@ where
     A: SagaStateExt,
 {
     let saga_id = context.saga_id;
+    let run = context.run_key();
     policy
         .validate()
         .map_err(|source| AcceptedStepError::InvalidPolicy {
@@ -456,7 +470,7 @@ where
     if actor
         .saga_support()
         .accepted_workflow_compensations
-        .contains_key(&saga_id)
+        .contains_key(&run)
     {
         return Err(AcceptedStepError::AlreadyAccepted {
             saga_id,
@@ -482,8 +496,8 @@ where
         hard_deadline_at_millis,
     };
     actor
-        .record_event_strict(
-            saga_id,
+        .record_event_run_strict(
+            &run,
             ParticipantEvent::AcceptedCompensationRecorded {
                 context: accepted.context.clone(),
                 participant_id: accepted.participant_id.clone(),
@@ -505,7 +519,7 @@ where
     actor
         .saga_support_mut()
         .accepted_workflow_compensations
-        .insert(saga_id, accepted);
+        .insert(run.clone(), accepted);
 
     Ok(SagaChoreographyEvent::CompensationAccepted {
         context: accepted_context,
@@ -525,7 +539,7 @@ pub fn complete_accepted_workflow_compensation<A>(
 where
     A: SagaStateExt + HasSagaWorkflowParticipants,
 {
-    let accepted = accepted_compensation_for_resolution(actor, saga_id, &execution_id)?;
+    let (_, accepted) = accepted_compensation_for_resolution(actor, saga_id, &execution_id)?;
     let workflow = A::saga_workflows().iter().copied().find(|workflow| {
         workflow.step_name() == accepted.context.step_name.as_ref()
             && workflow
@@ -583,10 +597,10 @@ fn complete_accepted_compensation_state<A>(
 where
     A: SagaStateExt,
 {
-    let accepted = accepted_compensation_for_resolution(actor, saga_id, &execution_id)?;
+    let (run, accepted) = accepted_compensation_for_resolution(actor, saga_id, &execution_id)?;
     actor
-        .record_event_strict(
-            saga_id,
+        .record_event_run_strict(
+            &run,
             ParticipantEvent::CompensationCompleted {
                 completed_at_millis: completion.completed_at_millis,
             },
@@ -599,16 +613,16 @@ where
     actor
         .saga_support_mut()
         .accepted_workflow_compensations
-        .remove(&saga_id);
-    if let Some(SagaStateEntry::Compensating(state)) = actor.saga_states().remove(&saga_id) {
+        .remove(&run);
+    if let Some(SagaStateEntry::Compensating(state)) = actor.saga_states().remove(&run) {
         actor.saga_states().insert(
-            saga_id,
+            run.clone(),
             SagaStateEntry::Compensated(
                 state.complete_compensation(completion.completed_at_millis),
             ),
         );
     }
-    mark_accepted_step_resolved(actor, saga_id, execution_id);
+    mark_accepted_step_resolved(actor, &run, execution_id);
     let mut context = accepted.context;
     context.event_timestamp_millis = completion.completed_at_millis;
     Ok(SagaChoreographyEvent::CompensationCompleted { context })
@@ -623,7 +637,7 @@ pub fn fail_accepted_workflow_compensation<A>(
 where
     A: SagaStateExt,
 {
-    let accepted = accepted_compensation_for_resolution(actor, saga_id, &execution_id)?;
+    let (run, accepted) = accepted_compensation_for_resolution(actor, saga_id, &execution_id)?;
     let durable_failure = if failure.is_ambiguous {
         ParticipantEvent::Quarantined {
             reason: failure.reason.clone(),
@@ -637,7 +651,7 @@ where
         }
     };
     actor
-        .record_event_strict(saga_id, durable_failure)
+        .record_event_run_strict(&run, durable_failure)
         .map_err(|source| AcceptedStepError::Durability {
             saga_id,
             execution_id: execution_id.clone(),
@@ -646,12 +660,12 @@ where
     actor
         .saga_support_mut()
         .accepted_workflow_compensations
-        .remove(&saga_id);
-    let state_entry = actor.saga_states().remove(&saga_id);
+        .remove(&run);
+    let state_entry = actor.saga_states().remove(&run);
     match state_entry {
         Some(SagaStateEntry::Compensating(state)) if failure.is_ambiguous => {
             actor.saga_states().insert(
-                saga_id,
+                run.clone(),
                 SagaStateEntry::Quarantined(
                     state.quarantine(failure.reason.clone(), failure.failed_at_millis),
                 ),
@@ -659,7 +673,7 @@ where
         }
         Some(SagaStateEntry::Compensating(state)) => {
             actor.saga_states().insert(
-                saga_id,
+                run.clone(),
                 SagaStateEntry::Failed(state.fail(
                     failure.reason.clone(),
                     false,
@@ -668,11 +682,11 @@ where
             );
         }
         Some(state) => {
-            actor.saga_states().insert(saga_id, state);
+            actor.saga_states().insert(run.clone(), state);
         }
         None => {}
     }
-    mark_accepted_step_resolved(actor, saga_id, execution_id);
+    mark_accepted_step_resolved(actor, &run, execution_id);
     let mut context = accepted.context;
     context.event_timestamp_millis = failure.failed_at_millis;
     Ok(SagaChoreographyEvent::CompensationFailed {
@@ -683,25 +697,41 @@ where
     })
 }
 
+/// Newest run of `saga_id` in `map` whose value satisfies `exec_matches`, else the newest run of
+/// the saga id. Saga-id-keyed public APIs resolve to a run through this (ADR-0001 §5).
+fn run_of_saga<V>(
+    map: &HashMap<RunKey, V>,
+    saga_id: SagaId,
+    exec_matches: impl Fn(&V) -> bool,
+) -> Option<RunKey> {
+    let newest = |matching: bool| {
+        map.iter()
+            .filter(|(run, value)| run.saga_id() == saga_id && (!matching || exec_matches(value)))
+            .map(|(run, _)| run)
+            .max_by_key(|run| run.incarnation())
+            .cloned()
+    };
+    newest(true).or_else(|| newest(false))
+}
+
 fn accepted_compensation_for_resolution<A>(
     actor: &A,
     saga_id: SagaId,
     execution_id: &StepExecutionId,
-) -> Result<AcceptedWorkflowCompensation, AcceptedStepError>
+) -> Result<(RunKey, AcceptedWorkflowCompensation), AcceptedStepError>
 where
     A: HasSagaParticipantSupport,
 {
-    let Some(accepted) = actor
-        .saga_support()
-        .accepted_workflow_compensations
-        .get(&saga_id)
-        .cloned()
-    else {
+    let compensations = &actor.saga_support().accepted_workflow_compensations;
+    let Some(run) = run_of_saga(compensations, saga_id, |accepted| {
+        accepted.execution_id == *execution_id
+    }) else {
         return Err(AcceptedStepError::NotFound {
             saga_id,
             execution_id: execution_id.clone(),
         });
     };
+    let accepted = compensations[&run].clone();
     if accepted.execution_id != *execution_id {
         return Err(AcceptedStepError::ExecutionIdMismatch {
             saga_id,
@@ -709,7 +739,7 @@ where
             actual: execution_id.clone(),
         });
     }
-    Ok(accepted)
+    Ok((run, accepted))
 }
 
 pub fn record_accepted_workflow_step_progress<A>(
@@ -721,26 +751,11 @@ pub fn record_accepted_workflow_step_progress<A>(
 where
     A: HasSagaParticipantSupport,
 {
-    if actor.saga_support().terminal_sagas.contains(&saga_id) {
-        return Err(AcceptedStepError::AlreadyTerminal {
-            saga_id,
-            execution_id,
-        });
-    }
-    if actor
-        .saga_support()
-        .resolved_workflow_steps
-        .contains(&(saga_id, execution_id.clone()))
-    {
-        return Err(AcceptedStepError::AlreadyResolved {
-            saga_id,
-            execution_id,
-        });
-    }
+    let (run, _) = accepted_step_for_resolution(actor, saga_id, &execution_id)?;
     let Some(accepted) = actor
         .saga_support_mut()
         .accepted_workflow_steps
-        .get_mut(&saga_id)
+        .get_mut(&run)
     else {
         return Err(AcceptedStepError::NotFound {
             saga_id,
@@ -820,11 +835,11 @@ where
         .saga_support()
         .accepted_workflow_steps
         .iter()
-        .filter_map(|(saga_id, accepted)| {
+        .filter_map(|(run, accepted)| {
             if now_millis > accepted.hard_deadline_at_millis {
-                Some((*saga_id, accepted.execution_id.clone(), true))
+                Some((run.saga_id(), accepted.execution_id.clone(), true))
             } else if now_millis > accepted.deadline_at_millis {
-                Some((*saga_id, accepted.execution_id.clone(), false))
+                Some((run.saga_id(), accepted.execution_id.clone(), false))
             } else {
                 None
             }
@@ -834,9 +849,128 @@ where
     expired
         .into_iter()
         .filter_map(|(saga_id, execution_id, hard_timeout)| {
-            resolve_accepted_timeout(actor, saga_id, execution_id, hard_timeout, now_millis).ok()
+            match resolve_accepted_timeout(actor, saga_id, execution_id, hard_timeout, now_millis) {
+                Ok(event) => Some(event),
+                Err(error) => {
+                    tracing::error!(
+                        target: "core::saga",
+                        event = "accepted_step_timeout_resolution_failed",
+                        saga_id = saga_id.get(),
+                        error = ?error
+                    );
+                    None
+                }
+            }
         })
         .collect()
+}
+
+/// One journaled run to recover; its identity comes from the stored `RunKey` (ADR-0001).
+struct RecoveryUnit {
+    run: RunKey,
+    entries: Vec<JournalEntry>,
+}
+
+/// Run recorded in a stored context, if any row carries one.
+fn run_from_entries(entries: &[JournalEntry]) -> Option<RunKey> {
+    entries
+        .iter()
+        .find_map(|entry| match entry.event.transition() {
+            ParticipantEvent::CompensationRequestRecorded { context, .. }
+            | ParticipantEvent::AcceptedStepRecorded { context, .. }
+            | ParticipantEvent::AcceptedCompensationRecorded { context, .. } => {
+                Some(context.run_key())
+            }
+            _ => None,
+        })
+}
+
+/// Journaled runs to recover. Run-scoped rows come from `list_runs`/`read_run`. Rows in the legacy
+/// `SagaId` partition are attributed only through a stored context (an exact identity); legacy
+/// rows without one cannot be attributed: with a single registered saga type they fail loudly
+/// instead of guessing an incarnation; with several types no registered type can claim them.
+fn recovery_units<J: ParticipantJournal>(
+    journal: &J,
+    claim_unattributed: bool,
+) -> Result<Vec<RecoveryUnit>, RecoveryCollectionError> {
+    let mut units: Vec<RecoveryUnit> = Vec::new();
+    for run in journal
+        .list_runs()
+        .map_err(RecoveryCollectionError::ListSagas)?
+    {
+        let entries =
+            journal
+                .read_run(&run)
+                .map_err(|source| RecoveryCollectionError::ReadRun {
+                    run: run.clone(),
+                    source,
+                })?;
+        if !entries.is_empty() {
+            units.push(RecoveryUnit { run, entries });
+        }
+    }
+    let saga_ids = journal
+        .list_sagas()
+        .map_err(RecoveryCollectionError::ListSagas)?;
+    for saga_id in saga_ids {
+        let all = journal
+            .read(saga_id)
+            .map_err(|source| RecoveryCollectionError::ReadSaga { saga_id, source })?;
+        let run_sequences: std::collections::HashSet<u64> = units
+            .iter()
+            .filter(|unit| unit.run.saga_id() == saga_id)
+            .flat_map(|unit| unit.entries.iter().map(|entry| entry.sequence))
+            .collect();
+        let legacy: Vec<JournalEntry> = all
+            .into_iter()
+            .filter(|entry| !run_sequences.contains(&entry.sequence))
+            .collect();
+        if legacy.is_empty() {
+            continue;
+        }
+        let Some(run) = run_from_entries(&legacy).filter(|run| run.saga_id() == saga_id) else {
+            // Rows that would not produce any recovery event need no identity.
+            if matches!(
+                classify_recovery(
+                    &legacy,
+                    SagaContext::now_millis(),
+                    RecoveryPolicy::default()
+                ),
+                RecoveryDecision::Continue | RecoveryDecision::TerminalNoAction
+            ) {
+                tracing::warn!(
+                    target: "core::saga",
+                    event = "recovery_unattributed_legacy_rows_ignored",
+                    saga_id = saga_id.get(),
+                    rows = legacy.len()
+                );
+                continue;
+            }
+            tracing::error!(
+                target: "core::saga",
+                event = "recovery_unattributed_legacy_rows",
+                saga_id = saga_id.get(),
+                rows = legacy.len(),
+                claimable = claim_unattributed
+            );
+            if claim_unattributed {
+                return Err(RecoveryCollectionError::UnattributedLegacyRows { saga_id });
+            }
+            // With several registered saga types no one can claim rows of unknown type.
+            continue;
+        };
+        match units.iter_mut().find(|unit| unit.run == run) {
+            Some(unit) => {
+                unit.entries.extend(legacy);
+                unit.entries.sort_by_key(|entry| entry.sequence);
+            }
+            None => units.push(RecoveryUnit {
+                run,
+                entries: legacy,
+            }),
+        }
+    }
+    Ok(units)
 }
 
 pub fn recover_accepted_workflow_steps_for_saga_type<J, D>(
@@ -848,16 +982,10 @@ where
     J: ParticipantJournal,
     D: ParticipantDedupeStore,
 {
-    let saga_ids = support
-        .journal
-        .list_sagas()
-        .map_err(RecoveryCollectionError::ListSagas)?;
+    let units = recovery_units(&support.journal, false)?; // rehydration needs stored contexts only; unattributed rows are reported by the event collector
     let now_millis = SagaContext::now_millis();
-    for saga_id in saga_ids {
-        let entries = support
-            .journal
-            .read(saga_id)
-            .map_err(|source| RecoveryCollectionError::ReadSaga { saga_id, source })?;
+    for RecoveryUnit { run, entries } in units {
+        let saga_id = run.saga_id();
         if let Some(request) = recover_unstarted_compensation_request_from_entries(&entries)
             && request.context().saga_type.as_ref() == saga_type
             && compensation_request_targets_step(&request, step_name)
@@ -887,7 +1015,8 @@ where
             .complete(output, compensation_data, completed_at_millis);
             support
                 .saga_states
-                .insert(saga_id, SagaStateEntry::Completed(state));
+                .insert(run.clone(), SagaStateEntry::Completed(state));
+            support.admitted_runs.insert(run.clone());
         }
         if let Some(accepted) = recover_accepted_workflow_compensation_from_entries(&entries) {
             if accepted.context.saga_type.as_ref() != saga_type
@@ -911,10 +1040,10 @@ where
             .start_compensation(accepted.accepted_at_millis);
             support
                 .saga_states
-                .insert(saga_id, SagaStateEntry::Compensating(state));
+                .insert(run.clone(), SagaStateEntry::Compensating(state));
             support
                 .accepted_workflow_compensations
-                .insert(saga_id, accepted);
+                .insert(run.clone(), accepted);
             continue;
         }
         if let Some(accepted) = recover_accepted_workflow_step_from_entries(&entries) {
@@ -950,12 +1079,15 @@ where
             .start_execution(accepted.accepted_at_millis);
             support
                 .saga_states
-                .insert(saga_id, SagaStateEntry::Executing(state));
-            support.accepted_workflow_steps.insert(saga_id, accepted);
+                .insert(run.clone(), SagaStateEntry::Executing(state));
+            support
+                .accepted_workflow_steps
+                .insert(run.clone(), accepted);
+            support.admitted_runs.insert(run.clone());
             if forward_execution_resolved {
                 support
                     .resolved_workflow_steps
-                    .insert((saga_id, execution_id));
+                    .insert((run.clone(), execution_id));
             }
         }
     }
@@ -1383,7 +1515,7 @@ fn resolve_accepted_timeout<A>(
 where
     A: SagaStateExt,
 {
-    let accepted = accepted_step_for_resolution(actor, saga_id, &execution_id)?;
+    let (run, accepted) = accepted_step_for_resolution(actor, saga_id, &execution_id)?;
     let timeout_kind = if hard_timeout { "hard" } else { "idle" };
     let reason: Box<str> = format!(
         "accepted step {timeout_kind} timeout saga_id={} step={} execution_id={}",
@@ -1398,8 +1530,8 @@ where
             requires_compensation,
         } => {
             actor
-                .record_event_strict(
-                    saga_id,
+                .record_event_run_strict(
+                    &run,
                     ParticipantEvent::StepExecutionFailed {
                         error: reason.clone(),
                         requires_compensation,
@@ -1412,17 +1544,16 @@ where
                     error: format!("{source:?}").into(),
                 })?;
             if !requires_compensation {
-                take_accepted_step(actor, saga_id, execution_id.clone())?;
-                mark_accepted_step_resolved(actor, saga_id, execution_id.clone());
-                if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&saga_id)
-                {
+                take_accepted_step(actor, &run, execution_id.clone())?;
+                mark_accepted_step_resolved(actor, &run, execution_id.clone());
+                if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&run) {
                     let new_state = state.fail(reason.clone(), false, timed_out_at_millis);
                     actor
                         .saga_states()
-                        .insert(saga_id, SagaStateEntry::Failed(new_state));
+                        .insert(run.clone(), SagaStateEntry::Failed(new_state));
                 }
             } else {
-                mark_accepted_step_resolved(actor, saga_id, execution_id.clone());
+                mark_accepted_step_resolved(actor, &run, execution_id.clone());
             }
             let mut context = accepted.context;
             context.event_timestamp_millis = timed_out_at_millis;
@@ -1436,8 +1567,8 @@ where
         }
         AcceptedStepTimeoutOutcome::QuarantineSaga => {
             actor
-                .record_event_strict(
-                    saga_id,
+                .record_event_run_strict(
+                    &run,
                     ParticipantEvent::Quarantined {
                         reason: reason.clone(),
                         quarantined_at_millis: timed_out_at_millis,
@@ -1448,13 +1579,13 @@ where
                     execution_id: execution_id.clone(),
                     error: format!("{source:?}").into(),
                 })?;
-            take_accepted_step(actor, saga_id, execution_id.clone())?;
-            mark_accepted_step_resolved(actor, saga_id, execution_id);
-            if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&saga_id) {
+            take_accepted_step(actor, &run, execution_id.clone())?;
+            mark_accepted_step_resolved(actor, &run, execution_id);
+            if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&run) {
                 let new_state = state.quarantine(reason.clone(), timed_out_at_millis);
                 actor
                     .saga_states()
-                    .insert(saga_id, SagaStateEntry::Quarantined(new_state));
+                    .insert(run.clone(), SagaStateEntry::Quarantined(new_state));
             }
             let step = accepted.context.step_name.clone();
             let mut context = accepted.context;
@@ -1473,32 +1604,49 @@ fn accepted_step_for_resolution<A>(
     actor: &A,
     saga_id: SagaId,
     execution_id: &StepExecutionId,
-) -> Result<AcceptedWorkflowStep, AcceptedStepError>
+) -> Result<(RunKey, AcceptedWorkflowStep), AcceptedStepError>
 where
     A: HasSagaParticipantSupport,
 {
-    if actor.saga_support().terminal_sagas.contains(&saga_id) {
+    let support = actor.saga_support();
+    let run = run_of_saga(&support.accepted_workflow_steps, saga_id, |accepted| {
+        accepted.execution_id == *execution_id
+    });
+    let terminal = match &run {
+        Some(run) => support.terminal_sagas.contains(run),
+        None => support
+            .terminal_sagas
+            .iter()
+            .any(|terminal| terminal.saga_id() == saga_id),
+    };
+    if terminal {
         return Err(AcceptedStepError::AlreadyTerminal {
             saga_id,
             execution_id: execution_id.clone(),
         });
     }
-    if actor
-        .saga_support()
-        .resolved_workflow_steps
-        .contains(&(saga_id, execution_id.clone()))
-    {
+    let resolved = match &run {
+        Some(run) => support
+            .resolved_workflow_steps
+            .contains(&(run.clone(), execution_id.clone())),
+        None => support
+            .resolved_workflow_steps
+            .iter()
+            .any(|(resolved, exec)| resolved.saga_id() == saga_id && exec == execution_id),
+    };
+    if resolved {
         return Err(AcceptedStepError::AlreadyResolved {
             saga_id,
             execution_id: execution_id.clone(),
         });
     }
-    let Some(accepted) = actor.saga_support().accepted_workflow_steps.get(&saga_id) else {
+    let Some(run) = run else {
         return Err(AcceptedStepError::NotFound {
             saga_id,
             execution_id: execution_id.clone(),
         });
     };
+    let accepted = &support.accepted_workflow_steps[&run];
     if accepted.execution_id != *execution_id {
         let expected = accepted.execution_id.clone();
         return Err(AcceptedStepError::ExecutionIdMismatch {
@@ -1507,28 +1655,29 @@ where
             actual: execution_id.clone(),
         });
     }
-    Ok(accepted.clone())
+    Ok((run, accepted.clone()))
 }
 
 fn take_accepted_step<A>(
     actor: &mut A,
-    saga_id: SagaId,
+    run: &RunKey,
     execution_id: StepExecutionId,
 ) -> Result<AcceptedWorkflowStep, AcceptedStepError>
 where
     A: HasSagaParticipantSupport,
 {
-    let accepted = accepted_step_for_resolution(actor, saga_id, &execution_id)?;
+    let (resolved_run, accepted) =
+        accepted_step_for_resolution(actor, run.saga_id(), &execution_id)?;
     actor
         .saga_support_mut()
         .accepted_workflow_steps
-        .remove(&saga_id);
+        .remove(&resolved_run);
     Ok(accepted)
 }
 
 pub(crate) fn mark_accepted_step_resolved<A>(
     actor: &mut A,
-    saga_id: SagaId,
+    run: &RunKey,
     execution_id: StepExecutionId,
 ) where
     A: HasSagaParticipantSupport,
@@ -1536,7 +1685,7 @@ pub(crate) fn mark_accepted_step_resolved<A>(
     actor
         .saga_support_mut()
         .resolved_workflow_steps
-        .insert((saga_id, execution_id));
+        .insert((run.clone(), execution_id));
 }
 
 fn mark_matching_accepted_step_failed<A>(actor: &mut A, event: &SagaChoreographyEvent)
@@ -1562,21 +1711,21 @@ where
     if *requires_compensation {
         return;
     }
-    let saga_id = context.saga_id;
+    let run = context.run_key();
     let Some(accepted) = actor
         .saga_support_mut()
         .accepted_workflow_steps
-        .remove(&saga_id)
+        .remove(&run)
     else {
         return;
     };
     if accepted.context.step_name == context.step_name {
-        mark_accepted_step_resolved(actor, saga_id, accepted.execution_id);
+        mark_accepted_step_resolved(actor, &run, accepted.execution_id);
     } else {
         actor
             .saga_support_mut()
             .accepted_workflow_steps
-            .insert(saga_id, accepted);
+            .insert(run.clone(), accepted);
     }
 }
 
@@ -1622,7 +1771,7 @@ pub fn apply_sync_participant_saga_ingress_with_hooks<P, FApplyTerminal, FOnInva
         if !is_valid_emitted_transition(
             participant
                 .saga_states_ref()
-                .get(&next_event.context().saga_id),
+                .get(&next_event.context().run_key()),
             &next_event,
         ) {
             on_invalid_transition(&next_event);
@@ -1737,7 +1886,7 @@ pub fn apply_sync_workflow_participant_saga_ingress_with_hooks<
     let saga_bus = actor.saga_support().bus.clone();
     for next_event in emitted {
         if !is_valid_emitted_transition(
-            actor.saga_states_ref().get(&next_event.context().saga_id),
+            actor.saga_states_ref().get(&next_event.context().run_key()),
             &next_event,
         ) {
             on_invalid_transition(&next_event);
@@ -1778,32 +1927,27 @@ fn handle_workflow_saga_event_with_emit<A, F>(
         return;
     }
 
-    let is_saga_started = matches!(event, SagaChoreographyEvent::SagaStarted { .. });
-    if is_saga_started
-        && actor.is_terminal_saga_start_replay(context.saga_id, context.saga_started_at_millis)
-    {
-        return;
-    }
-    if !is_saga_started && actor.is_terminal_saga_latched(context.saga_id) {
-        return;
-    }
-
+    let run = context.run_key();
+    let identity = event_identity(&event);
     // Idempotency is marked before workflow execution so replayed upstream
     // events do not duplicate business side effects. With persistent dedupe,
     // a crash between this mark and the StepExecutionStarted journal entry is
     // fail-loud rather than resumed: startup recovery has no durable execution
     // intent and the terminal resolver must eventually fail/quarantine the saga.
-    let dedupe_key = workflow_dedupe_key_for_event(&event);
-    match actor.check_dedupe_strict(context.saga_id, &dedupe_key) {
+    match admit_and_dedupe(actor, &event, &run, &identity) {
         Ok(true) => {}
         Ok(false) => return,
         Err(err) => {
-            emit(SagaChoreographyEvent::SagaQuarantined {
-                context: context.next_step(workflow.step_name().into()),
-                reason: format!("workflow dedupe check failed: {err:?}").into(),
-                step: workflow.step_name().into(),
-                participant_id: workflow.step_name().into(),
-            });
+            let step: Box<str> = workflow.step_name().into();
+            quarantine_admission_lookup_failure(
+                actor,
+                &context,
+                step.clone(),
+                step,
+                &err,
+                now,
+                &mut emit,
+            );
             return;
         }
     }
@@ -1813,9 +1957,6 @@ fn handle_workflow_saga_event_with_emit<A, F>(
         SagaChoreographyEvent::SagaStarted { payload, .. }
             if workflow.depends_on().is_on_saga_start() =>
         {
-            actor.record_saga_run_start(context.saga_id, context.saga_started_at_millis);
-            actor.unlatch_terminal_saga(context.saga_id);
-            actor.clear_in_memory_saga_run_tracking(context.saga_id);
             execute_workflow_step_with_emit(
                 actor,
                 workflow,
@@ -1825,11 +1966,8 @@ fn handle_workflow_saga_event_with_emit<A, F>(
                 &mut emit,
             );
         }
-        SagaChoreographyEvent::SagaStarted { .. } => {
-            actor.record_saga_run_start(context.saga_id, context.saga_started_at_millis);
-            actor.unlatch_terminal_saga(context.saga_id);
-            actor.clear_in_memory_saga_run_tracking(context.saga_id);
-        }
+        // A start for a run that does not execute on saga start only registers the run.
+        SagaChoreographyEvent::SagaStarted { .. } => {}
         SagaChoreographyEvent::StepCompleted {
             context: step_ctx,
             output,
@@ -1837,12 +1975,8 @@ fn handle_workflow_saga_event_with_emit<A, F>(
             ..
         } => {
             let dependency_spec = workflow.depends_on();
-            let should_fire = workflow_dependency_should_fire(
-                actor,
-                context.saga_id,
-                &dependency_spec,
-                &step_ctx.step_name,
-            );
+            let should_fire =
+                workflow_dependency_should_fire(actor, &run, &dependency_spec, &step_ctx.step_name);
             if should_fire {
                 let next_context = context.next_step(workflow.step_name().into());
                 let input = if dependency_spec.prefers_original_saga_input() {
@@ -1882,19 +2016,20 @@ fn handle_workflow_saga_event_with_emit<A, F>(
             }
         }
         SagaChoreographyEvent::SagaCompleted { .. } => {
-            actor.latch_terminal_saga(context.saga_id);
+            actor.latch_terminal_saga(&run);
             workflow.on_saga_completed(actor, &context);
-            actor.prune_saga(context.saga_id);
+            finalize_terminal_run(actor, &run, RunTerminalOutcome::Completed, &identity);
         }
         SagaChoreographyEvent::SagaFailed { reason, .. } => {
-            actor.latch_terminal_saga(context.saga_id);
+            actor.latch_terminal_saga(&run);
             workflow.on_saga_failed(actor, &context, &reason);
-            actor.prune_saga(context.saga_id);
+            finalize_terminal_run(actor, &run, RunTerminalOutcome::Failed, &identity);
         }
+        // Quarantined runs are never finalized: journal rows and dedupe marks stay as evidence.
         SagaChoreographyEvent::SagaQuarantined { reason, .. } => {
-            actor.latch_terminal_saga(context.saga_id);
+            actor.latch_terminal_saga(&run);
             workflow.on_quarantined(actor, &context, &reason);
-            actor.prune_saga(context.saga_id);
+            actor.clear_in_memory_saga_run_tracking(&run);
         }
         _ => {}
     }
@@ -1902,7 +2037,7 @@ fn handle_workflow_saga_event_with_emit<A, F>(
 
 fn workflow_dependency_should_fire<A>(
     actor: &mut A,
-    saga_id: SagaId,
+    run: &RunKey,
     dependency_spec: &crate::DependencySpec,
     completed_step: &str,
 ) -> bool
@@ -1915,48 +2050,30 @@ where
             if completed_step != *step {
                 return false;
             }
-            actor.dependency_fired().insert(saga_id)
+            actor.dependency_fired().insert(run.clone())
         }
         crate::DependencySpec::AnyOf(steps) => {
             if !steps.contains(&completed_step) {
                 return false;
             }
-            actor.dependency_fired().insert(saga_id)
+            actor.dependency_fired().insert(run.clone())
         }
         crate::DependencySpec::AllOf(steps) => {
             if !steps.contains(&completed_step) {
                 return false;
             }
             {
-                let seen = actor.dependency_completions().entry(saga_id).or_default();
+                let seen = actor
+                    .dependency_completions()
+                    .entry(run.clone())
+                    .or_default();
                 seen.insert(completed_step.into());
                 if !steps.iter().all(|step| seen.contains(*step)) {
                     return false;
                 }
             }
-            actor.dependency_fired().insert(saga_id)
+            actor.dependency_fired().insert(run.clone())
         }
-    }
-}
-
-fn workflow_dedupe_key_for_event(event: &SagaChoreographyEvent) -> String {
-    let context = event.context();
-    match event {
-        SagaChoreographyEvent::CompensationRequested { failed_step, .. } => format!(
-            "{}:{}:{}:{}:{}",
-            context.trace_id,
-            context.saga_started_at_millis,
-            event.event_type(),
-            context.step_name,
-            failed_step
-        ),
-        _ => format!(
-            "{}:{}:{}:{}",
-            context.trace_id,
-            context.saga_started_at_millis,
-            event.event_type(),
-            context.step_name
-        ),
     }
 }
 
@@ -1972,6 +2089,7 @@ fn execute_workflow_step_with_emit<A, F>(
     F: FnMut(SagaChoreographyEvent),
 {
     let saga_id = context.saga_id;
+    let run = context.run_key();
     let state = crate::SagaParticipantState::new(
         saga_id,
         context.saga_type.clone(),
@@ -1984,8 +2102,8 @@ fn execute_workflow_step_with_emit<A, F>(
     .trigger("dependency_satisfied", now)
     .start_execution(now);
 
-    actor.record_event(
-        saga_id,
+    actor.record_event_run(
+        &run,
         ParticipantEvent::StepExecutionStarted {
             attempt: 1,
             started_at_millis: now,
@@ -1993,7 +2111,7 @@ fn execute_workflow_step_with_emit<A, F>(
     );
     actor
         .saga_states()
-        .insert(saga_id, SagaStateEntry::Executing(state));
+        .insert(run.clone(), SagaStateEntry::Executing(state));
 
     let accepted_context = context.next_step(workflow.step_name().into());
     emit(SagaChoreographyEvent::StepStarted {
@@ -2017,7 +2135,7 @@ fn complete_workflow_step<A, F>(
     A: HasSagaParticipantSupport,
     F: FnMut(SagaChoreographyEvent),
 {
-    let saga_id = context.saga_id;
+    let run = context.run_key();
     if let StepOutput::Accepted {
         execution_id,
         policy,
@@ -2064,16 +2182,16 @@ fn complete_workflow_step<A, F>(
         StepOutput::Accepted { .. } => unreachable!("accepted output returned above"),
     };
 
-    if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&saga_id) {
+    if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&run) {
         let new_state = state.complete(out_data.clone(), comp_data.clone(), now);
         actor
             .saga_states()
-            .insert(saga_id, SagaStateEntry::Completed(new_state));
+            .insert(run.clone(), SagaStateEntry::Completed(new_state));
     }
 
     let emitted_output = out_data.clone();
-    actor.record_event(
-        saga_id,
+    actor.record_event_run(
+        &run,
         ParticipantEvent::StepExecutionCompleted {
             output: out_data,
             compensation_data: comp_data,
@@ -2100,15 +2218,15 @@ fn quarantine_workflow_step_persistence_failure<A, F>(
     A: HasSagaParticipantSupport,
     F: FnMut(SagaChoreographyEvent),
 {
-    let saga_id = context.saga_id;
-    if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&saga_id) {
+    let run = context.run_key();
+    if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&run) {
         actor.saga_states().insert(
-            saga_id,
+            run.clone(),
             SagaStateEntry::Quarantined(state.quarantine(reason.clone(), now)),
         );
     }
-    actor.record_event(
-        saga_id,
+    actor.record_event_run(
+        &run,
         ParticipantEvent::Quarantined {
             reason: reason.clone(),
             quarantined_at_millis: now,
@@ -2133,8 +2251,8 @@ fn quarantine_workflow_compensation_request_persistence_failure<A, F>(
     A: HasSagaParticipantSupport,
     F: FnMut(SagaChoreographyEvent),
 {
-    let saga_id = context.saga_id;
-    let state_entry = actor.saga_states().remove(&saga_id);
+    let run = context.run_key();
+    let state_entry = actor.saga_states().remove(&run);
     let quarantined = match state_entry {
         Some(SagaStateEntry::Executing(state)) => Some(state.quarantine(reason.clone(), now)),
         Some(SagaStateEntry::Completed(state)) => Some(
@@ -2144,7 +2262,7 @@ fn quarantine_workflow_compensation_request_persistence_failure<A, F>(
         ),
         Some(SagaStateEntry::Compensating(state)) => Some(state.quarantine(reason.clone(), now)),
         Some(other) => {
-            actor.saga_states().insert(saga_id, other);
+            actor.saga_states().insert(run.clone(), other);
             None
         }
         None => None,
@@ -2152,10 +2270,10 @@ fn quarantine_workflow_compensation_request_persistence_failure<A, F>(
     if let Some(state) = quarantined {
         actor
             .saga_states()
-            .insert(saga_id, SagaStateEntry::Quarantined(state));
+            .insert(run.clone(), SagaStateEntry::Quarantined(state));
     }
-    actor.record_event(
-        saga_id,
+    actor.record_event_run(
+        &run,
         ParticipantEvent::Quarantined {
             reason: reason.clone(),
             quarantined_at_millis: now,
@@ -2180,21 +2298,21 @@ fn fail_workflow_step<A, F>(
     A: HasSagaParticipantSupport,
     F: FnMut(SagaChoreographyEvent),
 {
-    let saga_id = context.saga_id;
+    let run = context.run_key();
     let (reason, requires_comp) = match error {
         crate::StepError::Terminal { reason } => (reason, false),
         crate::StepError::RequireCompensation { reason } => (reason, true),
     };
 
-    if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&saga_id) {
+    if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&run) {
         let new_state = state.fail(reason.clone(), requires_comp, now);
         actor
             .saga_states()
-            .insert(saga_id, SagaStateEntry::Failed(new_state));
+            .insert(run.clone(), SagaStateEntry::Failed(new_state));
     }
 
-    actor.record_event(
-        saga_id,
+    actor.record_event_run(
+        &run,
         ParticipantEvent::StepExecutionFailed {
             error: reason.clone(),
             requires_compensation: requires_comp,
@@ -2226,9 +2344,9 @@ fn compensate_workflow_with_emit<A, F>(
     A: HasSagaParticipantSupport,
     F: FnMut(SagaChoreographyEvent),
 {
-    let saga_id = context.saga_id;
-    if let Err(error) = actor.record_event_strict(
-        saga_id,
+    let run = context.run_key();
+    if let Err(error) = actor.record_event_run_strict(
+        &run,
         ParticipantEvent::CompensationRequestRecorded {
             context: context.clone(),
             failed_step,
@@ -2248,17 +2366,18 @@ fn compensate_workflow_with_emit<A, F>(
         );
         return;
     }
-    let accepted_recovery_data = actor
-        .saga_support()
-        .accepted_workflow_steps
-        .get(&saga_id)
-        .map(|accepted| {
-            (
-                accepted.saga_input.clone(),
-                accepted.compensation_data.clone(),
-            )
-        });
-    let state_entry = actor.saga_states().remove(&saga_id);
+    let accepted_recovery_data =
+        actor
+            .saga_support()
+            .accepted_workflow_steps
+            .get(&run)
+            .map(|accepted| {
+                (
+                    accepted.saga_input.clone(),
+                    accepted.compensation_data.clone(),
+                )
+            });
+    let state_entry = actor.saga_states().remove(&run);
     let (saga_input, comp_data, compensating_state) = match state_entry {
         Some(SagaStateEntry::Completed(state)) => {
             let comp_data = state.state.compensation_data.clone();
@@ -2268,30 +2387,31 @@ fn compensate_workflow_with_emit<A, F>(
             let Some((saga_input, comp_data)) = accepted_recovery_data else {
                 actor
                     .saga_states()
-                    .insert(saga_id, SagaStateEntry::Executing(state));
+                    .insert(run.clone(), SagaStateEntry::Executing(state));
                 return;
             };
             (saga_input, comp_data, state.start_compensation(now))
         }
         Some(other) => {
-            actor.saga_states().insert(saga_id, other);
+            actor.saga_states().insert(run.clone(), other);
             return;
         }
         None => return,
     };
-    actor
-        .saga_states()
-        .insert(saga_id, SagaStateEntry::Compensating(compensating_state));
+    actor.saga_states().insert(
+        run.clone(),
+        SagaStateEntry::Compensating(compensating_state),
+    );
     if let Some(accepted) = actor
         .saga_support_mut()
         .accepted_workflow_steps
-        .remove(&saga_id)
+        .remove(&run)
     {
-        mark_accepted_step_resolved(actor, saga_id, accepted.execution_id);
+        mark_accepted_step_resolved(actor, &run, accepted.execution_id);
     }
 
-    actor.record_event(
-        saga_id,
+    actor.record_event_run(
+        &run,
         ParticipantEvent::CompensationStarted {
             attempt: 1,
             started_at_millis: now,
@@ -2340,17 +2460,17 @@ fn complete_workflow_compensation<A, F>(
     A: HasSagaParticipantSupport,
     F: FnMut(SagaChoreographyEvent),
 {
-    let saga_id = context.saga_id;
+    let run = context.run_key();
 
-    if let Some(SagaStateEntry::Compensating(state)) = actor.saga_states().remove(&saga_id) {
+    if let Some(SagaStateEntry::Compensating(state)) = actor.saga_states().remove(&run) {
         let new_state = state.complete_compensation(now);
         actor
             .saga_states()
-            .insert(saga_id, SagaStateEntry::Compensated(new_state));
+            .insert(run.clone(), SagaStateEntry::Compensated(new_state));
     }
 
-    actor.record_event(
-        saga_id,
+    actor.record_event_run(
+        &run,
         ParticipantEvent::CompensationCompleted {
             completed_at_millis: now,
         },
@@ -2374,38 +2494,38 @@ fn fail_workflow_compensation<A, F>(
     A: HasSagaParticipantSupport,
     F: FnMut(SagaChoreographyEvent),
 {
-    let saga_id = context.saga_id;
+    let run = context.run_key();
     let (reason, is_ambiguous) = match error {
         crate::CompensationError::SafeToRetry { reason } => (reason, false),
         crate::CompensationError::Ambiguous { reason } => (reason, true),
         crate::CompensationError::Terminal { reason } => (reason, false),
     };
 
-    if let Some(SagaStateEntry::Compensating(state)) = actor.saga_states().remove(&saga_id) {
+    if let Some(SagaStateEntry::Compensating(state)) = actor.saga_states().remove(&run) {
         if is_ambiguous {
             let new_state = state.quarantine(reason.clone(), now);
             actor
                 .saga_states()
-                .insert(saga_id, SagaStateEntry::Quarantined(new_state));
+                .insert(run.clone(), SagaStateEntry::Quarantined(new_state));
         } else {
             let new_state = state.fail(reason.clone(), false, now);
             actor
                 .saga_states()
-                .insert(saga_id, SagaStateEntry::Failed(new_state));
+                .insert(run.clone(), SagaStateEntry::Failed(new_state));
         }
     }
 
     if is_ambiguous {
-        actor.record_event(
-            saga_id,
+        actor.record_event_run(
+            &run,
             ParticipantEvent::Quarantined {
                 reason: reason.clone(),
                 quarantined_at_millis: now,
             },
         );
     } else {
-        actor.record_event(
-            saga_id,
+        actor.record_event_run(
+            &run,
             ParticipantEvent::CompensationFailed {
                 error: reason.clone(),
                 is_ambiguous,
@@ -2482,7 +2602,7 @@ pub async fn apply_async_participant_saga_ingress_with_hooks<
         if !is_valid_emitted_transition(
             participant
                 .saga_states_ref()
-                .get(&next_event.context().saga_id),
+                .get(&next_event.context().run_key()),
             &next_event,
         ) {
             on_invalid_transition(&next_event);
@@ -2751,30 +2871,6 @@ pub fn collect_startup_recovery_events_for_saga_type<
     collect_startup_recovery_events_for_saga_type_inner(journal, saga_type, dedupe, step_name, true)
 }
 
-fn recorded_saga_type(entries: &[JournalEntry]) -> Option<&str> {
-    entries
-        .iter()
-        .rev()
-        .find_map(|entry| match entry.event.transition() {
-            ParticipantEvent::SagaRegistered { saga_type, .. } => Some(saga_type.as_ref()),
-            ParticipantEvent::CompensationRequestRecorded { context, .. }
-            | ParticipantEvent::AcceptedStepRecorded { context, .. }
-            | ParticipantEvent::AcceptedCompensationRecorded { context, .. } => {
-                Some(context.saga_type.as_ref())
-            }
-            ParticipantEvent::StepTriggered { .. }
-            | ParticipantEvent::StepExecutionStarted { .. }
-            | ParticipantEvent::StepExecutionCompleted { .. }
-            | ParticipantEvent::StepExecutionFailed { .. }
-            | ParticipantEvent::CompensationStarted { .. }
-            | ParticipantEvent::CompensationCompleted { .. }
-            | ParticipantEvent::CompensationFailed { .. }
-            | ParticipantEvent::Quarantined { .. }
-            | ParticipantEvent::InboxCommitted { .. }
-            | ParticipantEvent::TransitionCommitted { .. } => None,
-        })
-}
-
 fn collect_startup_recovery_events_for_saga_type_inner<
     J: ParticipantJournal,
     D: ParticipantDedupeStore,
@@ -2788,27 +2884,12 @@ fn collect_startup_recovery_events_for_saga_type_inner<
     let mut out = Vec::new();
     let policy = RecoveryPolicy::default();
     let now = SagaContext::now_millis();
-    let saga_ids = match journal.list_sagas() {
-        Ok(ids) => ids,
-        Err(err) => return Err(RecoveryCollectionError::ListSagas(err)),
-    };
-    for saga_id in saga_ids {
-        let entries = match journal.read(saga_id) {
-            Ok(entries) => entries,
-            Err(err) => {
-                return Err(RecoveryCollectionError::ReadSaga {
-                    saga_id,
-                    source: err,
-                });
-            }
-        };
-        if entries.is_empty() {
+    let units = recovery_units(journal, allow_untyped_recovery)?;
+    for RecoveryUnit { run, entries } in units {
+        let saga_id = run.saga_id();
+        // Every unit carries its stored saga type.
+        if run.saga_type() != saga_type {
             continue;
-        }
-        match recorded_saga_type(&entries) {
-            Some(recorded) if recorded != saga_type => continue,
-            None if !allow_untyped_recovery => continue,
-            Some(_) | None => {}
         }
         // Recovery only acts on durable journal evidence. If a persistent
         // dedupe store marked an upstream event but the participant crashed
@@ -2905,9 +2986,9 @@ fn collect_startup_recovery_events_for_saga_type_inner<
                 });
                 continue;
             }
-            let dedupe_key = workflow_dedupe_key_for_event(&request);
+            let dedupe_key = event_identity(&request);
             dedupe
-                .remove_processed(saga_id, &dedupe_key)
+                .remove_processed_run(&run, &dedupe_key)
                 .map_err(|source| RecoveryCollectionError::ResetDedupe { saga_id, source })?;
             out.push(request);
             continue;
@@ -2956,26 +3037,26 @@ fn collect_startup_recovery_events_for_saga_type_inner<
         match classify_recovery(&entries, now, policy) {
             RecoveryDecision::QuarantineStale => {
                 out.push(SagaChoreographyEvent::saga_failed_default(
-                    recovery_context_for_saga_type(saga_id, step_name, saga_type),
+                    recovery_context_for_run(&run, step_name),
                     Box::<str>::from("startup recovery quarantined stale saga"),
                 ));
             }
             RecoveryDecision::ReplayPanicQuarantine => {
-                let should_emit = match dedupe.check_and_mark(saga_id, PANIC_QUARANTINE_PUBLISH_KEY)
-                {
-                    Ok(value) => value,
-                    Err(err) => {
-                        return Err(RecoveryCollectionError::MarkDedupe {
-                            saga_id,
-                            source: err,
-                        });
-                    }
-                };
+                let should_emit =
+                    match dedupe.check_and_mark_run(&run, PANIC_QUARANTINE_PUBLISH_KEY) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            return Err(RecoveryCollectionError::MarkDedupe {
+                                saga_id,
+                                source: err,
+                            });
+                        }
+                    };
                 if should_emit {
                     let reason = panic_quarantine_reason_from_entries(&entries)
                         .unwrap_or_else(|| Box::<str>::from("panic quarantined during execution"));
                     out.push(SagaChoreographyEvent::SagaQuarantined {
-                        context: recovery_context_for_saga_type(saga_id, step_name, saga_type),
+                        context: recovery_context_for_run(&run, step_name),
                         reason,
                         step: step_name.into(),
                         participant_id: step_name.into(),
@@ -3073,15 +3154,13 @@ fn startup_accepted_compensation_timeout_event(
     })
 }
 
-fn recovery_context_for_saga_type(
-    saga_id: SagaId,
-    step_name: &'static str,
-    saga_type: &'static str,
-) -> SagaContext {
+/// Context for a framework-originated recovery event, built from the stored run identity.
+fn recovery_context_for_run(run: &RunKey, step_name: &'static str) -> SagaContext {
     let now = SagaContext::now_millis();
+    let saga_id = run.saga_id();
     SagaContext {
         saga_id,
-        saga_type: saga_type.into(),
+        saga_type: run.saga_type().into(),
         step_name: step_name.into(),
         correlation_id: saga_id.get(),
         causation_id: saga_id.get(),
@@ -3089,7 +3168,7 @@ fn recovery_context_for_saga_type(
         step_index: 0,
         attempt: 0,
         initiator_peer_id: [0; 32],
-        saga_started_at_millis: now,
+        saga_started_at_millis: run.incarnation().get(),
         event_timestamp_millis: now,
     }
 }
@@ -3997,7 +4076,14 @@ mod tests {
     impl Default for WorkflowTestActor {
         fn default() -> Self {
             Self {
-                saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+                saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new())
+                    // fixtures use fixed 2023 timestamps; keep them inside the replay window
+                    .with_replay_horizon(
+                        crate::ReplayHorizon::new(std::time::Duration::from_secs(
+                            100 * 365 * 24 * 3600,
+                        ))
+                        .expect("horizon above the floor"),
+                    ),
                 active: None,
                 alpha_calls: 0,
                 beta_calls: 0,

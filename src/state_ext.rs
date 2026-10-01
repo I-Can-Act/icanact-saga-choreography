@@ -8,11 +8,13 @@
 //! provide `SagaStateExt` automatically.
 
 use crate::{
-    DedupeError, HasSagaParticipantSupport, InboxState, InboxTxn, JournalError,
-    ParticipantDedupeStore, ParticipantEvent, ParticipantJournal, RunIncarnation, RunKey,
-    RunTombstone, SagaChoreographyEvent, SagaId, SagaStateEntry,
+    DedupeError, HasSagaParticipantSupport, InboxState, InboxTxn, JournalError, KnownRuns,
+    ParticipantDedupeStore, ParticipantEvent, ParticipantJournal, RunAdmission, RunIdentityError,
+    RunIncarnation, RunKey, RunStatus, RunTerminalOutcome, RunTombstone, SagaChoreographyEvent,
+    SagaId, SagaStateEntry, admit_run,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::Ordering;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SagaStateStoreError {
@@ -59,76 +61,61 @@ pub enum SagaStateStoreError {
 /// }
 /// ```
 pub trait SagaStateExt: HasSagaParticipantSupport {
-    /// Returns mutable access to the saga state map.
+    /// Returns mutable access to the per-run state map.
     ///
-    /// This provides direct access to the underlying storage for saga state entries,
-    /// allowing modifications such as inserting new sagas or updating existing ones.
-    fn saga_states(&mut self) -> &mut HashMap<SagaId, SagaStateEntry> {
+    /// This provides direct access to the underlying storage for run state entries,
+    /// allowing modifications such as inserting new runs or updating existing ones.
+    fn saga_states(&mut self) -> &mut HashMap<RunKey, SagaStateEntry> {
         &mut self.saga_support_mut().saga_states
     }
 
-    /// Returns immutable access to the saga state map.
+    /// Returns immutable access to the per-run state map.
     ///
-    /// Use this for read-only operations that need to inspect saga state
+    /// Use this for read-only operations that need to inspect run state
     /// without modifying it.
-    fn saga_states_ref(&self) -> &HashMap<SagaId, SagaStateEntry> {
+    fn saga_states_ref(&self) -> &HashMap<RunKey, SagaStateEntry> {
         &self.saga_support().saga_states
     }
 
-    /// Returns mutable access to per-saga dependency completion tracking.
-    fn dependency_completions(&mut self) -> &mut HashMap<SagaId, HashSet<Box<str>>> {
+    /// Returns mutable access to per-run dependency completion tracking.
+    fn dependency_completions(&mut self) -> &mut HashMap<RunKey, HashSet<Box<str>>> {
         &mut self.saga_support_mut().dependency_completions
     }
 
-    /// Returns mutable access to per-saga dependency fire tracking.
-    fn dependency_fired(&mut self) -> &mut HashSet<SagaId> {
+    /// Returns mutable access to per-run dependency fire tracking.
+    fn dependency_fired(&mut self) -> &mut HashSet<RunKey> {
         &mut self.saga_support_mut().dependency_fired
     }
 
-    /// Clears per-run in-memory tracking for a saga id before a new run or prune.
-    fn clear_in_memory_saga_run_tracking(&mut self, saga_id: SagaId) {
-        self.saga_states().remove(&saga_id);
-        self.dependency_completions().remove(&saga_id);
-        self.dependency_fired().remove(&saga_id);
-        self.saga_support_mut()
-            .accepted_workflow_steps
-            .remove(&saga_id);
-        self.saga_support_mut()
-            .accepted_workflow_compensations
-            .remove(&saga_id);
-        self.saga_support_mut()
+    /// Clears all in-memory tracking of exactly one run; other runs of the same saga id
+    /// are untouched (ADR-0001, Q4).
+    fn clear_in_memory_saga_run_tracking(&mut self, run: &RunKey) {
+        let support = self.saga_support_mut();
+        support.saga_states.remove(run);
+        support.dependency_completions.remove(run);
+        support.dependency_fired.remove(run);
+        support.accepted_workflow_steps.remove(run);
+        support.accepted_workflow_compensations.remove(run);
+        support
             .resolved_workflow_steps
-            .retain(|(resolved_saga_id, _)| *resolved_saga_id != saga_id);
+            .retain(|(resolved_run, _)| resolved_run != run);
+        support.inbox_states.remove(run);
+        support.admitted_runs.remove(run);
     }
 
-    /// Returns mutable access to terminal saga latches.
-    fn terminal_sagas(&mut self) -> &mut HashSet<SagaId> {
+    /// Returns mutable access to terminal run latches.
+    fn terminal_sagas(&mut self) -> &mut HashSet<RunKey> {
         &mut self.saga_support_mut().terminal_sagas
     }
 
-    fn terminal_saga_order(&mut self) -> &mut VecDeque<SagaId> {
+    fn terminal_saga_order(&mut self) -> &mut VecDeque<RunKey> {
         &mut self.saga_support_mut().terminal_saga_order
     }
 
-    /// Returns true when this participant has already observed terminal saga state
-    /// for the given saga id and should ignore late replays until a new SagaStarted resets it.
-    fn is_terminal_saga_latched(&self, saga_id: SagaId) -> bool {
-        self.saga_support().terminal_sagas.contains(&saga_id)
-    }
-
-    fn is_terminal_saga_start_replay(&self, saga_id: SagaId, started_at_millis: u64) -> bool {
-        self.is_terminal_saga_latched(saga_id)
-            && self
-                .saga_support()
-                .saga_run_started_at
-                .get(&saga_id)
-                .is_some_and(|started_at| *started_at == started_at_millis)
-    }
-
-    fn record_saga_run_start(&mut self, saga_id: SagaId, started_at_millis: u64) {
-        self.saga_support_mut()
-            .saga_run_started_at
-            .insert(saga_id, started_at_millis);
+    /// Returns true when this participant has already observed terminal state for the
+    /// run and should ignore late replays of it.
+    fn is_terminal_saga_latched(&self, run: &RunKey) -> bool {
+        self.saga_support().terminal_sagas.contains(run)
     }
 
     fn terminal_latch_retention_limit(&self) -> usize {
@@ -144,25 +131,24 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
         )
     }
 
-    fn latch_terminal_saga(&mut self, saga_id: SagaId) {
-        let inserted = self.terminal_sagas().insert(saga_id);
+    fn latch_terminal_saga(&mut self, run: &RunKey) {
+        let inserted = self.terminal_sagas().insert(run.clone());
         if !inserted {
             return;
         }
-        self.terminal_saga_order().push_back(saga_id);
+        self.terminal_saga_order().push_back(run.clone());
         let cap = self.terminal_latch_retention_limit();
         while self.terminal_saga_order().len() > cap {
             let Some(evicted) = self.terminal_saga_order().pop_front() else {
                 break;
             };
             self.terminal_sagas().remove(&evicted);
-            self.saga_support_mut().saga_run_started_at.remove(&evicted);
         }
     }
 
-    fn unlatch_terminal_saga(&mut self, saga_id: SagaId) {
-        self.terminal_sagas().remove(&saga_id);
-        self.terminal_saga_order().retain(|entry| *entry != saga_id);
+    fn unlatch_terminal_saga(&mut self, run: &RunKey) {
+        self.terminal_sagas().remove(run);
+        self.terminal_saga_order().retain(|entry| entry != run);
     }
 
     /// Returns the participant journal for event persistence.
@@ -313,13 +299,46 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
             .map_err(SagaStateStoreError::Dedupe)
     }
 
-    /// Finalize a terminal run and prune expired tombstones (ADR-0001); W1 body equals `prune_saga_strict`.
+    /// Finalize a terminal run (ADR-0001 §2.5): journal `finalize_run` (tombstone + delete the
+    /// run's rows + expire old tombstones), then, only on `Ok`, clear the run's memory, then
+    /// prune the run's dedupe marks. A journal failure leaves memory untouched.
     fn finalize_run_strict(
         &mut self,
         tombstone: &RunTombstone,
-        _cutoff: RunIncarnation,
+        cutoff: RunIncarnation,
     ) -> Result<(), SagaStateStoreError> {
-        self.prune_saga_strict(tombstone.run().saga_id())
+        let run = tombstone.run();
+        self.saga_journal()
+            .finalize_run(tombstone, cutoff)
+            .map_err(SagaStateStoreError::Journal)?;
+        self.clear_in_memory_saga_run_tracking(run);
+        self.saga_dedupe()
+            .prune_run(run)
+            .map_err(SagaStateStoreError::Dedupe)
+    }
+
+    /// Run-scoped journal append for events that must not be lost silently (ADR-0001).
+    fn record_event_run_strict(
+        &self,
+        run: &RunKey,
+        event: ParticipantEvent,
+    ) -> Result<(), SagaStateStoreError> {
+        self.saga_journal()
+            .append_run(run, event)
+            .map(|_| ())
+            .map_err(SagaStateStoreError::Journal)
+    }
+
+    /// Best-effort run-scoped append; failures are logged with the run key.
+    fn record_event_run(&self, run: &RunKey, event: ParticipantEvent) {
+        if let Err(err) = self.record_event_run_strict(run, event) {
+            tracing::error!(
+                target: "core::saga",
+                event = "saga_state_journal_append_failed",
+                run = %run,
+                error = ?err
+            );
+        }
     }
 
     /// Replay cutoff for this participant now (ADR-0001).
@@ -340,23 +359,32 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
             .or_default()
     }
 
-    /// Removes all state associated with a saga.
-    ///
-    /// This removes the saga from the state map, durable journal, and
-    /// deduplication entries. Use this when a saga has completed and its state
-    /// is no longer needed for recovery.
+    /// Removes all state of every run of a saga id: journal rows (all runs and the legacy
+    /// partition), dedupe marks, then in-memory tracking. Memory is cleared only after the
+    /// stores succeed. Terminal run handling uses [`SagaStateExt::finalize_run_strict`] instead.
     ///
     /// # Arguments
     ///
     /// * `saga_id` - The unique identifier of the saga to prune
     fn prune_saga_strict(&mut self, saga_id: SagaId) -> Result<(), SagaStateStoreError> {
-        self.clear_in_memory_saga_run_tracking(saga_id);
         self.saga_journal()
             .prune(saga_id)
             .map_err(SagaStateStoreError::Journal)?;
         self.saga_dedupe()
             .prune(saga_id)
-            .map_err(SagaStateStoreError::Dedupe)
+            .map_err(SagaStateStoreError::Dedupe)?;
+        let runs: Vec<RunKey> = self
+            .saga_support()
+            .admitted_runs
+            .iter()
+            .chain(self.saga_support().saga_states.keys())
+            .filter(|run| run.saga_id() == saga_id)
+            .cloned()
+            .collect();
+        for run in runs {
+            self.clear_in_memory_saga_run_tracking(&run);
+        }
+        Ok(())
     }
 
     fn prune_saga(&mut self, saga_id: SagaId) {
@@ -370,9 +398,9 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
         }
     }
 
-    /// Checks whether a saga is still actively running.
+    /// Checks whether any run of a saga id is still actively running.
     ///
-    /// Returns `true` if the saga exists and has not reached a terminal state,
+    /// Returns `true` if a run exists and has not reached a terminal state,
     /// `false` otherwise (including if the saga does not exist).
     ///
     /// # Arguments
@@ -383,10 +411,9 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
     ///
     /// `true` if the saga is active, `false` if completed, failed, or not found.
     fn is_saga_active(&self, saga_id: SagaId) -> bool {
-        match self.saga_states_ref().get(&saga_id) {
-            Some(entry) => !entry.is_terminal(),
-            None => false,
-        }
+        self.saga_states_ref()
+            .iter()
+            .any(|(run, entry)| run.saga_id() == saga_id && !entry.is_terminal())
     }
 
     /// Returns a list of all active saga identifiers.
@@ -398,11 +425,15 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
     ///
     /// A vector containing the IDs of all active sagas.
     fn active_saga_ids(&self) -> Vec<SagaId> {
-        self.saga_states_ref()
+        let mut ids: Vec<SagaId> = self
+            .saga_states_ref()
             .iter()
             .filter(|(_, entry)| !entry.is_terminal())
-            .map(|(id, _)| *id)
-            .collect()
+            .map(|(run, _)| run.saga_id())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
     }
 
     /// Returns the count of currently active sagas.
@@ -418,6 +449,185 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
             .values()
             .filter(|e| !e.is_terminal())
             .count()
+    }
+}
+
+/// Participant-side admission decision for one inbound event (ADR-0001 §2.2).
+pub(crate) enum EventAdmission {
+    /// Process the event (new run, or the event belongs to the active run).
+    Proceed,
+    /// Duplicate start, terminal run, or a rejected incarnation; already logged and counted.
+    Skip,
+    /// The run status or tombstone lookup failed; the caller must quarantine (ADR-0001 §2.7).
+    LookupFailed(SagaStateStoreError),
+}
+
+/// Status of the exact run plus what is known about other runs of the same saga id.
+fn run_status<A: SagaStateExt + ?Sized>(
+    actor: &A,
+    run: &RunKey,
+) -> Result<(RunStatus, KnownRuns), SagaStateStoreError> {
+    let support = actor.saga_support();
+    if support.admitted_runs.contains(run) {
+        return Ok((RunStatus::Active, KnownRuns::default()));
+    }
+    if support.terminal_sagas.contains(run) {
+        return Ok((RunStatus::Terminal, KnownRuns::default()));
+    }
+    let tombstones = support
+        .journal
+        .run_tombstones(run.saga_type(), run.saga_id())
+        .map_err(SagaStateStoreError::Journal)?;
+    if tombstones.iter().any(|tombstone| tombstone.run() == run) {
+        return Ok((RunStatus::Terminal, KnownRuns::default()));
+    }
+    let lowest = RunKey::new(run.saga_type(), run.saga_id(), RunIncarnation::new(0));
+    let highest = RunKey::new(
+        run.saga_type(),
+        run.saga_id(),
+        RunIncarnation::new(u64::MAX),
+    );
+    let mut newest = tombstones
+        .iter()
+        .map(|tombstone| tombstone.run().incarnation())
+        .max();
+    let mut other_active = 0;
+    for other in support.admitted_runs.range(lowest..=highest) {
+        other_active += 1;
+        newest = newest.max(Some(other.incarnation()));
+    }
+    Ok((
+        RunStatus::Unknown,
+        KnownRuns {
+            newest,
+            other_active,
+        },
+    ))
+}
+
+/// Run-identity admission for an inbound event; mutates only the in-memory admission set.
+pub(crate) fn admit_event<A: SagaStateExt + ?Sized>(
+    actor: &mut A,
+    event: &SagaChoreographyEvent,
+) -> EventAdmission {
+    let run = event.context().run_key();
+    let is_start = matches!(event, SagaChoreographyEvent::SagaStarted { .. });
+    let (exact, known) = match run_status(actor, &run) {
+        Ok(status) => status,
+        Err(err) => {
+            tracing::error!(
+                target: "core::saga",
+                event = "saga_admission_lookup_failed",
+                run = %run,
+                error = ?err
+            );
+            return EventAdmission::LookupFailed(err);
+        }
+    };
+    match admit_run(exact, known, &run, is_start, actor.replay_cutoff()) {
+        Ok(RunAdmission::NewRun { concurrent }) => {
+            if concurrent {
+                tracing::warn!(
+                    target: "core::saga",
+                    event = "saga_concurrent_run_admitted",
+                    run = %run,
+                    other_active = known.other_active
+                );
+                actor
+                    .saga_support()
+                    .stats
+                    .concurrent_runs_admitted
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            actor.saga_support_mut().admitted_runs.insert(run);
+            EventAdmission::Proceed
+        }
+        Ok(RunAdmission::CurrentRun) => EventAdmission::Proceed,
+        Ok(RunAdmission::DuplicateStart | RunAdmission::TerminalRun) => {
+            tracing::debug!(
+                target: "core::saga",
+                event = "saga_known_run_event_ignored",
+                run = %run,
+                event_type = event.event_type()
+            );
+            actor
+                .saga_support()
+                .stats
+                .duplicate_events
+                .fetch_add(1, Ordering::Relaxed);
+            EventAdmission::Skip
+        }
+        Err(RunIdentityError::StaleIncarnation { newest_known, .. }) => {
+            tracing::warn!(
+                target: "core::saga",
+                event = "saga_stale_incarnation_rejected",
+                run = %run,
+                newest_known = %newest_known
+            );
+            actor
+                .saga_support()
+                .stats
+                .runs_rejected_stale
+                .fetch_add(1, Ordering::Relaxed);
+            EventAdmission::Skip
+        }
+        Err(RunIdentityError::ExpiredIncarnation { cutoff, .. }) => {
+            tracing::warn!(
+                target: "core::saga",
+                event = "saga_expired_incarnation_rejected",
+                run = %run,
+                cutoff = %cutoff
+            );
+            actor
+                .saga_support()
+                .stats
+                .runs_rejected_expired
+                .fetch_add(1, Ordering::Relaxed);
+            EventAdmission::Skip
+        }
+    }
+}
+
+/// Finalizes a `Completed`/`Failed` run after its terminal event (ADR-0001 §2.5, §2.7).
+///
+/// On a journal failure the run's memory is kept, the failure is logged with the run key, and the
+/// terminal event's dedupe mark is removed so a redelivery retries the finalize. A failure after the
+/// tombstone was written (dedupe prune) is logged only: the tombstone already answers for the run.
+pub(crate) fn finalize_terminal_run<A: SagaStateExt + ?Sized>(
+    actor: &mut A,
+    run: &RunKey,
+    outcome: RunTerminalOutcome,
+    terminal_identity: &str,
+) {
+    let tombstone = RunTombstone::new(run.clone(), outcome, actor.now_millis());
+    let cutoff = actor.replay_cutoff();
+    let Err(err) = actor.finalize_run_strict(&tombstone, cutoff) else {
+        return;
+    };
+    actor
+        .saga_support()
+        .stats
+        .gc_failures
+        .fetch_add(1, Ordering::Relaxed);
+    tracing::error!(
+        target: "core::saga",
+        event = "saga_finalize_failed",
+        run = %run,
+        error = ?err
+    );
+    if matches!(err, SagaStateStoreError::Journal(_)) {
+        actor.unlatch_terminal_saga(run);
+        if let Err(mark_err) = actor
+            .saga_dedupe()
+            .remove_processed_run(run, terminal_identity)
+        {
+            tracing::error!(
+                target: "core::saga",
+                event = "saga_finalize_retry_unmark_failed",
+                run = %run,
+                error = %mark_err
+            );
+        }
     }
 }
 

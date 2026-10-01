@@ -24,6 +24,14 @@ use icanact_saga_choreography::{
     recover_accepted_workflow_steps_for_saga_type,
 };
 
+/// Fixtures use fixed 2023 timestamps; a horizon this long keeps them inside the replay window.
+fn fixture_horizon() -> icanact_saga_choreography::ReplayHorizon {
+    icanact_saga_choreography::ReplayHorizon::new(std::time::Duration::from_secs(
+        100 * 365 * 24 * 3600,
+    ))
+    .expect("horizon above the floor")
+}
+
 struct HarnessActor {
     saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
 }
@@ -31,7 +39,8 @@ struct HarnessActor {
 impl Default for HarnessActor {
     fn default() -> Self {
         Self {
-            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new())
+                .with_replay_horizon(fixture_horizon()),
         }
     }
 }
@@ -58,7 +67,8 @@ struct DeferredWorkflowActor {
 impl Default for DeferredWorkflowActor {
     fn default() -> Self {
         Self {
-            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new())
+                .with_replay_horizon(fixture_horizon()),
             emitted: Vec::new(),
             compensation_completed_hooks: 0,
         }
@@ -256,7 +266,8 @@ impl FailingJournalActor {
             saga: SagaParticipantSupport::new(
                 FailOnAppendJournal::new(fail_on_append),
                 InMemoryDedupe::new(),
-            ),
+            )
+            .with_replay_horizon(fixture_horizon()),
         }
     }
 }
@@ -365,7 +376,8 @@ impl HasSagaWorkflowParticipants for RestartedHarnessActor {
 impl RestartedHarnessActor {
     fn new(journal: Arc<InMemoryJournal>) -> Self {
         Self {
-            saga: SagaParticipantSupport::new(journal, InMemoryDedupe::new()),
+            saga: SagaParticipantSupport::new(journal, InMemoryDedupe::new())
+                .with_replay_horizon(fixture_horizon()),
         }
     }
 }
@@ -866,7 +878,7 @@ fn accepted_step_metadata_persistence_failure_quarantines_external_effect() {
             && participant_id.as_ref() == "create_order"
     ));
     assert!(matches!(
-        actor.saga.saga_states.get(&ctx.saga_id),
+        actor.saga.saga_states.get(&ctx.run_key()),
         Some(SagaStateEntry::Quarantined(_))
     ));
     let journal = actor
@@ -952,7 +964,7 @@ fn compensating_failure_tombstones_forward_execution_but_keeps_compensation_data
         actor
             .saga
             .accepted_workflow_steps
-            .get(&ctx.saga_id)
+            .get(&ctx.run_key())
             .expect("compensation data must remain available")
             .compensation_data,
         b"cancel-order-38"
@@ -1103,7 +1115,7 @@ fn compensating_failure_restart_keeps_forward_execution_tombstoned() {
         reopened
             .saga
             .accepted_workflow_steps
-            .get(&ctx.saga_id)
+            .get(&ctx.run_key())
             .expect("compensation data must recover")
             .compensation_data,
         b"cancel-order-39"
@@ -1229,7 +1241,7 @@ fn saga_run_tracking_reset_allows_same_saga_id_to_accept_again() {
     .expect("first run should resolve step");
     assert!(matches!(failed, SagaChoreographyEvent::StepFailed { .. }));
 
-    actor.clear_in_memory_saga_run_tracking(ctx.saga_id);
+    actor.clear_in_memory_saga_run_tracking(&ctx.run_key());
 
     let accepted_again = accept_workflow_step(
         &mut actor,
@@ -1370,7 +1382,7 @@ fn accepted_compensation_can_complete_after_participant_restart() {
     let recovered = reopened
         .saga
         .accepted_workflow_compensations
-        .get(&ctx.saga_id)
+        .get(&ctx.run_key())
         .expect("accepted compensation recovery projection should exist");
     assert_eq!(
         recovered.saga_input, b"original-order-saga-input",
@@ -1451,15 +1463,22 @@ fn unstarted_compensation_request_replays_and_rearms_its_dedupe_key() {
     journal
         .append(ctx.saga_id, request)
         .expect("compensation request should persist");
-    let dedupe_key = format!(
-        "{}:{}:compensation_requested:{}:{}",
-        resolver_context.trace_id,
-        resolver_context.saga_started_at_millis,
-        resolver_context.step_name,
-        "create_order"
-    );
+    let dedupe_key =
+        icanact_saga_choreography::event_identity(&SagaChoreographyEvent::CompensationRequested {
+            context: resolver_context.clone(),
+            failed_step: "create_order".into(),
+            reason: "authoritative create failure".into(),
+            failure: icanact_saga_choreography::SagaFailureDetails {
+                step_name: "create_order".into(),
+                participant_id: "order-manager".into(),
+                error_code: Some("exchange_rejected".into()),
+                error_message: "authoritative create failure".into(),
+                at_millis: 1_700_000_000_100,
+            },
+            steps_to_compensate: vec!["create_order".into()],
+        });
     dedupe
-        .mark_processed(ctx.saga_id, &dedupe_key)
+        .mark_processed_run(&ctx.run_key(), &dedupe_key)
         .expect("original ingress should be marked");
 
     let recovery_events = collect_startup_recovery_events_for_saga_type(
@@ -1476,16 +1495,17 @@ fn unstarted_compensation_request_replays_and_rearms_its_dedupe_key() {
     ));
     assert!(
         !dedupe
-            .contains(ctx.saga_id, &dedupe_key)
+            .contains_run(&ctx.run_key(), &dedupe_key)
             .expect("rearmed dedupe key should be readable"),
         "startup replay must be allowed through normal participant ingress exactly once"
     );
 
-    let mut support = SagaParticipantSupport::new(journal, dedupe);
+    let mut support =
+        SagaParticipantSupport::new(journal, dedupe).with_replay_horizon(fixture_horizon());
     recover_accepted_workflow_steps_for_saga_type(&mut support, "create_order", "order_lifecycle")
         .expect("compensable state should rehydrate before request replay");
     assert!(matches!(
-        support.saga_states.get(&ctx.saga_id),
+        support.saga_states.get(&ctx.run_key()),
         Some(SagaStateEntry::Completed(state))
             if state.step_name.as_ref() == "create_order"
                 && state.state.compensation_data.as_slice() == b"cancel-order-43"
@@ -1503,7 +1523,7 @@ fn unstarted_compensation_request_replays_and_rearms_its_dedupe_key() {
         .expect("compensation start should persist");
     support
         .dedupe
-        .mark_processed(ctx.saga_id, &dedupe_key)
+        .mark_processed_run(&ctx.run_key(), &dedupe_key)
         .expect("started request should remain deduped");
     let after_start = collect_startup_recovery_events_for_saga_type(
         &support.journal,
@@ -1516,7 +1536,7 @@ fn unstarted_compensation_request_replays_and_rearms_its_dedupe_key() {
     assert!(
         support
             .dedupe
-            .contains(ctx.saga_id, &dedupe_key)
+            .contains_run(&ctx.run_key(), &dedupe_key)
             .expect("started dedupe key should remain readable")
     );
 }
@@ -1658,9 +1678,9 @@ fn accepted_compensation_failure_leaves_no_compensating_state() {
         actor
             .saga
             .saga_states
-            .insert(ctx.saga_id, SagaStateEntry::Compensating(state));
+            .insert(ctx.run_key(), SagaStateEntry::Compensating(state));
         actor.saga.accepted_workflow_compensations.insert(
-            ctx.saga_id,
+            ctx.run_key(),
             AcceptedWorkflowCompensation {
                 context: ctx.clone(),
                 participant_id: "order-manager".into(),
@@ -1695,12 +1715,12 @@ fn accepted_compensation_failure_leaves_no_compensating_state() {
         ));
         if is_ambiguous {
             assert!(matches!(
-                actor.saga.saga_states.get(&ctx.saga_id),
+                actor.saga.saga_states.get(&ctx.run_key()),
                 Some(SagaStateEntry::Quarantined(_))
             ));
         } else {
             assert!(matches!(
-                actor.saga.saga_states.get(&ctx.saga_id),
+                actor.saga.saga_states.get(&ctx.run_key()),
                 Some(SagaStateEntry::Failed(_))
             ));
         }

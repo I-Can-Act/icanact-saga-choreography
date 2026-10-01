@@ -10,6 +10,14 @@ use icanact_saga_choreography::{
     complete_accepted_workflow_step,
 };
 
+/// Fixtures use fixed 2023 timestamps; a horizon this long keeps them inside the replay window.
+fn fixture_horizon() -> icanact_saga_choreography::ReplayHorizon {
+    icanact_saga_choreography::ReplayHorizon::new(std::time::Duration::from_secs(
+        100 * 365 * 24 * 3600,
+    ))
+    .expect("horizon above the floor")
+}
+
 struct AsyncTestParticipant {
     saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
     dependency_spec: DependencySpec,
@@ -22,7 +30,8 @@ struct AsyncTestParticipant {
 impl Default for AsyncTestParticipant {
     fn default() -> Self {
         Self {
-            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new())
+                .with_replay_horizon(fixture_horizon()),
             dependency_spec: DependencySpec::OnSagaStart,
             execute_output: Ok(StepOutput::Completed {
                 output: b"ok".to_vec(),
