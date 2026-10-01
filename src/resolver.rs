@@ -308,6 +308,8 @@ struct SagaResolutionState {
     accepted_steps: HashMap<Box<str>, AcceptedStepResolverState>,
     accepted_compensations: HashMap<Box<str>, AcceptedCompensationResolverState>,
     started_at_millis: u64,
+    /// Receive-time wall-clock mark of the last *novel* progress. Never moves
+    /// backwards; duplicates/replays and regressing clocks do not refresh it.
     last_progress_at_millis: u64,
     last_context: SagaContext,
     terminal_latched: bool,
@@ -336,7 +338,9 @@ struct AcceptedCompensationResolverState {
 impl SagaResolutionState {
     fn new(seed_context: &SagaContext, now_millis: u64) -> Self {
         let started_at_millis = now_millis.max(seed_context.saga_started_at_millis);
-        let progress_at_millis = now_millis.max(started_at_millis);
+        // Stall window starts at receive time; a skewed/future-dated start
+        // stamp must not extend it.
+        let progress_at_millis = now_millis;
         Self {
             completed_steps: HashSet::new(),
             started_steps: HashSet::new(),
@@ -518,8 +522,10 @@ impl TerminalResolver {
         }
 
         state.last_context = event.context().clone();
-        if is_progress_event(event) {
-            state.last_progress_at_millis = now_millis;
+        // Only novel progress refreshes the stall clock, and the mark never
+        // moves backwards (duplicates/replays and regressing clocks are inert).
+        if is_progress_event(event) && is_novel_progress(state, event) {
+            state.last_progress_at_millis = state.last_progress_at_millis.max(now_millis);
         }
 
         match event {
@@ -1020,6 +1026,69 @@ fn terminal_context_at(context: &SagaContext, now_millis: u64) -> SagaContext {
     let mut next = terminal_context(context);
     next.event_timestamp_millis = now_millis;
     next
+}
+
+/// Whether a progress-shaped event changes resolver state; replays of already
+/// observed progress must not extend the stall deadline.
+fn is_novel_progress(state: &SagaResolutionState, event: &SagaChoreographyEvent) -> bool {
+    match event {
+        SagaChoreographyEvent::SagaStarted { .. } => false,
+        SagaChoreographyEvent::StepStarted { context } => {
+            !state.started_steps.contains(&context.step_name)
+        }
+        SagaChoreographyEvent::StepAck { context, .. } => {
+            !state.acked_steps.contains(&context.step_name)
+        }
+        SagaChoreographyEvent::StepCompleted { context, .. } => {
+            !state.completed_steps.contains(&context.step_name)
+        }
+        SagaChoreographyEvent::StepFailed { context, .. } => {
+            !state.failed_steps.contains(&context.step_name)
+        }
+        SagaChoreographyEvent::StepAccepted {
+            context,
+            execution_id,
+            deadline_at_millis,
+            hard_deadline_at_millis,
+            ..
+        } => state
+            .accepted_steps
+            .get(context.step_name.as_ref())
+            .is_none_or(|known| {
+                known.execution_id != *execution_id
+                    || known.deadline_at_millis != *deadline_at_millis
+                    || known.hard_deadline_at_millis != *hard_deadline_at_millis
+            }),
+        SagaChoreographyEvent::CompensationAccepted {
+            context,
+            execution_id,
+            deadline_at_millis,
+            hard_deadline_at_millis,
+            ..
+        } => state
+            .accepted_compensations
+            .get(context.step_name.as_ref())
+            .is_none_or(|known| {
+                known.execution_id != *execution_id
+                    || known.deadline_at_millis != *deadline_at_millis
+                    || known.hard_deadline_at_millis != *hard_deadline_at_millis
+            }),
+        SagaChoreographyEvent::CompensationCompleted { context } => !state
+            .completed_compensation_steps
+            .contains(&context.step_name),
+        SagaChoreographyEvent::CompensationRequested {
+            steps_to_compensate,
+            ..
+        } => {
+            state.phase != ResolverPhase::Aborting
+                || steps_to_compensate.iter().any(|step| {
+                    !state.pending_compensation_steps.contains(step)
+                        && !state.completed_compensation_steps.contains(step)
+                })
+        }
+        // No per-event identity to dedupe on; treated as fresh progress.
+        _ => true,
+    }
 }
 
 fn is_progress_event(event: &SagaChoreographyEvent) -> bool {
@@ -2488,6 +2557,93 @@ mod tests {
                 if reason.as_ref().contains("stalled_timeout")
             ),
             "expected stalled-timeout quarantine (positions_check in flight), got: {timed_out:?}"
+        );
+    }
+
+    fn stall_policy() -> TerminalPolicy {
+        let mut required_steps = HashSet::new();
+        required_steps.insert("create_order".into());
+        TerminalPolicy::new(
+            "order_lifecycle".into(),
+            "stall-dedupe".into(),
+            FailureAuthority::AnyParticipant,
+            SuccessCriteria::AllOf(required_steps),
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+            &[],
+        )
+    }
+
+    fn is_stall_quarantine(events: &[SagaChoreographyEvent]) -> bool {
+        matches!(
+            events.first(),
+            Some(SagaChoreographyEvent::SagaQuarantined { reason, .. })
+            if reason.as_ref().contains("stalled_timeout")
+        )
+    }
+
+    #[test]
+    fn duplicate_progress_does_not_extend_stall_deadline() {
+        let mut resolver = TerminalResolver::new(stall_policy());
+        let start = SagaChoreographyEvent::SagaStarted {
+            context: ctx_at("risk_check", 9, 1_000, 1_000),
+            payload: Vec::new(),
+        };
+        let _ = resolver.ingest_at(&start, 1_000);
+        let progress = SagaChoreographyEvent::StepStarted {
+            context: ctx_at("positions_check", 9, 1_000, 1_050),
+        };
+        let _ = resolver.ingest_at(&progress, 1_050);
+        // Replays of the same progress and a late duplicate SagaStarted.
+        for at in [1_070, 1_090, 1_120] {
+            let _ = resolver.ingest_at(&progress, at);
+            let _ = resolver.ingest_at(&start, at);
+        }
+        assert!(resolver.poll_timeouts_at(1_150).is_empty());
+        let timed_out = resolver.poll_timeouts_at(1_151);
+        assert!(
+            is_stall_quarantine(&timed_out),
+            "duplicates must not extend the stall deadline past 1050+100: {timed_out:?}"
+        );
+    }
+
+    #[test]
+    fn regressing_progress_time_does_not_pull_stall_deadline_back() {
+        let mut resolver = TerminalResolver::new(stall_policy());
+        let start = SagaChoreographyEvent::SagaStarted {
+            context: ctx_at("risk_check", 9, 1_000, 1_000),
+            payload: Vec::new(),
+        };
+        let _ = resolver.ingest_at(&start, 1_000);
+        let first = SagaChoreographyEvent::StepStarted {
+            context: ctx_at("positions_check", 9, 1_000, 1_090),
+        };
+        let _ = resolver.ingest_at(&first, 1_090);
+        // Novel progress observed with an older clock reading.
+        let older = SagaChoreographyEvent::StepStarted {
+            context: ctx_at("fraud_check", 9, 1_000, 1_020),
+        };
+        let _ = resolver.ingest_at(&older, 1_020);
+        assert!(
+            resolver.poll_timeouts_at(1_150).is_empty(),
+            "a regressing clock must not move the progress mark backwards"
+        );
+        assert!(is_stall_quarantine(&resolver.poll_timeouts_at(1_191)));
+    }
+
+    #[test]
+    fn future_dated_saga_start_does_not_extend_initial_stall_window() {
+        let mut resolver = TerminalResolver::new(stall_policy());
+        let start = SagaChoreographyEvent::SagaStarted {
+            context: ctx_at("risk_check", 9, 50_000, 1_000),
+            payload: Vec::new(),
+        };
+        let _ = resolver.ingest_at(&start, 1_000);
+        let timed_out = resolver.poll_timeouts_at(1_101);
+        assert!(
+            is_stall_quarantine(&timed_out)
+                || matches!(timed_out.first(), Some(SagaChoreographyEvent::SagaFailed { reason, .. }) if reason.contains("stalled_timeout")),
+            "stall window is measured from receive time: {timed_out:?}"
         );
     }
 
