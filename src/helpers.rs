@@ -345,8 +345,11 @@ pub(crate) fn quarantine_admission_lookup_failure<A, F>(
     F: FnMut(SagaChoreographyEvent),
 {
     let run = context.run_key();
-    let reason: Box<str> =
-        format!("reconciliation_needed: admission_lookup_failed: {cause}").into();
+    let label = match cause {
+        SagaStateStoreError::Dedupe(_) => "dedupe_check_failed",
+        SagaStateStoreError::Journal(_) => "admission_lookup_failed",
+    };
+    let reason: Box<str> = format!("reconciliation_needed: {label}: {cause}").into();
     tracing::error!(
         target: "core::saga",
         event = "saga_admission_quarantined",
@@ -362,7 +365,7 @@ pub(crate) fn quarantine_admission_lookup_failure<A, F>(
         context.initiator_peer_id,
         context.saga_started_at_millis,
     )
-    .trigger("admission_lookup_failed", now)
+    .trigger(label, now)
     .start_execution(now)
     .quarantine(reason.clone(), now);
     actor
