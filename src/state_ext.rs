@@ -777,7 +777,12 @@ where
 ///
 /// Unless the journal shows the step was already settled (its undo completed or its forward
 /// execution failed, so there is nothing to undo), the run is quarantined through the single
-/// quarantine path and `ReconciliationNeeded { MissingCompletedState }` is returned.
+/// quarantine path and `ReconciliationNeeded { MissingCompletedState }` is returned. A journal read
+/// error is logged (`error!` with the RunKey) and counts as "not settled".
+///
+/// Multi-instance deployments (several instances serving one step name for a saga type) must tag
+/// steps per instance: a request addressed to a step this instance never executed is quarantined,
+/// not ignored.
 pub(crate) fn missing_completed_state_outcome<A, F>(
     actor: &mut A,
     context: &SagaContext,
