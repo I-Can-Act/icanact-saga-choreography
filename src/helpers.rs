@@ -1210,13 +1210,21 @@ where
     let will_compensate = match participant.saga_states_ref().get(&run) {
         Some(SagaStateEntry::Completed(_)) => true,
         Some(SagaStateEntry::Executing(_)) => accepted_recovery_data.is_some(),
+        // R2: a retry after `SafeToRetry` is a new undo invocation and needs its own durable start.
+        Some(SagaStateEntry::Compensating(state)) => {
+            state.state.compensation_data.is_some()
+                && !participant
+                    .saga_support()
+                    .accepted_workflow_compensations
+                    .contains_key(&run)
+        }
         _ => false,
     };
     if will_compensate
         && let Err(err) = participant.commit_transition(
             &run,
             ParticipantEvent::CompensationStarted {
-                attempt: 1,
+                attempt: context.attempt,
                 started_at_millis: now,
             },
         )
@@ -1384,13 +1392,21 @@ where
     let will_compensate = match participant.saga_states_ref().get(&run) {
         Some(SagaStateEntry::Completed(_)) => true,
         Some(SagaStateEntry::Executing(_)) => accepted_recovery_data.is_some(),
+        // R2: a retry after `SafeToRetry` is a new undo invocation and needs its own durable start.
+        Some(SagaStateEntry::Compensating(state)) => {
+            state.state.compensation_data.is_some()
+                && !participant
+                    .saga_support()
+                    .accepted_workflow_compensations
+                    .contains_key(&run)
+        }
         _ => false,
     };
     if will_compensate
         && let Err(err) = participant.commit_transition(
             &run,
             ParticipantEvent::CompensationStarted {
-                attempt: 1,
+                attempt: context.attempt,
                 started_at_millis: now,
             },
         )
@@ -1513,31 +1529,63 @@ fn retryable_context(context: &SagaContext, step: Box<str>) -> SagaContext {
 }
 
 /// ADR-0004 §2.5: the undo reported `SafeToRetry`. State stays `Compensating` with its undo
-/// data; `CompensationFailedRetryable` is emitted so the resolver can re-request. Not a
-/// quarantine: `on_quarantined` is not called.
-pub(crate) fn emit_compensation_retryable<F>(
+/// data; a durable `CompensationRetryable` marker closes the `CompensationStarted` row (R2), and
+/// `CompensationFailedRetryable` is emitted so the resolver can re-request. Not a quarantine:
+/// `on_quarantined` is not called.
+///
+/// If the marker cannot be committed the run is still retryable live (the retry commits its own
+/// `CompensationStarted`), but a crash before then reopens `Quarantined`; the commit failure is
+/// logged and returned as a typed `CompensationResult` failure after the event is emitted.
+pub(crate) fn emit_compensation_retryable<A, F>(
+    actor: &A,
     context: &SagaContext,
     step: Box<str>,
     participant_id: Box<str>,
-    reason: &str,
+    (reason, now): (&str, u64),
     emit: &mut F,
 ) -> IngressOutcome
 where
+    A: SagaStateExt + ?Sized,
     F: FnMut(SagaChoreographyEvent),
 {
+    let run = context.run_key();
     tracing::warn!(
         target: "core::saga",
         event = "saga_compensation_retryable",
-        run = %context.run_key(),
+        run = %run,
         attempt = context.attempt,
         reason = %reason
+    );
+    let marker = actor.commit_transition(
+        &run,
+        ParticipantEvent::CompensationRetryable {
+            attempt: context.attempt,
+            reason: reason.into(),
+            retryable_at_millis: now,
+        },
     );
     emit(SagaChoreographyEvent::CompensationFailedRetryable {
         context: retryable_context(context, step),
         participant_id,
         error: reason.into(),
     });
-    IngressOutcome::Applied
+    match marker {
+        Ok(()) => IngressOutcome::Applied,
+        Err(source) => {
+            tracing::error!(
+                target: "core::saga",
+                event = "saga_compensation_retryable_marker_failed",
+                run = %run,
+                error = ?source,
+                "retryable marker not durable: a crash before the retry reopens Quarantined"
+            );
+            IngressOutcome::Failed(IngressFailure {
+                run,
+                stage: CommitStage::CompensationResult,
+                source,
+            })
+        }
+    }
 }
 
 /// ADR-0002 §2.2 `CompensationStart`: `CompensationStarted` could not be committed, so the undo
@@ -1789,7 +1837,14 @@ where
         CompensationError::SafeToRetry { reason } => {
             let step = participant.step_name().into();
             let participant_id = participant.participant_id_owned();
-            return emit_compensation_retryable(context, step, participant_id, &reason, emit);
+            return emit_compensation_retryable(
+                participant,
+                context,
+                step,
+                participant_id,
+                (&reason, now),
+                emit,
+            );
         }
         CompensationError::Ambiguous { reason } => (reason, true),
         CompensationError::Terminal { reason } => (reason, false),
@@ -1826,7 +1881,14 @@ where
         CompensationError::SafeToRetry { reason } => {
             let step = participant.step_name().into();
             let participant_id = participant.participant_id_owned();
-            return emit_compensation_retryable(context, step, participant_id, &reason, emit);
+            return emit_compensation_retryable(
+                participant,
+                context,
+                step,
+                participant_id,
+                (&reason, now),
+                emit,
+            );
         }
         CompensationError::Ambiguous { reason } => (reason, true),
         CompensationError::Terminal { reason } => (reason, false),

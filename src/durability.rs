@@ -1091,6 +1091,38 @@ where
             );
             continue;
         }
+        if run.saga_type() == saga_type
+            && !support.saga_states.contains_key(&run)
+            && let Some(started_at_millis) =
+                recover_dangling_compensation_start_from_entries(&entries)
+        {
+            // R2 / Q6: crash mid-undo. Evidence stays in the journal; the run is fenced
+            // `Quarantined` and `SagaQuarantined` is re-derived for startup publication.
+            let context = recovery_context_for_run(&run, step_name);
+            let state = crate::SagaParticipantState::new(
+                saga_id,
+                context.saga_type.clone(),
+                context.step_name.clone(),
+                context.correlation_id,
+                context.trace_id,
+                context.initiator_peer_id,
+                context.saga_started_at_millis,
+            )
+            .trigger("compensation_start_dangling", started_at_millis)
+            .start_execution(started_at_millis)
+            .quarantine(DANGLING_COMPENSATION_REASON.into(), started_at_millis);
+            support
+                .saga_states
+                .insert(run.clone(), SagaStateEntry::Quarantined(state));
+            tracing::error!(
+                target: "core::saga",
+                event = "saga_compensation_dangling_start_quarantined",
+                run = %run,
+                step = step_name,
+                "CompensationStarted has no recorded outcome: undo may have run; quarantined"
+            );
+            continue;
+        }
         if let Some(request) = recover_unstarted_compensation_request_from_entries(&entries)
             && request.context().saga_type.as_ref() == saga_type
             && compensation_request_targets_step(&request, step_name)
@@ -1387,7 +1419,8 @@ fn recover_completed_accepted_compensation_from_entries(
             | ParticipantEvent::CompensationStarted { .. }
             | ParticipantEvent::AcceptedStepRecorded { .. }
             | ParticipantEvent::InboxCommitted { .. }
-            | ParticipantEvent::TransitionCommitted { .. } => {}
+            | ParticipantEvent::TransitionCommitted { .. }
+            | ParticipantEvent::CompensationRetryable { .. } => {}
         }
     }
     completed
@@ -1462,7 +1495,8 @@ fn recover_failed_accepted_compensation_from_entries(
             | ParticipantEvent::CompensationStarted { .. }
             | ParticipantEvent::AcceptedStepRecorded { .. }
             | ParticipantEvent::InboxCommitted { .. }
-            | ParticipantEvent::TransitionCommitted { .. } => {}
+            | ParticipantEvent::TransitionCommitted { .. }
+            | ParticipantEvent::CompensationRetryable { .. } => {}
         }
     }
     failed
@@ -1472,6 +1506,9 @@ fn recover_unstarted_compensation_request_from_entries(
     entries: &[JournalEntry],
 ) -> Option<SagaChoreographyEvent> {
     let mut request = None;
+    // R2: an undo started and never settled or marked retryable may have run; a request recorded
+    // after it is not "unstarted" and must not be replayed.
+    let mut dangling_start = false;
     for entry in entries {
         match entry.event.transition() {
             ParticipantEvent::CompensationRequestRecorded {
@@ -1481,7 +1518,7 @@ fn recover_unstarted_compensation_request_from_entries(
                 failure,
                 steps_to_compensate,
                 requested_at_millis,
-            } => {
+            } if !dangling_start => {
                 let mut context = context.clone();
                 context.event_timestamp_millis = *requested_at_millis;
                 request = Some(SagaChoreographyEvent::CompensationRequested {
@@ -1492,11 +1529,19 @@ fn recover_unstarted_compensation_request_from_entries(
                     steps_to_compensate: steps_to_compensate.clone(),
                 });
             }
-            ParticipantEvent::CompensationStarted { .. }
+            ParticipantEvent::CompensationStarted { .. } => {
+                dangling_start = true;
+                request = None;
+            }
+            ParticipantEvent::CompensationRetryable { .. }
             | ParticipantEvent::AcceptedCompensationRecorded { .. }
             | ParticipantEvent::CompensationCompleted { .. }
             | ParticipantEvent::CompensationFailed { .. }
-            | ParticipantEvent::Quarantined { .. } => request = None,
+            | ParticipantEvent::Quarantined { .. } => {
+                dangling_start = false;
+                request = None;
+            }
+            ParticipantEvent::CompensationRequestRecorded { .. } => request = None,
             ParticipantEvent::SagaRegistered { .. }
             | ParticipantEvent::StepTriggered { .. }
             | ParticipantEvent::StepExecutionStarted { .. }
@@ -1527,6 +1572,7 @@ fn recover_completed_step_effect_for_unstarted_compensation(
 ) -> Option<(Vec<u8>, Vec<u8>, u64)> {
     let mut completed = None;
     let mut effect_at_request = None;
+    let mut dangling_start = false; // R2: see `recover_unstarted_compensation_request_from_entries`
     for entry in entries {
         match entry.event.transition() {
             ParticipantEvent::StepExecutionStarted { .. }
@@ -1546,13 +1592,24 @@ fn recover_completed_step_effect_for_unstarted_compensation(
                 ));
             }
             ParticipantEvent::CompensationRequestRecorded { .. } => {
-                effect_at_request = completed.clone();
+                effect_at_request = if dangling_start {
+                    None
+                } else {
+                    completed.clone()
+                };
             }
-            ParticipantEvent::CompensationStarted { .. }
+            ParticipantEvent::CompensationStarted { .. } => {
+                dangling_start = true;
+                effect_at_request = None;
+            }
+            ParticipantEvent::CompensationRetryable { .. }
             | ParticipantEvent::AcceptedCompensationRecorded { .. }
             | ParticipantEvent::CompensationCompleted { .. }
             | ParticipantEvent::CompensationFailed { .. }
-            | ParticipantEvent::Quarantined { .. } => effect_at_request = None,
+            | ParticipantEvent::Quarantined { .. } => {
+                dangling_start = false;
+                effect_at_request = None;
+            }
             ParticipantEvent::SagaRegistered { .. }
             | ParticipantEvent::StepTriggered { .. }
             | ParticipantEvent::StepExecutionFailed { .. }
@@ -1606,18 +1663,22 @@ fn recover_live_completed_step_from_entries(
                 execution_intent: None,
                 ..
             }
-            | ParticipantEvent::TransitionCommitted { .. } => {}
+            | ParticipantEvent::TransitionCommitted { .. }
+            | ParticipantEvent::CompensationRetryable { .. } => {}
         }
     }
     completed
 }
 
-/// A started-but-unsettled undo of an ordinary completed step: the last `StepExecutionCompleted`
-/// followed by `CompensationStarted` with no later completion, failure, quarantine or restart of
-/// execution. Returns the undo data and the start time (R13).
+/// A retryable undo of an ordinary completed step: the last `StepExecutionCompleted` followed by
+/// `CompensationStarted` and the durable `CompensationRetryable` marker, with no later completion,
+/// failure, quarantine or restart of execution. Returns the undo data and the start time (R13/R2).
+/// A `CompensationStarted` without the marker is a crash mid-undo, see
+/// [`recover_dangling_compensation_start_from_entries`].
 fn recover_retryable_compensation_from_entries(entries: &[JournalEntry]) -> Option<(Vec<u8>, u64)> {
     let mut completed: Option<Vec<u8>> = None;
     let mut started_at = None;
+    let mut retryable = false;
     for entry in entries {
         match entry.event.transition() {
             ParticipantEvent::StepExecutionCompleted {
@@ -1625,13 +1686,18 @@ fn recover_retryable_compensation_from_entries(entries: &[JournalEntry]) -> Opti
             } => {
                 completed = Some(compensation_data.clone());
                 started_at = None;
+                retryable = false;
             }
             ParticipantEvent::CompensationStarted {
                 started_at_millis, ..
             } => {
                 if completed.is_some() {
                     started_at = Some(*started_at_millis);
+                    retryable = false;
                 }
+            }
+            ParticipantEvent::CompensationRetryable { .. } => {
+                retryable = started_at.is_some();
             }
             ParticipantEvent::StepExecutionStarted { .. }
             | ParticipantEvent::InboxCommitted {
@@ -1646,6 +1712,7 @@ fn recover_retryable_compensation_from_entries(entries: &[JournalEntry]) -> Opti
             | ParticipantEvent::Quarantined { .. } => {
                 completed = None;
                 started_at = None;
+                retryable = false;
             }
             ParticipantEvent::SagaRegistered { .. }
             | ParticipantEvent::StepTriggered { .. }
@@ -1657,8 +1724,52 @@ fn recover_retryable_compensation_from_entries(entries: &[JournalEntry]) -> Opti
             | ParticipantEvent::TransitionCommitted { .. } => {}
         }
     }
-    completed.zip(started_at)
+    if retryable {
+        completed.zip(started_at)
+    } else {
+        None
+    }
 }
+
+/// R2 (Q6): a `CompensationStarted` with no settling row (completion, failure, quarantine,
+/// accepted-compensation record) and no `CompensationRetryable` marker after it. The undo may have
+/// run before the crash; its outcome is uncertain and it is never re-run automatically. Returns the
+/// start time.
+fn recover_dangling_compensation_start_from_entries(entries: &[JournalEntry]) -> Option<u64> {
+    let mut dangling = None;
+    for entry in entries {
+        match entry.event.transition() {
+            ParticipantEvent::CompensationStarted {
+                started_at_millis, ..
+            } => dangling = Some(*started_at_millis),
+            ParticipantEvent::CompensationRetryable { .. }
+            | ParticipantEvent::AcceptedCompensationRecorded { .. }
+            | ParticipantEvent::CompensationCompleted { .. }
+            | ParticipantEvent::CompensationFailed { .. }
+            | ParticipantEvent::Quarantined { .. }
+            | ParticipantEvent::StepExecutionStarted { .. }
+            | ParticipantEvent::StepExecutionCompleted { .. }
+            | ParticipantEvent::StepExecutionFailed { .. }
+            | ParticipantEvent::AcceptedStepRecorded { .. }
+            | ParticipantEvent::InboxCommitted {
+                execution_intent: Some(_),
+                ..
+            } => dangling = None,
+            ParticipantEvent::SagaRegistered { .. }
+            | ParticipantEvent::StepTriggered { .. }
+            | ParticipantEvent::CompensationRequestRecorded { .. }
+            | ParticipantEvent::InboxCommitted {
+                execution_intent: None,
+                ..
+            }
+            | ParticipantEvent::TransitionCommitted { .. } => {}
+        }
+    }
+    dangling
+}
+
+/// Reason stamped on the quarantine of a dangling `CompensationStarted`.
+const DANGLING_COMPENSATION_REASON: &str = "reconciliation_needed: compensation started but its outcome was never recorded (crash mid-undo)";
 
 fn recover_accepted_workflow_step_from_entries(
     entries: &[JournalEntry],
@@ -1716,7 +1827,8 @@ fn recover_accepted_workflow_step_from_entries(
             | ParticipantEvent::CompensationRequestRecorded { .. }
             | ParticipantEvent::AcceptedCompensationRecorded { .. }
             | ParticipantEvent::InboxCommitted { .. }
-            | ParticipantEvent::TransitionCommitted { .. } => {}
+            | ParticipantEvent::TransitionCommitted { .. }
+            | ParticipantEvent::CompensationRetryable { .. } => {}
         }
     }
     accepted
@@ -1755,7 +1867,8 @@ fn accepted_step_failure_requiring_compensation(
             | ParticipantEvent::CompensationRequestRecorded { .. }
             | ParticipantEvent::AcceptedCompensationRecorded { .. }
             | ParticipantEvent::InboxCommitted { .. }
-            | ParticipantEvent::TransitionCommitted { .. } => {}
+            | ParticipantEvent::TransitionCommitted { .. }
+            | ParticipantEvent::CompensationRetryable { .. } => {}
         }
     }
     failure
@@ -2908,6 +3021,14 @@ where
     let will_compensate = match actor.saga_states_ref().get(&run) {
         Some(SagaStateEntry::Completed(_)) => true,
         Some(SagaStateEntry::Executing(_)) => accepted_recovery_data.is_some(),
+        // R2: a retry after `SafeToRetry` is a new undo invocation and needs its own durable start.
+        Some(SagaStateEntry::Compensating(state)) => {
+            state.state.compensation_data.is_some()
+                && !actor
+                    .saga_support()
+                    .accepted_workflow_compensations
+                    .contains_key(&run)
+        }
         _ => false,
     };
     // The undo must not run without a durable start (ADR-0002 `CompensationStart`).
@@ -2915,7 +3036,7 @@ where
         && let Err(err) = actor.commit_transition(
             &run,
             ParticipantEvent::CompensationStarted {
-                attempt: 1,
+                attempt: context.attempt,
                 started_at_millis: now,
             },
         )
@@ -3072,10 +3193,11 @@ where
         // re-request within its budget. Not a quarantine.
         crate::CompensationError::SafeToRetry { reason } => {
             return crate::helpers::emit_compensation_retryable(
+                actor,
                 context,
                 workflow.step_name().into(),
                 workflow.participant_id_owned(),
-                &reason,
+                (&reason, now),
                 emit,
             );
         }
@@ -3609,6 +3731,24 @@ fn collect_startup_recovery_events_for_saga_type_inner<
             {
                 out.push(timeout_event);
             }
+            continue;
+        }
+        if recover_dangling_compensation_start_from_entries(&entries).is_some() {
+            // R2 / Q6: never re-run an undo that may already have run. Re-derived from the
+            // journal on every startup (no pre-mark), like the panic quarantine.
+            tracing::error!(
+                target: "core::saga",
+                event = "saga_compensation_dangling_start_quarantined",
+                run = %run,
+                step = step_name,
+                "CompensationStarted has no recorded outcome: undo may have run; quarantined"
+            );
+            out.push(SagaChoreographyEvent::SagaQuarantined {
+                context: recovery_context_for_run(&run, step_name),
+                reason: DANGLING_COMPENSATION_REASON.into(),
+                step: step_name.into(),
+                participant_id: step_name.into(),
+            });
             continue;
         }
         if let Some(request) = recover_unstarted_compensation_request_from_entries(&entries)

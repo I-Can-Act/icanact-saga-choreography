@@ -533,6 +533,17 @@ pub enum ParticipantEvent {
         transition: Box<ParticipantEvent>,
         outbox: Vec<SagaChoreographyEvent>,
     },
+    /// The undo reported `SafeToRetry` (ADR-0004 §2.5): it did not take effect and the resolver may
+    /// re-request it. Closes the preceding `CompensationStarted`; without it a `CompensationStarted`
+    /// that never settled means the undo may have run (crash mid-undo) and the run is quarantined.
+    CompensationRetryable {
+        /// The attempt of the request whose undo reported `SafeToRetry`.
+        attempt: u32,
+        /// Why the undo is retryable.
+        reason: Box<str>,
+        /// The timestamp (in milliseconds since epoch) of the retryable outcome.
+        retryable_at_millis: u64,
+    },
 }
 
 impl ParticipantEvent {
