@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use crate::{
     AcceptedStepTimeoutOutcome, KnownRuns, ReplayHorizon, RunAdmission, RunIdentityError, RunKey,
@@ -469,6 +469,11 @@ impl TerminalResolver {
             Some(_) => RunStatus::Active,
             None => RunStatus::Unknown,
         }
+    }
+
+    /// `true` once `run` is latched terminal.
+    pub(crate) fn run_is_terminal(&self, run: &RunKey) -> bool {
+        self.run_status(run) == RunStatus::Terminal
     }
 
     fn known_runs(&self, run: &RunKey) -> KnownRuns {
@@ -970,7 +975,64 @@ impl TerminalResolver {
         out
     }
 
-    fn poll_timeouts_at(&mut self, now_millis: u64) -> Vec<SagaChoreographyEvent> {
+    /// The bus could not deliver the resolver's own `CompensationRequested` for
+    /// `step` (its participant is gone). The undo can never run, so the effect
+    /// stays unresolved: the step is given up (R3 semantics) and the run settles,
+    /// quarantining immediately unless other undos are still in flight.
+    pub(crate) fn mark_compensation_undeliverable(
+        &mut self,
+        run: &RunKey,
+        step: &str,
+        now_millis: u64,
+    ) -> Vec<SagaChoreographyEvent> {
+        let Some(state) = self.states.get_mut(run) else {
+            warn!(
+                event = "saga_undeliverable_compensation_for_unknown_run",
+                run = %run,
+                step,
+                "undeliverable compensation reported for a run the resolver does not hold"
+            );
+            return Vec::new();
+        };
+        if state.terminal_latched || state.phase != ResolverPhase::Aborting {
+            debug!(
+                event = "saga_undeliverable_compensation_ignored",
+                run = %run,
+                step,
+                "run is not rolling back; nothing to give up"
+            );
+            return Vec::new();
+        }
+        error!(
+            event = "saga_compensation_undeliverable",
+            run = %run,
+            step,
+            "compensation request could not be delivered; effect remains unresolved"
+        );
+        let step: Box<str> = step.into();
+        retire_compensation(state, step.as_ref());
+        if !state.unresolved.contains(&step) {
+            state.unresolved.push(step.clone());
+        }
+        if !state.given_up_undos.contains(&step) {
+            state.given_up_undos.push(step);
+        }
+        let context = state.last_context.clone();
+        let mut out = Vec::new();
+        release_compensation_frontier(
+            self.policy.workflow_steps,
+            state,
+            terminal_context_at(&context, now_millis),
+            &mut out,
+        );
+        settle(state, &context, None, &mut out);
+        if state.terminal_latched {
+            self.latch_terminal(run.clone());
+        }
+        out
+    }
+
+    pub(crate) fn poll_timeouts_at(&mut self, now_millis: u64) -> Vec<SagaChoreographyEvent> {
         let mut out = Vec::new();
         let mut newly_latched = Vec::new();
         for (run, state) in self.states.iter_mut() {
@@ -3437,6 +3499,27 @@ mod tests {
                 ] if step.as_ref() == "B"
             ),
             "{out:?}"
+        );
+    }
+
+    #[test]
+    fn undeliverable_compensation_gives_the_step_up_and_quarantines_naming_it() {
+        let (mut resolver, emitted) = rolling_back();
+        let run = emitted[0].context().run_key();
+        let out = resolver.mark_compensation_undeliverable(&run, "A", 1_030);
+        match out.as_slice() {
+            [SagaChoreographyEvent::SagaQuarantined { step, reason, .. }] => {
+                assert_eq!(step.as_ref(), "A");
+                assert!(reason.contains('A'), "{reason}");
+            }
+            other => panic!("expected one quarantine, got {other:?}"),
+        }
+        assert!(resolver.run_is_terminal(&run));
+        assert!(
+            resolver
+                .mark_compensation_undeliverable(&run, "A", 1_040)
+                .is_empty(),
+            "a latched run produces nothing more"
         );
     }
 

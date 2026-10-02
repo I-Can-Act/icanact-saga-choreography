@@ -7,6 +7,35 @@ use crate::{
     SagaWorkflowParticipant,
 };
 
+/// Tags every saga type with the participant's `steps`. An empty slice would
+/// silently make the subscription untagged (it could never satisfy a required
+/// step), so it is refused.
+fn tag_saga_types(
+    saga_types: &[&'static str],
+    steps: &[&str],
+) -> Result<Vec<SagaTypeSteps>, String> {
+    if steps.is_empty() {
+        tracing::error!(
+            target: "core::saga",
+            event = "participant_binding_empty_steps",
+            saga_types = ?saga_types,
+            "plain participant binding refused: `steps` is empty, the subscription would be untagged"
+        );
+        return Err(format!(
+            "plain participant binding requires a non-empty `steps` slice (an untagged subscription never satisfies a required step); saga_types={saga_types:?}"
+        ));
+    }
+    Ok(saga_types
+        .iter()
+        .map(|saga_type| {
+            (
+                *saga_type,
+                steps.iter().map(|s| Box::<str>::from(*s)).collect(),
+            )
+        })
+        .collect())
+}
+
 fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
@@ -309,15 +338,7 @@ where
     A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
     C: Send + 'static,
 {
-    let tagged: Vec<SagaTypeSteps> = saga_types
-        .iter()
-        .map(|saga_type| {
-            (
-                *saga_type,
-                steps.iter().map(|s| Box::<str>::from(*s)).collect(),
-            )
-        })
-        .collect();
+    let tagged = tag_saga_types(saga_types, steps)?;
     bind_sync_participant_channel_lazy_tagged::<A, C>(
         bus,
         actor_ref,
@@ -376,15 +397,7 @@ where
     A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
     C: Send + 'static,
 {
-    let tagged: Vec<SagaTypeSteps> = saga_types
-        .iter()
-        .map(|saga_type| {
-            (
-                *saga_type,
-                steps.iter().map(|s| Box::<str>::from(*s)).collect(),
-            )
-        })
-        .collect();
+    let tagged = tag_saga_types(saga_types, steps)?;
     bind_sync_participant_channel_tagged::<A, C>(bus, actor_ref, &tagged, channel_name, capacity)
 }
 
@@ -516,15 +529,7 @@ where
     A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
     F: Fn(SagaChoreographyEvent) -> A::Tell + Send + Sync + 'static,
 {
-    let tagged: Vec<SagaTypeSteps> = saga_types
-        .iter()
-        .map(|saga_type| {
-            (
-                *saga_type,
-                steps.iter().map(|s| Box::<str>::from(*s)).collect(),
-            )
-        })
-        .collect();
+    let tagged = tag_saga_types(saga_types, steps)?;
     bind_sync_participant_tell_tagged::<A, F>(bus, actor_ref, &tagged, map_event)
 }
 
@@ -614,15 +619,7 @@ where
     A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
     C: Send + 'static,
 {
-    let tagged: Vec<SagaTypeSteps> = saga_types
-        .iter()
-        .map(|saga_type| {
-            (
-                *saga_type,
-                steps.iter().map(|s| Box::<str>::from(*s)).collect(),
-            )
-        })
-        .collect();
+    let tagged = tag_saga_types(saga_types, steps)?;
     bind_async_participant_channel_lazy_tagged::<A, C>(
         bus,
         actor_ref,
@@ -681,15 +678,7 @@ where
     A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
     C: Send + 'static,
 {
-    let tagged: Vec<SagaTypeSteps> = saga_types
-        .iter()
-        .map(|saga_type| {
-            (
-                *saga_type,
-                steps.iter().map(|s| Box::<str>::from(*s)).collect(),
-            )
-        })
-        .collect();
+    let tagged = tag_saga_types(saga_types, steps)?;
     bind_async_participant_channel_tagged::<A, C>(bus, actor_ref, &tagged, channel_name, capacity)
 }
 
@@ -821,15 +810,7 @@ where
     A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
     F: Fn(SagaChoreographyEvent) -> A::Tell + Send + Sync + 'static,
 {
-    let tagged: Vec<SagaTypeSteps> = saga_types
-        .iter()
-        .map(|saga_type| {
-            (
-                *saga_type,
-                steps.iter().map(|s| Box::<str>::from(*s)).collect(),
-            )
-        })
-        .collect();
+    let tagged = tag_saga_types(saga_types, steps)?;
     bind_async_participant_tell_tagged::<A, F>(bus, actor_ref, &tagged, map_event)
 }
 
@@ -1256,6 +1237,33 @@ mod tests {
         for sub in subs {
             let _ = bus.unsubscribe(sub);
         }
+        handle.shutdown();
+    }
+
+    #[test]
+    fn plain_binders_reject_an_empty_steps_slice() {
+        let bus = SagaChoreographyBus::new();
+        let (actor_ref, handle) = local_sync::spawn(BindingActor);
+        let err = super::bind_sync_participant_channel::<BindingActor, ()>(
+            &bus,
+            &actor_ref,
+            &["binding_test"],
+            &[],
+            "saga",
+            8,
+        )
+        .expect_err("an untagged plain binding must be refused");
+        assert!(err.contains("steps"), "{err}");
+        let err = super::bind_sync_participant_channel_lazy::<BindingActor, ()>(
+            &bus,
+            &actor_ref,
+            &["binding_test"],
+            &[],
+            "saga",
+            8,
+        )
+        .expect_err("an untagged lazy plain binding must be refused");
+        assert!(err.contains("steps"), "{err}");
         handle.shutdown();
     }
 
