@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
-use tracing::{debug, error, warn};
+use tracing::{error, warn};
 
 use crate::{
     AcceptedStepTimeoutOutcome, KnownRuns, ReplayHorizon, RunAdmission, RunIdentityError, RunKey,
@@ -783,13 +783,18 @@ impl TerminalResolver {
                     if !state.given_up_undos.contains(&context.step_name) {
                         state.given_up_undos.push(context.step_name.clone());
                     }
-                    release_compensation_frontier(
-                        self.policy.workflow_steps,
-                        state,
-                        terminal_context(context),
-                        &mut out,
-                    );
-                    settle(state, context, None, &mut out);
+                    // Replay may see this give-up before the request it answers
+                    // (the request is journaled via its echo, after the bus
+                    // decided); only an Aborting run releases and settles.
+                    if state.phase == ResolverPhase::Aborting {
+                        release_compensation_frontier(
+                            self.policy.workflow_steps,
+                            state,
+                            terminal_context(context),
+                            &mut out,
+                        );
+                        settle(state, context, None, &mut out);
+                    }
                 }
             }
             SagaChoreographyEvent::CompensationRequested {
@@ -809,9 +814,12 @@ impl TerminalResolver {
                 for step in steps_to_compensate {
                     state.accepted_steps.remove(step.as_ref());
                 }
+                // A given-up undo is never owed again: its request echo can
+                // trail the give-up decision (live and in the journal).
                 let newly_pending: Vec<Box<str>> = steps_to_compensate
                     .iter()
                     .filter(|step| !state.completed_compensation_steps.contains(*step))
+                    .filter(|step| !state.given_up_undos.contains(*step))
                     .cloned()
                     .collect();
                 if state.phase == ResolverPhase::Aborting {
@@ -972,63 +980,6 @@ impl TerminalResolver {
             self.latch_terminal(run);
         }
 
-        out
-    }
-
-    /// The bus could not deliver the resolver's own `CompensationRequested` for
-    /// `step` (its participant is gone). The undo can never run, so the effect
-    /// stays unresolved: the step is given up (R3 semantics) and the run settles,
-    /// quarantining immediately unless other undos are still in flight.
-    pub(crate) fn mark_compensation_undeliverable(
-        &mut self,
-        run: &RunKey,
-        step: &str,
-        now_millis: u64,
-    ) -> Vec<SagaChoreographyEvent> {
-        let Some(state) = self.states.get_mut(run) else {
-            warn!(
-                event = "saga_undeliverable_compensation_for_unknown_run",
-                run = %run,
-                step,
-                "undeliverable compensation reported for a run the resolver does not hold"
-            );
-            return Vec::new();
-        };
-        if state.terminal_latched || state.phase != ResolverPhase::Aborting {
-            debug!(
-                event = "saga_undeliverable_compensation_ignored",
-                run = %run,
-                step,
-                "run is not rolling back; nothing to give up"
-            );
-            return Vec::new();
-        }
-        error!(
-            event = "saga_compensation_undeliverable",
-            run = %run,
-            step,
-            "compensation request could not be delivered; effect remains unresolved"
-        );
-        let step: Box<str> = step.into();
-        retire_compensation(state, step.as_ref());
-        if !state.unresolved.contains(&step) {
-            state.unresolved.push(step.clone());
-        }
-        if !state.given_up_undos.contains(&step) {
-            state.given_up_undos.push(step);
-        }
-        let context = state.last_context.clone();
-        let mut out = Vec::new();
-        release_compensation_frontier(
-            self.policy.workflow_steps,
-            state,
-            terminal_context_at(&context, now_millis),
-            &mut out,
-        );
-        settle(state, &context, None, &mut out);
-        if state.terminal_latched {
-            self.latch_terminal(run.clone());
-        }
         out
     }
 
@@ -3506,7 +3457,17 @@ mod tests {
     fn undeliverable_compensation_gives_the_step_up_and_quarantines_naming_it() {
         let (mut resolver, emitted) = rolling_back();
         let run = emitted[0].context().run_key();
-        let out = resolver.mark_compensation_undeliverable(&run, "A", 1_030);
+        let undeliverable = |at| {
+            let mut context = ctx_at("A", 51, 1_000, at);
+            context.step_index = 9;
+            SagaChoreographyEvent::CompensationFailed {
+                context,
+                participant_id: super::TERMINAL_RESOLVER_STEP.into(),
+                error: "compensation undeliverable".into(),
+                is_ambiguous: false,
+            }
+        };
+        let out = resolver.ingest_at(&undeliverable(1_030), 1_030);
         match out.as_slice() {
             [SagaChoreographyEvent::SagaQuarantined { step, reason, .. }] => {
                 assert_eq!(step.as_ref(), "A");
@@ -3516,9 +3477,7 @@ mod tests {
         }
         assert!(resolver.run_is_terminal(&run));
         assert!(
-            resolver
-                .mark_compensation_undeliverable(&run, "A", 1_040)
-                .is_empty(),
+            resolver.ingest_at(&undeliverable(1_040), 1_040).is_empty(),
             "a latched run produces nothing more"
         );
     }

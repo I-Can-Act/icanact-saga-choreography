@@ -16,7 +16,7 @@ use crate::{
     HasSagaWorkflowParticipants, RunIncarnation, RunKey, SagaChoreographyEvent, SagaContext,
     SagaId, SagaReplyTo, SagaTerminalOutcome, SagaWorkflowContract, SagaWorkflowStepContract,
     TERMINAL_RESOLVER_STEP, TerminalPolicy, TerminalResolver, TerminalResolverJournal,
-    required_steps_from_success_criteria, validate_workflow_contract,
+    TerminalResolverJournalError, required_steps_from_success_criteria, validate_workflow_contract,
 };
 
 #[derive(Clone, Debug)]
@@ -475,6 +475,38 @@ struct TerminalResolverActor {
 }
 
 impl TerminalResolverActor {
+    /// A journal append failed for `event`: durability is lost, so the only
+    /// honest outcome is quarantine. Resolves the waiter and returns the
+    /// quarantine to publish (none when `event` already is one).
+    fn quarantine_after_journal_failure(
+        &self,
+        event: &SagaChoreographyEvent,
+        error: &TerminalResolverJournalError,
+    ) -> Option<SagaChoreographyEvent> {
+        tracing::error!(
+            target: "core::saga",
+            event = "terminal_resolver_journal_append_failed",
+            saga_type = self.saga_type.as_ref(),
+            run = %event.context().run_key(),
+            error = ?error,
+            "event not ingested: resolver journal append failed"
+        );
+        let already = matches!(event, SagaChoreographyEvent::SagaQuarantined { .. });
+        let quarantine = if already {
+            event.clone()
+        } else {
+            SagaChoreographyEvent::SagaQuarantined {
+                context: event.context().next_step(TERMINAL_RESOLVER_STEP.into()),
+                reason: format!("terminal resolver durability failed: {error}").into(),
+                step: TERMINAL_RESOLVER_STEP.into(),
+                participant_id: self.responder.as_ref().into(),
+            }
+        };
+        self.bus
+            .complete_terminal_reply_from_event(&quarantine, self.responder.as_ref());
+        (!already).then_some(quarantine)
+    }
+
     /// Publishes resolver outputs. Replies are NOT resolved here: they follow the
     /// durable decision when the resolver ingests its own echoed terminal event
     /// (ADR-0003 §2.4). Returns the events to retain for a later retry; each
@@ -533,13 +565,34 @@ impl TerminalResolverActor {
                     // The undo can never be delivered: the resolver gives the
                     // step up and settles (quarantine), instead of retrying.
                     for step in gone {
-                        let now = SagaContext::now_millis();
-                        queue.extend(
-                            self.resolver
-                                .mark_compensation_undeliverable(&run, step, now)
-                                .into_iter()
-                                .map(RetainedEvent::new),
-                        );
+                        let decision = SagaChoreographyEvent::CompensationFailed {
+                            context: retained.event.context().next_step(step.clone()),
+                            participant_id: TERMINAL_RESOLVER_STEP.into(),
+                            error: "compensation undeliverable".into(),
+                            is_ambiguous: false,
+                        };
+                        // The give-up must be durable so a restart replays it.
+                        if let Some(journal) = &self.journal
+                            && let Err(error) = journal.append(decision.clone())
+                        {
+                            queue.extend(
+                                self.quarantine_after_journal_failure(&decision, &error)
+                                    .map(RetainedEvent::new),
+                            );
+                            continue;
+                        }
+                        match self
+                            .resolver
+                            .try_ingest_at(&decision, SagaContext::now_millis())
+                        {
+                            Ok(events) => queue.extend(events.into_iter().map(RetainedEvent::new)),
+                            Err(error) => tracing::warn!(
+                                target: "core::saga",
+                                event = "terminal_resolver_run_identity_rejected",
+                                run = %run,
+                                error = ?error
+                            ),
+                        }
                     }
                     continue;
                 }
@@ -579,40 +632,17 @@ impl SyncActor for TerminalResolverActor {
                 if let Some(journal) = &self.journal
                     && let Err(error) = journal.append((*event).clone())
                 {
-                    let run = event.context().run_key();
-                    tracing::error!(
-                        target: "core::saga",
-                        event = "terminal_resolver_journal_append_failed",
-                        saga_type = self.saga_type.as_ref(),
-                        run = %run,
-                        error = ?error,
-                        "event not ingested: resolver journal append failed"
-                    );
-                    let quarantine =
-                        if matches!(*event, SagaChoreographyEvent::SagaQuarantined { .. }) {
-                            (*event).clone()
-                        } else {
-                            let context = event.context().next_step(TERMINAL_RESOLVER_STEP.into());
-                            SagaChoreographyEvent::SagaQuarantined {
-                                context,
-                                reason: format!("terminal resolver durability failed: {error}")
-                                    .into(),
-                                step: TERMINAL_RESOLVER_STEP.into(),
-                                participant_id: self.responder.as_ref().into(),
-                            }
-                        };
-                    // Durability failed: the only honest outcome for the waiter is quarantine.
-                    self.bus
-                        .complete_terminal_reply_from_event(&quarantine, self.responder.as_ref());
-                    if !matches!(*event, SagaChoreographyEvent::SagaQuarantined { .. }) {
-                        let retained = vec![RetainedEvent::new(quarantine)];
-                        if self.activated {
-                            let failed = self.publish_terminal_events(retained);
-                            self.recovery_events.extend(failed);
-                        } else {
-                            // Participants are not bound yet: hold it like any output.
-                            self.recovery_events.extend(retained);
-                        }
+                    let retained: Vec<RetainedEvent> = self
+                        .quarantine_after_journal_failure(&event, &error)
+                        .map(RetainedEvent::new)
+                        .into_iter()
+                        .collect();
+                    if self.activated {
+                        let failed = self.publish_terminal_events(retained);
+                        self.recovery_events.extend(failed);
+                    } else {
+                        // Participants are not bound yet: hold it like any output.
+                        self.recovery_events.extend(retained);
                     }
                     return;
                 }
@@ -3263,6 +3293,174 @@ mod tests {
             requests.load(Ordering::Relaxed) <= super::RESOLVER_PUBLISH_MAX_ATTEMPTS as usize,
             "requests={}",
             requests.load(Ordering::Relaxed)
+        );
+    }
+
+    struct DurableGraphContract;
+
+    impl SagaWorkflowContract for DurableGraphContract {
+        fn saga_type() -> &'static str {
+            "durable_graph"
+        }
+
+        fn first_step() -> &'static str {
+            "A"
+        }
+
+        fn steps() -> &'static [SagaWorkflowStepContract] {
+            &[
+                SagaWorkflowStepContract {
+                    step_name: "A",
+                    participant_id: "a",
+                    depends_on: WorkflowDependencySpec::OnSagaStart,
+                },
+                SagaWorkflowStepContract {
+                    step_name: "B",
+                    participant_id: "b",
+                    depends_on: WorkflowDependencySpec::OnSagaStart,
+                },
+                SagaWorkflowStepContract {
+                    step_name: "C",
+                    participant_id: "c",
+                    depends_on: WorkflowDependencySpec::AllOf(&["A", "B"]),
+                },
+            ]
+        }
+
+        fn terminal_policy() -> TerminalPolicy {
+            let mut required = HashSet::new();
+            required.insert(Box::<str>::from("C"));
+            TerminalPolicy::new(
+                "durable_graph".into(),
+                "durable_graph/test".into(),
+                FailureAuthority::AnyParticipant,
+                SuccessCriteria::AllOf(required),
+                Duration::from_secs(3_600),
+                Duration::from_secs(3_600),
+                DurableGraphContract::steps(),
+            )
+        }
+    }
+
+    #[test]
+    fn undeliverable_compensation_decision_survives_restart() {
+        let journal = Arc::new(InMemoryTerminalResolverJournal::default());
+        let policy = DurableGraphContract::terminal_policy();
+        {
+            let bus = SagaChoreographyBus::new();
+            bus.register_workflow_contract_provider::<DurableGraphContract>()
+                .expect("contract registration");
+            for step in ["A", "B", "C"] {
+                bus.register_bound_workflow_step("durable_graph", step)
+                    .expect("step binding");
+            }
+            let b_requests = Arc::new(AtomicUsize::new(0));
+            let participant_a = bus.subscribe_participant_fn("durable_graph", &["A"], |_| true);
+            let _participant_b = bus.subscribe_participant_fn("durable_graph", &["B"], {
+                let b_requests = Arc::clone(&b_requests);
+                move |event| {
+                    if matches!(event, SagaChoreographyEvent::CompensationRequested { .. }) {
+                        b_requests.fetch_add(1, Ordering::Relaxed);
+                    }
+                    true
+                }
+            });
+            let _participant_c = bus.subscribe_participant_fn("durable_graph", &["C"], |_| true);
+            let _resolver = bus
+                .attach_durable_terminal_resolver(
+                    policy.clone(),
+                    "terminal-resolver",
+                    Arc::clone(&journal),
+                )
+                .expect("durable resolver attaches");
+            bus.activate_terminal_resolver_recovery("durable_graph")
+                .expect("activation");
+            let start = context_for("durable_graph", "A", 840);
+            bus.publish_strict(SagaChoreographyEvent::SagaStarted {
+                context: start.clone(),
+                payload: Vec::new(),
+            })
+            .expect("start admitted");
+            for step in ["A", "B"] {
+                bus.publish_strict(SagaChoreographyEvent::StepCompleted {
+                    context: start.next_step(step.into()),
+                    output: Vec::new(),
+                    saga_input: Vec::new(),
+                    compensation_available: true,
+                })
+                .expect("completion publishes");
+            }
+            // The target of the first undo goes away before the rollback.
+            assert!(bus.unsubscribe(participant_a));
+            let _ = bus.publish(SagaChoreographyEvent::StepFailed {
+                context: context_for("durable_graph", "C", 840),
+                participant_id: "c".into(),
+                error_code: None,
+                error: "c failed".into(),
+                requires_compensation: true,
+            });
+            wait_until(Instant::now() + Duration::from_secs(5), || {
+                b_requests.load(Ordering::Relaxed) >= 1
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let journaled = loop {
+                let found = journal.read_all().is_ok_and(|entries| {
+                    entries.iter().any(|entry| {
+                        matches!(
+                            &entry.event,
+                            SagaChoreographyEvent::CompensationFailed {
+                                context,
+                                participant_id,
+                                is_ambiguous: false,
+                                ..
+                            } if context.step_name.as_ref() == "A"
+                                && participant_id.as_ref() == TERMINAL_RESOLVER_STEP
+                        )
+                    })
+                });
+                if found || Instant::now() >= deadline {
+                    break found;
+                }
+                thread::sleep(Duration::from_millis(5));
+            };
+            assert!(
+                journaled,
+                "the undeliverable-compensation decision must be journaled"
+            );
+        }
+
+        let bus = SagaChoreographyBus::new();
+        let _resolver = bus
+            .attach_durable_terminal_resolver(policy, "terminal-resolver", Arc::clone(&journal))
+            .expect("durable resolver restores");
+        let _participants: Vec<_> = ["A", "B", "C"]
+            .into_iter()
+            .map(|step| bus.subscribe_participant_fn("durable_graph", &[step], |_| true))
+            .collect();
+        let quarantined: Arc<std::sync::Mutex<Vec<Box<str>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _observer = bus.subscribe_saga_type_fn("durable_graph", {
+            let quarantined = Arc::clone(&quarantined);
+            move |event| {
+                if let SagaChoreographyEvent::SagaQuarantined { step, .. } = event {
+                    quarantined.lock().expect("lock").push(step.clone());
+                }
+                true
+            }
+        });
+        bus.activate_terminal_resolver_recovery("durable_graph")
+            .expect("recovery activation");
+        bus.publish_strict(SagaChoreographyEvent::CompensationCompleted {
+            context: context_for("durable_graph", "B", 840),
+        })
+        .expect("B's undo ack publishes");
+        wait_until(Instant::now() + Duration::from_secs(5), || {
+            !quarantined.lock().expect("lock").is_empty()
+        });
+        assert_eq!(
+            quarantined.lock().expect("lock").as_slice(),
+            [Box::<str>::from("A")],
+            "restored run quarantines naming the undeliverable step"
         );
     }
 
