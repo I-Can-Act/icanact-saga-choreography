@@ -9,7 +9,8 @@
 
 use crate::{
     DedupeError, HasSagaParticipantSupport, JournalError, ParticipantDedupeStore, ParticipantEvent,
-    ParticipantJournal, SagaId, SagaStateEntry,
+    ParticipantJournal, ParticipantTerminalKind, SagaChoreographyEvent, SagaContext, SagaId,
+    SagaStateEntry,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -17,6 +18,51 @@ use std::collections::{HashMap, HashSet, VecDeque};
 pub enum SagaStateStoreError {
     Dedupe(DedupeError),
     Journal(JournalError),
+}
+
+impl std::fmt::Display for SagaStateStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dedupe(err) => write!(f, "dedupe store: {err}"),
+            Self::Journal(err) => write!(f, "journal store: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for SagaStateStoreError {}
+
+/// Result of shared durable participant admission for one event's run identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParticipantAdmission {
+    /// The event's run may be processed; its run record is durable.
+    Admitted,
+    /// The same run (id, type, start time) already has a durable terminal tombstone.
+    TerminalReplay { outcome: ParticipantTerminalKind },
+    /// A strictly newer run for this saga id has already been recorded.
+    StaleRun { latest_started_at_millis: u64 },
+    /// An unresolved run still owns this saga id; a new run cannot replace it.
+    ActiveRunReuse { active_started_at_millis: u64 },
+    /// Legacy execution evidence has no durable run identity and needs reconciliation.
+    LegacyHistory,
+    /// The latest run is quarantined; the saga id cannot be reused until an operator
+    /// explicitly resolves or archives it.
+    QuarantinedReuse {
+        quarantined_started_at_millis: u64,
+        reason: Box<str>,
+    },
+}
+
+impl ParticipantAdmission {
+    pub fn is_admitted(&self) -> bool {
+        matches!(self, Self::Admitted)
+    }
+}
+
+/// Result of a run-scoped dedupe mark. Storage failures are `Err`, never `Duplicate`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunDedupe {
+    First,
+    Duplicate,
 }
 
 /// Extension trait providing common saga state management operations.
@@ -296,6 +342,158 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
         }
     }
 
+    /// Returns the run-scoped dedupe key: the run identity (start time and saga type)
+    /// prefixed to `key`, so a later run of the same saga id never collides with an
+    /// earlier run's markers.
+    fn run_dedupe_key(&self, context: &SagaContext, key: &str) -> String {
+        format!(
+            "run\u{1f}{}\u{1f}{}\u{1f}{key}",
+            context.saga_started_at_millis, context.saga_type
+        )
+    }
+
+    /// Run-scoped atomic check-and-mark. A true duplicate is `Ok(Duplicate)`; storage
+    /// failure is `Err` and must fail closed (it is never reported as a duplicate).
+    fn check_run_dedupe_strict(
+        &self,
+        context: &SagaContext,
+        key: &str,
+    ) -> Result<RunDedupe, SagaStateStoreError> {
+        let scoped = self.run_dedupe_key(context, key);
+        Ok(if self.check_dedupe_strict(context.saga_id, &scoped)? {
+            RunDedupe::First
+        } else {
+            RunDedupe::Duplicate
+        })
+    }
+
+    /// Returns the durable terminal tombstone for exactly this run, if any.
+    fn terminal_run_outcome_strict(
+        &self,
+        context: &SagaContext,
+    ) -> Result<Option<ParticipantTerminalKind>, SagaStateStoreError> {
+        let entries = self
+            .saga_journal()
+            .read(context.saga_id)
+            .map_err(SagaStateStoreError::Journal)?;
+        Ok(scan_runs(&entries)
+            .terminal_of(context)
+            .map(|(kind, _)| kind))
+    }
+
+    /// Shared durable admission. Consults the journal (never a bounded cache) for run
+    /// identity `(saga_id, saga_type, saga_started_at_millis)`, surfaces read and write
+    /// errors, and records the run durably before returning `Admitted`.
+    ///
+    /// Rejects terminal replays, stale runs, unresolved-run replacement, quarantine
+    /// reuse, and legacy execution history whose run identity is unknown. A new
+    /// ordinary run is admitted only after earlier identified runs have resolved.
+    fn admit_participant_event_strict(
+        &self,
+        context: &SagaContext,
+    ) -> Result<ParticipantAdmission, SagaStateStoreError> {
+        let entries = self
+            .saga_journal()
+            .read(context.saga_id)
+            .map_err(SagaStateStoreError::Journal)?;
+        let runs = scan_runs(&entries);
+        if runs.runs.is_empty()
+            && entries
+                .iter()
+                .any(|entry| !matches!(entry.event, ParticipantEvent::SagaRegistered { .. }))
+        {
+            return Ok(ParticipantAdmission::LegacyHistory);
+        }
+        if let Some((outcome, _)) = runs.terminal_of(context) {
+            return Ok(ParticipantAdmission::TerminalReplay { outcome });
+        }
+        if let Some(latest) = runs.latest_started_at()
+            && context.saga_started_at_millis < latest
+        {
+            return Ok(ParticipantAdmission::StaleRun {
+                latest_started_at_millis: latest,
+            });
+        }
+        if let Some((started_at, reason)) = runs.runs.iter().find_map(|run| match run.terminal {
+            Some((ParticipantTerminalKind::Quarantined, reason)) => Some((run.started_at, reason)),
+            _ => None,
+        }) {
+            return Ok(ParticipantAdmission::QuarantinedReuse {
+                quarantined_started_at_millis: started_at,
+                reason: reason.into(),
+            });
+        }
+        if !runs.contains(context) {
+            if let Some(active) = runs.runs.iter().find(|run| run.terminal.is_none()) {
+                return Ok(ParticipantAdmission::ActiveRunReuse {
+                    active_started_at_millis: active.started_at,
+                });
+            }
+            self.record_event_strict(
+                context.saga_id,
+                ParticipantEvent::ParticipantRunRecorded {
+                    saga_type: context.saga_type.clone(),
+                    saga_started_at_millis: context.saga_started_at_millis,
+                    recorded_at_millis: self.now_millis(),
+                },
+            )?;
+        }
+        Ok(ParticipantAdmission::Admitted)
+    }
+
+    /// Durably retains a terminal tombstone for this run (no pruning of journal,
+    /// dedupe or accepted metadata), then latches the in-memory cache. The first
+    /// recorded terminal outcome for a run is absorbing. Nothing is latched in memory
+    /// unless the durable write succeeded.
+    fn retain_terminal_saga_strict(
+        &mut self,
+        context: &SagaContext,
+        outcome: ParticipantTerminalKind,
+        reason: &str,
+    ) -> Result<(), SagaStateStoreError> {
+        let entries = self
+            .saga_journal()
+            .read(context.saga_id)
+            .map_err(SagaStateStoreError::Journal)?;
+        if scan_runs(&entries).terminal_of(context).is_none() {
+            self.record_event_strict(
+                context.saga_id,
+                ParticipantEvent::ParticipantTerminalRecorded {
+                    saga_type: context.saga_type.clone(),
+                    saga_started_at_millis: context.saga_started_at_millis,
+                    outcome,
+                    reason: reason.into(),
+                    recorded_at_millis: self.now_millis(),
+                },
+            )?;
+        }
+        self.record_saga_run_start(context.saga_id, context.saga_started_at_millis);
+        self.latch_terminal_saga(context.saga_id);
+        Ok(())
+    }
+
+    /// Retains the tombstone for a terminal choreography event. Returns `Ok(false)`
+    /// for non-terminal events.
+    fn retain_terminal_event_strict(
+        &mut self,
+        event: &SagaChoreographyEvent,
+    ) -> Result<bool, SagaStateStoreError> {
+        let (outcome, reason): (_, &str) = match event {
+            SagaChoreographyEvent::SagaCompleted { .. } => {
+                (ParticipantTerminalKind::Completed, "saga completed")
+            }
+            SagaChoreographyEvent::SagaFailed { reason, .. } => {
+                (ParticipantTerminalKind::Failed, reason)
+            }
+            SagaChoreographyEvent::SagaQuarantined { reason, .. } => {
+                (ParticipantTerminalKind::Quarantined, reason)
+            }
+            _ => return Ok(false),
+        };
+        self.retain_terminal_saga_strict(event.context(), outcome, reason)?;
+        Ok(true)
+    }
+
     /// Checks whether a saga is still actively running.
     ///
     /// Returns `true` if the saga exists and has not reached a terminal state,
@@ -344,6 +542,83 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
             .values()
             .filter(|e| !e.is_terminal())
             .count()
+    }
+}
+
+/// Durable run history of one saga id, derived from journal run/terminal records.
+struct RunScan<'a> {
+    runs: Vec<RunRecord<'a>>,
+}
+
+struct RunRecord<'a> {
+    saga_type: &'a str,
+    started_at: u64,
+    terminal: Option<(ParticipantTerminalKind, &'a str)>,
+}
+
+fn scan_runs(entries: &[crate::JournalEntry]) -> RunScan<'_> {
+    let mut runs: Vec<RunRecord<'_>> = Vec::new();
+    for entry in entries {
+        match &entry.event {
+            ParticipantEvent::ParticipantRunRecorded {
+                saga_type,
+                saga_started_at_millis,
+                ..
+            } => {
+                if !runs
+                    .iter()
+                    .any(|r| r.saga_type == &**saga_type && r.started_at == *saga_started_at_millis)
+                {
+                    runs.push(RunRecord {
+                        saga_type,
+                        started_at: *saga_started_at_millis,
+                        terminal: None,
+                    });
+                }
+            }
+            ParticipantEvent::ParticipantTerminalRecorded {
+                saga_type,
+                saga_started_at_millis,
+                outcome,
+                reason,
+                ..
+            } => {
+                match runs.iter_mut().find(|r| {
+                    r.saga_type == &**saga_type && r.started_at == *saga_started_at_millis
+                }) {
+                    Some(run) => {
+                        run.terminal.get_or_insert((*outcome, reason));
+                    }
+                    None => runs.push(RunRecord {
+                        saga_type,
+                        started_at: *saga_started_at_millis,
+                        terminal: Some((*outcome, reason)),
+                    }),
+                }
+            }
+            _ => {}
+        }
+    }
+    RunScan { runs }
+}
+
+impl<'a> RunScan<'a> {
+    fn find(&self, context: &SagaContext) -> Option<&RunRecord<'a>> {
+        self.runs.iter().find(|r| {
+            r.saga_type == &*context.saga_type && r.started_at == context.saga_started_at_millis
+        })
+    }
+
+    fn contains(&self, context: &SagaContext) -> bool {
+        self.find(context).is_some()
+    }
+
+    fn terminal_of(&self, context: &SagaContext) -> Option<(ParticipantTerminalKind, &'a str)> {
+        self.find(context).and_then(|r| r.terminal)
+    }
+
+    fn latest_started_at(&self) -> Option<u64> {
+        self.runs.iter().map(|r| r.started_at).max()
     }
 }
 

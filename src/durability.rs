@@ -1082,6 +1082,8 @@ fn recover_completed_accepted_compensation_from_entries(
                 completed = None;
             }
             ParticipantEvent::SagaRegistered { .. }
+            | ParticipantEvent::ParticipantRunRecorded { .. }
+            | ParticipantEvent::ParticipantTerminalRecorded { .. }
             | ParticipantEvent::StepTriggered { .. }
             | ParticipantEvent::StepExecutionStarted { .. }
             | ParticipantEvent::StepExecutionCompleted { .. }
@@ -1155,6 +1157,8 @@ fn recover_failed_accepted_compensation_from_entries(
                 failed = None;
             }
             ParticipantEvent::SagaRegistered { .. }
+            | ParticipantEvent::ParticipantRunRecorded { .. }
+            | ParticipantEvent::ParticipantTerminalRecorded { .. }
             | ParticipantEvent::StepTriggered { .. }
             | ParticipantEvent::StepExecutionStarted { .. }
             | ParticipantEvent::StepExecutionCompleted { .. }
@@ -1196,6 +1200,8 @@ fn recover_unstarted_compensation_request_from_entries(
             | ParticipantEvent::CompensationFailed { .. }
             | ParticipantEvent::Quarantined { .. } => request = None,
             ParticipantEvent::SagaRegistered { .. }
+            | ParticipantEvent::ParticipantRunRecorded { .. }
+            | ParticipantEvent::ParticipantTerminalRecorded { .. }
             | ParticipantEvent::StepTriggered { .. }
             | ParticipantEvent::StepExecutionStarted { .. }
             | ParticipantEvent::StepExecutionCompleted { .. }
@@ -1246,6 +1252,8 @@ fn recover_completed_step_effect_for_unstarted_compensation(
             | ParticipantEvent::CompensationFailed { .. }
             | ParticipantEvent::Quarantined { .. } => effect_at_request = None,
             ParticipantEvent::SagaRegistered { .. }
+            | ParticipantEvent::ParticipantRunRecorded { .. }
+            | ParticipantEvent::ParticipantTerminalRecorded { .. }
             | ParticipantEvent::StepTriggered { .. }
             | ParticipantEvent::StepExecutionFailed { .. }
             | ParticipantEvent::AcceptedStepRecorded { .. } => {}
@@ -1301,6 +1309,8 @@ fn recover_accepted_workflow_step_from_entries(
                 accepted = None;
             }
             ParticipantEvent::SagaRegistered { .. }
+            | ParticipantEvent::ParticipantRunRecorded { .. }
+            | ParticipantEvent::ParticipantTerminalRecorded { .. }
             | ParticipantEvent::StepTriggered { .. }
             | ParticipantEvent::StepExecutionStarted { .. }
             | ParticipantEvent::StepExecutionFailed {
@@ -1342,6 +1352,8 @@ fn accepted_step_failure_requiring_compensation(
                 failure = None;
             }
             ParticipantEvent::SagaRegistered { .. }
+            | ParticipantEvent::ParticipantRunRecorded { .. }
+            | ParticipantEvent::ParticipantTerminalRecorded { .. }
             | ParticipantEvent::StepTriggered { .. }
             | ParticipantEvent::StepExecutionStarted { .. }
             | ParticipantEvent::CompensationRequestRecorded { .. }
@@ -2675,6 +2687,7 @@ pub fn classify_recovery(
         last.event,
         ParticipantEvent::CompensationCompleted { .. }
             | ParticipantEvent::Quarantined { .. }
+            | ParticipantEvent::ParticipantTerminalRecorded { .. }
             | ParticipantEvent::StepExecutionFailed {
                 requires_compensation: false,
                 ..
@@ -2731,7 +2744,11 @@ pub fn collect_startup_recovery_events_for_saga_type<
 
 fn recorded_saga_type(entries: &[JournalEntry]) -> Option<&str> {
     entries.iter().rev().find_map(|entry| match &entry.event {
-        ParticipantEvent::SagaRegistered { saga_type, .. } => Some(saga_type.as_ref()),
+        ParticipantEvent::SagaRegistered { saga_type, .. }
+        | ParticipantEvent::ParticipantRunRecorded { saga_type, .. }
+        | ParticipantEvent::ParticipantTerminalRecorded { saga_type, .. } => {
+            Some(saga_type.as_ref())
+        }
         ParticipantEvent::CompensationRequestRecorded { context, .. }
         | ParticipantEvent::AcceptedStepRecorded { context, .. }
         | ParticipantEvent::AcceptedCompensationRecorded { context, .. } => {

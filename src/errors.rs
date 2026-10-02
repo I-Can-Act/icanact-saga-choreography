@@ -142,10 +142,63 @@ pub enum StepOutput {
         output: Vec<u8>,
         /// Compensation data
         compensation_data: Vec<u8>,
-        /// Effect identifier (actor message to send)
+        /// Effect identifier. It must be handed to the participant's
+        /// `dispatch_effect` hook; framework code must not discard it or treat the
+        /// step as durably complete until the hook returns durable evidence.
         effect: Box<str>,
     },
 }
+
+/// Borrowed request handed to a participant `dispatch_effect` hook.
+#[derive(Clone, Copy, Debug)]
+pub struct EffectDispatchRequest<'a> {
+    pub context: &'a super::SagaContext,
+    /// Effect identifier carried by `StepOutput::CompletedWithEffect`.
+    pub effect: &'a str,
+    pub output: &'a [u8],
+    pub compensation_data: &'a [u8],
+}
+
+/// Durable evidence that an effect was handed off.
+///
+/// Returning this asserts the hand-off survives a restart (for example an outbox
+/// row or an idempotent downstream acknowledgement). Fire-and-forget remote
+/// sends must NOT return it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EffectDispatchOutcome {
+    Durable {
+        /// Stable receipt/idempotency reference recorded as evidence.
+        receipt: Box<str>,
+    },
+}
+
+/// Effect dispatch failure. Both variants fail closed: the step must not be
+/// reported as successfully completed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EffectDispatchError {
+    /// The participant has no durable dispatch implementation (the default).
+    Unsupported { effect: Box<str> },
+    /// Dispatch failed; `ambiguous` means the effect may have been handed off.
+    Failed { reason: Box<str>, ambiguous: bool },
+}
+
+impl std::fmt::Display for EffectDispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported { effect } => {
+                write!(f, "no durable dispatch implemented for effect `{effect}`")
+            }
+            Self::Failed { reason, ambiguous } => {
+                write!(
+                    f,
+                    "effect dispatch failed (ambiguous={ambiguous}): {reason}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for EffectDispatchError {}
 
 /// Output from compensation execution.
 #[derive(Clone, Debug)]

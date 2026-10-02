@@ -99,20 +99,20 @@ pub use support::{
 
 // Events
 pub use events::{
-    AckStatus, ParticipantEvent, SagaChoreographyEvent, SagaFailureDetails, SagaReplyTo,
-    SagaTerminalOutcome,
+    AckStatus, ParticipantEvent, ParticipantTerminalKind, SagaChoreographyEvent,
+    SagaFailureDetails, SagaReplyTo, SagaTerminalOutcome,
 };
 
 // Errors
 pub use errors::{
     AcceptedCompensationCompletion, AcceptedCompensationFailure, AcceptedStepCompletion,
     AcceptedStepError, AcceptedStepFailure, AcceptedStepPolicy, AcceptedStepPolicyError,
-    AcceptedStepTimeoutOutcome, CompensationError, CompensationOutput, StepError, StepExecutionId,
-    StepOutput,
+    AcceptedStepTimeoutOutcome, CompensationError, CompensationOutput, EffectDispatchError,
+    EffectDispatchOutcome, EffectDispatchRequest, StepError, StepExecutionId, StepOutput,
 };
 
 // Traits
-pub use state_ext::SagaStateExt;
+pub use state_ext::{ParticipantAdmission, RunDedupe, SagaStateExt, SagaStateStoreError};
 pub use traits::{
     AllowsSagaTellIngress, AsyncSagaParticipant, DependencySpec, HasSagaWorkflowParticipants,
     SagaBoxFuture, SagaParticipant, SagaWorkflowParticipant,

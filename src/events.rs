@@ -445,4 +445,31 @@ pub enum ParticipantEvent {
         deadline_at_millis: u64,
         hard_deadline_at_millis: u64,
     },
+    /// Durable identity of a participant run (appended; never reorders earlier variants).
+    ///
+    /// A run is identified by saga id (journal key), `saga_type` and
+    /// `saga_started_at_millis`.
+    ParticipantRunRecorded {
+        saga_type: Box<str>,
+        saga_started_at_millis: u64,
+        recorded_at_millis: u64,
+    },
+    /// Durable terminal tombstone for one participant run. Retained so replay of the
+    /// same run stays fenced after restart and after in-memory cache eviction.
+    ParticipantTerminalRecorded {
+        saga_type: Box<str>,
+        saga_started_at_millis: u64,
+        outcome: ParticipantTerminalKind,
+        reason: Box<str>,
+        recorded_at_millis: u64,
+    },
+}
+
+/// Terminal classification stored in a participant terminal tombstone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum ParticipantTerminalKind {
+    Completed,
+    Failed,
+    /// Needs explicit operator resolution; blocks reuse of the saga id.
+    Quarantined,
 }
