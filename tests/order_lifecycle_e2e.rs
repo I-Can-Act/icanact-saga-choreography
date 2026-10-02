@@ -917,7 +917,9 @@ fn position_compensation_fails_terminal_quarantines() {
         requires_compensation: true,
     });
 
-    wait_until(TIMEOUT, || query_terminal_counts(&terminal_ref).quarantined >= 1);
+    wait_until(TIMEOUT, || {
+        query_terminal_counts(&terminal_ref).quarantined >= 1
+    });
 
     wait_until(TIMEOUT, || query_state(&p_ref).compensated_count >= 1);
 

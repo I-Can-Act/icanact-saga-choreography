@@ -1121,6 +1121,37 @@ where
         if run.saga_type() == saga_type
             && !support.saga_states.contains_key(&run)
             && recover_accepted_workflow_step_from_entries(&entries).is_none()
+            && let Some((compensation_data, started_at_millis)) =
+                recover_retryable_compensation_from_entries(&entries)
+        {
+            // R13: an undo was started but never settled (a `SafeToRetry` outcome writes no
+            // row). Rehydrate `Compensating` with the durable undo data so the resolver's
+            // re-request re-invokes the undo instead of stalling. The undo may therefore run
+            // again after a crash mid-undo: undo handlers must be idempotent.
+            let context = recovery_context_for_run(&run, step_name);
+            let mut state = crate::SagaParticipantState::new(
+                saga_id,
+                context.saga_type.clone(),
+                context.step_name.clone(),
+                context.correlation_id,
+                context.trace_id,
+                context.initiator_peer_id,
+                context.saga_started_at_millis,
+            )
+            .trigger("step_recovered", started_at_millis)
+            .start_execution(started_at_millis)
+            .complete(Vec::new(), compensation_data.clone(), started_at_millis)
+            .start_compensation(started_at_millis);
+            state.state.compensation_data = Some(compensation_data);
+            support
+                .saga_states
+                .insert(run.clone(), SagaStateEntry::Compensating(state));
+            support.admitted_runs.insert(run.clone());
+            continue;
+        }
+        if run.saga_type() == saga_type
+            && !support.saga_states.contains_key(&run)
+            && recover_accepted_workflow_step_from_entries(&entries).is_none()
             && let Some((output, compensation_data, completed_at_millis)) =
                 recover_live_completed_step_from_entries(&entries)
         {
@@ -1546,6 +1577,54 @@ fn recover_live_completed_step_from_entries(
         }
     }
     completed
+}
+
+/// A started-but-unsettled undo of an ordinary completed step: the last `StepExecutionCompleted`
+/// followed by `CompensationStarted` with no later completion, failure, quarantine or restart of
+/// execution. Returns the undo data and the start time (R13).
+fn recover_retryable_compensation_from_entries(entries: &[JournalEntry]) -> Option<(Vec<u8>, u64)> {
+    let mut completed: Option<Vec<u8>> = None;
+    let mut started_at = None;
+    for entry in entries {
+        match entry.event.transition() {
+            ParticipantEvent::StepExecutionCompleted {
+                compensation_data, ..
+            } => {
+                completed = Some(compensation_data.clone());
+                started_at = None;
+            }
+            ParticipantEvent::CompensationStarted {
+                started_at_millis, ..
+            } => {
+                if completed.is_some() {
+                    started_at = Some(*started_at_millis);
+                }
+            }
+            ParticipantEvent::StepExecutionStarted { .. }
+            | ParticipantEvent::InboxCommitted {
+                execution_intent: Some(_),
+                ..
+            }
+            | ParticipantEvent::StepExecutionFailed { .. }
+            | ParticipantEvent::AcceptedStepRecorded { .. }
+            | ParticipantEvent::AcceptedCompensationRecorded { .. }
+            | ParticipantEvent::CompensationCompleted { .. }
+            | ParticipantEvent::CompensationFailed { .. }
+            | ParticipantEvent::Quarantined { .. } => {
+                completed = None;
+                started_at = None;
+            }
+            ParticipantEvent::SagaRegistered { .. }
+            | ParticipantEvent::StepTriggered { .. }
+            | ParticipantEvent::CompensationRequestRecorded { .. }
+            | ParticipantEvent::InboxCommitted {
+                execution_intent: None,
+                ..
+            }
+            | ParticipantEvent::TransitionCommitted { .. } => {}
+        }
+    }
+    completed.zip(started_at)
 }
 
 fn recover_accepted_workflow_step_from_entries(
@@ -2813,11 +2892,24 @@ where
             emit,
         );
     }
+    let compensation_in_flight = actor
+        .saga_support()
+        .accepted_workflow_compensations
+        .contains_key(&run);
     let state_entry = actor.saga_states().remove(&run);
     let (saga_input, comp_data, compensating_state) = match state_entry {
         Some(SagaStateEntry::Completed(state)) => {
             let comp_data = state.state.compensation_data.clone();
             (Vec::new(), comp_data, state.start_compensation(now))
+        }
+        // ADR-0004 §2.5: a re-request after `CompensationFailedRetryable` re-invokes the undo
+        // with the kept data, unless an accepted async undo is still in flight.
+        Some(SagaStateEntry::Compensating(mut state))
+            if state.state.compensation_data.is_some() && !compensation_in_flight =>
+        {
+            state.state.attempt = context.attempt;
+            let comp_data = state.state.compensation_data.clone().unwrap_or_default();
+            (Vec::new(), comp_data, state)
         }
         Some(SagaStateEntry::Executing(state)) => {
             let Some((saga_input, comp_data)) = accepted_recovery_data else {
@@ -2829,11 +2921,21 @@ where
             (saga_input, comp_data, state.start_compensation(now))
         }
         Some(other) => {
+            if matches!(other, SagaStateEntry::Compensating(_)) {
+                tracing::error!(
+                    target: "core::saga",
+                    event = "saga_compensation_rerequest_not_retried",
+                    run = %run,
+                    "compensation re-request ignored: undo data unknown or undo still in flight"
+                );
+            }
             actor.saga_states().insert(run.clone(), other);
             return IngressOutcome::Applied;
         }
         None => return IngressOutcome::Applied,
     };
+    let mut compensating_state = compensating_state;
+    compensating_state.state.compensation_data = Some(comp_data.clone());
     actor.saga_states().insert(
         run.clone(),
         SagaStateEntry::Compensating(compensating_state),
@@ -2920,7 +3022,17 @@ where
     F: FnMut(SagaChoreographyEvent),
 {
     let (reason, is_ambiguous) = match error {
-        crate::CompensationError::SafeToRetry { reason } => (reason, false),
+        // ADR-0004 §2.5: the undo did not take effect; stay `Compensating` and let the resolver
+        // re-request within its budget. Not a quarantine.
+        crate::CompensationError::SafeToRetry { reason } => {
+            return crate::helpers::emit_compensation_retryable(
+                context,
+                workflow.step_name().into(),
+                workflow.participant_id_owned(),
+                &reason,
+                emit,
+            );
+        }
         crate::CompensationError::Ambiguous { reason } => (reason, true),
         crate::CompensationError::Terminal { reason } => (reason, false),
     };
@@ -2933,7 +3045,7 @@ where
         now,
         emit,
     );
-    if matches!(outcome, IngressOutcome::Applied) {
+    if is_ambiguous && matches!(outcome, IngressOutcome::Applied) {
         workflow.on_quarantined(actor, context, &reason);
     }
     outcome
