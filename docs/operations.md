@@ -14,7 +14,7 @@ load, Linux/Windows or external-service certification.
    `durability::lmdb::open_lmdb_participant_support_for_saga_type` (or `_for_saga_types`)
    collects startup recovery events and invokes
    `durability::recover_accepted_workflow_steps_for_saga_type` to restore accepted
-   work, recorded unstarted undo requests and current-run fences. For custom stores,
+   work, confirmed completed projections, recorded unstarted undo requests and current-run fences. For custom stores,
    use that recovery function plus `collect_startup_recovery_events_for_saga_type`.
    Applications remain responsible for their business projections and reconciliation;
    opening stores is not permission to replay unresolved business effects.
@@ -25,8 +25,10 @@ load, Linux/Windows or external-service certification.
    Activation queues retained output; it is not an acknowledgement that remote work
    has finished. Only then admit new `SagaStarted` events.
 
-Starts before activation or against unreadable durable history are rejected before
-fanout. Required-delivery shortfalls, including partial start fanout, quarantine because
+Unreadable durable history blocks resolver attachment; starts before recovery activation
+are rejected before fanout. Admission indexes retained history once, then strictly records
+and reserves each durable start before fanout. Ephemeral resolvers serialize live starts
+but cannot retain fences across process restart. Required-delivery shortfalls, including partial start fanout, quarantine because
 an effect owner may already have received the event. Always handle `publish_strict`
 and participant-support publication errors; do not treat best-effort publish statistics
 as a delivery guarantee. Shut down application actor handles before releasing stores.
@@ -68,9 +70,13 @@ Rollback absorbs forward success. Late compensable effects join its queue or qua
 an effect materialising after its undo/ordinary failure escalates to quarantine. Failed
 undo, including definitive final undo failure, keeps the unreversed effect quarantined.
 Forward overall/stalled expiry starts rollback when effects exist, with renewed rollback
-budgets. Expiry with unresolved undo quarantines instead of ordinary failure. Stale
-identified participant execution/undo likewise recovers as quarantine using its original
-run identity; unidentified stale execution blocks recovery rather than inventing an outcome.
+budgets. Started-unresolved or accepted forward work remains uncertain: known effects are
+undone first, then remaining uncertainty quarantines. Expiry with unresolved undo likewise
+quarantines. Participant recovery distinguishes idle admission and healthy accepted deadlines
+from open execution/undo intent or an unconfirmed result. Uncertainty quarantines at any age,
+using its original run identity; idle/confirmed work is not quarantined merely by elapsed
+age. `RecoveryPolicy::stale_after_ms` remains an API compatibility field, not a safety proxy.
+Unidentified execution blocks recovery rather than inventing an outcome.
 
 An accepted deadline does not physically cancel remote work. Choose ordinary accepted
 failure outcomes only when the application's remote contract makes late effects safe;
@@ -86,11 +92,14 @@ quarantines and never publishes step success. Compensation metadata is persisted
 dispatch. Plain `Completed` does not require a hook; arbitrary effects inside
 `execute_step` are still application-owned.
 
-Implement durable outbox/idempotency semantics in the hook. The returned receipt is logged,
-not a library-managed outbox record. Persist your own receipts and reconcile the crash
-window between external dispatch and local completion/acceptance metadata. Accepted
-execution IDs must also remain stable. Panic quarantine does not establish whether an
-external effect happened.
+Implement durable outbox/idempotency semantics in the hook. After successful dispatch,
+`ParticipantForwardOutcomeRecorded` retains the returned receipt along with the original
+completion context, input, output and compensation data, strictly before publication. It is
+a local confirmation record, **not** a library-managed external outbox. Persist application
+receipts at handoff and reconcile the crash window before local confirmation. Accepted
+execution IDs must remain stable within a run and distinguish different runs; a callback ID
+that names multiple retained runs requires explicit application reconciliation. Panic
+quarantine does not establish whether an external effect happened.
 
 ## Capacity and maintenance
 
@@ -111,6 +120,35 @@ external effect happened.
   primitives: they remove replay protection and are **not** routine terminal cleanup.
   Do not use them to unblock a saga or replace safe resolver compaction.
 
+## Application hooks and restart
+
+The library does not promise that arbitrary application hooks run exactly once across a
+restart. Terminal side-effect hooks and effect hooks **must be idempotent**. Managed
+ingress fences duplicate/stale ordinary terminal callbacks for its supported saga types;
+quarantine notifications and arbitrary non-terminal/foreign application callbacks still
+require idempotence. A confirmed forward outcome (`ParticipantForwardOutcomeRecorded`,
+tag 15) is persisted by `SagaStateExt::record_forward_outcome_strict` before success.
+`participant_run_evidence_strict` separates it from an unconfirmed raw result; the stored
+`ParticipantForwardOutcome::completion_event()` is resent without re-execution.
+A confirmed AnyOf branch (including a receipted dispatch) is already fired, not uncertain.
+A cold undo request hydrates retained compensation; a proved completed undo resends only
+its acknowledgement. Missing confirmation is not automatic success.
+
+`complete_accepted_workflow_step` may return `SagaQuarantined` for late identified
+completion, including after cold restart. Publish the returned event, not only
+`StepCompleted`; typed reconciliation evidence retains the late output/compensation under
+its original run without contaminating a successor. Result-write errors retain evidence
+and quarantine where storage permits; they do not authorize another external execution.
+Use `register_terminal_reply_for_run` and `take_terminal_outcome_for_run` with the full
+context. Saga-ID-only compatibility lookups follow the newest admitted run; they are not
+an unambiguous way to wait for concurrent saga types sharing an ID.
+
+## Release and migration
+
+This work contains breaking changes (exhaustive enums, appended archive tags, fail-closed
+default effect hook, legacy-identity reconciliation). See [migration.md](migration.md).
+No version bump is included; a bump and release work are prerequisites before publication.
+
 ## Administrative reconciliation
 
 There is no built-in “clear quarantine and safely retry” API. Stop starts for the affected
@@ -119,7 +157,10 @@ operation; reconcile forward/undo outcomes out of band and record an audited app
 resolution. Preserve a durable replacement replay fence before any deliberate archival
 or deletion. An operator cannot turn uncertain work into safe replay merely by changing
 a timestamp or pruning a journal. Prefer a separately identified, reconciled new business
-operation rather than erasing the old quarantine.
+operation with a **new saga ID** rather than erasing the old quarantine. There is no
+built-in replacement-fence or legacy-row repair API: replacement fencing/reconciliation
+is application-owned and audited (see [migration.md](migration.md)). Keep blocked legacy
+stores/evidence intact; do not hand-edit or prune them to force a participant open.
 
 External idempotency keys should include saga type, **saga ID**, original start time,
 participant/step, forward-versus-undo direction, and a stable effect/execution identifier.

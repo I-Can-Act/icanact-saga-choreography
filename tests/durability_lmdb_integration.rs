@@ -196,6 +196,16 @@ fn open_support_replays_panic_quarantine_once() {
     journal
         .append(
             saga_id,
+            ParticipantEvent::ParticipantRunRecorded {
+                saga_type: "mature_pool_refresh".into(),
+                saga_started_at_millis: 2_020,
+                recorded_at_millis: 2_020,
+            },
+        )
+        .expect("append run record should succeed");
+    journal
+        .append(
+            saga_id,
             ParticipantEvent::Quarantined {
                 reason: panic_quarantine_reason(ActiveSagaExecutionPhase::StepExecution, "boom"),
                 quarantined_at_millis: SagaContext::now_millis(),
@@ -211,7 +221,9 @@ fn open_support_replays_panic_quarantine_once() {
     assert!(matches!(
         &first_events[0],
         SagaChoreographyEvent::SagaQuarantined { context, .. }
-            if context.saga_type.as_ref() == "mature_pool_refresh" && context.saga_id == saga_id
+            if context.saga_type.as_ref() == "mature_pool_refresh"
+                && context.saga_id == saga_id
+                && context.saga_started_at_millis == 2_020
     ));
 
     let mut second =
@@ -306,6 +318,8 @@ mod workflow_reopen {
     struct Actor {
         saga: SagaParticipantSupport<LmdbJournal, LmdbDedupe>,
         pay_calls: usize,
+        comp_calls: usize,
+        last_comp_data: Vec<u8>,
     }
 
     impl Actor {
@@ -314,6 +328,8 @@ mod workflow_reopen {
                 saga: open_lmdb_participant_support_for_saga_type(base, "pay", "wf_pay")
                     .expect("support should open"),
                 pay_calls: 0,
+                comp_calls: 0,
+                last_comp_data: Vec::new(),
             }
         }
     }
@@ -360,10 +376,12 @@ mod workflow_reopen {
         }
         fn compensate_step(
             &self,
-            _actor: &mut Actor,
+            actor: &mut Actor,
             _context: &SagaContext,
-            _data: &[u8],
+            data: &[u8],
         ) -> Result<CompensationOutput, CompensationError> {
+            actor.comp_calls += 1;
+            actor.last_comp_data = data.to_vec();
             Ok(CompensationOutput::Completed)
         }
     }
@@ -401,6 +419,203 @@ mod workflow_reopen {
             context: context.clone(),
             payload: b"in".to_vec(),
         }
+    }
+
+    fn undo_request(run: &SagaContext) -> SagaChoreographyEvent {
+        SagaChoreographyEvent::CompensationRequested {
+            context: run.next_step("terminal_resolver".into()),
+            failed_step: "later".into(),
+            reason: "rollback".into(),
+            failure: icanact_saga_choreography::SagaFailureDetails {
+                step_name: "later".into(),
+                participant_id: "p".into(),
+                error_code: None,
+                error_message: "rollback".into(),
+                at_millis: 100,
+            },
+            steps_to_compensate: vec!["pay".into()],
+        }
+    }
+
+    #[test]
+    fn confirmed_forward_proof_resends_original_completion_after_lmdb_reopen() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let run = ctx(100);
+        let original = {
+            let mut actor = Actor::open(temp.path());
+            let out = deliver(&mut actor, start(&run));
+            assert_eq!(actor.pay_calls, 1);
+            out.into_iter()
+                .find(|e| matches!(e, SagaChoreographyEvent::StepCompleted { .. }))
+                .expect("original completion")
+        };
+
+        let mut reopened = Actor::open(temp.path());
+        let resent = reopened.saga.take_startup_recovery_events();
+        assert_eq!(resent.len(), 1, "{resent:?}");
+        match (&resent[0], &original) {
+            (
+                SagaChoreographyEvent::StepCompleted {
+                    context: replay,
+                    output: out,
+                    saga_input: input,
+                    compensation_available: comp,
+                },
+                SagaChoreographyEvent::StepCompleted {
+                    context: first,
+                    output,
+                    saga_input,
+                    compensation_available,
+                },
+            ) => {
+                assert_eq!(
+                    (out, input, comp),
+                    (output, saga_input, compensation_available)
+                );
+                assert_eq!(
+                    (
+                        replay.saga_id,
+                        &replay.saga_type,
+                        &replay.step_name,
+                        replay.saga_started_at_millis,
+                        replay.event_timestamp_millis,
+                        replay.trace_id,
+                        replay.causation_id,
+                        replay.correlation_id,
+                        replay.step_index,
+                        replay.attempt,
+                        replay.initiator_peer_id
+                    ),
+                    (
+                        first.saga_id,
+                        &first.saga_type,
+                        &first.step_name,
+                        first.saga_started_at_millis,
+                        first.event_timestamp_millis,
+                        first.trace_id,
+                        first.causation_id,
+                        first.correlation_id,
+                        first.step_index,
+                        first.attempt,
+                        first.initiator_peer_id
+                    )
+                );
+            }
+            _ => panic!("confirmed recovery must preserve the exact completion"),
+        }
+        assert_eq!(reopened.pay_calls, 0, "recovery must never re-run the step");
+        assert!(matches!(
+            reopened.saga.saga_states.get(&run.saga_id),
+            Some(icanact_saga_choreography::SagaStateEntry::Completed(_))
+        ));
+        assert!(reopened.saga.dependency_fired.contains(&run.saga_id));
+
+        // A re-delivered start (new trace) still cannot repeat the effect.
+        let mut retry = run.clone();
+        retry.trace_id = 999;
+        let replay = deliver(&mut reopened, start(&retry));
+        assert_eq!(reopened.pay_calls, 0, "{replay:?}");
+    }
+
+    #[test]
+    fn undo_after_lmdb_cold_restart_uses_journaled_compensation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let run = ctx(100);
+        {
+            let mut actor = Actor::open(temp.path());
+            deliver(&mut actor, start(&run));
+        }
+        let mut reopened = Actor::open(temp.path());
+        let out = deliver(&mut reopened, undo_request(&run));
+        assert_eq!(reopened.comp_calls, 1, "{out:?}");
+        assert_eq!(reopened.last_comp_data, b"refund");
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, SagaChoreographyEvent::CompensationCompleted { .. })),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn open_intent_and_unconfirmed_result_quarantine_visibly_after_lmdb_reopen() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let run = ctx(100);
+        {
+            // Crash between durable intent and result: nothing else was written.
+            let actor = Actor::open(temp.path());
+            actor.admit_participant_event_strict(&run).expect("admit");
+            actor
+                .record_event_strict(
+                    run.saga_id,
+                    ParticipantEvent::StepExecutionStarted {
+                        attempt: 1,
+                        started_at_millis: SagaContext::now_millis(),
+                    },
+                )
+                .expect("intent");
+        }
+        let mut reopened = Actor::open(temp.path());
+        let events = reopened.saga.take_startup_recovery_events();
+        assert!(
+            matches!(events.as_slice(), [SagaChoreographyEvent::SagaQuarantined { context, .. }]
+                if context.saga_started_at_millis == 100),
+            "{events:?}"
+        );
+        assert_eq!(reopened.pay_calls, 0);
+
+        // Partial failure: the result landed but the confirming proof did not.
+        let other = SagaContext {
+            saga_id: SagaId::new(62),
+            ..ctx(300)
+        };
+        {
+            let actor = Actor::open(temp.path());
+            actor.admit_participant_event_strict(&other).expect("admit");
+            for event in [
+                ParticipantEvent::StepExecutionStarted {
+                    attempt: 1,
+                    started_at_millis: 1,
+                },
+                ParticipantEvent::StepExecutionCompleted {
+                    output: b"paid".to_vec(),
+                    compensation_data: b"refund".to_vec(),
+                    completed_at_millis: 2,
+                },
+            ] {
+                actor
+                    .record_event_strict(other.saga_id, event)
+                    .expect("append");
+            }
+        }
+        let mut again = Actor::open(temp.path());
+        let events = again.saga.take_startup_recovery_events();
+        assert!(
+            events.iter().any(
+                |e| matches!(e, SagaChoreographyEvent::SagaQuarantined { context, .. }
+                if context.saga_id == SagaId::new(62) && context.saga_started_at_millis == 300)
+            ),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SagaChoreographyEvent::StepCompleted { .. })),
+            "an unconfirmed result must never be resent as success: {events:?}"
+        );
+    }
+
+    #[test]
+    fn idle_participant_is_not_quarantined_by_lmdb_reopen() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let run = ctx(100);
+        {
+            let actor = Actor::open(temp.path());
+            // Only the run record: this participant is still waiting on dependencies.
+            actor.admit_participant_event_strict(&run).expect("admit");
+        }
+        let mut reopened = Actor::open(temp.path());
+        let events = reopened.saga.take_startup_recovery_events();
+        assert!(events.is_empty(), "{events:?}");
     }
 
     #[test]
@@ -471,10 +686,25 @@ mod workflow_reopen {
         let reuse = deliver(&mut reopened, start(&ctx(200)));
         assert_eq!(reopened.pay_calls, 0);
         assert!(
-            reuse
+            reuse.is_empty(),
+            "refusal must not create a foreign quarantine: {reuse:?}"
+        );
+        assert!(
+            reopened
+                .saga
+                .journal
+                .read(run.saga_id)
+                .unwrap()
                 .iter()
-                .any(|e| matches!(e, SagaChoreographyEvent::SagaQuarantined { .. })),
-            "{reuse:?}"
+                .any(|entry| matches!(
+                    &entry.event,
+                    ParticipantEvent::ParticipantTerminalRecorded {
+                        outcome: ParticipantTerminalKind::Quarantined,
+                        saga_started_at_millis: 100,
+                        ..
+                    }
+                )),
+            "retained original quarantine must continue fencing reuse"
         );
     }
 

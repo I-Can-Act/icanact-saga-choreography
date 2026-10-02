@@ -423,7 +423,10 @@ impl TerminalResolver {
         if state.terminal_latched {
             // An accepted effect can materialise after its undo and ordinary
             // failure. Terminal absorption must not hide this new obligation.
-            if state.rollback.is_some()
+            // Any ordinary failure (with or without a rollback plan, and also
+            // when restored from compacted terminal-only history) can be
+            // followed by an effect the resolver never saw.
+            if (state.rollback.is_some() || state.terminal_outcome == Some("saga_failed"))
                 && state.terminal_outcome != Some("saga_quarantined")
                 && let SagaChoreographyEvent::StepCompleted {
                     context,
@@ -828,6 +831,17 @@ fn advance_rollback(
         });
         return;
     }
+    let uncertain = uncertain_steps(state);
+    let Some(plan) = state.rollback.as_ref() else {
+        return;
+    };
+    if !uncertain.is_empty() {
+        // Known effects are undone, but unresolved forward work may still
+        // hold an effect: never resolve this as an ordinary failure.
+        let prefix = plan.reason.clone();
+        quarantine_uncertain(state, terminal_context(context), &uncertain, &prefix, out);
+        return;
+    }
     let (reason, failure) = match &plan.timeout_reason {
         Some(reason) => (reason.clone(), None),
         None => (
@@ -1215,35 +1229,119 @@ fn apply_step_failure(
         at_millis: context.event_timestamp_millis,
     };
 
-    if requires_compensation {
-        if state.rollback.is_none() {
-            begin_rollback(state, failure.clone(), error, None);
+    // A non-compensating failure still cannot hide effects the resolver knows
+    // about, so any known effect starts the ordinary rollback.
+    if state.rollback.is_none() {
+        if requires_compensation || has_pending_effects(state) {
+            begin_rollback(state, failure.clone(), error.clone(), None);
             let nothing_to_undo = state
                 .rollback
                 .as_ref()
                 .is_some_and(|plan| plan.queue.is_empty());
             if nothing_to_undo {
-                out.push(SagaChoreographyEvent::SagaFailed {
-                    context: terminal_context(context),
-                    reason: "step failed and no compensations were pending".into(),
-                    failure: Some(failure),
-                });
-                state.terminal_latched = true;
+                resolve_without_undo(
+                    state,
+                    context,
+                    "step failed and no compensations were pending".into(),
+                    failure,
+                    out,
+                );
             } else {
                 advance_rollback(state, context, out);
             }
+        } else {
+            resolve_without_undo(state, context, error, failure, out);
         }
-        // Otherwise rollback already owns the saga: the first failure stays the
-        // failure of record and obligations are not re-planned.
-    } else if state.rollback.is_none() {
+    }
+    // Otherwise rollback already owns the saga: the first failure stays the
+    // failure of record, obligations are not re-planned, and a non-compensating
+    // failure cannot bypass the undo obligations.
+}
+
+fn has_pending_effects(state: &SagaResolutionState) -> bool {
+    state
+        .compensable_steps
+        .iter()
+        .any(|step| !state.completed_compensation_steps.contains(step))
+}
+
+/// Forward work whose outcome is unknown: started, accepted or acked but
+/// neither completed, failed nor undone. It may still materialise an effect, so no
+/// ordinary terminal may be issued while any remains. Sorted for determinism.
+fn uncertain_steps(state: &SagaResolutionState) -> Vec<Box<str>> {
+    let resolved_failure = state
+        .pending_failure
+        .as_ref()
+        .map(|failure| failure.step_name.as_ref());
+    let mut steps: Vec<Box<str>> = state
+        .started_steps
+        .iter()
+        .chain(state.accepted_steps.keys())
+        .filter(|step| {
+            !state.completed_steps.contains(*step)
+                && !state.failed_steps.contains(*step)
+                // An undone accepted effect is resolved; a later completion
+                // is escalated by the terminal-absorption path.
+                && !state.completed_compensation_steps.contains(*step)
+                && Some(step.as_ref()) != resolved_failure
+                && step.as_ref() != TERMINAL_RESOLVER_STEP
+        })
+        .cloned()
+        .collect();
+    steps.sort_unstable();
+    steps.dedup();
+    steps
+}
+
+/// Quarantine for unresolved forward work, keeping the evidence in the event.
+fn quarantine_uncertain(
+    state: &mut SagaResolutionState,
+    context: SagaContext,
+    uncertain: &[Box<str>],
+    prefix: &str,
+    out: &mut Vec<SagaChoreographyEvent>,
+) {
+    let step = uncertain
+        .first()
+        .cloned()
+        .unwrap_or_else(|| TERMINAL_RESOLVER_STEP.into());
+    let participant_id = state
+        .accepted_participants
+        .get(&step)
+        .cloned()
+        .unwrap_or_else(|| "unknown".into());
+    out.push(SagaChoreographyEvent::SagaQuarantined {
+        context,
+        reason: format!(
+            "{prefix} with unresolved forward work: steps={}",
+            uncertain.join(",")
+        )
+        .into(),
+        step,
+        participant_id,
+    });
+    state.terminal_latched = true;
+}
+
+/// Ordinary failure when no undo is owed, unless forward work is unresolved.
+fn resolve_without_undo(
+    state: &mut SagaResolutionState,
+    context: &SagaContext,
+    reason: Box<str>,
+    failure: SagaFailureDetails,
+    out: &mut Vec<SagaChoreographyEvent>,
+) {
+    let uncertain = uncertain_steps(state);
+    if uncertain.is_empty() {
         out.push(SagaChoreographyEvent::SagaFailed {
             context: terminal_context(context),
-            reason: error,
+            reason,
             failure: Some(failure),
         });
         state.terminal_latched = true;
+    } else {
+        quarantine_uncertain(state, terminal_context(context), &uncertain, &reason, out);
     }
-    // A non-compensating failure during rollback cannot bypass the undo obligations.
 }
 
 #[derive(Debug)]
@@ -1550,12 +1648,19 @@ fn resolve_generic_timeout(
         return out;
     }
 
-    state.terminal_latched = true;
-    vec![SagaChoreographyEvent::SagaFailed {
-        context,
-        reason,
-        failure: None,
-    }]
+    let uncertain = uncertain_steps(state);
+    let mut out = Vec::new();
+    if uncertain.is_empty() {
+        state.terminal_latched = true;
+        out.push(SagaChoreographyEvent::SagaFailed {
+            context,
+            reason,
+            failure: None,
+        });
+    } else {
+        quarantine_uncertain(state, context, &uncertain, &reason, &mut out);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -2410,10 +2515,11 @@ mod tests {
         assert!(
             matches!(
                 timed_out.first(),
-                Some(SagaChoreographyEvent::SagaFailed { reason, .. })
+                Some(SagaChoreographyEvent::SagaQuarantined { reason, .. })
                 if reason.as_ref().contains("stalled_timeout")
             ),
-            "expected stalled-timeout failure, got: {timed_out:?}"
+            // A started step is unresolved forward work: never an ordinary failure.
+            "expected stalled-timeout quarantine, got: {timed_out:?}"
         );
     }
 
@@ -2490,8 +2596,8 @@ mod tests {
         );
 
         let timed_out = resolver.poll_timeouts_at(1_111);
-        let Some(SagaChoreographyEvent::SagaFailed { reason, .. }) = timed_out.first() else {
-            panic!("expected stalled timeout, got: {timed_out:?}");
+        let Some(SagaChoreographyEvent::SagaQuarantined { reason, .. }) = timed_out.first() else {
+            panic!("expected stalled-timeout quarantine, got: {timed_out:?}");
         };
         assert!(
             reason.contains("started_not_completed=risk_check(account-balance)"),
@@ -2580,6 +2686,73 @@ mod tests {
                 }] if steps_to_compensate.as_slice() == [Box::<str>::from("first_effect")]
             ),
             "unexpected follow-up output: {next:?}"
+        );
+    }
+
+    #[test]
+    fn accepted_step_without_compensation_yet_is_uncertain_at_generic_expiry() {
+        let now = 1_000_000;
+        let mut resolver = TerminalResolver::new(open_position_policy(Duration::from_millis(50)));
+        resolver.ingest_at(
+            &SagaChoreographyEvent::SagaStarted {
+                context: ctx_at("risk_check", 60, now, now),
+                payload: vec![],
+            },
+            now,
+        );
+        resolver.ingest_at(
+            &SagaChoreographyEvent::StepAccepted {
+                context: ctx_at("risk_check", 60, now, now),
+                participant_id: "account-balance".into(),
+                execution_id: StepExecutionId::new("exec-60"),
+                deadline_at_millis: now + 3_600_000,
+                hard_deadline_at_millis: now + 3_600_000,
+                timeouts_enabled: true,
+                timeout_outcome: AcceptedStepTimeoutOutcome::QuarantineSaga,
+                compensation_available: false,
+            },
+            now,
+        );
+        let out = resolver.poll_timeouts_at(now + 1_000);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [SagaChoreographyEvent::SagaQuarantined { step, participant_id, .. }]
+                    if step.as_ref() == "risk_check" && participant_id.as_ref() == "account-balance"
+            ),
+            "unexpected output: {out:?}"
+        );
+    }
+
+    #[test]
+    fn restored_terminal_only_history_escalates_a_late_compensable_effect() {
+        let now = 2_000_000;
+        let started = SagaChoreographyEvent::SagaStarted {
+            context: ctx_at("risk_check", 61, now, now),
+            payload: vec![],
+        };
+        let failed = SagaChoreographyEvent::SagaFailed {
+            context: ctx_at("saga_terminal_resolver", 61, now, now + 1),
+            reason: "boom".into(),
+            failure: None,
+        };
+        let (mut restored, unpublished) = TerminalResolver::restore_from_events(
+            open_position_policy(Duration::from_secs(60)),
+            &[started, failed],
+        );
+        assert!(unpublished.is_empty());
+        let out = restored.ingest_at(
+            &SagaChoreographyEvent::StepCompleted {
+                context: ctx_at("risk_check", 61, now, now + 2),
+                output: vec![],
+                saga_input: vec![],
+                compensation_available: true,
+            },
+            now + 2,
+        );
+        assert!(
+            matches!(out.as_slice(), [SagaChoreographyEvent::SagaQuarantined { step, .. }] if step.as_ref() == "risk_check"),
+            "unexpected output: {out:?}"
         );
     }
 }

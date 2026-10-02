@@ -2,12 +2,11 @@ use std::time::Duration;
 
 use icanact_saga_choreography::durability::apply_async_participant_saga_ingress_with_hooks;
 use icanact_saga_choreography::{
-    AcceptedStepCompletion, AcceptedStepError, AcceptedStepPolicy, AcceptedStepTimeoutOutcome,
-    AsyncSagaParticipant, CompensationError, CompensationOutput, DependencySpec,
-    HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal, ParticipantEvent,
-    ParticipantJournal, PeerId, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipantSupport,
-    SagaStateEntry, SagaStateExt, StepError, StepExecutionId, StepOutput,
-    complete_accepted_workflow_step,
+    AcceptedStepCompletion, AcceptedStepPolicy, AcceptedStepTimeoutOutcome, AsyncSagaParticipant,
+    CompensationError, CompensationOutput, DependencySpec, HasSagaParticipantSupport,
+    InMemoryDedupe, InMemoryJournal, ParticipantEvent, ParticipantJournal, PeerId,
+    SagaChoreographyEvent, SagaContext, SagaId, SagaParticipantSupport, SagaStateEntry,
+    SagaStateExt, StepError, StepExecutionId, StepOutput, complete_accepted_workflow_step,
 };
 
 struct AsyncTestParticipant {
@@ -316,6 +315,6 @@ async fn async_ingress_tombstones_an_accepted_step_after_terminal_timeout() {
     );
     assert!(matches!(
         late,
-        Err(AcceptedStepError::AlreadyResolved { .. })
+        Ok(SagaChoreographyEvent::SagaQuarantined { .. })
     ));
 }

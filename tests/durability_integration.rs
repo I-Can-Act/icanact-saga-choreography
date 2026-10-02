@@ -321,6 +321,17 @@ fn lmdb_multi_saga_open_only_replays_stale_journal_with_exact_type_evidence() {
         .journal
         .append(
             SagaId::new(193),
+            ParticipantEvent::ParticipantRunRecorded {
+                saga_type: OPEN_POSITION.into(),
+                saga_started_at_millis: 9_001,
+                recorded_at_millis: 9_001,
+            },
+        )
+        .expect("typed run identity should persist");
+    support
+        .journal
+        .append(
+            SagaId::new(193),
             ParticipantEvent::Quarantined {
                 reason: panic_quarantine_reason(
                     ActiveSagaExecutionPhase::StepExecution,
@@ -344,6 +355,7 @@ fn lmdb_multi_saga_open_only_replays_stale_journal_with_exact_type_evidence() {
         [SagaChoreographyEvent::SagaQuarantined { context, .. }]
             if context.saga_id == SagaId::new(193)
                 && context.saga_type.as_ref() == OPEN_POSITION
+                && context.saga_started_at_millis == 9_001
     ));
 }
 
@@ -406,7 +418,7 @@ fn lmdb_open_does_not_rehydrate_expired_accepted_step() {
     };
     assert!(matches!(
         complete_accepted_workflow_step(&mut reopened, ctx.saga_id, execution_id, completion),
-        Err(icanact_saga_choreography::AcceptedStepError::NotFound { .. })
+        Ok(SagaChoreographyEvent::SagaQuarantined { .. })
     ));
 }
 
@@ -484,7 +496,7 @@ fn lmdb_open_rehydrates_expired_compensable_step_with_forward_tombstone() {
                 compensation_data: b"cancel-order-92".to_vec(),
             },
         ),
-        Err(icanact_saga_choreography::AcceptedStepError::AlreadyResolved { .. })
+        Ok(SagaChoreographyEvent::SagaQuarantined { .. })
     ));
 }
 
@@ -642,6 +654,17 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
 
     let saga_id = SagaId::new(13);
     let reason = panic_quarantine_reason(ActiveSagaExecutionPhase::CompensationExecution, "boom");
+    // A panic can only follow an admitted run, whose identity the recovery must reuse.
+    journal
+        .append(
+            saga_id,
+            ParticipantEvent::ParticipantRunRecorded {
+                saga_type: "mature_pool_refresh".into(),
+                saga_started_at_millis: 4_242,
+                recorded_at_millis: 4_242,
+            },
+        )
+        .expect("run record should append");
     journal
         .append(
             saga_id,
@@ -664,6 +687,7 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
         &first[0],
         SagaChoreographyEvent::SagaQuarantined { context, .. }
             if context.saga_type.as_ref() == "mature_pool_refresh"
+                && context.saga_started_at_millis == 4_242
     ));
 
     let second = collect_startup_recovery_events_for_saga_type(
@@ -1070,9 +1094,30 @@ fn helper_and_wrapper_apis_cover_default_branches() {
             started_at_millis: 9_900,
         },
     }];
+    // An open forward intent has an unknown outcome and is unsafe at any age.
     assert_eq!(
         classify_recovery(
             &recent_entries,
+            10_000,
+            RecoveryPolicy {
+                stale_after_ms: 500
+            }
+        ),
+        RecoveryDecision::QuarantineStale
+    );
+    // An idle run record is healthy in-flight state however old it is.
+    let idle_entries = vec![JournalEntry {
+        sequence: 3,
+        recorded_at_millis: 1,
+        event: ParticipantEvent::ParticipantRunRecorded {
+            saga_type: "mature_pool_refresh".into(),
+            saga_started_at_millis: 1,
+            recorded_at_millis: 1,
+        },
+    }];
+    assert_eq!(
+        classify_recovery(
+            &idle_entries,
             10_000,
             RecoveryPolicy {
                 stale_after_ms: 500
@@ -1199,6 +1244,16 @@ fn startup_recovery_collectors_cover_default_and_stale_paths() {
     default_journal
         .append(
             default_saga,
+            ParticipantEvent::ParticipantRunRecorded {
+                saga_type: DEFAULT_RECOVERY_SAGA_TYPE.into(),
+                saga_started_at_millis: 55,
+                recorded_at_millis: 55,
+            },
+        )
+        .expect("run record should append");
+    default_journal
+        .append(
+            default_saga,
             ParticipantEvent::Quarantined {
                 reason: panic_quarantine_reason(ActiveSagaExecutionPhase::StepExecution, "boom"),
                 quarantined_at_millis: SagaContext::now_millis(),
@@ -1223,12 +1278,14 @@ fn startup_recovery_collectors_cover_default_and_stale_paths() {
         (mixed_saga_empty, vec![]),
         (
             mixed_saga_continue,
+            // Healthy idle in-flight work: a run record with no open intent.
             vec![JournalEntry {
                 sequence: 1,
                 recorded_at_millis: SagaContext::now_millis(),
-                event: ParticipantEvent::StepExecutionStarted {
-                    attempt: 1,
-                    started_at_millis: SagaContext::now_millis(),
+                event: ParticipantEvent::ParticipantRunRecorded {
+                    saga_type: "mature_pool_refresh".into(),
+                    saga_started_at_millis: SagaContext::now_millis(),
+                    recorded_at_millis: SagaContext::now_millis(),
                 },
             }],
         ),

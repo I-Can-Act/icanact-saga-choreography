@@ -335,12 +335,17 @@ fn recovery_does_not_fold_a_resolved_old_run_into_the_current_run() {
     append(&journal, id, run_recorded("wf_accept", 200));
     append(&journal, id, started_event());
 
+    // The new run holds an open forward intent with unknown outcome, which is unsafe
+    // at any age and must be quarantined visibly. The resolved old run's accepted step
+    // must neither be replayed nor attributed to the new run.
     let events =
         collect_startup_recovery_events_for_saga_type(&journal, &dedupe, "reserve", "wf_accept")
             .unwrap();
     assert!(
-        events.is_empty(),
-        "old run replayed into new run: {events:?}"
+        matches!(events.as_slice(),
+            [SagaChoreographyEvent::SagaQuarantined { context, .. }]
+                if context.saga_started_at_millis == 200),
+        "old run replayed into new run, or the new run's open intent was not quarantined: {events:?}"
     );
 
     let mut support = SagaParticipantSupport::new(journal.clone(), dedupe.clone());

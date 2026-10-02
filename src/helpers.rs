@@ -14,9 +14,9 @@
 use crate::{
     AsyncSagaParticipant, CompensationError, CompensationOutput, DependencySpec,
     EffectDispatchOutcome, EffectDispatchRequest, ParticipantAdmission, ParticipantEvent,
-    ParticipantTerminalKind, RunDedupe, SagaChoreographyEvent, SagaContext, SagaFailureDetails,
-    SagaId, SagaParticipant, SagaParticipantState, SagaStateEntry, SagaStateExt, StepError,
-    StepOutput,
+    ParticipantForwardOutcome, ParticipantTerminalKind, RunDedupe, SagaChoreographyEvent,
+    SagaContext, SagaFailureDetails, SagaId, SagaParticipant, SagaParticipantState, SagaStateEntry,
+    SagaStateExt, StepError, StepOutput,
 };
 
 /// Saga event handler with an explicit emit sink for produced choreography events.
@@ -59,8 +59,10 @@ pub fn handle_saga_event_with_emit<P, F>(
             }
         }
         SagaChoreographyEvent::SagaFailed { ref reason, .. } => {
-            if retain_terminal(participant, &event) {
-                participant.on_saga_failed(&context, reason);
+            match resolve_failed(participant, &event, &who, now, &mut emit) {
+                FailedResolution::Ordinary => participant.on_saga_failed(&context, reason),
+                FailedResolution::Escalated(why) => participant.on_quarantined(&context, &why),
+                FailedResolution::NotRetained => {}
             }
         }
         SagaChoreographyEvent::SagaQuarantined { ref reason, .. } => {
@@ -85,7 +87,8 @@ pub fn handle_saga_event_with_emit<P, F>(
                 context.saga_id,
                 &dependency_spec,
                 &step_ctx.step_name,
-            ) {
+            ) && !forward_already_confirmed(participant, &context)
+            {
                 let next_context = context.next_step(participant.step_name().into());
                 let input = if dependency_spec.prefers_original_saga_input() {
                     saga_input
@@ -158,8 +161,10 @@ pub async fn handle_async_saga_event_with_emit<P, F>(
             }
         }
         SagaChoreographyEvent::SagaFailed { ref reason, .. } => {
-            if retain_terminal(participant, &event) {
-                participant.on_saga_failed(&context, reason);
+            match resolve_failed(participant, &event, &who, now, &mut emit) {
+                FailedResolution::Ordinary => participant.on_saga_failed(&context, reason),
+                FailedResolution::Escalated(why) => participant.on_quarantined(&context, &why),
+                FailedResolution::NotRetained => {}
             }
         }
         SagaChoreographyEvent::SagaQuarantined { ref reason, .. } => {
@@ -185,7 +190,8 @@ pub async fn handle_async_saga_event_with_emit<P, F>(
                 context.saga_id,
                 &dependency_spec,
                 &step_ctx.step_name,
-            ) {
+            ) && !forward_already_confirmed(participant, &context)
+            {
                 let next_context = context.next_step(participant.step_name().into());
                 let input = if dependency_spec.prefers_original_saga_input() {
                     saga_input
@@ -324,7 +330,11 @@ where
                 saga_id = context.saga_id.get(),
                 error = %error
             );
-            if !is_terminal_event(event) {
+            // An unreadable journal cannot prove a failure is ordinary, so a failure
+            // escalates visibly as well; success/quarantine terminals stay idempotent.
+            if !is_terminal_event(event)
+                || matches!(event, SagaChoreographyEvent::SagaFailed { .. })
+            {
                 quarantine_run(
                     actor,
                     who,
@@ -408,6 +418,71 @@ where
     }
 }
 
+/// Outcome of handling an ordinary `SagaFailed` for this participant.
+enum FailedResolution {
+    /// Nothing unresolved: ordinary failure cleanup may run.
+    Ordinary,
+    /// Unresolved intent/effect/undo (or unreadable evidence): quarantined and
+    /// published as `SagaQuarantined`; ordinary failure cleanup must not run.
+    Escalated(Box<str>),
+    /// The tombstone could not be made durable.
+    NotRetained,
+}
+
+/// A failure is ordinary only when the journal shows no open intent, accepted work,
+/// unreversed compensation/effect or undo uncertainty. Otherwise the failure is
+/// escalated to a retained quarantine (evidence, accepted metadata and dedupe stay).
+fn resolve_failed<A, F>(
+    actor: &mut A,
+    event: &SagaChoreographyEvent,
+    who: &Who,
+    now: u64,
+    emit: &mut F,
+) -> FailedResolution
+where
+    A: SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let context = event.context();
+    let reason: Box<str> = match actor.participant_run_evidence_strict(context) {
+        Ok(evidence) if !evidence.failure_requires_quarantine() => {
+            return if retain_terminal(actor, event) {
+                FailedResolution::Ordinary
+            } else {
+                FailedResolution::NotRetained
+            };
+        }
+        Ok(_) => {
+            let SagaChoreographyEvent::SagaFailed { reason, .. } = event else {
+                return FailedResolution::NotRetained;
+            };
+            format!("saga failed ({reason}) with unresolved participant intent/effect/undo").into()
+        }
+        Err(error) => format!("saga failure evidence unavailable: {error}").into(),
+    };
+    quarantine_run(actor, who, context, reason.clone(), now, emit);
+    FailedResolution::Escalated(reason)
+}
+
+/// True when this run already has durably confirmed forward work and no undo
+/// uncertainty, so a repeated dependency firing (e.g. the second AnyOf branch after
+/// a restart cleared volatile tracking) is ignored rather than re-executed or
+/// quarantined. Unconfirmed or unreadable evidence returns false so `begin_step`
+/// fails closed.
+fn forward_already_confirmed<A>(actor: &A, context: &SagaContext) -> bool
+where
+    A: SagaStateExt,
+{
+    actor
+        .participant_run_evidence_strict(context)
+        .is_ok_and(|evidence| {
+            evidence.forward_outcome.is_some()
+                && !evidence.undo_intent_open
+                && !evidence.needs_reconciliation
+                && !evidence.quarantined
+        })
+}
+
 fn dependency_should_fire<A>(
     actor: &mut A,
     saga_id: SagaId,
@@ -473,6 +548,8 @@ struct StepResult {
     output: Vec<u8>,
     compensation_data: Vec<u8>,
     effect: Option<Box<str>>,
+    /// Durable dispatch receipt, set once a declared effect was dispatched.
+    receipt: Option<Box<str>>,
 }
 
 /// Persists forward execution intent, then publishes `StepStarted`. When intent
@@ -547,6 +624,7 @@ fn split_output(output: StepOutput) -> Result<StepResult, AcceptedOutput> {
             output,
             compensation_data,
             effect: None,
+            receipt: None,
         }),
         StepOutput::CompletedWithEffect {
             output,
@@ -556,6 +634,7 @@ fn split_output(output: StepOutput) -> Result<StepResult, AcceptedOutput> {
             output,
             compensation_data,
             effect: Some(effect),
+            receipt: None,
         }),
         StepOutput::Accepted {
             execution_id,
@@ -672,7 +751,11 @@ fn dispatch_failure_reason(error: &crate::EffectDispatchError) -> Box<str> {
     format!("effect dispatch failed: {error}").into()
 }
 
-fn log_dispatch_receipt(context: &SagaContext, effect: &str, outcome: EffectDispatchOutcome) {
+fn log_dispatch_receipt(
+    context: &SagaContext,
+    effect: &str,
+    outcome: EffectDispatchOutcome,
+) -> Box<str> {
     let EffectDispatchOutcome::Durable { receipt } = outcome;
     tracing::debug!(
         target: "core::saga",
@@ -681,23 +764,41 @@ fn log_dispatch_receipt(context: &SagaContext, effect: &str, outcome: EffectDisp
         effect,
         receipt = %receipt
     );
+    receipt
 }
 
-fn emit_step_completed<F>(
+/// Persists the confirmed forward proof (after business and declared-effect success)
+/// and only then publishes the original `StepCompleted`. A failed append quarantines
+/// and publishes no success.
+fn finish_step<A, F>(
+    actor: &mut A,
     who: &Who,
     context: &SagaContext,
     saga_input: Vec<u8>,
     result: StepResult,
+    now: u64,
     emit: &mut F,
-) where
+) -> Result<(), Box<str>>
+where
+    A: SagaStateExt,
     F: FnMut(SagaChoreographyEvent),
 {
-    emit(SagaChoreographyEvent::StepCompleted {
+    let outcome = ParticipantForwardOutcome {
         context: context.next_step(who.step.clone()),
-        compensation_available: !result.compensation_data.is_empty(),
         output: result.output,
         saga_input,
-    });
+        compensation_data: result.compensation_data,
+        effect: result.effect,
+        receipt: result.receipt,
+        recorded_at_millis: now,
+    };
+    if let Err(error) = actor.record_forward_outcome_strict(&outcome) {
+        let reason: Box<str> = format!("forward outcome persistence failed: {error}").into();
+        quarantine_run(actor, who, context, reason.clone(), now, emit);
+        return Err(reason);
+    }
+    emit(outcome.completion_event());
+    Ok(())
 }
 
 /// Evidence-preserving quarantine: state, durable `Quarantined` row, durable terminal
@@ -787,7 +888,7 @@ async fn execute_step_wrapper_with_emit_async<P, F>(
             return;
         }
     };
-    let result = match split_output(output) {
+    let mut result = match split_output(output) {
         Ok(result) => result,
         Err(accepted) => {
             accept_step(participant, &who, &context, input, accepted, now, emit);
@@ -798,24 +899,30 @@ async fn execute_step_wrapper_with_emit_async<P, F>(
         participant.on_quarantined(&context, &reason);
         return;
     }
-    if let Some(effect) = result.effect.as_deref() {
-        let request = EffectDispatchRequest {
-            context: &context,
-            effect,
-            output: &result.output,
-            compensation_data: &result.compensation_data,
-        };
-        match participant.dispatch_effect(&request).await {
-            Ok(outcome) => log_dispatch_receipt(&context, effect, outcome),
-            Err(error) => {
-                let reason = dispatch_failure_reason(&error);
-                quarantine_run(participant, &who, &context, reason.clone(), now, emit);
-                participant.on_quarantined(&context, &reason);
-                return;
+    let receipt = match result.effect.as_deref() {
+        Some(effect) => {
+            let request = EffectDispatchRequest {
+                context: &context,
+                effect,
+                output: &result.output,
+                compensation_data: &result.compensation_data,
+            };
+            match participant.dispatch_effect(&request).await {
+                Ok(outcome) => Some(log_dispatch_receipt(&context, effect, outcome)),
+                Err(error) => {
+                    let reason = dispatch_failure_reason(&error);
+                    quarantine_run(participant, &who, &context, reason.clone(), now, emit);
+                    participant.on_quarantined(&context, &reason);
+                    return;
+                }
             }
         }
+        None => None,
+    };
+    result.receipt = receipt;
+    if let Err(reason) = finish_step(participant, &who, &context, input, result, now, emit) {
+        participant.on_quarantined(&context, &reason);
     }
-    emit_step_completed(&who, &context, input, result, emit);
 }
 
 fn execute_step_wrapper_with_emit<P, F>(
@@ -839,7 +946,7 @@ fn execute_step_wrapper_with_emit<P, F>(
             return;
         }
     };
-    let result = match split_output(output) {
+    let mut result = match split_output(output) {
         Ok(result) => result,
         Err(accepted) => {
             accept_step(participant, &who, &context, input, accepted, now, emit);
@@ -850,24 +957,30 @@ fn execute_step_wrapper_with_emit<P, F>(
         participant.on_quarantined(&context, &reason);
         return;
     }
-    if let Some(effect) = result.effect.as_deref() {
-        let request = EffectDispatchRequest {
-            context: &context,
-            effect,
-            output: &result.output,
-            compensation_data: &result.compensation_data,
-        };
-        match participant.dispatch_effect(&request) {
-            Ok(outcome) => log_dispatch_receipt(&context, effect, outcome),
-            Err(error) => {
-                let reason = dispatch_failure_reason(&error);
-                quarantine_run(participant, &who, &context, reason.clone(), now, emit);
-                participant.on_quarantined(&context, &reason);
-                return;
+    let receipt = match result.effect.as_deref() {
+        Some(effect) => {
+            let request = EffectDispatchRequest {
+                context: &context,
+                effect,
+                output: &result.output,
+                compensation_data: &result.compensation_data,
+            };
+            match participant.dispatch_effect(&request) {
+                Ok(outcome) => Some(log_dispatch_receipt(&context, effect, outcome)),
+                Err(error) => {
+                    let reason = dispatch_failure_reason(&error);
+                    quarantine_run(participant, &who, &context, reason.clone(), now, emit);
+                    participant.on_quarantined(&context, &reason);
+                    return;
+                }
             }
         }
+        None => None,
+    };
+    result.receipt = receipt;
+    if let Err(reason) = finish_step(participant, &who, &context, input, result, now, emit) {
+        participant.on_quarantined(&context, &reason);
     }
-    emit_step_completed(&who, &context, input, result, emit);
 }
 
 /// Fail a step with state transition. A failure is conservative, so a lost failure
@@ -933,7 +1046,109 @@ enum CompensationStart {
         compensation_data: Vec<u8>,
     },
     Skip,
+    /// The undo already completed durably; only its acknowledgement is resent.
+    Acknowledge,
     Quarantined(Box<str>),
+}
+
+/// Journal-derived answer for an undo request when no usable in-memory state exists.
+enum UndoRecovery {
+    /// Confirmed forward work: completed state rebuilt; carries its undo data.
+    Rebuilt(Vec<u8>),
+    Acknowledge,
+    /// No forward work or undo obligation exists for this participant.
+    Nothing,
+    Unsafe(Box<str>),
+}
+
+/// Rebuilds completed state on demand from durable, confirmed forward proof. Never
+/// re-executes forward work and never guesses: open/unconfirmed intent, accepted
+/// work, undo uncertainty or late forward evidence after an undo are `Unsafe`.
+fn recover_for_undo<A>(actor: &mut A, who: &Who, context: &SagaContext, now: u64) -> UndoRecovery
+where
+    A: SagaStateExt,
+{
+    let evidence = match actor.participant_run_evidence_strict(context) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return UndoRecovery::Unsafe(
+                format!("undo recovery evidence unavailable: {error}").into(),
+            );
+        }
+    };
+    if evidence.quarantined {
+        return UndoRecovery::Nothing;
+    }
+    if evidence.undo_completed && !evidence.needs_reconciliation && !evidence.undo_intent_open {
+        let state = SagaParticipantState::new(
+            context.saga_id,
+            context.saga_type.clone(),
+            who.step.clone(),
+            context.correlation_id,
+            context.trace_id,
+            context.initiator_peer_id,
+            context.saga_started_at_millis,
+        )
+        .trigger("undo_recovered", now)
+        .start_execution(now)
+        .complete(evidence.output, evidence.compensation_data, now)
+        .start_compensation(now)
+        .complete_compensation(now);
+        actor
+            .saga_states()
+            .insert(context.saga_id, SagaStateEntry::Compensated(state));
+        return UndoRecovery::Acknowledge;
+    }
+    if evidence.needs_reconciliation {
+        return UndoRecovery::Unsafe(
+            "undo requested but the run has unreconciled or late forward evidence".into(),
+        );
+    }
+    if evidence.undo_intent_open {
+        return UndoRecovery::Unsafe(
+            "undo intent has no durable completion; its effect is uncertain".into(),
+        );
+    }
+    if evidence.forward_intent_open
+        || evidence.accepted_forward_pending
+        || (evidence.forward_result_recorded && evidence.forward_outcome.is_none())
+    {
+        return UndoRecovery::Unsafe(
+            "undo requested but forward work is unconfirmed; reconciliation required".into(),
+        );
+    }
+    let Some(outcome) = evidence.forward_outcome else {
+        return UndoRecovery::Nothing;
+    };
+    let completed = SagaParticipantState::new(
+        context.saga_id,
+        context.saga_type.clone(),
+        who.step.clone(),
+        context.correlation_id,
+        context.trace_id,
+        context.initiator_peer_id,
+        context.saga_started_at_millis,
+    )
+    .trigger("recovered_forward_outcome", now)
+    .start_execution(outcome.recorded_at_millis)
+    .complete(
+        outcome.output,
+        outcome.compensation_data.clone(),
+        outcome.recorded_at_millis,
+    );
+    actor
+        .saga_states()
+        .insert(context.saga_id, SagaStateEntry::Completed(completed));
+    UndoRecovery::Rebuilt(outcome.compensation_data)
+}
+
+fn resend_compensation_ack<F>(who: &Who, context: &SagaContext, emit: &mut F)
+where
+    F: FnMut(SagaChoreographyEvent),
+{
+    emit(SagaChoreographyEvent::CompensationCompleted {
+        context: context.next_step(who.step.clone()),
+    });
 }
 
 /// Persists the rollback request and the undo intent *before* the undo effect, then
@@ -968,20 +1183,37 @@ where
         return CompensationStart::Quarantined(reason);
     }
 
-    let (saga_input, compensation_data) = match actor.saga_states_ref().get(&saga_id) {
+    let local = match actor.saga_states_ref().get(&saga_id) {
         Some(SagaStateEntry::Completed(state)) => {
-            (Vec::new(), state.state.compensation_data.clone())
+            Some((Vec::new(), state.state.compensation_data.clone()))
         }
-        Some(SagaStateEntry::Executing(_)) => {
-            match actor.saga_support().accepted_workflow_steps.get(&saga_id) {
-                Some(accepted) => (
+        Some(SagaStateEntry::Executing(_)) => actor
+            .saga_support()
+            .accepted_workflow_steps
+            .get(&saga_id)
+            .map(|accepted| {
+                (
                     accepted.saga_input.clone(),
                     accepted.compensation_data.clone(),
-                ),
-                None => return CompensationStart::Skip,
-            }
+                )
+            }),
+        // An undo is already in flight (or the run is quarantined): this is a repeat.
+        Some(SagaStateEntry::Compensating(_) | SagaStateEntry::Quarantined(_)) => {
+            return CompensationStart::Skip;
         }
-        _ => return CompensationStart::Skip,
+        _ => None,
+    };
+    let (saga_input, compensation_data) = match local {
+        Some(local) => local,
+        None => match recover_for_undo(actor, who, context, now) {
+            UndoRecovery::Rebuilt(data) => (Vec::new(), data),
+            UndoRecovery::Acknowledge => return CompensationStart::Acknowledge,
+            UndoRecovery::Nothing => return CompensationStart::Skip,
+            UndoRecovery::Unsafe(reason) => {
+                quarantine_run(actor, who, context, reason.clone(), now, emit);
+                return CompensationStart::Quarantined(reason);
+            }
+        },
     };
 
     if let Err(error) = actor.record_event_strict(
@@ -1039,6 +1271,10 @@ async fn compensate_wrapper_with_emit_async<P, F>(
                 compensation_data,
             } => (saga_input, compensation_data),
             CompensationStart::Skip => return,
+            CompensationStart::Acknowledge => {
+                resend_compensation_ack(&who, context, emit);
+                return;
+            }
             CompensationStart::Quarantined(reason) => {
                 participant.on_quarantined(context, &reason);
                 return;
@@ -1109,6 +1345,10 @@ fn compensate_wrapper_with_emit<P, F>(
                 compensation_data,
             } => (saga_input, compensation_data),
             CompensationStart::Skip => return,
+            CompensationStart::Acknowledge => {
+                resend_compensation_ack(&who, context, emit);
+                return;
+            }
             CompensationStart::Quarantined(reason) => {
                 participant.on_quarantined(context, &reason);
                 return;
@@ -1433,8 +1673,12 @@ mod tests {
                         ..
                     },
                     ..
+                },
+                crate::JournalEntry {
+                    event: ParticipantEvent::ParticipantForwardOutcomeRecorded { outcome },
+                    ..
                 }
-            ] if compensation_data == &[9]
+            ] if compensation_data == &[9] && outcome.compensation_data == [9]
         ));
     }
 

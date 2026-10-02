@@ -75,7 +75,8 @@ binding is live, so recovered compensation requests cannot be lost during startu
 
 Startup order is: attach resolver -> bind/hydrate participants -> activate recovery -> accept
 new starts. Terminal and quarantine state is durably fenced so restarts do not repeat
-terminal effects; rollback is serialized in reverse order; effect dispatch is explicit and
+managed terminal ingress side effects (managed ingress fences stale or replayed
+terminal side-effect hooks; arbitrary application hooks must still be idempotent); rollback is serialized in reverse order; effect dispatch is explicit and
 fails closed by default; terminal retention needs capacity/compaction maintenance
 (quarantines are never auto-pruned). The library does not promise exactly-once effects:
 use stable external idempotency keys and reconciliation. See
@@ -98,3 +99,4 @@ use stable external idempotency keys and reconciliation. See
 - [docs/integration_guide.md](docs/integration_guide.md)
 - [docs/architecture.md](docs/architecture.md)
 - [docs/operations.md](docs/operations.md)
+- [docs/migration.md](docs/migration.md) (breaking changes and release prerequisites)

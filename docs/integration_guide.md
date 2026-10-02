@@ -184,7 +184,7 @@ publish new `SagaStarted`. `CompletedWithEffect` participants must implement `di
 on `SagaParticipant`, `AsyncSagaParticipant` or `SagaWorkflowParticipant` (the default
 returns `Unsupported` and quarantines). Plain `Completed` needs no hook. Use a stable external
 idempotency key per step (reused across retries and restarts) and reconcile in-flight steps on
-recovery; no exactly-once guarantee is provided. Schedule capacity/compaction maintenance and
+recovery; no exactly-once guarantee is provided. Application hooks must be idempotent (managed ingress fences stale/replayed terminal side-effect hooks). Upgrading from the baseline is breaking: see [migration.md](migration.md). Schedule capacity/compaction maintenance and
 resolve quarantines administratively (never auto-pruned). See [operations.md](operations.md).
 
 ## Event Flow
@@ -316,7 +316,7 @@ actor.shutdown();
 
 ## Recovery
 
-On startup or restart, enumerate participant journal state through your durability layer and decide how your application should resume or reconcile non-terminal workflows. Terminal and quarantine fences are durable, so replayed events for finished sagas are ignored; rollback runs serialized in reverse order. Follow [operations.md](operations.md).
+On startup or restart, enumerate participant journal state through your durability layer and decide how your application should resume or reconcile non-terminal workflows. Terminal and quarantine fences are durable, so managed ingress rejects replayed events for finished sagas (application hooks must still be idempotent); rollback runs serialized in reverse order. Follow [operations.md](operations.md).
 
 ## Timeout Model
 

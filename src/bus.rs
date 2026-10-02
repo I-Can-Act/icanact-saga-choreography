@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -25,11 +25,52 @@ struct WorkflowContractState {
     required_path_description: Box<str>,
 }
 
+/// An id-scoped waiter: bound to the first run admitted after it registered;
+/// until then only a run that began after registration may resolve it.
+#[derive(Clone, Debug)]
+struct LegacyWaiter {
+    registered_at_millis: u64,
+    bound_run: Option<RunKey>,
+}
+
+impl LegacyWaiter {
+    fn accepts(&self, context: &SagaContext) -> bool {
+        match &self.bound_run {
+            Some(bound) => *bound == RunKey::of(context),
+            None => context.saga_started_at_millis >= self.registered_at_millis,
+        }
+    }
+}
+
+/// Identity of one saga run. Waiters and outcomes are scoped by it so an
+/// earlier run's terminal can never satisfy a later run that reuses the id.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct RunKey {
+    saga_type: Box<str>,
+    saga_id: SagaId,
+    started_at_millis: u64,
+}
+
+impl RunKey {
+    fn of(context: &SagaContext) -> Self {
+        Self {
+            saga_type: context.saga_type.clone(),
+            saga_id: context.saga_id,
+            started_at_millis: context.saga_started_at_millis,
+        }
+    }
+}
+
 #[derive(Default)]
 struct BusStateActor {
-    terminal_replies: HashMap<SagaId, SagaReplyTo>,
-    terminal_outcomes: HashMap<SagaId, SagaTerminalOutcome>,
-    terminal_order: VecDeque<SagaId>,
+    terminal_replies: HashMap<RunKey, SagaReplyTo>,
+    terminal_outcomes: HashMap<RunKey, SagaTerminalOutcome>,
+    terminal_order: VecDeque<RunKey>,
+    /// Bounded cache tombstones survive consumption: repeated publication cannot
+    /// recreate an already-taken ordinary result; quarantine may still escalate it.
+    terminal_strengths: HashMap<RunKey, bool>,
+    /// Newest admitted/stored run per saga id, for the saga-id compatibility API.
+    latest_run_by_id: HashMap<SagaId, RunKey>,
     terminal_policies_by_saga_type: HashMap<Box<str>, Box<str>>,
     workflow_contracts_by_saga_type: HashMap<Box<str>, WorkflowContractState>,
     bound_steps_by_saga_type: HashMap<Box<str>, HashSet<Box<str>>>,
@@ -68,20 +109,30 @@ enum BusStateAsk {
     SagaStartExpectedMinDelivery {
         saga_type: Box<str>,
     },
+    NoteAdmittedRun {
+        run: RunKey,
+    },
     StoreTerminalReply {
-        saga_id: SagaId,
+        run: RunKey,
         reply: SagaReplyTo,
         retention_limit: usize,
     },
     StoreTerminalOutcome {
-        saga_id: SagaId,
+        run: RunKey,
         outcome: SagaTerminalOutcome,
         retention_limit: usize,
     },
     TakeTerminalReply {
-        saga_id: SagaId,
+        run: RunKey,
     },
     TakeTerminalOutcome {
+        run: RunKey,
+    },
+    /// Saga-id compatibility: the newest stored run for the id.
+    TakeLatestTerminalReply {
+        saga_id: SagaId,
+    },
+    TakeLatestTerminalOutcome {
         saga_id: SagaId,
     },
 }
@@ -99,26 +150,68 @@ enum BusStateReply {
 }
 
 impl BusStateActor {
+    /// Records the newest run per id; an older run never displaces a newer one.
+    fn note_latest(&mut self, run: &RunKey) {
+        match self.latest_run_by_id.get(&run.saga_id) {
+            Some(current)
+                if current.started_at_millis > run.started_at_millis
+                    || (current.started_at_millis == run.started_at_millis && current != run) => {}
+            _ => {
+                self.latest_run_by_id.insert(run.saga_id, run.clone());
+            }
+        }
+    }
+
     fn insert_terminal_outcome(
         &mut self,
-        saga_id: SagaId,
+        run: RunKey,
         outcome: SagaTerminalOutcome,
         retention_limit: usize,
-    ) {
-        let inserted_new = self.terminal_outcomes.insert(saga_id, outcome).is_none();
+    ) -> Option<SagaTerminalOutcome> {
+        let quarantine = matches!(outcome, SagaTerminalOutcome::Quarantined { .. });
+        if let Some(was_quarantined) = self.terminal_strengths.get(&run)
+            && (*was_quarantined || !quarantine)
+        {
+            return self.terminal_outcomes.get(&run).cloned();
+        }
+        self.note_latest(&run);
+        let inserted_new = self
+            .terminal_strengths
+            .insert(run.clone(), quarantine)
+            .is_none();
+        self.terminal_outcomes.insert(run.clone(), outcome.clone());
         if inserted_new {
-            self.terminal_order.push_back(saga_id);
+            self.terminal_order.push_back(run.clone());
         }
         while self.terminal_order.len() > retention_limit {
             let Some(candidate) = self.terminal_order.pop_front() else {
                 break;
             };
-            if candidate != saga_id {
+            if candidate != run {
                 self.terminal_outcomes.remove(&candidate);
                 self.terminal_replies.remove(&candidate);
+                self.terminal_strengths.remove(&candidate);
+                if self.latest_run_by_id.get(&candidate.saga_id) == Some(&candidate) {
+                    self.latest_run_by_id.remove(&candidate.saga_id);
+                }
                 break;
             }
         }
+        Some(outcome)
+    }
+
+    fn take_reply(&mut self, run: &RunKey) -> Option<SagaReplyTo> {
+        let reply = self.terminal_replies.remove(run);
+        if reply.is_some() {
+            self.terminal_outcomes.remove(run);
+        }
+        reply
+    }
+
+    fn take_outcome(&mut self, run: &RunKey) -> Option<SagaTerminalOutcome> {
+        let reply = self.terminal_replies.remove(run).map(|reply| reply.outcome);
+        let direct = self.terminal_outcomes.remove(run);
+        reply.or(direct)
     }
 }
 
@@ -211,38 +304,51 @@ impl SyncActor for BusStateActor {
                     });
                 BusStateReply::OptionalU32(expected)
             }
-            BusStateAsk::StoreTerminalReply {
-                saga_id,
-                reply,
-                retention_limit,
-            } => {
-                let outcome = reply.outcome.clone();
-                self.terminal_replies.insert(saga_id, reply);
-                self.insert_terminal_outcome(saga_id, outcome, retention_limit);
+            BusStateAsk::NoteAdmittedRun { run } => {
+                self.latest_run_by_id.insert(run.saga_id, run);
                 BusStateReply::Unit
             }
+            BusStateAsk::StoreTerminalReply {
+                run,
+                mut reply,
+                retention_limit,
+            } => {
+                match self.insert_terminal_outcome(
+                    run.clone(),
+                    reply.outcome.clone(),
+                    retention_limit,
+                ) {
+                    Some(outcome) => {
+                        reply.outcome = outcome;
+                        self.terminal_replies.insert(run, reply.clone());
+                        BusStateReply::TerminalReply(Some(reply))
+                    }
+                    None => BusStateReply::TerminalReply(None),
+                }
+            }
             BusStateAsk::StoreTerminalOutcome {
-                saga_id,
+                run,
                 outcome,
                 retention_limit,
             } => {
-                self.insert_terminal_outcome(saga_id, outcome, retention_limit);
+                self.insert_terminal_outcome(run, outcome, retention_limit);
                 BusStateReply::Unit
             }
-            BusStateAsk::TakeTerminalReply { saga_id } => {
-                let reply = self.terminal_replies.remove(&saga_id);
-                if reply.is_some() {
-                    self.terminal_outcomes.remove(&saga_id);
-                }
+            BusStateAsk::TakeTerminalReply { run } => {
+                BusStateReply::TerminalReply(self.take_reply(&run))
+            }
+            BusStateAsk::TakeTerminalOutcome { run } => {
+                BusStateReply::TerminalOutcome(self.take_outcome(&run))
+            }
+            BusStateAsk::TakeLatestTerminalReply { saga_id } => {
+                let run = self.latest_run_by_id.get(&saga_id).cloned();
+                let reply = run.as_ref().and_then(|run| self.take_reply(run));
                 BusStateReply::TerminalReply(reply)
             }
-            BusStateAsk::TakeTerminalOutcome { saga_id } => {
-                let reply = self
-                    .terminal_replies
-                    .remove(&saga_id)
-                    .map(|reply| reply.outcome);
-                let direct = self.terminal_outcomes.remove(&saga_id);
-                BusStateReply::TerminalOutcome(reply.or(direct))
+            BusStateAsk::TakeLatestTerminalOutcome { saga_id } => {
+                let run = self.latest_run_by_id.get(&saga_id).cloned();
+                let outcome = run.as_ref().and_then(|run| self.take_outcome(run));
+                BusStateReply::TerminalOutcome(outcome)
             }
         }
     }
@@ -255,6 +361,264 @@ impl SyncActor for BusStateActor {
 struct ResolverGate {
     journal: Option<Arc<dyn TerminalResolverJournal>>,
     activated: AtomicBool,
+    /// Durable run index, built once from the journal at attach and kept
+    /// current from admitted/ingested events. Serializes start admission.
+    admission: Mutex<AdmissionIndex>,
+}
+
+/// Lifecycle phase of one run as known from retained durable history.
+/// Ordered by strength: a phase never weakens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum RunPhase {
+    Active,
+    Terminal,
+    Quarantined,
+}
+
+/// What the resolver does with a non-start event, given durable history.
+#[derive(Debug, PartialEq, Eq)]
+enum Fence {
+    /// Unknown or active run: the resolver handles it normally.
+    Pass,
+    /// Ordinarily resolved run: stale replay, no journal, no output.
+    Drop,
+    /// Quarantined run (or a quarantine of a resolved run): keep the evidence
+    /// but never feed a resolver whose cache may have been evicted.
+    RetainOnly,
+    /// New compensable effect after an ordinary terminal: retain it and escalate.
+    Escalate,
+}
+
+/// Why a start was refused, and which waiters the refusal may fail.
+struct Refusal {
+    reason: Box<str>,
+    /// The refused run is not an admitted run, so its own waiter may fail.
+    reject_run_waiter: bool,
+    /// No run of the id is open, so an id-scoped waiter cannot belong to an owner.
+    reject_id_waiter: bool,
+}
+
+#[derive(Default)]
+struct AdmissionIndex {
+    runs: HashMap<SagaId, Vec<(u64, RunPhase)>>,
+    /// Starts whose admission intent is already journaled; the resolver must not
+    /// append them a second time when the fanned-out event reaches it.
+    prejournaled: HashSet<(SagaId, u64)>,
+    completed_forward: HashSet<(SagaId, u64, Box<str>, u64)>,
+    accepted_forward: HashSet<(SagaId, u64, Box<str>, crate::StepExecutionId)>,
+}
+
+impl AdmissionIndex {
+    fn from_events<'a>(events: impl Iterator<Item = &'a SagaChoreographyEvent>) -> Self {
+        let mut index = Self::default();
+        for event in events {
+            index.observe(event);
+        }
+        index
+    }
+
+    fn phase(&self, context: &SagaContext) -> Option<RunPhase> {
+        self.runs
+            .get(&context.saga_id)?
+            .iter()
+            .find(|(started, _)| *started == context.saga_started_at_millis)
+            .map(|(_, phase)| *phase)
+    }
+
+    fn raise(&mut self, saga_id: SagaId, started: u64, phase: RunPhase) {
+        let runs = self.runs.entry(saga_id).or_default();
+        match runs.iter_mut().find(|(run, _)| *run == started) {
+            Some((_, current)) => *current = (*current).max(phase),
+            None => runs.push((started, phase)),
+        }
+    }
+
+    fn observe(&mut self, event: &SagaChoreographyEvent) {
+        let context = event.context();
+        match event {
+            SagaChoreographyEvent::StepCompleted { .. } => {
+                self.completed_forward.insert((
+                    context.saga_id,
+                    context.saga_started_at_millis,
+                    context.step_name.clone(),
+                    context.trace_id,
+                ));
+            }
+            SagaChoreographyEvent::StepAccepted { execution_id, .. } => {
+                self.accepted_forward.insert((
+                    context.saga_id,
+                    context.saga_started_at_millis,
+                    context.step_name.clone(),
+                    execution_id.clone(),
+                ));
+            }
+            _ => {}
+        }
+        let phase = match event {
+            SagaChoreographyEvent::SagaCompleted { .. }
+            | SagaChoreographyEvent::SagaFailed { .. } => RunPhase::Terminal,
+            SagaChoreographyEvent::SagaQuarantined { .. } => RunPhase::Quarantined,
+            _ => RunPhase::Active,
+        };
+        self.raise(context.saga_id, context.saga_started_at_millis, phase);
+    }
+
+    fn has_open_run(&self, saga_id: SagaId) -> bool {
+        self.runs.get(&saga_id).is_some_and(|runs| {
+            runs.iter()
+                .any(|(_, phase)| matches!(phase, RunPhase::Active | RunPhase::Quarantined))
+        })
+    }
+
+    /// Replay, quarantine and active-ownership rules for a new start.
+    fn start_refusal(&self, start: &SagaContext) -> Option<String> {
+        let runs = self.runs.get(&start.saga_id)?;
+        if runs
+            .iter()
+            .any(|(_, phase)| *phase == RunPhase::Quarantined)
+        {
+            return Some(format!(
+                "saga id is quarantined and unresolved; saga_id={}",
+                start.saga_id.get()
+            ));
+        }
+        if runs.iter().any(|(started, phase)| {
+            *phase == RunPhase::Terminal && *started >= start.saga_started_at_millis
+        }) {
+            return Some(format!(
+                "terminal saga run replay; saga_id={} run_started_at_millis={}",
+                start.saga_id.get(),
+                start.saga_started_at_millis
+            ));
+        }
+        if runs.iter().any(|(started, phase)| {
+            *phase == RunPhase::Active && *started != start.saga_started_at_millis
+        }) {
+            return Some(format!(
+                "saga id has an unresolved active run; saga_id={}",
+                start.saga_id.get()
+            ));
+        }
+        if self.phase(start).is_some() {
+            return Some(format!(
+                "saga run was already admitted; saga_id={} run_started_at_millis={}",
+                start.saga_id.get(),
+                start.saga_started_at_millis
+            ));
+        }
+        None
+    }
+
+    fn has_successor(&self, context: &SagaContext) -> bool {
+        self.runs.get(&context.saga_id).is_some_and(|runs| {
+            runs.iter().any(|(started, phase)| {
+                *started != context.saga_started_at_millis && *phase != RunPhase::Quarantined
+            })
+        })
+    }
+
+    fn fence(&self, event: &SagaChoreographyEvent) -> Fence {
+        let context = event.context();
+        match self.phase(context) {
+            None | Some(RunPhase::Active) => Fence::Pass,
+            Some(RunPhase::Quarantined) => Fence::RetainOnly,
+            Some(RunPhase::Terminal) => match event {
+                SagaChoreographyEvent::SagaQuarantined { .. } => Fence::RetainOnly,
+                SagaChoreographyEvent::StepCompleted {
+                    compensation_available: true,
+                    ..
+                } if !self.completed_forward.contains(&(
+                    context.saga_id,
+                    context.saga_started_at_millis,
+                    context.step_name.clone(),
+                    context.trace_id,
+                )) =>
+                {
+                    Fence::Escalate
+                }
+                SagaChoreographyEvent::StepAccepted { execution_id, .. }
+                    if !self.accepted_forward.contains(&(
+                        context.saga_id,
+                        context.saga_started_at_millis,
+                        context.step_name.clone(),
+                        execution_id.clone(),
+                    )) =>
+                {
+                    Fence::Escalate
+                }
+                _ => Fence::Drop,
+            },
+        }
+    }
+}
+
+impl ResolverGate {
+    fn index(&self) -> std::sync::MutexGuard<'_, AdmissionIndex> {
+        // The index only ever grows monotonically, so a poisoned guard is still
+        // a safe (conservative) view for the resolver actor.
+        self.admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Serialized start admission: check, journal the intent strictly, then
+    /// reserve the run. Nothing is fanned out unless this returns `Ok`.
+    fn admit_start(
+        &self,
+        event: &SagaChoreographyEvent,
+        context: &SagaContext,
+    ) -> Result<(), Refusal> {
+        if !self.activated.load(Ordering::Acquire) {
+            return Err(Refusal {
+                reason: format!(
+                    "terminal resolver recovery is not activated; saga_type={} saga_id={}",
+                    context.saga_type,
+                    context.saga_id.get()
+                )
+                .into(),
+                reject_run_waiter: true,
+                reject_id_waiter: false,
+            });
+        }
+        let Ok(mut index) = self.admission.lock() else {
+            return Err(Refusal {
+                reason: "terminal resolver admission index unavailable".into(),
+                reject_run_waiter: true,
+                reject_id_waiter: false,
+            });
+        };
+        if let Some(reason) = index.start_refusal(context) {
+            return Err(Refusal {
+                reason: reason.into(),
+                reject_run_waiter: index.phase(context).is_none(),
+                reject_id_waiter: !index.has_open_run(context.saga_id),
+            });
+        }
+        if let Some(journal) = &self.journal
+            && let Err(error) = journal.append(event.clone())
+        {
+            return Err(Refusal {
+                reason: format!(
+                    "terminal resolver could not journal start admission; saga_id={}: {error}",
+                    context.saga_id.get()
+                )
+                .into(),
+                reject_run_waiter: true,
+                reject_id_waiter: false,
+            });
+        }
+        index.raise(
+            context.saga_id,
+            context.saga_started_at_millis,
+            RunPhase::Active,
+        );
+        if self.journal.is_some() {
+            index
+                .prejournaled
+                .insert((context.saga_id, context.saga_started_at_millis));
+        }
+        Ok(())
+    }
 }
 
 struct TerminalResolverRuntime {
@@ -370,7 +734,7 @@ struct TerminalResolverActor {
     /// activation so watchdog and ingress recovery cannot precede binding.
     held_events: Vec<SagaChoreographyEvent>,
     activated: bool,
-    journal: Option<Arc<dyn TerminalResolverJournal>>,
+    gate: Arc<ResolverGate>,
     bus: SagaChoreographyBus,
     responder: Arc<str>,
     saga_type: Box<str>,
@@ -398,6 +762,40 @@ impl TerminalResolverActor {
     }
 }
 
+impl TerminalResolverActor {
+    /// Journals evidence for a fenced run without involving the resolver.
+    fn retain_evidence(&mut self, event: &SagaChoreographyEvent) {
+        if let Some(journal) = &self.gate.journal
+            && let Err(error) = journal.append(event.clone())
+        {
+            tracing::error!(target: "core::saga", event = "terminal_resolver_evidence_append_failed",
+                saga_type = self.saga_type.as_ref(), saga_id = %event.context().saga_id, error = ?error);
+        }
+        // Storage failure cannot weaken the live fence; restart reconciliation
+        // still requires a writable journal/application-owned durable evidence.
+        self.gate.index().observe(event);
+    }
+
+    /// A compensable effect materialised after an ordinary terminal. The
+    /// evidence is retained and the run escalates to quarantine. The index is
+    /// raised first so a second queued late effect cannot escalate twice.
+    fn escalate_late_effect(&mut self, event: &SagaChoreographyEvent) {
+        let context = event.context();
+        self.retain_evidence(event);
+        self.gate.index().raise(
+            context.saga_id,
+            context.saga_started_at_millis,
+            RunPhase::Quarantined,
+        );
+        self.publish_terminal_events(vec![SagaChoreographyEvent::SagaQuarantined {
+            context: context.next_step(TERMINAL_RESOLVER_STEP.into()),
+            reason: "a compensable effect materialised after the saga resolved".into(),
+            step: context.step_name.clone(),
+            participant_id: "unknown".into(),
+        }]);
+    }
+}
+
 impl SyncActor for TerminalResolverActor {
     type Contract = local_sync::contract::TellOnly;
     type Tell = TerminalResolverTell;
@@ -410,7 +808,47 @@ impl SyncActor for TerminalResolverActor {
     fn handle_tell(&mut self, msg: Self::Tell) {
         let terminal_events = match msg {
             TerminalResolverTell::Ingest(event) => {
-                if let Some(journal) = &self.journal
+                {
+                    let fence = self.gate.index().fence(&event);
+                    match fence {
+                        Fence::Pass => {}
+                        Fence::Drop => {
+                            tracing::warn!(
+                                target: "core::saga",
+                                event = "terminal_resolver_fenced_stale_event",
+                                saga_type = self.saga_type.as_ref(),
+                                saga_id = %event.context().saga_id,
+                                event_type = event.event_type()
+                            );
+                            return;
+                        }
+                        Fence::RetainOnly => {
+                            // Older-run uncertainty also fences an active successor.
+                            // Do not bypass the resolver's cross-run quarantine rule.
+                            let fence_successor =
+                                matches!(*event, SagaChoreographyEvent::SagaQuarantined { .. })
+                                    && self.gate.index().has_successor(event.context());
+                            self.retain_evidence(&event);
+                            if fence_successor {
+                                let terminal_events = self.resolver.ingest(&event);
+                                self.publish_terminal_events(terminal_events);
+                            }
+                            return;
+                        }
+                        Fence::Escalate => {
+                            self.escalate_late_effect(&event);
+                            return;
+                        }
+                    }
+                }
+                let already_journaled = matches!(*event, SagaChoreographyEvent::SagaStarted { .. })
+                    && self.gate.journal.is_some()
+                    && self.gate.index().prejournaled.remove(&(
+                        event.context().saga_id,
+                        event.context().saga_started_at_millis,
+                    ));
+                if !already_journaled
+                    && let Some(journal) = &self.gate.journal
                     && let Err(error) = journal.append((*event).clone())
                 {
                     tracing::error!(
@@ -434,6 +872,9 @@ impl SyncActor for TerminalResolverActor {
                     }
                     return;
                 }
+                if !already_journaled {
+                    self.gate.index().observe(&event);
+                }
                 self.resolver.ingest(&event)
             }
             TerminalResolverTell::ActivateRecovery => {
@@ -451,7 +892,13 @@ impl SyncActor for TerminalResolverActor {
 
 pub struct SagaChoreographyBus {
     bus: FirehosePubSub<SagaChoreographyEvent>,
+    /// Saga-id compatibility waiters; see `legacy_waiter_floors`.
     pending_replies: CorrelationRegistry<SagaId, SagaReplyToResult>,
+    /// Run-scoped waiters keyed by saga type, id and start time.
+    pending_run_replies: CorrelationRegistry<RunKey, SagaReplyToResult>,
+    /// Binding of id-scoped waiters to a run, so a terminal of any other run
+    /// cannot satisfy them.
+    legacy_waiter_floors: Arc<Mutex<HashMap<SagaId, LegacyWaiter>>>,
     state_ref: local_sync::SyncActorRef<BusStateActor>,
     terminal_resolver_registry_ref: local_sync::SyncActorRef<TerminalResolverRegistryActor>,
     // Public clones own shutdown; internal resolver clones must not create a
@@ -461,6 +908,7 @@ pub struct SagaChoreographyBus {
 
 struct BusActorLifecycle {
     pending_replies: CorrelationRegistry<SagaId, SagaReplyToResult>,
+    pending_run_replies: CorrelationRegistry<RunKey, SagaReplyToResult>,
     state_handle: Option<local_sync::ActorHandle>,
     terminal_resolver_registry_ref: local_sync::SyncActorRef<TerminalResolverRegistryActor>,
     terminal_resolver_registry_handle: Option<local_sync::ActorHandle>,
@@ -479,6 +927,9 @@ impl Drop for BusActorLifecycle {
         }
 
         for (_, reply) in self.pending_replies.drain() {
+            let _ = reply.reply(Err("saga bus dropped".to_string()));
+        }
+        for (_, reply) in self.pending_run_replies.drain() {
             let _ = reply.reply(Err("saga bus dropped".to_string()));
         }
     }
@@ -558,8 +1009,10 @@ impl SagaChoreographyBus {
         let (terminal_resolver_registry_ref, terminal_resolver_registry_handle) =
             local_sync::spawn(TerminalResolverRegistryActor::default());
         let pending_replies = CorrelationRegistry::new();
+        let pending_run_replies = CorrelationRegistry::new();
         let lifecycle = Arc::new(BusActorLifecycle {
             pending_replies: pending_replies.clone(),
+            pending_run_replies: pending_run_replies.clone(),
             state_handle: Some(state_handle),
             terminal_resolver_registry_ref: terminal_resolver_registry_ref.clone(),
             terminal_resolver_registry_handle: Some(terminal_resolver_registry_handle),
@@ -567,6 +1020,8 @@ impl SagaChoreographyBus {
         Self {
             bus: FirehosePubSub::new(),
             pending_replies,
+            pending_run_replies,
+            legacy_waiter_floors: Arc::default(),
             state_ref,
             terminal_resolver_registry_ref,
             _lifecycle: Some(lifecycle),
@@ -622,12 +1077,28 @@ impl SagaChoreographyBus {
         if let SagaChoreographyEvent::SagaStarted { context, .. } = &event {
             // Durable ownership precedes contract diagnostics: never overwrite
             // retained quarantine or active history with a fabricated failure.
-            if let Some(reason) = self.start_recovery_rejection(context) {
+            // Serialized: the intent is journaled and the run reserved before
+            // any fanout, so concurrent or back-to-back starts cannot both win.
+            if let Err(refusal) = self.admit_start(&event, context) {
                 tracing::error!(target: "core::saga", event = "saga_start_admission_rejected",
-                    saga_type = context.saga_type.as_ref(), saga_id = context.saga_id.get(), reason = %reason);
-                let _ = self.reject_terminal_reply(context.saga_id, reason.to_string());
-                return (PublishStats::default(), Some(reason));
+                    saga_type = context.saga_type.as_ref(), saga_id = context.saga_id.get(), reason = %refusal.reason);
+                // A refused start never fails the waiter of the run that owns the id.
+                if refusal.reject_run_waiter {
+                    let _ = self.reject_terminal_reply_for_run(context, refusal.reason.to_string());
+                }
+                if refusal.reject_id_waiter {
+                    let _ = self.resolve_id_waiter(
+                        context.saga_id,
+                        Some(context),
+                        Err(refusal.reason.to_string()),
+                    );
+                }
+                return (PublishStats::default(), Some(refusal.reason));
             }
+            self.bind_id_waiter(context);
+            let _ = self.ask_state(BusStateAsk::NoteAdmittedRun {
+                run: RunKey::of(context),
+            });
             if !self.has_terminal_policy_for_saga_type(context.saga_type.as_ref()) {
                 let reason: Box<str> = format!(
                     "terminal policy is required before saga start; saga_type={} saga_id={}",
@@ -641,7 +1112,7 @@ impl SagaChoreographyBus {
                     failure: None,
                 };
                 if let Some(outcome) = terminal.terminal_outcome() {
-                    self.store_terminal_outcome(terminal.context().saga_id, outcome);
+                    self.store_terminal_outcome(terminal.context(), outcome);
                 }
                 return (self.publish_event(terminal), Some(reason));
             }
@@ -653,7 +1124,7 @@ impl SagaChoreographyBus {
                     failure: None,
                 };
                 if let Some(outcome) = terminal.terminal_outcome() {
-                    self.store_terminal_outcome(terminal.context().saga_id, outcome);
+                    self.store_terminal_outcome(terminal.context(), outcome);
                 }
                 return (self.publish_event(terminal), Some(reason));
             }
@@ -674,7 +1145,7 @@ impl SagaChoreographyBus {
         }
         let is_terminal_event = event.terminal_outcome().is_some();
         if let Some(outcome) = event.terminal_outcome() {
-            self.store_terminal_outcome(event.context().saga_id, outcome);
+            self.store_terminal_outcome(event.context(), outcome);
         }
         let stats = self.publish_event(event);
         if let (Some(required_min_delivery), Some(context)) =
@@ -908,13 +1379,28 @@ impl SagaChoreographyBus {
         self.subscribe_fn(saga_type, f)
     }
 
+    /// Registers an id-scoped terminal waiter (compatibility API).
+    ///
+    /// It is resolved only by a terminal of a run that started at or after the
+    /// registration; prefer [`Self::register_terminal_reply_for_run`].
     pub fn register_terminal_reply(
         &self,
         saga_id: SagaId,
         reply: SagaReplyToHandle,
     ) -> Result<(), Box<str>> {
         match self.pending_replies.register(saga_id, reply) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if let Ok(mut floors) = self.legacy_waiter_floors.lock() {
+                    floors.insert(
+                        saga_id,
+                        LegacyWaiter {
+                            registered_at_millis: SagaContext::now_millis(),
+                            bound_run: None,
+                        },
+                    );
+                }
+                Ok(())
+            }
             Err(err) => {
                 let reply = err.into_reply();
                 let _ = reply.reply(Err("terminal reply already registered for saga id".into()));
@@ -923,15 +1409,102 @@ impl SagaChoreographyBus {
         }
     }
 
+    /// Registers a terminal waiter for exactly the run identified by `context`
+    /// (saga type, id and start time).
+    pub fn register_terminal_reply_for_run(
+        &self,
+        context: &SagaContext,
+        reply: SagaReplyToHandle,
+    ) -> Result<(), Box<str>> {
+        match self
+            .pending_run_replies
+            .register(RunKey::of(context), reply)
+        {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let reply = err.into_reply();
+                let _ = reply.reply(Err("terminal reply already registered for saga run".into()));
+                Err("terminal reply already registered for saga run".into())
+            }
+        }
+    }
+
     pub fn complete_terminal_reply(&self, saga_id: SagaId, reply: SagaReplyTo) -> bool {
-        self.store_terminal_reply(saga_id, reply.clone());
-        self.pending_replies.resolve(&saga_id, Ok(reply)).is_ok()
+        // Without run identity the reply is stored as the id's newest outcome.
+        let Some(reply) = self.store_terminal_reply(
+            RunKey {
+                saga_type: "".into(),
+                saga_id,
+                started_at_millis: SagaContext::now_millis(),
+            },
+            reply,
+        ) else {
+            return false;
+        };
+        self.resolve_id_waiter(saga_id, None, Ok(reply))
+    }
+
+    pub fn complete_terminal_reply_for_run(
+        &self,
+        context: &SagaContext,
+        reply: SagaReplyTo,
+    ) -> bool {
+        let Some(reply) = self.store_terminal_reply(RunKey::of(context), reply) else {
+            return false;
+        };
+        self.resolve_run_waiters(context, Ok(reply))
     }
 
     pub fn reject_terminal_reply(&self, saga_id: SagaId, reason: impl Into<String>) -> bool {
-        self.pending_replies
-            .resolve(&saga_id, Err(reason.into()))
+        self.resolve_id_waiter(saga_id, None, Err(reason.into()))
+    }
+
+    pub fn reject_terminal_reply_for_run(
+        &self,
+        context: &SagaContext,
+        reason: impl Into<String>,
+    ) -> bool {
+        self.pending_run_replies
+            .resolve(&RunKey::of(context), Err(reason.into()))
             .is_ok()
+    }
+
+    /// Binds a not-yet-bound id-scoped waiter to the run just admitted.
+    fn bind_id_waiter(&self, context: &SagaContext) {
+        if let Ok(mut waiters) = self.legacy_waiter_floors.lock()
+            && let Some(waiter) = waiters.get_mut(&context.saga_id)
+            && waiter.bound_run.is_none()
+        {
+            waiter.bound_run = Some(RunKey::of(context));
+        }
+    }
+
+    /// Resolves the id-scoped waiter. With `run_started_at`, only the run the
+    /// waiter belongs to is allowed to satisfy it.
+    fn resolve_id_waiter(
+        &self,
+        saga_id: SagaId,
+        context: Option<&SagaContext>,
+        result: SagaReplyToResult,
+    ) -> bool {
+        if let Ok(mut floors) = self.legacy_waiter_floors.lock() {
+            match (floors.get(&saga_id), context) {
+                (Some(waiter), Some(context)) if !waiter.accepts(context) => return false,
+                _ => {
+                    floors.remove(&saga_id);
+                }
+            }
+        }
+        self.pending_replies.resolve(&saga_id, result).is_ok()
+    }
+
+    fn resolve_run_waiters(&self, context: &SagaContext, result: SagaReplyToResult) -> bool {
+        let run = self
+            .pending_run_replies
+            .resolve(&RunKey::of(context), result.clone())
+            .is_ok();
+        let id = self.resolve_id_waiter(context.saga_id, Some(context), result);
+        run || id
     }
 
     pub fn attach_terminal_resolver(
@@ -1000,7 +1573,7 @@ impl SagaChoreographyBus {
         bus._lifecycle = None;
         let responder: Arc<str> = Arc::from(responder);
         let shutdown = Arc::new(AtomicBool::new(false));
-        let (resolver, recovery_events) = match &journal {
+        let (resolver, recovery_events, admission) = match &journal {
             Some(journal) => {
                 let entries = journal.read_all().map_err(|error| {
                     format!(
@@ -1020,21 +1593,30 @@ impl SagaChoreographyBus {
                     }
                     events.push(entry.event);
                 }
-                TerminalResolver::restore_from_events(policy.clone(), &events)
+                // The only full history read: later starts consult this index.
+                let admission = AdmissionIndex::from_events(events.iter());
+                let (resolver, recovery_events) =
+                    TerminalResolver::restore_from_events(policy.clone(), &events);
+                (resolver, recovery_events, admission)
             }
-            None => (TerminalResolver::new(policy.clone()), Vec::new()),
+            None => (
+                TerminalResolver::new(policy.clone()),
+                Vec::new(),
+                AdmissionIndex::default(),
+            ),
         };
         let durable = journal.is_some();
         let gate = Arc::new(ResolverGate {
-            journal: journal.clone(),
+            journal,
             activated: AtomicBool::new(!durable),
+            admission: Mutex::new(admission),
         });
         let (resolver_ref, resolver_handle) = local_sync::spawn(TerminalResolverActor {
             resolver,
             recovery_events,
             held_events: Vec::new(),
             activated: !durable,
-            journal,
+            gate: Arc::clone(&gate),
             bus: bus.clone(),
             responder: Arc::clone(&responder),
             saga_type: saga_type_topic.clone(),
@@ -1131,15 +1713,38 @@ impl SagaChoreographyBus {
         self.activate_terminal_resolver_recovery(C::saga_type())
     }
 
+    /// Newest stored terminal reply for the id (compatibility API).
     pub fn take_terminal_reply(&self, saga_id: SagaId) -> Option<SagaReplyTo> {
-        match self.ask_state(BusStateAsk::TakeTerminalReply { saga_id }) {
+        match self.ask_state(BusStateAsk::TakeLatestTerminalReply { saga_id }) {
             Some(BusStateReply::TerminalReply(reply)) => reply,
             _ => None,
         }
     }
 
+    /// Newest stored terminal outcome for the id (compatibility API).
     pub fn take_terminal_outcome(&self, saga_id: SagaId) -> Option<crate::SagaTerminalOutcome> {
-        match self.ask_state(BusStateAsk::TakeTerminalOutcome { saga_id }) {
+        match self.ask_state(BusStateAsk::TakeLatestTerminalOutcome { saga_id }) {
+            Some(BusStateReply::TerminalOutcome(outcome)) => outcome,
+            _ => None,
+        }
+    }
+
+    pub fn take_terminal_reply_for_run(&self, context: &SagaContext) -> Option<SagaReplyTo> {
+        match self.ask_state(BusStateAsk::TakeTerminalReply {
+            run: RunKey::of(context),
+        }) {
+            Some(BusStateReply::TerminalReply(reply)) => reply,
+            _ => None,
+        }
+    }
+
+    pub fn take_terminal_outcome_for_run(
+        &self,
+        context: &SagaContext,
+    ) -> Option<crate::SagaTerminalOutcome> {
+        match self.ask_state(BusStateAsk::TakeTerminalOutcome {
+            run: RunKey::of(context),
+        }) {
             Some(BusStateReply::TerminalOutcome(outcome)) => outcome,
             _ => None,
         }
@@ -1164,13 +1769,15 @@ impl SagaChoreographyBus {
         let Some(outcome) = event.terminal_outcome() else {
             return false;
         };
-        self.complete_terminal_reply(
-            event.context().saga_id,
-            SagaReplyTo {
-                responder: responder.into(),
-                outcome,
-            },
-        )
+        let reply = SagaReplyTo {
+            responder: responder.into(),
+            outcome,
+        };
+        // Core forbids waiting on an ask inside a sync actor. The cache request
+        // is best-effort/enqueued; authoritative resolver notification must not
+        // depend on receiving its synchronous return in this trusted path.
+        let _ = self.store_terminal_reply(RunKey::of(event.context()), reply.clone());
+        self.resolve_run_waiters(event.context(), Ok(reply))
     }
 
     /// Publishes evidence-preserving quarantine for a delivery failure.
@@ -1182,47 +1789,34 @@ impl SagaChoreographyBus {
             participant_id: TERMINAL_RESOLVER_STEP.into(),
         };
         if let Some(outcome) = quarantine.terminal_outcome() {
-            self.store_terminal_outcome(quarantine.context().saga_id, outcome);
+            self.store_terminal_outcome(quarantine.context(), outcome);
         }
         self.publish_event(quarantine)
     }
 
     /// Fail-closed start admission against a durable resolver: recovery must
     /// be activated and retained history must not already fence this run.
-    fn start_recovery_rejection(&self, context: &SagaContext) -> Option<Box<str>> {
+    /// Uses the in-memory index built at attach; never rereads the journal.
+    fn admit_start(
+        &self,
+        event: &SagaChoreographyEvent,
+        context: &SagaContext,
+    ) -> Result<(), Refusal> {
         let gate = match self
             .terminal_resolver_registry_ref
             .ask(TerminalResolverRegistryAsk::Gate(context.saga_type.clone()))
         {
-            Ok(TerminalResolverRegistryReply::Gate(gate)) => gate?,
+            Ok(TerminalResolverRegistryReply::Gate(Some(gate))) => gate,
+            Ok(TerminalResolverRegistryReply::Gate(None)) => return Ok(()),
             _ => {
-                return Some(
-                    "terminal resolver registry unavailable during start admission".into(),
-                );
+                return Err(Refusal {
+                    reason: "terminal resolver registry unavailable during start admission".into(),
+                    reject_run_waiter: true,
+                    reject_id_waiter: false,
+                });
             }
         };
-        let journal = gate.journal.as_ref()?;
-        if !gate.activated.load(Ordering::Acquire) {
-            return Some(
-                format!(
-                    "terminal resolver recovery is not activated; saga_type={} saga_id={}",
-                    context.saga_type,
-                    context.saga_id.get()
-                )
-                .into(),
-            );
-        }
-        match journal.read_all() {
-            Ok(entries) => replay_rejection(entries.iter().map(|entry| &entry.event), context)
-                .map(Into::into),
-            Err(error) => Some(
-                format!(
-                    "terminal resolver history unreadable during start admission; saga_id={}: {error}",
-                    context.saga_id.get()
-                )
-                .into(),
-            ),
-        }
+        gate.admit_start(event, context)
     }
 
     fn terminal_retention_limit(&self) -> usize {
@@ -1346,75 +1940,26 @@ impl SagaChoreographyBus {
         }
     }
 
-    fn store_terminal_reply(&self, saga_id: SagaId, reply: SagaReplyTo) {
+    fn store_terminal_reply(&self, run: RunKey, reply: SagaReplyTo) -> Option<SagaReplyTo> {
         let retention_limit = self.terminal_retention_limit();
-        let _ = self.ask_state(BusStateAsk::StoreTerminalReply {
-            saga_id,
+        match self.ask_state(BusStateAsk::StoreTerminalReply {
+            run,
             reply,
             retention_limit,
-        });
+        }) {
+            Some(BusStateReply::TerminalReply(reply)) => reply,
+            _ => None,
+        }
     }
 
-    fn store_terminal_outcome(&self, saga_id: SagaId, outcome: SagaTerminalOutcome) {
+    fn store_terminal_outcome(&self, context: &SagaContext, outcome: SagaTerminalOutcome) {
         let retention_limit = self.terminal_retention_limit();
         let _ = self.ask_state(BusStateAsk::StoreTerminalOutcome {
-            saga_id,
+            run: RunKey::of(context),
             outcome,
             retention_limit,
         });
     }
-}
-
-/// Decides from retained durable history whether a start replays a terminal
-/// run (same or older `saga_started_at_millis`) or reuses a quarantined id.
-/// Strictly later runs of an ordinarily resolved id are admitted.
-fn replay_rejection<'a>(
-    history: impl Iterator<Item = &'a SagaChoreographyEvent>,
-    start: &SagaContext,
-) -> Option<String> {
-    let mut runs = HashMap::new();
-    for event in history {
-        let context = event.context();
-        if context.saga_id != start.saga_id || context.saga_type != start.saga_type {
-            continue;
-        }
-        let resolved = runs.entry(context.saga_started_at_millis).or_insert(false);
-        if matches!(
-            event,
-            SagaChoreographyEvent::SagaCompleted { .. } | SagaChoreographyEvent::SagaFailed { .. }
-        ) {
-            *resolved = true;
-        }
-        match event {
-            SagaChoreographyEvent::SagaQuarantined { .. } => {
-                return Some(format!(
-                    "saga id is quarantined and unresolved; saga_id={}",
-                    start.saga_id.get()
-                ));
-            }
-            SagaChoreographyEvent::SagaCompleted { .. }
-            | SagaChoreographyEvent::SagaFailed { .. }
-                if context.saga_started_at_millis >= start.saga_started_at_millis =>
-            {
-                return Some(format!(
-                    "terminal saga run replay; saga_id={} run_started_at_millis={}",
-                    start.saga_id.get(),
-                    start.saga_started_at_millis
-                ));
-            }
-            _ => {}
-        }
-    }
-    if runs
-        .iter()
-        .any(|(run, resolved)| !resolved && *run != start.saga_started_at_millis)
-    {
-        return Some(format!(
-            "saga id has an unresolved active run; saga_id={}",
-            start.saga_id.get()
-        ));
-    }
-    None
 }
 
 fn terminal_watchdog_tick_interval() -> Duration {
@@ -1480,6 +2025,8 @@ impl Clone for SagaChoreographyBus {
         Self {
             bus: self.bus.clone(),
             pending_replies: self.pending_replies.clone(),
+            pending_run_replies: self.pending_run_replies.clone(),
+            legacy_waiter_floors: Arc::clone(&self.legacy_waiter_floors),
             state_ref: self.state_ref.clone(),
             terminal_resolver_registry_ref: self.terminal_resolver_registry_ref.clone(),
             _lifecycle: self._lifecycle.clone(),

@@ -312,21 +312,23 @@ impl TerminalResolverJournal for ReadFailJournal {
 }
 
 #[test]
-fn journal_read_failure_blocks_admission() {
+fn journal_read_failure_blocks_resolver_attachment_before_admission() {
     let journal = Arc::new(ReadFailJournal {
         inner: InMemoryTerminalResolverJournal::default(),
-        fail_reads: AtomicBool::new(false),
+        fail_reads: AtomicBool::new(true),
     });
     let (bus, seen) = prepared_bus();
+    // History is indexed once at attachment, not re-read for every start.
+    assert!(
+        bus.attach_durable_terminal_resolver_for_contract::<BusContract, _>("qa", journal.clone())
+            .is_err()
+    );
+    assert_eq!(count(&seen, is_start), 0);
+    journal.fail_reads.store(false, Ordering::SeqCst);
     bus.attach_durable_terminal_resolver_for_contract::<BusContract, _>("qa", journal.clone())
         .unwrap();
     bus.activate_terminal_resolver_recovery_for_contract::<BusContract>()
         .unwrap();
-    journal.fail_reads.store(true, Ordering::SeqCst);
-    let err = bus.publish_strict(started(&context(401, "a"))).unwrap_err();
-    assert!(matches!(err, SagaBusPublishError::AdmissionRejected { .. }));
-    assert_eq!(count(&seen, is_start), 0);
-    journal.fail_reads.store(false, Ordering::SeqCst);
     bus.publish_strict(started(&context(401, "a"))).unwrap();
 }
 

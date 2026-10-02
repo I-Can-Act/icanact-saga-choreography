@@ -512,9 +512,23 @@ fn quarantined_run_retains_evidence_and_is_not_auto_resolved_or_reused() {
     let mut restarted = Actor::new(&journal, &dedupe);
     let reuse = deliver(&mut restarted, started(&ctx("wf_pay", "pay", 200)));
     assert_eq!(restarted.pay_calls, 0);
-    assert!(reuse.has_quarantine(), "{reuse:?}");
+    assert!(
+        reuse.valid.is_empty() && reuse.invalid.is_empty(),
+        "refusal must not manufacture uncertainty in the incoming run: {reuse:?}"
+    );
     let after = journal.read(run.saga_id).unwrap();
     assert!(after.len() >= entries.len(), "evidence must never shrink");
+    assert!(
+        after.iter().any(|entry| matches!(
+            &entry.event,
+            ParticipantEvent::ParticipantTerminalRecorded {
+                outcome: ParticipantTerminalKind::Quarantined,
+                saga_started_at_millis: 100,
+                ..
+            }
+        )),
+        "original quarantine must remain authoritative"
+    );
 }
 
 impl std::fmt::Debug for Delivery {

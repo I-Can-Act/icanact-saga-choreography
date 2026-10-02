@@ -691,7 +691,7 @@ fn workflow_owned_order_and_release_wait_for_authoritative_completion() {
 }
 
 #[test]
-fn accept_failure_on_started_append_leaves_no_accepted_metadata() {
+fn accept_failure_on_run_identity_append_leaves_no_accepted_metadata() {
     let mut actor = FailingJournalActor::fail_on_append(1);
     let ctx = context("create_order", 30);
 
@@ -720,7 +720,8 @@ fn accept_failure_on_started_append_leaves_no_accepted_metadata() {
 
 #[test]
 fn accept_failure_on_metadata_append_does_not_orphan_accepted_metadata() {
-    let mut actor = FailingJournalActor::fail_on_append(2);
+    // Run identity and forward intent precede accepted metadata.
+    let mut actor = FailingJournalActor::fail_on_append(3);
     let ctx = context("create_order", 31);
 
     assert!(matches!(
@@ -743,10 +744,16 @@ fn accept_failure_on_metadata_append_does_not_orphan_accepted_metadata() {
         .expect("journal read should succeed");
     assert!(matches!(
         entries.as_slice(),
-        [icanact_saga_choreography::JournalEntry {
-            event: ParticipantEvent::StepExecutionStarted { .. },
-            ..
-        }]
+        [
+            icanact_saga_choreography::JournalEntry {
+                event: ParticipantEvent::ParticipantRunRecorded { .. },
+                ..
+            },
+            icanact_saga_choreography::JournalEntry {
+                event: ParticipantEvent::StepExecutionStarted { .. },
+                ..
+            }
+        ]
     ));
     assert!(
         !entries
@@ -756,8 +763,8 @@ fn accept_failure_on_metadata_append_does_not_orphan_accepted_metadata() {
 }
 
 #[test]
-fn accepted_completion_append_failure_keeps_step_pending_for_retry() {
-    let mut actor = FailingJournalActor::fail_on_append(3);
+fn accepted_completion_append_failure_preserves_evidence_without_reopening_success() {
+    let mut actor = FailingJournalActor::fail_on_append(4);
     let ctx = context("create_order", 32);
     let execution_id = StepExecutionId::new("effect-complete-retry");
     accept_workflow_step(
@@ -783,15 +790,21 @@ fn accepted_completion_append_failure_keeps_step_pending_for_retry() {
     assert_eq!(actor.saga.accepted_workflow_step_count(), 1);
     assert_eq!(actor.saga.resolved_workflow_step_count(), 0);
 
-    complete_accepted_workflow_step(
+    let retry = complete_accepted_workflow_step(
         &mut actor,
         ctx.saga_id,
         execution_id,
         completion(1_700_000_000_070, b"created", b"input", b"undo"),
     )
-    .expect("retry should append terminal record and complete");
-    assert_eq!(actor.saga.accepted_workflow_step_count(), 0);
-    assert_eq!(actor.saga.resolved_workflow_step_count(), 1);
+    .expect("late authoritative evidence should remain retainable");
+    assert!(matches!(
+        retry,
+        SagaChoreographyEvent::SagaQuarantined { .. }
+    ));
+    assert_eq!(actor.saga.accepted_workflow_step_count(), 1);
+    assert_eq!(actor.saga.resolved_workflow_step_count(), 0);
+    assert!(actor.saga.journal.read(ctx.saga_id).unwrap().iter().any(|entry|
+        matches!(&entry.event, ParticipantEvent::ParticipantReconciliationEvidence { compensation_data, .. } if compensation_data == b"undo")));
 }
 
 #[test]
@@ -840,7 +853,7 @@ fn accepted_step_metadata_persistence_failure_quarantines_external_effect() {
 
 #[test]
 fn accepted_failure_append_failure_keeps_step_pending_for_retry() {
-    let mut actor = FailingJournalActor::fail_on_append(3);
+    let mut actor = FailingJournalActor::fail_on_append(4);
     let ctx = context("create_order", 33);
     let execution_id = StepExecutionId::new("effect-fail-retry");
     accept_workflow_step(
@@ -926,7 +939,7 @@ fn compensating_failure_tombstones_forward_execution_but_keeps_compensation_data
                 b"cancel-order-38",
             ),
         ),
-        Err(AcceptedStepError::AlreadyResolved { .. })
+        Ok(SagaChoreographyEvent::SagaQuarantined { .. })
     ));
 }
 
@@ -1077,13 +1090,13 @@ fn compensating_failure_restart_keeps_forward_execution_tombstoned() {
                 b"cancel-order-39",
             ),
         ),
-        Err(AcceptedStepError::AlreadyResolved { .. })
+        Ok(SagaChoreographyEvent::SagaQuarantined { .. })
     ));
 }
 
 #[test]
 fn accepted_timeout_append_failure_keeps_step_pending_for_retry() {
-    let mut actor = FailingJournalActor::fail_on_append(3);
+    let mut actor = FailingJournalActor::fail_on_append(4);
     let ctx = context("create_order", 34);
     let accepted = accept_workflow_step(
         &mut actor,
@@ -1161,7 +1174,7 @@ fn accepted_step_uses_actor_clock_for_context_and_deadlines() {
 }
 
 #[test]
-fn saga_run_tracking_reset_allows_same_saga_id_to_accept_again() {
+fn volatile_run_tracking_reset_cannot_reaccept_durably_recorded_execution() {
     let mut actor = HarnessActor::default();
     let ctx = context("create_order", 22);
     let execution_id = StepExecutionId::new("effect-22");
@@ -1198,11 +1211,8 @@ fn saga_run_tracking_reset_allows_same_saga_id_to_accept_again() {
         }),
     );
     assert!(
-        matches!(
-            accepted_again,
-            Ok(SagaChoreographyEvent::StepAccepted { .. })
-        ),
-        "reset/prune must clear accepted and resolved step maps for saga id reuse"
+        matches!(accepted_again, Err(AcceptedStepError::Durability { .. })),
+        "clearing volatile maps must not remove the current run's execution fence"
     );
 }
 
@@ -1469,7 +1479,11 @@ fn unstarted_compensation_request_replays_and_rearms_its_dedupe_key() {
         "order_lifecycle",
     )
     .expect("started compensation recovery should classify");
-    assert!(after_start.is_empty());
+    assert!(
+        matches!(after_start.as_slice(), [SagaChoreographyEvent::SagaQuarantined { context, .. }]
+        if context.saga_started_at_millis == ctx.saga_started_at_millis),
+        "unknown undo outcome must be visible: {after_start:?}"
+    );
     assert!(
         support
             .dedupe
@@ -2089,7 +2103,7 @@ fn accepted_step_progress_extends_idle_deadline_but_not_hard_deadline() {
             execution_id,
             completion(1_700_000_000_260, b"too-late", Vec::new(), Vec::new()),
         ),
-        Err(AcceptedStepError::AlreadyResolved { .. })
+        Ok(SagaChoreographyEvent::SagaQuarantined { .. })
     ));
 }
 
@@ -2136,7 +2150,7 @@ fn resolver_timeout_step_failure_blocks_late_accepted_completion() {
             execution_id,
             completion(1_700_000_000_260, b"too-late", Vec::new(), Vec::new()),
         ),
-        Err(AcceptedStepError::AlreadyResolved { .. })
+        Ok(SagaChoreographyEvent::SagaQuarantined { .. })
     ));
 }
 

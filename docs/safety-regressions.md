@@ -87,6 +87,44 @@ assert safe behavior instead.
   unsuccessful undo now assert retained evidence/quarantine. Recovery fixtures share a
   single run identity and assert singleton, dependency-ordered compensation.
 
+## Independent review follow-up coverage
+
+The first independent review of `ece1cb4` returned **BLOCK** (two P1, nine P2).
+The following assertions address its concrete findings; a passing suite is not a review
+verdict. The same reviewer is re-challenged only after parent verification/commit.
+
+- **P1-1, unresolved forward effects:** `tests/qa_review_resolver.rs` exercises long-running
+  and accepted work, known undo plus unknown obligations, and late effects after ordinary
+  failure/full or compacted history. `tests/qa_review_state.rs` fences unsafe failure and
+  pins confirmed outcome tag 15. Helper/workflow follow-up suites require visible
+  quarantine, strict proof before success and retained result-write/late-callback evidence.
+- **P1-2, healthy restart:** `tests/qa_review_durability.rs` covers ancient idle admission,
+  healthy accepted deadlines, immediate open-intent/unconfirmed-result quarantine, and
+  original-context confirmed replay. `tests/durability_lmdb_integration.rs` mirrors real
+  close/reopen, hydration and cold undo.
+- **P2-1/2, cold undo and AnyOf:** `tests/qa_review_helpers.rs` and
+  `tests/qa_review_durability.rs` verify retained compensation, acknowledgement-only undo
+  replay, and already-confirmed dependency firing without effects or false quarantine.
+  Receipted declared dispatch is already confirmed too, not a reason to re-dispatch.
+- **P2-3/4, identity and admission races:** `tests/qa_review_bus.rs` covers concurrent
+  starts, strict append failure, one history read, reentrant fanout, refused-owner waiter
+  protection, full type/ID/start binding, successor outcome isolation, one-time outcome
+  consumption and quarantine dominance. Ephemeral resolvers serialize live admission too.
+- **P2-5/6/7, low-level and callback APIs:** `tests/qa_review_durability.rs` verifies durable
+  acceptance/resolution fences, failed-write evidence, recorded panic identity, explicit
+  unidentified-history errors and duplicate/stale callback suppression. Late cold results
+  remain context-bearing evidence and cannot become a successor's generic result.
+- **P2-8, evicted terminal ingress:** `tests/qa_review_bus.rs` retains new effect uncertainty
+  and fences a successor while ignoring known completion replay. Resolver cache loss never
+  authorizes an older run to mutate fresh resolution state.
+- **P2-9, compatibility:** [migration.md](migration.md) describes enum/tag, hook, recovery,
+  accepted-API and publication prerequisites. There is no invented administrative repair API.
+
+Parent integration reproduced further bus and durability edge failures before fixing them;
+logs include `review-bus-parent-red.log`, `review-durability-parent-red.log`,
+`review-shared-state-red.log` and `review-foreign-owner-parent-red.log`. Historical worker
+and iteration logs are not substituted for final SHA-bound verification.
+
 ## Evidence and limits
 
 Behavior-bearing writers supplied pre-change RED/characterization logs. Parent inspection
@@ -97,10 +135,15 @@ ingress-driven activation, workflow legacy ordering and lifecycle release.
 The parent runs authoritative default/all-feature debug, all-feature release, both Clippy
 configurations with `-D warnings`, formatting, rustdoc with `-D warnings` and diff hygiene.
 Local artifacts/logs are under `/tmp/saga-remediation-20261002/`; the parent checkpoint
-binds their results to the integrated commit. One fresh serial native independent reviewer
-is gated on that verified commit, not on worker assertions. No push, PR, deployment or
+binds their results to the integrated commit. Exactly one fresh serial native independent
+reviewer owns the review; subsequent challenges resume that same reviewer against verified
+commits, not worker assertions. No push, PR, deployment or
 main-branch merge is part of this task. The plan's unavailable document-review mechanism
 did not run and is not represented as an independent code review.
+
+Breaking changes and the release prerequisite (no version bump here) are in
+[migration.md](migration.md). Review follow-ups are not claimed fixed by documentation;
+this ledger is not completed verification, review or production certification.
 
 See [operations.md](operations.md) for startup, capacity, archives, destructive admin
 primitives and external idempotency. This change does not establish Linux/Windows runtime,
