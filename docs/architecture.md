@@ -149,8 +149,12 @@ sequenceDiagram
 
 - Recovery enumerates known saga IDs from the journal and rebuilds coarse state from event history.
 - Non-terminal sagas are returned for resume/reconciliation.
-- On terminal saga events (`SagaCompleted` or `SagaFailed`), participants prune local in-memory state and dedupe keys.
-- Quarantined sagas are intentionally preserved for manual investigation.
+- Ordinary terminal events clear only volatile run tracking; durable terminal tombstones, journal history and dedupe markers remain. Quarantine also retains in-memory state and accepted metadata.
+- Quarantined sagas are intentionally preserved for manual investigation and are never pruned automatically; operators resolve them administratively.
+- Terminal and quarantine outcomes are durably fenced and rehydrated at startup so replayed events cannot repeat terminal effects. Startup order: attach -> bind/hydrate -> activate -> new starts.
+- Reverse compensation is serialized with a single owner; terminal failure is published only after all owed compensation completes, otherwise the saga is quarantined.
+- Effect dispatch is explicit and fails closed by default. Retained terminal records need capacity/compaction maintenance.
+- Bus delivery may be lost or duplicated; handle strict publication errors. There is no exactly-once external-effect guarantee. Use stable idempotency keys and reconciliation; see [operations.md](operations.md).
 - Terminal policies support two timeout dimensions:
 - `overall_timeout` (overall wall clock)
 - `stalled_timeout` (watchdog reset by each progress event)

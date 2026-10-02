@@ -103,9 +103,23 @@ where
         let Some(sender) = self.sender.as_ref() else {
             return false;
         };
-        sender
+        let context = event.context().clone();
+        let delivered = sender
             .try_send(SagaParticipantChannel::Saga(event).into())
-            .is_ok()
+            .is_ok();
+        if !delivered {
+            // The `false` return is counted as an undelivered subscriber; the bus
+            // quarantines (never plain-fails) when required delivery falls short.
+            tracing::error!(
+                target: "core::saga",
+                event = "saga_participant_forward_failed",
+                saga_type = context.saga_type.as_ref(),
+                saga_id = context.saga_id.get(),
+                step = context.step_name.as_ref(),
+                channel_name = %self.channel_name
+            );
+        }
+        delivered
     }
 }
 
@@ -191,9 +205,23 @@ where
         let Some(sender) = self.sender.as_ref() else {
             return false;
         };
-        sender
+        let context = event.context().clone();
+        let delivered = sender
             .try_send(SagaParticipantChannel::Saga(event).into())
-            .is_ok()
+            .is_ok();
+        if !delivered {
+            // The `false` return is counted as an undelivered subscriber; the bus
+            // quarantines (never plain-fails) when required delivery falls short.
+            tracing::error!(
+                target: "core::saga",
+                event = "saga_participant_forward_failed",
+                saga_type = context.saga_type.as_ref(),
+                saga_id = context.saga_id.get(),
+                step = context.step_name.as_ref(),
+                channel_name = %self.channel_name
+            );
+        }
+        delivered
     }
 }
 

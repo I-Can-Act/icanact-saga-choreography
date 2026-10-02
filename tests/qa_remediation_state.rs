@@ -376,6 +376,16 @@ fn legacy_archives_remain_readable_and_variant_layout_is_unchanged() {
         }),
         13
     );
+    assert_eq!(
+        tag(ParticipantEvent::ParticipantReconciliationEvidence {
+            context: ctx("s", 1),
+            output: vec![1],
+            compensation_data: vec![2],
+            reason: "result write failed".into(),
+            recorded_at_millis: 1,
+        }),
+        14
+    );
 }
 
 #[test]

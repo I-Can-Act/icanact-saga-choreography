@@ -463,6 +463,16 @@ pub enum ParticipantEvent {
         reason: Box<str>,
         recorded_at_millis: u64,
     },
+    /// Typed recovery evidence when the ordinary result write failed after an
+    /// effect. This is not a successful result and never authorizes replay.
+    /// Compensation bytes stay out of public quarantine reasons and logs.
+    ParticipantReconciliationEvidence {
+        context: SagaContext,
+        output: Vec<u8>,
+        compensation_data: Vec<u8>,
+        reason: Box<str>,
+        recorded_at_millis: u64,
+    },
 }
 
 /// Terminal classification stored in a participant terminal tombstone.

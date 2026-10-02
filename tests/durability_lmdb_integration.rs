@@ -289,3 +289,354 @@ fn lmdb_journal_rejects_unversioned_persisted_rows() {
         "unexpected schema error: {err}"
     );
 }
+
+// ---- U6: reopened LMDB workflow replay safety ------------------------------------
+
+mod workflow_reopen {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    use super::*;
+    use icanact_saga_choreography::durability::apply_sync_workflow_participant_saga_ingress_with_hooks;
+    use icanact_saga_choreography::{
+        CompensationError, CompensationOutput, HasSagaWorkflowParticipants,
+        ParticipantTerminalKind, PeerId, SagaWorkflowParticipant, StepError, StepOutput,
+    };
+
+    struct Actor {
+        saga: SagaParticipantSupport<LmdbJournal, LmdbDedupe>,
+        pay_calls: usize,
+    }
+
+    impl Actor {
+        fn open(base: &Path) -> Self {
+            Self {
+                saga: open_lmdb_participant_support_for_saga_type(base, "pay", "wf_pay")
+                    .expect("support should open"),
+                pay_calls: 0,
+            }
+        }
+    }
+
+    impl HasSagaParticipantSupport for Actor {
+        type Journal = LmdbJournal;
+        type Dedupe = LmdbDedupe;
+        fn saga_support(&self) -> &SagaParticipantSupport<LmdbJournal, LmdbDedupe> {
+            &self.saga
+        }
+        fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<LmdbJournal, LmdbDedupe> {
+            &mut self.saga
+        }
+    }
+
+    struct Pay;
+    static PAY: Pay = Pay;
+    static WORKFLOWS: [&'static dyn SagaWorkflowParticipant<Actor>; 1] = [&PAY];
+
+    impl HasSagaWorkflowParticipants for Actor {
+        fn saga_workflows() -> &'static [&'static dyn SagaWorkflowParticipant<Self>] {
+            &WORKFLOWS
+        }
+    }
+
+    impl SagaWorkflowParticipant<Actor> for Pay {
+        fn step_name(&self) -> &'static str {
+            "pay"
+        }
+        fn saga_types(&self) -> &[&'static str] {
+            &["wf_pay"]
+        }
+        fn execute_step(
+            &self,
+            actor: &mut Actor,
+            _context: &SagaContext,
+            _input: &[u8],
+        ) -> Result<StepOutput, StepError> {
+            actor.pay_calls += 1;
+            Ok(StepOutput::Completed {
+                output: b"paid".to_vec(),
+                compensation_data: b"refund".to_vec(),
+            })
+        }
+        fn compensate_step(
+            &self,
+            _actor: &mut Actor,
+            _context: &SagaContext,
+            _data: &[u8],
+        ) -> Result<CompensationOutput, CompensationError> {
+            Ok(CompensationOutput::Completed)
+        }
+    }
+
+    fn ctx(started_at: u64) -> SagaContext {
+        SagaContext {
+            saga_id: SagaId::new(61),
+            saga_type: "wf_pay".into(),
+            step_name: "pay".into(),
+            correlation_id: 61,
+            causation_id: 61,
+            trace_id: 61,
+            step_index: 0,
+            attempt: 0,
+            initiator_peer_id: PeerId::default(),
+            saga_started_at_millis: started_at,
+            event_timestamp_millis: started_at,
+        }
+    }
+
+    fn deliver(actor: &mut Actor, event: SagaChoreographyEvent) -> Vec<SagaChoreographyEvent> {
+        let out = RefCell::new(Vec::new());
+        apply_sync_workflow_participant_saga_ingress_with_hooks(
+            actor,
+            event,
+            |_actor, _event| {},
+            |event| panic!("valid transition rejected: {event:?}"),
+            |_actor, event| out.borrow_mut().push(event.clone()),
+        );
+        out.into_inner()
+    }
+
+    fn start(context: &SagaContext) -> SagaChoreographyEvent {
+        SagaChoreographyEvent::SagaStarted {
+            context: context.clone(),
+            payload: b"in".to_vec(),
+        }
+    }
+
+    #[test]
+    fn completed_run_does_not_repeat_effect_after_lmdb_reopen() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let run = ctx(100);
+        {
+            let mut actor = Actor::open(temp.path());
+            deliver(&mut actor, start(&run));
+            deliver(
+                &mut actor,
+                SagaChoreographyEvent::SagaCompleted {
+                    context: run.clone(),
+                },
+            );
+            assert_eq!(actor.pay_calls, 1);
+        }
+
+        let mut reopened = Actor::open(temp.path());
+        let replay = deliver(&mut reopened, start(&run));
+        assert_eq!(reopened.pay_calls, 0, "terminal run repeated its effect");
+        assert!(replay.is_empty(), "{replay:?}");
+
+        let later = ctx(200);
+        deliver(&mut reopened, start(&later));
+        assert_eq!(
+            reopened.pay_calls, 1,
+            "a later valid run must still execute"
+        );
+    }
+
+    #[test]
+    fn quarantined_run_keeps_evidence_and_blocks_reuse_after_lmdb_reopen() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let run = ctx(100);
+        {
+            let mut actor = Actor::open(temp.path());
+            deliver(&mut actor, start(&run));
+            deliver(
+                &mut actor,
+                SagaChoreographyEvent::SagaQuarantined {
+                    context: run.clone(),
+                    reason: "operator review".into(),
+                    step: "pay".into(),
+                    participant_id: "pay".into(),
+                },
+            );
+        }
+
+        let mut reopened = Actor::open(temp.path());
+        assert!(
+            reopened.saga.take_startup_recovery_events().is_empty(),
+            "restart must not auto-resolve quarantined work"
+        );
+        let entries = reopened.saga.journal.read(run.saga_id).expect("read");
+        assert!(entries.iter().any(|e| matches!(
+            &e.event,
+            ParticipantEvent::StepExecutionCompleted { compensation_data, .. }
+                if compensation_data == b"refund"
+        )));
+        assert!(entries.iter().any(|e| matches!(
+            &e.event,
+            ParticipantEvent::ParticipantTerminalRecorded {
+                outcome: ParticipantTerminalKind::Quarantined,
+                ..
+            }
+        )));
+        let reuse = deliver(&mut reopened, start(&ctx(200)));
+        assert_eq!(reopened.pay_calls, 0);
+        assert!(
+            reuse
+                .iter()
+                .any(|e| matches!(e, SagaChoreographyEvent::SagaQuarantined { .. })),
+            "{reuse:?}"
+        );
+    }
+
+    icanact_saga_choreography::define_saga_workflow_contract! {
+        struct ReopenContract {
+            saga_type: "wf_pay", first_step: pay, failure_authority: any (),
+            required_steps: [pay], overall_timeout_ms: 60_000, stalled_timeout_ms: 60_000,
+            steps: { pay => { participant: "pay", depends_on: on_start () } }
+        }
+    }
+
+    #[test]
+    fn resolver_and_participant_lmdb_reopen_fence_replay_before_fanout() {
+        use icanact_saga_choreography::{
+            LmdbTerminalResolverJournal, SagaBusPublishError, SagaChoreographyBus,
+            TerminalResolverJournal,
+        };
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        let temp = tempfile::tempdir().unwrap();
+        let participant_path = temp.path().join("participant");
+        let resolver_path = temp.path().join("resolver");
+        let run = ctx(SagaContext::now_millis());
+        {
+            let mut actor = Actor::open(&participant_path);
+            let journal = Arc::new(LmdbTerminalResolverJournal::open(&resolver_path).unwrap());
+            let bus = SagaChoreographyBus::new();
+            bus.register_workflow_contract_provider::<ReopenContract>()
+                .unwrap();
+            bus.register_bound_workflow_step("wf_pay", "pay").unwrap();
+            bus.subscribe_saga_type_fn("wf_pay", |_| true);
+            bus.attach_durable_terminal_resolver_for_contract::<ReopenContract, _>(
+                "qa",
+                Arc::clone(&journal),
+            )
+            .unwrap();
+            bus.activate_terminal_resolver_recovery("wf_pay").unwrap();
+            bus.publish_strict(start(&run)).unwrap();
+            for event in deliver(&mut actor, start(&run)) {
+                bus.publish_strict(event).unwrap();
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let terminal = loop {
+                if let Some(event) = journal.read_all().unwrap().into_iter().find(|entry| {
+                    matches!(entry.event, SagaChoreographyEvent::SagaCompleted { .. })
+                }) {
+                    break event.event;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "resolver did not durably record completion"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            deliver(&mut actor, terminal);
+            assert_eq!(actor.pay_calls, 1);
+        }
+        // Both LMDB environments and their owning actors/bus are really reopened.
+        let mut actor = Actor::open(&participant_path);
+        let journal = Arc::new(LmdbTerminalResolverJournal::open(&resolver_path).unwrap());
+        let bus = SagaChoreographyBus::new();
+        bus.register_workflow_contract_provider::<ReopenContract>()
+            .unwrap();
+        bus.register_bound_workflow_step("wf_pay", "pay").unwrap();
+        let fanout = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&fanout);
+        bus.subscribe_saga_type_fn("wf_pay", move |event| {
+            sink.lock().unwrap().push(event.clone());
+            true
+        });
+        bus.attach_durable_terminal_resolver_for_contract::<ReopenContract, _>("qa", journal)
+            .unwrap();
+        bus.activate_terminal_resolver_recovery("wf_pay").unwrap();
+        assert!(matches!(
+            bus.publish_strict(start(&run)),
+            Err(SagaBusPublishError::AdmissionRejected { .. })
+        ));
+        assert!(
+            !fanout
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, SagaChoreographyEvent::SagaStarted { .. }))
+        );
+        assert!(
+            deliver(&mut actor, start(&run)).is_empty(),
+            "participant fence independently survives reopen"
+        );
+        assert_eq!(actor.pay_calls, 0, "terminal effect must not run again");
+    }
+}
+
+#[test]
+fn lmdb_journal_reads_varied_payload_lengths_and_survives_reopen() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("journal");
+    let saga = SagaId::new(70);
+    {
+        let journal = LmdbJournal::open(&path).expect("open");
+        for len in 0..9usize {
+            journal
+                .append(
+                    saga,
+                    ParticipantEvent::StepExecutionCompleted {
+                        output: vec![7; len],
+                        compensation_data: vec![9; len],
+                        completed_at_millis: len as u64,
+                    },
+                )
+                .expect("append");
+        }
+        assert_eq!(journal.read(saga).expect("live read").len(), 9);
+    }
+    let reopened = LmdbJournal::open(&path).expect("reopen");
+    let entries = reopened.read(saga).expect("reopened read");
+    assert_eq!(entries.len(), 9);
+    assert!(entries.iter().enumerate().all(|(len, e)| matches!(
+        &e.event,
+        ParticipantEvent::StepExecutionCompleted { output, .. } if output.len() == len
+    )));
+}
+
+#[test]
+fn lmdb_journal_rejects_malformed_archive_rows_instead_of_decoding_them() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("journal");
+    let saga = SagaId::new(71);
+    {
+        let journal = LmdbJournal::open(&path).expect("open");
+        journal
+            .append(
+                saga,
+                ParticipantEvent::StepExecutionStarted {
+                    attempt: 1,
+                    started_at_millis: 1,
+                },
+            )
+            .expect("append");
+    }
+    {
+        let env = unsafe {
+            EnvOpenOptions::new()
+                .max_dbs(16)
+                .map_size(1024 * 1024 * 1024)
+                .open(&path)
+        }
+        .expect("raw env");
+        let mut wtxn = env.write_txn().expect("write txn");
+        let rows = env
+            .create_database::<Str, Bytes>(&mut wtxn, Some("journal_rows"))
+            .expect("rows db");
+        rows.put(
+            &mut wtxn,
+            &format!("{:020}:{:020}", saga.get(), 99u64),
+            &[0xAB; 37],
+        )
+        .expect("corrupt row");
+        wtxn.commit().expect("commit");
+    }
+    let reopened = LmdbJournal::open(&path).expect("reopen");
+    let err = reopened
+        .read(saga)
+        .expect_err("a malformed archive must fail validation");
+    assert!(!err.to_string().is_empty());
+}

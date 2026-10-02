@@ -14,12 +14,26 @@ pub enum TerminalResolverJournalError {
     Storage(Box<str>),
     #[error("terminal resolver journal sequence space exhausted")]
     SequenceExhausted,
+    #[error("terminal resolver journal maintenance unsupported: {0}")]
+    Unsupported(Box<str>),
 }
 
 pub trait TerminalResolverJournal: Send + Sync + 'static {
     fn append(&self, event: SagaChoreographyEvent) -> Result<u64, TerminalResolverJournalError>;
 
     fn read_all(&self) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError>;
+
+    /// Removes ordinarily resolved run detail while retaining its terminal replay
+    /// fence. Every unresolved or quarantined run keeps all evidence. Returns the
+    /// number of rows removed.
+    ///
+    /// The default reports [`TerminalResolverJournalError::Unsupported`]; it
+    /// never pretends to compact.
+    fn compact_terminal_detail(&self) -> Result<u64, TerminalResolverJournalError> {
+        Err(TerminalResolverJournalError::Unsupported(
+            "this journal does not implement compaction".into(),
+        ))
+    }
 }
 
 #[derive(Default)]
@@ -63,6 +77,7 @@ impl TerminalResolverJournal for InMemoryTerminalResolverJournal {
 
 #[cfg(feature = "lmdb")]
 pub mod lmdb {
+    use std::collections::{HashMap, HashSet};
     use std::path::Path;
 
     use heed::types::{Bytes, Str};
@@ -86,11 +101,18 @@ pub mod lmdb {
 
     impl LmdbTerminalResolverJournal {
         pub fn open(path: &Path) -> Result<Self, TerminalResolverJournalError> {
+            Self::open_with_map_size(path, DEFAULT_MAP_SIZE_BYTES)
+        }
+
+        pub fn open_with_map_size(
+            path: &Path,
+            map_size_bytes: usize,
+        ) -> Result<Self, TerminalResolverJournalError> {
             std::fs::create_dir_all(path).map_err(storage_error)?;
             let env = unsafe {
                 EnvOpenOptions::new()
                     .max_dbs(4)
-                    .map_size(DEFAULT_MAP_SIZE_BYTES)
+                    .map_size(map_size_bytes)
                     .open(path)
             }
             .map_err(storage_error)?;
@@ -205,14 +227,81 @@ pub mod lmdb {
             let mut entries = Vec::new();
             for row in iter {
                 let (_, bytes) = row.map_err(storage_error)?;
-                let entry =
-                    rkyv::from_bytes::<TerminalResolverJournalEntry, rkyv::rancor::Error>(bytes)
-                        .map_err(storage_error)?;
-                entries.push(entry);
+                entries.push(decode_entry(bytes)?);
             }
             entries.sort_by_key(|entry| entry.sequence);
             Ok(entries)
         }
+
+        fn compact_terminal_detail(&self) -> Result<u64, TerminalResolverJournalError> {
+            let mut wtxn = self.env.write_txn().map_err(storage_error)?;
+            let mut decoded = Vec::new();
+            for row in self.rows.iter(&wtxn).map_err(storage_error)? {
+                let (key, bytes) = row.map_err(storage_error)?;
+                decoded.push((key.to_owned(), decode_entry(bytes)?));
+            }
+            // Quarantine remains unresolved even if contradictory ordinary
+            // terminal evidence also exists. Maintenance is not reconciliation.
+            let mut quarantined = HashSet::new();
+            let mut fences: HashMap<RunKey, u64> = HashMap::new();
+            for (_, entry) in &decoded {
+                if matches!(entry.event, SagaChoreographyEvent::SagaQuarantined { .. }) {
+                    quarantined.insert(run_key(&entry.event));
+                } else if is_terminal(&entry.event) {
+                    fences
+                        .entry(run_key(&entry.event))
+                        .or_insert(entry.sequence);
+                }
+            }
+            let mut removed = 0u64;
+            for (key, entry) in &decoded {
+                let run = run_key(&entry.event);
+                if quarantined.contains(&run) {
+                    continue;
+                }
+                let Some(fence) = fences.get(&run) else {
+                    continue; // unresolved run: keep everything
+                };
+                if *fence != entry.sequence {
+                    self.rows.delete(&mut wtxn, key).map_err(storage_error)?;
+                    removed += 1;
+                }
+            }
+            // next_sequence is untouched so removed sequences are never reused.
+            wtxn.commit().map_err(storage_error)?;
+            Ok(removed)
+        }
+    }
+
+    type RunKey = (u64, Box<str>, u64);
+
+    fn run_key(event: &SagaChoreographyEvent) -> RunKey {
+        let context = event.context();
+        (
+            context.saga_id.get(),
+            context.saga_type.clone(),
+            context.saga_started_at_millis,
+        )
+    }
+
+    fn is_terminal(event: &SagaChoreographyEvent) -> bool {
+        matches!(
+            event,
+            SagaChoreographyEvent::SagaCompleted { .. }
+                | SagaChoreographyEvent::SagaFailed { .. }
+                | SagaChoreographyEvent::SagaQuarantined { .. }
+        )
+    }
+
+    /// Decodes a validated archive from an explicitly aligned owned copy;
+    /// LMDB value slices carry no alignment guarantee.
+    fn decode_entry(
+        bytes: &[u8],
+    ) -> Result<TerminalResolverJournalEntry, TerminalResolverJournalError> {
+        let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(bytes.len());
+        aligned.extend_from_slice(bytes);
+        rkyv::from_bytes::<TerminalResolverJournalEntry, rkyv::rancor::Error>(&aligned)
+            .map_err(storage_error)
     }
 
     fn storage_error(error: impl std::fmt::Display) -> TerminalResolverJournalError {

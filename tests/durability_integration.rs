@@ -1185,21 +1185,14 @@ fn startup_recovery_collectors_cover_default_and_stale_paths() {
             },
         }],
     )]);
-    let stale_events = collect_startup_recovery_events_for_saga_type(
+    let error = collect_startup_recovery_events_for_saga_type(
         &stale_journal,
         &InMemoryDedupe::new(),
         "risk_gate",
         "mature_pool_refresh",
     )
-    .expect("startup recovery should collect");
-    assert_eq!(stale_events.len(), 1);
-    assert!(matches!(
-        &stale_events[0],
-        SagaChoreographyEvent::SagaFailed { context, reason, .. }
-            if context.saga_type.as_ref() == "mature_pool_refresh"
-                && context.saga_id == stale_saga
-                && reason.as_ref().contains("startup recovery quarantined stale saga")
-    ));
+    .expect_err("unidentified execution history must not fabricate a terminal outcome");
+    assert!(format!("{error:?}").contains("reconciliation required"));
 
     let default_saga = SagaId::new(89);
     let default_journal = InMemoryJournal::new();

@@ -796,7 +796,8 @@ fn accepted_completion_append_failure_keeps_step_pending_for_retry() {
 
 #[test]
 fn accepted_step_metadata_persistence_failure_quarantines_external_effect() {
-    let mut actor = FailingJournalActor::fail_on_append(2);
+    // Run identity + execution intent precede accepted metadata.
+    let mut actor = FailingJournalActor::fail_on_append(3);
     let ctx = context("create_order", 42);
     let mut emitted = Vec::new();
 
@@ -831,8 +832,9 @@ fn accepted_step_metadata_persistence_failure_quarantines_external_effect() {
         .expect("quarantine evidence should remain readable");
     assert!(matches!(
         journal.last().map(|entry| &entry.event),
-        Some(ParticipantEvent::Quarantined { reason, .. })
+        Some(ParticipantEvent::ParticipantTerminalRecorded { reason, outcome, .. })
             if reason.contains("accepted step persistence failed")
+                && *outcome == icanact_saga_choreography::ParticipantTerminalKind::Quarantined
     ));
 }
 
@@ -1701,17 +1703,13 @@ fn accepted_compensation_failure_leaves_no_compensating_state() {
         let mut resolver = TerminalResolver::new(terminal_policy());
         assert!(resolver.ingest(&recovery_events[0]).is_empty());
         let terminal = resolver.ingest(&recovery_events[1]);
-        if is_ambiguous {
-            assert!(matches!(
+        assert!(
+            matches!(
                 terminal.as_slice(),
                 [SagaChoreographyEvent::SagaQuarantined { .. }]
-            ));
-        } else {
-            assert!(matches!(
-                terminal.as_slice(),
-                [SagaChoreographyEvent::SagaFailed { .. }]
-            ));
-        }
+            ),
+            "failed undo remains unreversed even when failure is definitive"
+        );
     }
 }
 

@@ -73,10 +73,20 @@ reconstruct compensation ownership across all participants.
 Activation is deliberately separate from attachment: call it only after every participant
 binding is live, so recovered compensation requests cannot be lost during startup.
 
+Startup order is: attach resolver -> bind/hydrate participants -> activate recovery -> accept
+new starts. Terminal and quarantine state is durably fenced so restarts do not repeat
+terminal effects; rollback is serialized in reverse order; effect dispatch is explicit and
+fails closed by default; terminal retention needs capacity/compaction maintenance
+(quarantines are never auto-pruned). The library does not promise exactly-once effects:
+use stable external idempotency keys and reconciliation. See
+[docs/operations.md](docs/operations.md).
+
 ## Timeout Semantics
 
-- `overall_timeout`: hard wall-clock budget from saga start.
+- `overall_timeout`: forward wall-clock budget; forward expiry with known effects starts
+  rollback with renewed budgets instead of bypassing undo.
 - `stalled_timeout`: resettable watchdog budget; resets on participant progress events.
+- Expiry or failed undo while rollback is unresolved quarantines and retains evidence.
 
 ## Testing
 
@@ -87,3 +97,4 @@ binding is live, so recovered compensation requests cannot be lost during startu
 
 - [docs/integration_guide.md](docs/integration_guide.md)
 - [docs/architecture.md](docs/architecture.md)
+- [docs/operations.md](docs/operations.md)

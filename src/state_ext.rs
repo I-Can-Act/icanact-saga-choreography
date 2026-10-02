@@ -282,9 +282,8 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
 
     /// Records an event to the saga journal.
     ///
-    /// Appends the given event to the durable journal for the specified saga.
-    /// Errors during journaling are silently ignored; use this for best-effort
-    /// event recording where durability is desired but not strictly required.
+    /// Appends the event to the durable journal and propagates storage errors.
+    /// Critical intent/result/fence writes must use this strict operation.
     ///
     /// # Arguments
     ///
@@ -314,9 +313,10 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
 
     /// Removes all state associated with a saga.
     ///
-    /// This removes the saga from the state map, durable journal, and
-    /// deduplication entries. Use this when a saga has completed and its state
-    /// is no longer needed for recovery.
+    /// This destructive administrative primitive removes the durable replay fence
+    /// as well as volatile state, journal history and dedupe entries. Never use it
+    /// as routine terminal cleanup or to unblock a quarantine. Preserve an audited
+    /// replacement fence before deliberate deletion.
     ///
     /// # Arguments
     ///
@@ -441,10 +441,56 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
         Ok(ParticipantAdmission::Admitted)
     }
 
+    /// Checks the current run's durable forward intent/evidence. A changed
+    /// delivery trace or cleared volatile dependency cache must not reopen it.
+    fn forward_execution_recorded_strict(
+        &self,
+        context: &SagaContext,
+    ) -> Result<bool, SagaStateStoreError> {
+        let entries = self
+            .saga_journal()
+            .read(context.saga_id)
+            .map_err(SagaStateStoreError::Journal)?;
+        let start = entries.iter().rposition(|entry| matches!(&entry.event,
+            ParticipantEvent::ParticipantRunRecorded { saga_type, saga_started_at_millis, .. }
+                if saga_type == &context.saga_type && *saga_started_at_millis == context.saga_started_at_millis
+        )).unwrap_or(0);
+        Ok(entries[start..].iter().any(|entry| {
+            matches!(
+                entry.event,
+                ParticipantEvent::StepExecutionStarted { .. }
+                    | ParticipantEvent::StepExecutionCompleted { .. }
+                    | ParticipantEvent::Quarantined { .. }
+                    | ParticipantEvent::ParticipantReconciliationEvidence { .. }
+            )
+        }))
+    }
+
+    /// Retains typed reconciliation data after a result-write failure. This does
+    /// not claim success or authorize automatic execution/undo on recovery.
+    fn retain_reconciliation_evidence_strict(
+        &self,
+        context: &SagaContext,
+        output: &[u8],
+        compensation_data: &[u8],
+        reason: &str,
+    ) -> Result<(), SagaStateStoreError> {
+        self.record_event_strict(
+            context.saga_id,
+            ParticipantEvent::ParticipantReconciliationEvidence {
+                context: context.clone(),
+                output: output.to_vec(),
+                compensation_data: compensation_data.to_vec(),
+                reason: reason.into(),
+                recorded_at_millis: self.now_millis(),
+            },
+        )
+    }
+
     /// Durably retains a terminal tombstone for this run (no pruning of journal,
     /// dedupe or accepted metadata), then latches the in-memory cache. The first
-    /// recorded terminal outcome for a run is absorbing. Nothing is latched in memory
-    /// unless the durable write succeeded.
+    /// ordinary outcome is absorbing, but late effect evidence may escalate it to
+    /// quarantine. Quarantine never downgrades. The latch requires a durable write.
     fn retain_terminal_saga_strict(
         &mut self,
         context: &SagaContext,
@@ -455,7 +501,13 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
             .saga_journal()
             .read(context.saga_id)
             .map_err(SagaStateStoreError::Journal)?;
-        if scan_runs(&entries).terminal_of(context).is_none() {
+        let previous = scan_runs(&entries)
+            .terminal_of(context)
+            .map(|(kind, _)| kind);
+        if previous.is_none()
+            || (outcome == ParticipantTerminalKind::Quarantined
+                && previous != Some(ParticipantTerminalKind::Quarantined))
+        {
             self.record_event_strict(
                 context.saga_id,
                 ParticipantEvent::ParticipantTerminalRecorded {
@@ -587,7 +639,11 @@ fn scan_runs(entries: &[crate::JournalEntry]) -> RunScan<'_> {
                     r.saga_type == &**saga_type && r.started_at == *saga_started_at_millis
                 }) {
                     Some(run) => {
-                        run.terminal.get_or_insert((*outcome, reason));
+                        if *outcome == ParticipantTerminalKind::Quarantined {
+                            run.terminal = Some((*outcome, reason));
+                        } else {
+                            run.terminal.get_or_insert((*outcome, reason));
+                        }
                     }
                     None => runs.push(RunRecord {
                         saga_type,

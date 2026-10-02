@@ -110,9 +110,9 @@ pub trait ParticipantJournal: Send + Sync + 'static {
 
     /// Deletes all journal entries for a specific SAGA.
     ///
-    /// Terminal saga cleanup uses this to keep durable participant journals
-    /// bounded. Active, non-terminal SAGAs remain journaled for startup
-    /// recovery until they reach a terminal event.
+    /// Destructive administrative primitive: deletion removes replay protection
+    /// and unresolved evidence. Never use it for automatic terminal cleanup;
+    /// preserve an audited replacement fence before deliberate archival/deletion.
     fn prune(&self, saga_id: SagaId) -> Result<(), JournalError>;
 }
 
