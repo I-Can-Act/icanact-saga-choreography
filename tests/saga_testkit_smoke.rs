@@ -424,6 +424,9 @@ fn register_sync_order_lifecycle_contract(world: &SagaTestWorld) {
         bus.register_bound_workflow_step("order_lifecycle", step)
             .expect("sync order_lifecycle test step binding should succeed");
     }
+    // `start` is the contract's first step, a real SagaStarted recipient: serve
+    // it with a participant tagged with that step (dropping the handle keeps it subscribed).
+    drop(bus.subscribe_participant_fn("order_lifecycle", &["start"], |_event| true));
 }
 
 fn register_async_order_lifecycle_contract(world: &SagaTestWorld) {
@@ -444,6 +447,9 @@ fn register_workflow_beta_contract(world: &SagaTestWorld) {
         bus.register_bound_workflow_step("workflow_beta", step)
             .expect("workflow_beta test step binding should succeed");
     }
+    // `start` is the contract's first step, a real SagaStarted recipient: serve
+    // it with a participant tagged with that step (dropping the handle keeps it subscribed).
+    drop(bus.subscribe_participant_fn("workflow_beta", &["start"], |_event| true));
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

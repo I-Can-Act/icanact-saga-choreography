@@ -419,7 +419,20 @@ fn new_e2e_bus() -> SagaChoreographyBus {
         bus.register_bound_workflow_step(SAGA_TYPE, step)
             .expect("order lifecycle test step binding should succeed");
     }
+    // The saga initiator's lane: `start` is the contract's first step, a real
+    // recipient of SagaStarted, so it needs a participant tagged with it.
+    let _ = bus.subscribe_participant_fn(SAGA_TYPE, &[STEP_START], |_event| true);
     bus
+}
+
+/// A passive lane for a required step this test does not spawn (the step is
+/// driven by hand or emitted manually): a participant tagged with the step that
+/// accepts deliveries. Untagged receipts never stand in for a required step.
+fn serve_step(
+    bus: &SagaChoreographyBus,
+    step: &'static str,
+) -> icanact_core::local::FirehoseSubscription {
+    bus.subscribe_participant_fn(SAGA_TYPE, &[step], |_event| true)
 }
 
 /// Mailbox capacity large enough for synchronous re-entrant bus dispatch cascades.
@@ -437,6 +450,7 @@ fn spawn_and_subscribe(
     SpawnedParticipant,
 ) {
     participant.attach_bus(bus.clone());
+    let step_name = participant.step_name;
     let opts = local_sync::SpawnOpts {
         mailbox_capacity: MAILBOX_CAPACITY,
         ..Default::default()
@@ -447,6 +461,7 @@ fn spawn_and_subscribe(
         bus,
         &actor_ref,
         &[SAGA_TYPE],
+        &[step_name],
         "saga",
         MAILBOX_CAPACITY,
     )
@@ -475,11 +490,10 @@ fn spawn_terminal_probe(
     let (probe_ref, handle) = world.spawn_sync_with_opts(TerminalProbe::new(), opts);
     handle.wait_for_startup();
     let ref_clone = probe_ref.clone();
-    let probe =
-        bus.subscribe_participant_fn(SAGA_TYPE, &[], move |event: &SagaChoreographyEvent| {
-            let _ = ref_clone.try_tell(TerminalProbeMsg(event.clone()));
-            true
-        });
+    let probe = bus.subscribe_fn(SAGA_TYPE, move |event: &SagaChoreographyEvent| {
+        let _ = ref_clone.try_tell(TerminalProbeMsg(event.clone()));
+        true
+    });
     (
         probe_ref,
         SpawnedTerminalProbe {
@@ -886,12 +900,12 @@ fn position_compensation_fails_terminal_quarantines() {
     let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
+    let _lane_0 = serve_step(&bus, STEP_BALANCE);
+    let _lane_1 = serve_step(&bus, STEP_ORDER);
     let _resolver = bus
         .attach_terminal_resolver(test_policy(), "e2e-resolver")
         .expect("terminal resolver should attach");
     let (terminal_ref, terminal_h) = spawn_terminal_probe(&world, &bus);
-    let _pad_sub_a = bus.subscribe_participant_fn(SAGA_TYPE, &[], |_event| true);
-    let _pad_sub_b = bus.subscribe_participant_fn(SAGA_TYPE, &[], |_event| true);
 
     let (p_ref, p_h) = spawn_and_subscribe(
         &world,
@@ -1187,13 +1201,14 @@ fn order_panics_after_both_succeed() {
     let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
+    let _lane_0 = serve_step(&bus, STEP_ORDER);
     let _resolver = bus
         .attach_terminal_resolver(test_policy(), "e2e-resolver")
         .expect("terminal resolver should attach");
     let (terminal_ref, terminal_h) = spawn_terminal_probe(&world, &bus);
     let aborted = Arc::new(AtomicBool::new(false));
     let aborted_probe = Arc::clone(&aborted);
-    let _observer = bus.subscribe_participant_fn(SAGA_TYPE, &[], move |event| {
+    let _observer = bus.subscribe_fn(SAGA_TYPE, move |event| {
         if matches!(event, SagaChoreographyEvent::SagaAbortRequested { .. }) {
             aborted_probe.store(true, Ordering::SeqCst);
         }
@@ -1509,12 +1524,11 @@ fn duplicate_compensation_request_is_deduped() {
     let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
+    let _lane_0 = serve_step(&bus, STEP_BALANCE);
+    let _lane_1 = serve_step(&bus, STEP_ORDER);
     let _resolver = bus
         .attach_terminal_resolver(test_policy(), "e2e-resolver")
         .expect("terminal resolver should attach");
-    let _pad_sub_a = bus.subscribe_participant_fn(SAGA_TYPE, &[], |_event| true);
-    let _pad_sub_b = bus.subscribe_participant_fn(SAGA_TYPE, &[], |_event| true);
-    let _pad_sub_c = bus.subscribe_participant_fn(SAGA_TYPE, &[], |_event| true);
 
     let (p_ref, p_h) = spawn_and_subscribe(
         &world,
