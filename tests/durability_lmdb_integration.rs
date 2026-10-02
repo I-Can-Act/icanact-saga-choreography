@@ -188,7 +188,7 @@ fn prune_saga_removes_lmdb_journal_and_dedupe_state() {
 }
 
 #[test]
-fn open_support_replays_panic_quarantine_once() {
+fn open_support_replays_panic_quarantine_until_sent() {
     let temp = tempfile::tempdir().expect("tempdir should open");
     let base: PathBuf = temp.path().join("support");
 
@@ -223,9 +223,11 @@ fn open_support_replays_panic_quarantine_once() {
         open_lmdb_participant_support_for_saga_type(&base, "risk_gate", "mature_pool_refresh")
             .expect("support should reopen");
     let second_events = second.take_startup_recovery_events();
-    assert!(
-        second_events.is_empty(),
-        "dedupe should prevent replaying panic quarantine more than once"
+    // R09/ADR-0003: re-derived on every open until actually sent; no pre-marked replay key.
+    assert_eq!(
+        second_events.len(),
+        1,
+        "panic quarantine emission must be re-derived on every open"
     );
 
     let mut default_support =
@@ -233,7 +235,7 @@ fn open_support_replays_panic_quarantine_once() {
     let default_events = default_support.take_startup_recovery_events();
     assert!(
         default_events.is_empty(),
-        "panic replay should remain deduped through default open helper"
+        "default open helper recovers only its own saga type"
     );
 }
 

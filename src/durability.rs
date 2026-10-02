@@ -47,6 +47,8 @@ pub enum RecoveryCollectionError {
     UnattributedLegacyRows {
         saga_id: SagaId,
     },
+    /// `outbox_for_replay` failed; the participant must not start with unknown obligations (ADR-0003).
+    OutboxReplay(JournalError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1116,6 +1118,33 @@ where
                 .insert(run.clone(), accepted);
             continue;
         }
+        if run.saga_type() == saga_type
+            && !support.saga_states.contains_key(&run)
+            && recover_accepted_workflow_step_from_entries(&entries).is_none()
+            && let Some((output, compensation_data, completed_at_millis)) =
+                recover_live_completed_step_from_entries(&entries)
+        {
+            // R02: the effect completed before the restart; keep its undo ownership so a later
+            // compensation request finds a `Completed` state instead of silently returning.
+            let context = recovery_context_for_run(&run, step_name);
+            let state = crate::SagaParticipantState::new(
+                saga_id,
+                context.saga_type.clone(),
+                context.step_name.clone(),
+                context.correlation_id,
+                context.trace_id,
+                context.initiator_peer_id,
+                context.saga_started_at_millis,
+            )
+            .trigger("step_recovered", completed_at_millis)
+            .start_execution(completed_at_millis)
+            .complete(output, compensation_data, completed_at_millis);
+            support
+                .saga_states
+                .insert(run.clone(), SagaStateEntry::Completed(state));
+            support.admitted_runs.insert(run.clone());
+            continue;
+        }
         if let Some(accepted) = recover_accepted_workflow_step_from_entries(&entries) {
             let expired = accepted.deadline_at_millis < now_millis
                 || accepted.hard_deadline_at_millis < now_millis;
@@ -1472,6 +1501,51 @@ fn recover_completed_step_effect_for_unstarted_compensation(
         }
     }
     effect_at_request
+}
+
+/// Ordinary completed-step effect that is still live at the end of the journal: the last
+/// `StepExecutionCompleted` with no later restart of execution, failure, compensation or
+/// quarantine (R02). Accepted-step rows are handled by their own recovery path.
+fn recover_live_completed_step_from_entries(
+    entries: &[JournalEntry],
+) -> Option<(Vec<u8>, Vec<u8>, u64)> {
+    let mut completed = None;
+    for entry in entries {
+        match entry.event.transition() {
+            ParticipantEvent::StepExecutionCompleted {
+                output,
+                compensation_data,
+                completed_at_millis,
+            } => {
+                completed = Some((
+                    output.clone(),
+                    compensation_data.clone(),
+                    *completed_at_millis,
+                ));
+            }
+            ParticipantEvent::StepExecutionStarted { .. }
+            | ParticipantEvent::InboxCommitted {
+                execution_intent: Some(_),
+                ..
+            }
+            | ParticipantEvent::StepExecutionFailed { .. }
+            | ParticipantEvent::AcceptedStepRecorded { .. }
+            | ParticipantEvent::CompensationStarted { .. }
+            | ParticipantEvent::AcceptedCompensationRecorded { .. }
+            | ParticipantEvent::CompensationCompleted { .. }
+            | ParticipantEvent::CompensationFailed { .. }
+            | ParticipantEvent::Quarantined { .. } => completed = None,
+            ParticipantEvent::SagaRegistered { .. }
+            | ParticipantEvent::StepTriggered { .. }
+            | ParticipantEvent::CompensationRequestRecorded { .. }
+            | ParticipantEvent::InboxCommitted {
+                execution_intent: None,
+                ..
+            }
+            | ParticipantEvent::TransitionCommitted { .. } => {}
+        }
+    }
+    completed
 }
 
 fn recover_accepted_workflow_step_from_entries(
@@ -3245,6 +3319,44 @@ pub fn collect_startup_recovery_events_for_saga_type<
     collect_startup_recovery_events_for_saga_type_inner(journal, saga_type, dedupe, step_name, true)
 }
 
+/// Durable outbound obligations of the non-finalized runs of `saga_types` inside the replay
+/// horizon, in `(run, sequence, index)` order (ADR-0003 §2.2). Runs older than the cutoff are
+/// retained but not replayed (receivers would reject them as expired); one `warn!` per run.
+pub fn collect_outbox_replay_events<J: ParticipantJournal>(
+    journal: &J,
+    saga_types: &[&'static str],
+    horizon: crate::ReplayHorizon,
+    now_millis: u64,
+) -> Result<Vec<SagaChoreographyEvent>, RecoveryCollectionError> {
+    let cutoff = horizon.cutoff(now_millis);
+    let records = journal.outbox_for_replay(cutoff).map_err(|err| {
+        tracing::error!(
+            target: "core::saga",
+            event = "saga_outbox_replay_failed",
+            error = %err
+        );
+        RecoveryCollectionError::OutboxReplay(err)
+    })?;
+    for run in journal
+        .list_runs()
+        .map_err(RecoveryCollectionError::ListSagas)?
+    {
+        if run.incarnation() < cutoff && saga_types.contains(&run.saga_type()) {
+            tracing::warn!(
+                target: "core::saga",
+                event = "saga_outbox_retained_not_replayed",
+                run = %run,
+                cutoff = cutoff.get()
+            );
+        }
+    }
+    Ok(records
+        .into_iter()
+        .filter(|record| saga_types.contains(&record.id.run().saga_type()))
+        .map(|record| record.event)
+        .collect())
+}
+
 fn collect_startup_recovery_events_for_saga_type_inner<
     J: ParticipantJournal,
     D: ParticipantDedupeStore,
@@ -3427,26 +3539,16 @@ fn collect_startup_recovery_events_for_saga_type_inner<
                 });
             }
             RecoveryDecision::ReplayPanicQuarantine => {
-                let should_emit =
-                    match dedupe.check_and_mark_run(&run, PANIC_QUARANTINE_PUBLISH_KEY) {
-                        Ok(value) => value,
-                        Err(err) => {
-                            return Err(RecoveryCollectionError::MarkDedupe {
-                                saga_id,
-                                source: err,
-                            });
-                        }
-                    };
-                if should_emit {
-                    let reason = panic_quarantine_reason_from_entries(&entries)
-                        .unwrap_or_else(|| Box::<str>::from("panic quarantined during execution"));
-                    out.push(SagaChoreographyEvent::SagaQuarantined {
-                        context: recovery_context_for_run(&run, step_name),
-                        reason,
-                        step: step_name.into(),
-                        participant_id: step_name.into(),
-                    });
-                }
+                // ADR-0003 §2.3: re-derived from the journal on every startup; no pre-mark, so a
+                // crash before the send cannot suppress it. Receivers are idempotent per RunKey.
+                let reason = panic_quarantine_reason_from_entries(&entries)
+                    .unwrap_or_else(|| Box::<str>::from("panic quarantined during execution"));
+                out.push(SagaChoreographyEvent::SagaQuarantined {
+                    context: recovery_context_for_run(&run, step_name),
+                    reason,
+                    step: step_name.into(),
+                    participant_id: step_name.into(),
+                });
             }
             RecoveryDecision::Continue | RecoveryDecision::TerminalNoAction => {}
         }
@@ -4403,7 +4505,14 @@ pub mod lmdb {
         }
         let journal = LmdbJournal::open(&base.join("journal")).map_err(|err| err.to_string())?;
         let dedupe = LmdbDedupe::open(&base.join("dedupe")).map_err(|err| err.to_string())?;
-        let mut startup_recovery_events = Vec::new();
+        // ADR-0003: durable obligations first, then re-derived recovery events.
+        let mut startup_recovery_events = super::collect_outbox_replay_events(
+            &journal,
+            saga_types,
+            crate::ReplayHorizon::PARTICIPANT_DEFAULT,
+            crate::SagaContext::now_millis(),
+        )
+        .map_err(|err| format!("startup outbox replay failed: {err:?}"))?;
         for saga_type in saga_types {
             let mut events = collect_startup_recovery_events_for_saga_type_inner(
                 &journal,
