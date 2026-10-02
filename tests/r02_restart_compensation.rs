@@ -157,12 +157,9 @@ fn completed_effect_survives_restart_before_compensation_request() {
     );
 }
 
-// BLOCKED (lane P): the `None => return IngressOutcome::Applied` arms of the sync/async
-// compensate wrappers in src/helpers.rs must return
-// `ReconciliationNeeded { MissingCompletedState }`, quarantine the run (SagaQuarantined +
-// error! with the RunKey). Un-ignore once that lands.
+// A required compensation request with no Completed state quarantines the run and returns
+// `ReconciliationNeeded { MissingCompletedState }` (never a silent `Applied`).
 #[test]
-#[ignore = "needs src/helpers.rs (lane P): missing Completed state on a required compensation request"]
 fn compensation_request_without_completed_state_is_never_silent() {
     use icanact_saga_choreography::{IngressOutcome, ReconciliationCause};
     let temp = tempfile::tempdir().expect("tempdir");
@@ -187,4 +184,44 @@ fn compensation_request_without_completed_state_is_never_silent() {
         "{emitted:?}"
     );
     assert_eq!(ledger.undo_count(&run.to_string()), 0);
+}
+
+#[test]
+fn rerequest_after_settled_compensation_and_restart_is_not_a_reconciliation_case() {
+    use icanact_saga_choreography::IngressOutcome;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let ledger = EffectLedger::new();
+    let context = ctx(3);
+    let run = context.run_key();
+    {
+        let mut actor = open(temp.path(), &ledger);
+        feed(
+            &mut actor,
+            SagaChoreographyEvent::SagaStarted {
+                context: context.clone(),
+                payload: vec![7],
+            },
+        );
+        let (_, emitted) = feed(&mut actor, request(&context));
+        assert!(
+            emitted
+                .iter()
+                .any(|e| matches!(e, SagaChoreographyEvent::CompensationCompleted { .. })),
+            "{emitted:?}"
+        );
+    }
+    let mut actor = open(temp.path(), &ledger);
+    let (outcome, emitted) = feed(&mut actor, request(&context));
+    // The dedupe mark answers `Duplicate`; either way it is never a reconciliation case.
+    assert!(
+        matches!(outcome, IngressOutcome::Applied | IngressOutcome::Duplicate),
+        "{outcome:?}"
+    );
+    assert!(
+        !emitted
+            .iter()
+            .any(|e| matches!(e, SagaChoreographyEvent::SagaQuarantined { .. })),
+        "{emitted:?}"
+    );
+    assert_eq!(ledger.undo_count(&run.to_string()), 1);
 }

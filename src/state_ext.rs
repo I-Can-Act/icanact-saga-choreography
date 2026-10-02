@@ -7,7 +7,10 @@
 //! and implement [`crate::HasSagaParticipantSupport`]. This crate will then
 //! provide `SagaStateExt` automatically.
 
-use crate::{CommitStage, IngressFailure, IngressOutcome, IngressRejection};
+use crate::{
+    CommitStage, IngressFailure, IngressOutcome, IngressRejection, ReconciliationCause,
+    ReconciliationNeeded,
+};
 use crate::{
     DedupeError, HasSagaParticipantSupport, InboxState, InboxTxn, JournalError, KnownRuns,
     ParticipantDedupeStore, ParticipantEvent, ParticipantJournal, RunAdmission, RunIdentityError,
@@ -767,6 +770,68 @@ where
         participant_id,
     });
     true
+}
+
+/// R02 (ADR-0002, owner decision NO SILENT FAILURES): a `CompensationRequested` names this
+/// participant's step but the run holds no in-memory state, so the undo ownership is unknown.
+///
+/// Unless the journal shows the step was already settled (its undo completed or its forward
+/// execution failed, so there is nothing to undo), the run is quarantined through the single
+/// quarantine path and `ReconciliationNeeded { MissingCompletedState }` is returned.
+pub(crate) fn missing_completed_state_outcome<A, F>(
+    actor: &mut A,
+    context: &SagaContext,
+    (step, participant_id): (Box<str>, Box<str>),
+    now: u64,
+    emit: &mut F,
+) -> IngressOutcome
+where
+    A: SagaStateExt + ?Sized,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let run = context.run_key();
+    let settled = actor.saga_journal().read_run(&run).is_ok_and(|rows| {
+        rows.iter().any(|row| {
+            matches!(
+                row.event.transition(),
+                ParticipantEvent::CompensationCompleted { .. }
+                    | ParticipantEvent::StepExecutionFailed { .. }
+            )
+        })
+    });
+    if settled {
+        tracing::debug!(
+            target: "core::saga",
+            event = "saga_compensation_request_already_settled",
+            run = %run,
+            step = %step
+        );
+        return IngressOutcome::Applied;
+    }
+    tracing::error!(
+        target: "core::saga",
+        event = "saga_compensation_missing_completed_state",
+        run = %run,
+        step = %step,
+        "compensation required but this participant holds no completed state"
+    );
+    quarantine_run_with_evidence(
+        actor,
+        context,
+        (step.clone(), participant_id),
+        (
+            "compensation_missing_completed_state",
+            "reconciliation_needed: compensation requested without completed state".into(),
+        ),
+        now,
+        emit,
+    );
+    IngressOutcome::ReconciliationNeeded(ReconciliationNeeded {
+        run,
+        step,
+        cause: ReconciliationCause::MissingCompletedState,
+        compensation_data: Vec::new(),
+    })
 }
 
 /// Finalizes a `Completed`/`Failed` run after its terminal event (ADR-0001 §2.5, §2.7).

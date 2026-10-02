@@ -1265,7 +1265,17 @@ where
             participant.saga_states().insert(run.clone(), other);
             return IngressOutcome::Applied;
         }
-        None => return IngressOutcome::Applied,
+        None => {
+            let step = participant.step_name().into();
+            let participant_id = participant.participant_id_owned();
+            return crate::state_ext::missing_completed_state_outcome(
+                participant,
+                context,
+                (step, participant_id),
+                now,
+                emit,
+            );
+        }
     };
     let mut new_state = new_state;
     new_state.state.compensation_data = Some(comp_data.clone());
@@ -1429,7 +1439,17 @@ where
             participant.saga_states().insert(run.clone(), other);
             return IngressOutcome::Applied;
         }
-        None => return IngressOutcome::Applied,
+        None => {
+            let step = participant.step_name().into();
+            let participant_id = participant.participant_id_owned();
+            return crate::state_ext::missing_completed_state_outcome(
+                participant,
+                context,
+                (step, participant_id),
+                now,
+                emit,
+            );
+        }
     };
     let mut new_state = new_state;
     new_state.state.compensation_data = Some(comp_data.clone());
