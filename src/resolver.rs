@@ -295,6 +295,8 @@ struct SagaResolutionState {
     phase: ResolverPhase,
     /// Effects that completed during rollback and cannot be undone.
     unresolved: Vec<Box<str>>,
+    /// `CompensationFailedRetryable` count per step (retry budget, ADR-0004).
+    compensation_retries: HashMap<Box<str>, u32>,
     /// Set for internal aborts (timeouts, `SagaAbortRequested`): the settled
     /// `SagaFailed` carries this reason and no step failure.
     abort_reason: Option<Box<str>>,
@@ -354,6 +356,7 @@ impl SagaResolutionState {
             compensable_steps: Vec::new(),
             phase: ResolverPhase::Running,
             unresolved: Vec::new(),
+            compensation_retries: HashMap::new(),
             abort_reason: None,
             aborting_since_millis: None,
             pending_compensation_steps: HashSet::new(),
@@ -726,15 +729,26 @@ impl TerminalResolver {
                         step: context.step_name.clone(),
                         participant_id: participant_id.clone(),
                     });
+                    state.terminal_latched = true;
                 } else {
-                    let failure = state.pending_failure.clone();
-                    out.push(SagaChoreographyEvent::SagaFailed {
-                        context: terminal_context(context),
-                        reason: error.clone(),
-                        failure,
-                    });
+                    // Q9: the undo cannot be performed, so the effect remains.
+                    // Other pending undos still run; once none are pending the
+                    // run is quarantined (never `SagaFailed`).
+                    error!(
+                        event = "saga_compensation_failed_terminal",
+                        run = %context.run_key(),
+                        step = %context.step_name,
+                        %error,
+                        "compensation failed terminally; effect remains unresolved"
+                    );
+                    state
+                        .pending_compensation_steps
+                        .remove(context.step_name.as_ref());
+                    if !state.unresolved.contains(&context.step_name) {
+                        state.unresolved.push(context.step_name.clone());
+                    }
+                    settle(state, context, None, &mut out);
                 }
-                state.terminal_latched = true;
             }
             SagaChoreographyEvent::CompensationRequested {
                 failure,
@@ -810,23 +824,57 @@ impl TerminalResolver {
                 state
                     .accepted_compensations
                     .remove(context.step_name.as_ref());
-                // The undo never ran: the effect is still live. Never a
-                // `SagaFailed` (interim until bounded retries exist).
-                error!(
-                    event = "saga_compensation_failed_retryable",
-                    run = %context.run_key(),
-                    step = %context.step_name,
-                    %error,
-                    "compensation failed; effect remains unresolved"
-                );
-                if !state.unresolved.contains(&context.step_name) {
-                    state.unresolved.push(context.step_name.clone());
+                // The undo never ran: the effect is still live. Re-request it
+                // within the retry budget; exhausted budget leaves it
+                // unresolved, which quarantines (never `SagaFailed`).
+                let step = context.step_name.clone();
+                let retryable_now = state.phase == ResolverPhase::Aborting
+                    && state.pending_compensation_steps.contains(&step);
+                let retries = state.compensation_retries.entry(step.clone()).or_insert(0);
+                if retryable_now {
+                    *retries += 1;
                 }
-                if state.phase == ResolverPhase::Aborting {
-                    state
-                        .pending_compensation_steps
-                        .remove(context.step_name.as_ref());
-                    settle(state, context, None, &mut out);
+                let attempt = *retries;
+                let failure = state.pending_failure.clone();
+                match failure {
+                    Some(failure)
+                        if retryable_now && attempt <= self.policy.compensation_retry_limit() =>
+                    {
+                        warn!(
+                            event = "saga_compensation_retry_requested",
+                            run = %context.run_key(),
+                            step = %step,
+                            attempt,
+                            %error,
+                            "compensation failed retryably; re-requesting undo"
+                        );
+                        let mut request_context = terminal_context(context);
+                        request_context.attempt = attempt;
+                        out.push(SagaChoreographyEvent::CompensationRequested {
+                            context: request_context,
+                            failed_step: failure.step_name.clone(),
+                            reason: "compensation_retry".into(),
+                            failure,
+                            steps_to_compensate: vec![step],
+                        });
+                    }
+                    _ => {
+                        error!(
+                            event = "saga_compensation_failed_retryable",
+                            run = %context.run_key(),
+                            step = %step,
+                            attempt,
+                            %error,
+                            "compensation failed; effect remains unresolved"
+                        );
+                        if !state.unresolved.contains(&step) {
+                            state.unresolved.push(step.clone());
+                        }
+                        if state.phase == ResolverPhase::Aborting {
+                            state.pending_compensation_steps.remove(step.as_ref());
+                            settle(state, context, None, &mut out);
+                        }
+                    }
                 }
             }
         }
@@ -3244,8 +3292,11 @@ mod tests {
     }
 
     #[test]
-    fn retryable_compensation_failure_during_rollback_quarantines() {
-        let (mut resolver, _) = rolling_back();
+    fn retryable_compensation_failure_with_no_retry_budget_quarantines() {
+        let mut resolver =
+            TerminalResolver::new(rollback_policy().with_compensation_retry_limit(0));
+        resolver.ingest_at(&completed("A", 1_010, true), 1_010);
+        resolver.ingest_at(&step_failed("C", 1_020, true), 1_020);
         let out = resolver.ingest_at(&retryable("A", 1_030), 1_030);
         assert!(
             matches!(
@@ -3262,13 +3313,98 @@ mod tests {
         // B completes late and is owed an undo, so the run keeps rolling back.
         let late = resolver.ingest_at(&completed("B", 1_030, true), 1_030);
         assert_eq!(late.len(), 1, "late B owed an undo: {late:?}");
-        assert!(resolver.ingest_at(&retryable("A", 1_040), 1_040).is_empty());
+        let retry = resolver.ingest_at(&retryable("A", 1_040), 1_040);
+        assert_eq!(re_requests_of(&retry, "A"), vec![1], "{retry:?}");
         // A's undo is retried and succeeds: no longer unresolved.
         assert!(resolver.ingest_at(&undo_ack("A", 1_050), 1_050).is_empty());
         let end = resolver.ingest_at(&undo_ack("B", 1_060), 1_060);
         assert!(
             matches!(end.as_slice(), [SagaChoreographyEvent::SagaFailed { .. }]),
             "clean rollback must not quarantine: {end:?}"
+        );
+    }
+
+    fn terminal_undo_failure(step: &str, at: u64) -> SagaChoreographyEvent {
+        SagaChoreographyEvent::CompensationFailed {
+            context: ctx_at(step, 51, 1_000, at),
+            participant_id: step.into(),
+            error: "undo refused".into(),
+            is_ambiguous: false,
+        }
+    }
+
+    fn re_requests_of(events: &[SagaChoreographyEvent], step: &str) -> Vec<u32> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                SagaChoreographyEvent::CompensationRequested {
+                    context,
+                    steps_to_compensate,
+                    ..
+                } if steps_to_compensate.len() == 1 && steps_to_compensate[0].as_ref() == step => {
+                    Some(context.attempt)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn retryable_compensation_failure_preserves_pending_plan_and_retries() {
+        let (mut resolver, _) = rolling_back();
+        // B completes late: undo of A and B both owed.
+        let late = resolver.ingest_at(&completed("B", 1_030, true), 1_030);
+        assert_eq!(late.len(), 1, "late B owed an undo: {late:?}");
+        // A's undo fails retryably: re-request A with attempt 1, no terminal.
+        let retry = resolver.ingest_at(&retryable("A", 1_040), 1_040);
+        assert_eq!(re_requests_of(&retry, "A"), vec![1], "{retry:?}");
+        assert!(
+            !retry.iter().any(is_terminal_event),
+            "no terminal while undo remains: {retry:?}"
+        );
+        // B's ack alone must not settle: A is still pending its retry.
+        assert!(resolver.ingest_at(&undo_ack("B", 1_050), 1_050).is_empty());
+        let end = resolver.ingest_at(&undo_ack("A", 1_060), 1_060);
+        assert!(
+            matches!(end.as_slice(), [SagaChoreographyEvent::SagaFailed { .. }]),
+            "{end:?}"
+        );
+    }
+
+    #[test]
+    fn retry_budget_exhaustion_quarantines_once_nothing_is_pending() {
+        let mut resolver =
+            TerminalResolver::new(rollback_policy().with_compensation_retry_limit(1));
+        resolver.ingest_at(&completed("A", 1_010, true), 1_010);
+        resolver.ingest_at(&step_failed("C", 1_020, true), 1_020);
+        let first = resolver.ingest_at(&retryable("A", 1_030), 1_030);
+        assert_eq!(re_requests_of(&first, "A"), vec![1], "{first:?}");
+        let second = resolver.ingest_at(&retryable("A", 1_040), 1_040);
+        assert!(
+            matches!(
+                second.as_slice(),
+                [SagaChoreographyEvent::SagaQuarantined { step, .. }] if step.as_ref() == "A"
+            ),
+            "budget exhausted must quarantine, never fail: {second:?}"
+        );
+    }
+
+    #[test]
+    fn terminal_compensation_failure_quarantines_after_pending_undo_settles() {
+        let (mut resolver, _) = rolling_back();
+        let late = resolver.ingest_at(&completed("B", 1_030, true), 1_030);
+        assert_eq!(late.len(), 1, "late B owed an undo: {late:?}");
+        // A's undo fails terminally while B's undo is still pending: nothing
+        // is latched yet and never a SagaFailed.
+        let out = resolver.ingest_at(&terminal_undo_failure("A", 1_040), 1_040);
+        assert!(out.is_empty(), "other undo still pending: {out:?}");
+        let end = resolver.ingest_at(&undo_ack("B", 1_050), 1_050);
+        assert!(
+            matches!(
+                end.as_slice(),
+                [SagaChoreographyEvent::SagaQuarantined { step, .. }] if step.as_ref() == "A"
+            ),
+            "an effect remains in the world: {end:?}"
         );
     }
 
