@@ -790,15 +790,27 @@ where
     F: FnMut(SagaChoreographyEvent),
 {
     let run = context.run_key();
-    let settled = actor.saga_journal().read_run(&run).is_ok_and(|rows| {
-        rows.iter().any(|row| {
+    let settled = match actor.saga_journal().read_run(&run) {
+        Ok(rows) => rows.iter().any(|row| {
             matches!(
                 row.event.transition(),
                 ParticipantEvent::CompensationCompleted { .. }
                     | ParticipantEvent::StepExecutionFailed { .. }
             )
-        })
-    });
+        }),
+        Err(error) => {
+            // W4-review R4: fail closed. A journal we cannot read proves nothing was settled.
+            tracing::error!(
+                target: "core::saga",
+                event = "saga_compensation_settled_check_read_failed",
+                run = %run,
+                step = %step,
+                error = %error,
+                "cannot read the journal to confirm the step was settled; treating as not settled"
+            );
+            false
+        }
+    };
     if settled {
         tracing::debug!(
             target: "core::saga",
