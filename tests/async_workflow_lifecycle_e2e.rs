@@ -1074,9 +1074,11 @@ fn compensating_failure_restart_keeps_forward_execution_tombstoned() {
         "order_lifecycle",
     )
     .expect("durable failure recovery events should be collected");
+    // W4-review R6: the public collector now leads with the durable outbox replay (the committed
+    // `StepFailed` obligation), then the re-derived hydration + failure pair.
     assert!(matches!(
         recovery_events.as_slice(),
-        [SagaChoreographyEvent::StepAccepted {
+        [SagaChoreographyEvent::StepFailed { .. }, SagaChoreographyEvent::StepAccepted {
             timeouts_enabled: false,
             ..
         }, SagaChoreographyEvent::StepFailed {
@@ -1089,7 +1091,8 @@ fn compensating_failure_restart_keeps_forward_execution_tombstoned() {
     ));
     let mut restarted_resolver = TerminalResolver::new(terminal_policy());
     let mut resolver_events = Vec::new();
-    for event in &recovery_events {
+    // Skip the leading outbox-replayed `StepFailed`: the resolver needs the hydration first.
+    for event in recovery_events.iter().skip(1) {
         resolver_events.extend(restarted_resolver.ingest(event));
     }
     assert!(matches!(
@@ -1537,7 +1540,12 @@ fn unstarted_compensation_request_replays_and_rearms_its_dedupe_key() {
         "order_lifecycle",
     )
     .expect("started compensation recovery should classify");
-    assert!(after_start.is_empty());
+    // W4-review R2: a CompensationStarted with no recorded outcome is a crash mid-undo: the
+    // request is not replayed and the quarantine is re-derived.
+    assert!(matches!(
+        after_start.as_slice(),
+        [SagaChoreographyEvent::SagaQuarantined { context, .. }] if context.saga_id == ctx.saga_id
+    ));
     assert!(
         support
             .dedupe
