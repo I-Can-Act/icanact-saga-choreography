@@ -23,7 +23,8 @@ At saga start, framework enforcement is fail-fast:
 - Missing workflow contract for the saga type: immediate `SagaFailed`.
 - `SagaStarted.context.step_name` does not match contract `first_step`: immediate `SagaFailed`.
 - Any declared contract step is not bound to a participant: immediate `SagaFailed` with `missing_steps=...`.
-- Live start-event fanout below contract minimum (`declared_steps + terminal_resolver`): immediate `SagaFailed` (prevents latent stalls from stale/unwired subscribers).
+- Live start-event fanout below contract minimum (`declared_steps + terminal_resolver`), judged by tagged required-path receipts (each declared step's participant plus the resolver): the bus publishes `SagaAbortRequested` so the resolver rolls the run back. `SagaFailed` is only a fallback when no resolver receives the abort (prevents latent stalls from stale/unwired subscribers).
+- Durable resolver activation gate: until `activate_terminal_resolver_recovery` runs for the saga type, a durable resolver publishes nothing, and `SagaStarted` is rejected with `SagaBusPublishError::AdmissionRejected`. An in-memory resolver is active immediately.
 - Invalid workflow contracts are rejected at registration (duplicate steps, undeclared dependencies, cycles, required terminal steps missing).
 
 This prevents runtime “partial wiring” where a saga starts and then stalls waiting for steps that can never run.

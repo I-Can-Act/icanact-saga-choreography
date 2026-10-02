@@ -212,7 +212,7 @@ Typical flow:
 Delivery requirements:
 
 - The first-step participant must receive `SagaStarted`; the emitter is not excluded for `SagaStarted`, so a missing first participant is a shortfall rather than being hidden.
-- Each `CompensationRequested` needs a receipt from the tagged participant of its target step. If that participant is gone, the bus logs the shortfall and the compensation is undeliverable: the resolver gives that step up and the run is quarantined with `SagaQuarantined` naming the step, rather than waiting for the rollback timeout or reporting rollback complete.
+- Each `CompensationRequested` needs a receipt from the tagged participant of its target step. A missing receipt (participant gone, or its mailbox full) is not decided on the spot: the resolver retains the request and retries it on its watchdog polls. A full mailbox that drains is delivered normally. Only after `RESOLVER_PUBLISH_MAX_ATTEMPTS` (5) failed attempts does the resolver log an `error!`, journal an "undeliverable" give-up for that step and settle: the run is quarantined with `SagaQuarantined` naming the step (once any other in-flight undos finish), rather than waiting for the rollback timeout or reporting rollback complete. The give-up is journaled, so a durable resolver replays it after a restart.
 
 At step 1, the bus validates startup invariants:
 
