@@ -228,9 +228,19 @@ impl SyncActor for BusStateActor {
                 let required = self
                     .workflow_contracts_by_saga_type
                     .get(saga_type.as_ref())
-                    .and_then(|contract| match &step_name {
-                        Some(step) if !contract.required_path_steps.contains(step.as_ref()) => None,
-                        _ => Some(contract.required_path_steps.clone()),
+                    .and_then(|contract| {
+                        // The emitting step never receives its own event; for
+                        // SagaStarted (`None`) the emitter is the start step.
+                        let emitter = match &step_name {
+                            Some(step) if !contract.required_path_steps.contains(step.as_ref()) => {
+                                return None;
+                            }
+                            Some(step) => step.as_ref(),
+                            None => contract.first_step.as_ref(),
+                        };
+                        let mut required = contract.required_path_steps.clone();
+                        required.remove(emitter);
+                        Some(required)
                     });
                 BusStateReply::RequiredRecipients(required)
             }
@@ -2524,23 +2534,30 @@ mod tests {
         let _resolver = bus
             .attach_durable_terminal_resolver(policy, "terminal-resolver", Arc::clone(&journal))
             .expect("durable resolver should restore");
-        let compensation_scope = Arc::new(std::sync::Mutex::new(None));
+        let requests: Arc<std::sync::Mutex<Vec<Vec<Box<str>>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
         let _capture = bus.subscribe_saga_type_fn("durable_multi_step", {
-            let compensation_scope = Arc::clone(&compensation_scope);
+            let requests = Arc::clone(&requests);
             move |event| {
                 if let SagaChoreographyEvent::CompensationRequested {
                     steps_to_compensate,
                     ..
                 } = event
                 {
-                    let mut guard = compensation_scope
+                    requests
                         .lock()
-                        .expect("capture lock should remain available");
-                    *guard = Some(steps_to_compensate.clone());
+                        .expect("capture lock should remain available")
+                        .push(steps_to_compensate.to_vec());
                 }
                 true
             }
         });
+        let request_count = || {
+            requests
+                .lock()
+                .expect("capture lock should remain available")
+                .len()
+        };
         bus.publish_strict(SagaChoreographyEvent::StepFailed {
             context: context_for("durable_multi_step", "second_effect", 812),
             participant_id: "second-participant".into(),
@@ -2550,24 +2567,27 @@ mod tests {
         })
         .expect("recovered failure should publish");
 
+        // Serial frontier: the later effect is undone first, alone.
         wait_until(Instant::now() + Duration::from_secs(1), || {
-            compensation_scope
-                .lock()
-                .expect("capture lock should remain available")
-                .is_some()
+            request_count() >= 1
         });
         assert_eq!(
-            compensation_scope
-                .lock()
-                .expect("capture lock should remain available")
-                .as_deref(),
-            Some(
-                [
-                    Box::<str>::from("second_effect"),
-                    Box::<str>::from("first_effect"),
-                ]
-                .as_slice()
-            )
+            requests.lock().expect("capture lock")[0],
+            vec![Box::<str>::from("second_effect")]
+        );
+        assert_eq!(request_count(), 1, "first_effect waits for the ack");
+
+        // After the ack, the earlier effect follows: the restored scope is complete.
+        bus.publish_strict(SagaChoreographyEvent::CompensationCompleted {
+            context: context_for("durable_multi_step", "second_effect", 812),
+        })
+        .expect("compensation ack should publish");
+        wait_until(Instant::now() + Duration::from_secs(1), || {
+            request_count() >= 2
+        });
+        assert_eq!(
+            requests.lock().expect("capture lock")[1],
+            vec![Box::<str>::from("first_effect")]
         );
     }
 
@@ -3591,7 +3611,7 @@ mod tests {
             "unexpected reason: {reason}"
         );
         assert!(
-            reason.contains("required_min_delivered=3"),
+            reason.contains("required_min_delivered=2"),
             "expected minimum delivery requirement in reason, got: {reason}"
         );
         assert!(
@@ -3763,7 +3783,7 @@ mod tests {
         let super::SagaBusPublishError::RequiredPathDeliveryShortfall {
             step_name,
             event_type: "step_completed",
-            required_min_delivered: 3,
+            required_min_delivered: 2,
             required_path,
             ..
         } = err
@@ -4216,5 +4236,29 @@ mod t14b_required_recipient_tests {
             missing.contains(crate::TERMINAL_RESOLVER_STEP),
             "missing: {missing}"
         );
+    }
+
+    #[test]
+    fn saga_started_does_not_require_the_start_step_to_receive_it() {
+        let bus = SagaChoreographyBus::new();
+        bus.register_workflow_contract_provider::<TwoStep>()
+            .expect("contract registers");
+        bus.register_bound_workflow_step(SAGA, "risk_check")
+            .expect("bind A");
+        bus.register_bound_workflow_step(SAGA, "create_order")
+            .expect("bind B");
+        let _resolver = bus
+            .attach_terminal_resolver_for_contract::<TwoStep>("t14b-resolver")
+            .expect("resolver attaches");
+        // Only the non-start participant listens; the start step emitted the event.
+        let _b = bus.subscribe_participant_fn(SAGA, &["create_order"], |_| true);
+        let SagaChoreographyEvent::StepCompleted { context, .. } = step_completed(14_004) else {
+            unreachable!("fixture is StepCompleted");
+        };
+        bus.publish_strict(SagaChoreographyEvent::SagaStarted {
+            context,
+            payload: Vec::new(),
+        })
+        .expect("start step is the emitter and must not count as a missing recipient");
     }
 }

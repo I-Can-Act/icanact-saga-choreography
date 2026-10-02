@@ -758,9 +758,11 @@ impl SagaTestWorld {
             self.ensure_capture_saga_type(saga_type);
             let actor_ref = actor_ref.clone();
             let map_event = Arc::clone(&map_event);
-            let sub = self.bus.subscribe_saga_type_fn(saga_type, move |event| {
-                actor_ref.tell(map_event(event.clone()))
-            });
+            let sub = self
+                .bus
+                .subscribe_participant_fn(saga_type, &[], move |event| {
+                    actor_ref.tell(map_event(event.clone()))
+                });
             let _ = sub;
         }
     }
@@ -780,9 +782,11 @@ impl SagaTestWorld {
             self.ensure_capture_saga_type(saga_type);
             let actor_ref = actor_ref.clone();
             let map_event = Arc::clone(&map_event);
-            let sub = self.bus.subscribe_saga_type_fn(saga_type, move |event| {
-                actor_ref.tell(map_event(event.clone()))
-            });
+            let sub = self
+                .bus
+                .subscribe_participant_fn(saga_type, &[], move |event| {
+                    actor_ref.tell(map_event(event.clone()))
+                });
             let _ = sub;
         }
     }

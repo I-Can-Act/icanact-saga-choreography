@@ -621,7 +621,7 @@ type Terminals = Arc<Mutex<Vec<(RunKey, &'static str)>>>;
 fn capture_terminals(bus: &SagaChoreographyBus, saga_type: &str) -> Terminals {
     let seen: Terminals = Arc::default();
     let sink = Arc::clone(&seen);
-    let sub = bus.subscribe_saga_type_fn(saga_type, move |event| {
+    let sub = bus.subscribe_participant_fn(saga_type, &[], move |event| {
         let kind = match event {
             SagaChoreographyEvent::SagaCompleted { .. } => "completed",
             SagaChoreographyEvent::SagaFailed { .. } => "failed",

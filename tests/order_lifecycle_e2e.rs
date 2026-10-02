@@ -475,10 +475,11 @@ fn spawn_terminal_probe(
     let (probe_ref, handle) = world.spawn_sync_with_opts(TerminalProbe::new(), opts);
     handle.wait_for_startup();
     let ref_clone = probe_ref.clone();
-    let probe = bus.subscribe_saga_type_fn(SAGA_TYPE, move |event: &SagaChoreographyEvent| {
-        let _ = ref_clone.try_tell(TerminalProbeMsg(event.clone()));
-        true
-    });
+    let probe =
+        bus.subscribe_participant_fn(SAGA_TYPE, &[], move |event: &SagaChoreographyEvent| {
+            let _ = ref_clone.try_tell(TerminalProbeMsg(event.clone()));
+            true
+        });
     (
         probe_ref,
         SpawnedTerminalProbe {
@@ -889,8 +890,8 @@ fn position_compensation_fails_terminal_causes_saga_failed() {
         .attach_terminal_resolver(test_policy(), "e2e-resolver")
         .expect("terminal resolver should attach");
     let (terminal_ref, terminal_h) = spawn_terminal_probe(&world, &bus);
-    let _pad_sub_a = bus.subscribe_saga_type_fn(SAGA_TYPE, |_event| true);
-    let _pad_sub_b = bus.subscribe_saga_type_fn(SAGA_TYPE, |_event| true);
+    let _pad_sub_a = bus.subscribe_participant_fn(SAGA_TYPE, &[], |_event| true);
+    let _pad_sub_b = bus.subscribe_participant_fn(SAGA_TYPE, &[], |_event| true);
 
     let (p_ref, p_h) = spawn_and_subscribe(
         &world,
@@ -1184,7 +1185,7 @@ fn order_panics_after_both_succeed() {
     let (terminal_ref, terminal_h) = spawn_terminal_probe(&world, &bus);
     let aborted = Arc::new(AtomicBool::new(false));
     let aborted_probe = Arc::clone(&aborted);
-    let _observer = bus.subscribe_saga_type_fn(SAGA_TYPE, move |event| {
+    let _observer = bus.subscribe_participant_fn(SAGA_TYPE, &[], move |event| {
         if matches!(event, SagaChoreographyEvent::SagaAbortRequested { .. }) {
             aborted_probe.store(true, Ordering::SeqCst);
         }
@@ -1503,9 +1504,9 @@ fn duplicate_compensation_request_is_deduped() {
     let _resolver = bus
         .attach_terminal_resolver(test_policy(), "e2e-resolver")
         .expect("terminal resolver should attach");
-    let _pad_sub_a = bus.subscribe_saga_type_fn(SAGA_TYPE, |_event| true);
-    let _pad_sub_b = bus.subscribe_saga_type_fn(SAGA_TYPE, |_event| true);
-    let _pad_sub_c = bus.subscribe_saga_type_fn(SAGA_TYPE, |_event| true);
+    let _pad_sub_a = bus.subscribe_participant_fn(SAGA_TYPE, &[], |_event| true);
+    let _pad_sub_b = bus.subscribe_participant_fn(SAGA_TYPE, &[], |_event| true);
+    let _pad_sub_c = bus.subscribe_participant_fn(SAGA_TYPE, &[], |_event| true);
 
     let (p_ref, p_h) = spawn_and_subscribe(
         &world,

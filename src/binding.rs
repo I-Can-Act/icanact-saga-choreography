@@ -894,21 +894,48 @@ mod tests {
 
     #[test]
     fn lazy_channel_delivery_failure_is_reported_to_strict_publish() {
+        // The start step is the emitter and is never a required recipient, so
+        // the lazily bound `gate_step` is the second required step here.
+        define_saga_workflow_contract! {
+            struct LazyGateContract {
+                saga_type: "binding_test",
+                first_step: entry_step,
+                failure_authority: any (),
+                required_steps: [entry_step, gate_step],
+                overall_timeout_ms: 30_000,
+                stalled_timeout_ms: 10_000,
+                steps: {
+                    entry_step => {
+                        participant: "entry-actor",
+                        depends_on: on_start ()
+                    },
+                    gate_step => {
+                        participant: "binding-actor",
+                        depends_on: after [entry_step]
+                    }
+                }
+            }
+        }
+
         let bus = SagaChoreographyBus::new();
-        bus.register_workflow_contract_provider::<BindingWorkflowContract>()
+        bus.register_workflow_contract_provider::<LazyGateContract>()
             .expect("workflow contract registration should succeed");
         let _resolver = bus
-            .attach_terminal_resolver_for_contract::<BindingWorkflowContract>("binding-resolver")
+            .attach_terminal_resolver_for_contract::<LazyGateContract>("binding-resolver")
             .expect("terminal resolver should attach");
+        bus.register_bound_workflow_step("binding_test", "entry_step")
+            .expect("entry step binding should succeed");
+        bus.register_bound_workflow_step("binding_test", "gate_step")
+            .expect("gate step binding should succeed");
         let actor_ref = icanact_core::SyncActorRef::<BindingActor>::new_unset();
-        let subs = bind_sync_workflow_participant_channel_lazy_strict::<BindingActor, ()>(
+        let subs = crate::bind_sync_workflow_participant_channel_lazy::<BindingActor, ()>(
             &bus, &actor_ref, "saga", 1,
         )
-        .expect("lazy strict workflow binding should not require channel lane yet");
+        .expect("lazy workflow binding should not require channel lane yet");
 
         let err = bus
             .publish_strict(SagaChoreographyEvent::SagaStarted {
-                context: context("gate_step", 7004),
+                context: context("entry_step", 7004),
                 payload: Vec::new(),
             })
             .expect_err("unset lazy channel must not count as delivered");
