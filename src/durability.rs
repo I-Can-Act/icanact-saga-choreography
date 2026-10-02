@@ -1058,6 +1058,39 @@ where
     let now_millis = SagaContext::now_millis();
     for RecoveryUnit { run, entries } in units {
         let saga_id = run.saga_id();
+        // R07 / owner decision Q6: a run whose last durable row is `Quarantined` stays fenced
+        // after a restart; admission rejects it and no business effect runs automatically.
+        if run.saga_type() == saga_type
+            && !support.saga_states.contains_key(&run)
+            && let Some(ParticipantEvent::Quarantined {
+                reason,
+                quarantined_at_millis,
+            }) = entries.last().map(|entry| entry.event.transition())
+        {
+            let context = recovery_context_for_run(&run, step_name);
+            let state = crate::SagaParticipantState::new(
+                saga_id,
+                context.saga_type.clone(),
+                context.step_name.clone(),
+                context.correlation_id,
+                context.trace_id,
+                context.initiator_peer_id,
+                context.saga_started_at_millis,
+            )
+            .trigger("quarantine_recovered", *quarantined_at_millis)
+            .start_execution(*quarantined_at_millis)
+            .quarantine(reason.clone(), *quarantined_at_millis);
+            support
+                .saga_states
+                .insert(run.clone(), SagaStateEntry::Quarantined(state));
+            tracing::error!(
+                target: "core::saga",
+                event = "saga_quarantine_rehydrated",
+                run = %run,
+                reason = %reason
+            );
+            continue;
+        }
         if let Some(request) = recover_unstarted_compensation_request_from_entries(&entries)
             && request.context().saga_type.as_ref() == saga_type
             && compensation_request_targets_step(&request, step_name)
@@ -2329,20 +2362,23 @@ where
         SagaChoreographyEvent::SagaCompleted { .. } => {
             actor.latch_terminal_saga(&run);
             workflow.on_saga_completed(actor, &context);
-            finalize_terminal_run(actor, &run, RunTerminalOutcome::Completed, &identity);
-            IngressOutcome::Applied
+            match finalize_terminal_run(actor, &run, RunTerminalOutcome::Completed, &identity) {
+                Ok(()) => IngressOutcome::Applied,
+                Err(failure) => IngressOutcome::Failed(failure),
+            }
         }
         SagaChoreographyEvent::SagaFailed { reason, .. } => {
             actor.latch_terminal_saga(&run);
             workflow.on_saga_failed(actor, &context, &reason);
-            finalize_terminal_run(actor, &run, RunTerminalOutcome::Failed, &identity);
-            IngressOutcome::Applied
+            match finalize_terminal_run(actor, &run, RunTerminalOutcome::Failed, &identity) {
+                Ok(()) => IngressOutcome::Applied,
+                Err(failure) => IngressOutcome::Failed(failure),
+            }
         }
         // Quarantined runs are never finalized: journal rows and dedupe marks stay as evidence.
         SagaChoreographyEvent::SagaQuarantined { reason, .. } => {
             actor.latch_terminal_saga(&run);
             workflow.on_quarantined(actor, &context, &reason);
-            actor.clear_in_memory_saga_run_tracking(&run);
             IngressOutcome::Applied
         }
         _ => IngressOutcome::Applied,

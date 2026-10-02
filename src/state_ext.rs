@@ -7,13 +7,13 @@
 //! and implement [`crate::HasSagaParticipantSupport`]. This crate will then
 //! provide `SagaStateExt` automatically.
 
+use crate::{CommitStage, IngressFailure, IngressOutcome, IngressRejection};
 use crate::{
     DedupeError, HasSagaParticipantSupport, InboxState, InboxTxn, JournalError, KnownRuns,
     ParticipantDedupeStore, ParticipantEvent, ParticipantJournal, RunAdmission, RunIdentityError,
     RunIncarnation, RunKey, RunStatus, RunTerminalOutcome, RunTombstone, SagaChoreographyEvent,
     SagaContext, SagaId, SagaParticipantState, SagaStateEntry, admit_run,
 };
-use crate::{IngressOutcome, IngressRejection};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::Ordering;
 
@@ -773,13 +773,14 @@ where
 ///
 /// On a journal failure the run's memory is kept, the failure is logged with the run key, and the
 /// terminal event's dedupe mark is removed so a redelivery retries the finalize. A failure after the
-/// tombstone was written (dedupe prune) is logged only: the tombstone already answers for the run.
+/// tombstone was written (dedupe prune) is logged and returned as a typed `Finalize` failure; the
+/// tombstone already answers for the run, so the run stays terminal.
 pub(crate) fn finalize_terminal_run<A: SagaStateExt + ?Sized>(
     actor: &mut A,
     run: &RunKey,
     outcome: RunTerminalOutcome,
     terminal_identity: &str,
-) {
+) -> Result<(), IngressFailure> {
     // A quarantined run keeps its journal rows and dedupe marks as evidence (owner decision Q6).
     if matches!(
         actor.saga_states_ref().get(run),
@@ -791,12 +792,12 @@ pub(crate) fn finalize_terminal_run<A: SagaStateExt + ?Sized>(
             run = %run,
             outcome = ?outcome
         );
-        return;
+        return Ok(());
     }
     let tombstone = RunTombstone::new(run.clone(), outcome, actor.now_millis());
     let cutoff = actor.replay_cutoff();
     let Err(err) = actor.finalize_run_strict(&tombstone, cutoff) else {
-        return;
+        return Ok(());
     };
     actor
         .saga_support()
@@ -823,6 +824,11 @@ pub(crate) fn finalize_terminal_run<A: SagaStateExt + ?Sized>(
             );
         }
     }
+    Err(IngressFailure {
+        run: run.clone(),
+        stage: CommitStage::Finalize,
+        source: err,
+    })
 }
 
 impl<T> SagaStateExt for T where T: HasSagaParticipantSupport {}

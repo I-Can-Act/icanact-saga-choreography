@@ -118,15 +118,20 @@ where
         SagaChoreographyEvent::SagaCompleted { .. } => {
             participant.latch_terminal_saga(&run);
             participant.on_saga_completed(&context);
-            finalize_terminal_run(participant, &run, RunTerminalOutcome::Completed, &identity);
-            IngressOutcome::Applied
+            match finalize_terminal_run(participant, &run, RunTerminalOutcome::Completed, &identity)
+            {
+                Ok(()) => IngressOutcome::Applied,
+                Err(failure) => IngressOutcome::Failed(failure),
+            }
         }
 
         SagaChoreographyEvent::SagaFailed { reason, .. } => {
             participant.latch_terminal_saga(&run);
             participant.on_saga_failed(&context, &reason);
-            finalize_terminal_run(participant, &run, RunTerminalOutcome::Failed, &identity);
-            IngressOutcome::Applied
+            match finalize_terminal_run(participant, &run, RunTerminalOutcome::Failed, &identity) {
+                Ok(()) => IngressOutcome::Applied,
+                Err(failure) => IngressOutcome::Failed(failure),
+            }
         }
 
         // Quarantined runs are never finalized or pruned: journal rows, dedupe marks and the
@@ -258,14 +263,19 @@ where
         SagaChoreographyEvent::SagaCompleted { .. } => {
             participant.latch_terminal_saga(&run);
             participant.on_saga_completed(&context);
-            finalize_terminal_run(participant, &run, RunTerminalOutcome::Completed, &identity);
-            IngressOutcome::Applied
+            match finalize_terminal_run(participant, &run, RunTerminalOutcome::Completed, &identity)
+            {
+                Ok(()) => IngressOutcome::Applied,
+                Err(failure) => IngressOutcome::Failed(failure),
+            }
         }
         SagaChoreographyEvent::SagaFailed { reason, .. } => {
             participant.latch_terminal_saga(&run);
             participant.on_saga_failed(&context, &reason);
-            finalize_terminal_run(participant, &run, RunTerminalOutcome::Failed, &identity);
-            IngressOutcome::Applied
+            match finalize_terminal_run(participant, &run, RunTerminalOutcome::Failed, &identity) {
+                Ok(()) => IngressOutcome::Applied,
+                Err(failure) => IngressOutcome::Failed(failure),
+            }
         }
         SagaChoreographyEvent::SagaQuarantined { reason, .. } => {
             participant.latch_terminal_saga(&run);
