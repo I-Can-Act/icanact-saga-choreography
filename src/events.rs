@@ -324,6 +324,31 @@ pub enum AckStatus {
     AlreadyProcessing,
 }
 
+/// Durable confirmation that forward business execution and any declared effect
+/// dispatch succeeded. Recorded strictly before publishing the original completion.
+/// Its stored context is reused verbatim on recovery, not re-traced.
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct ParticipantForwardOutcome {
+    pub context: SagaContext,
+    pub output: Vec<u8>,
+    pub saga_input: Vec<u8>,
+    pub compensation_data: Vec<u8>,
+    pub effect: Option<Box<str>>,
+    pub receipt: Option<Box<str>>,
+    pub recorded_at_millis: u64,
+}
+
+impl ParticipantForwardOutcome {
+    pub fn completion_event(&self) -> SagaChoreographyEvent {
+        SagaChoreographyEvent::StepCompleted {
+            context: self.context.clone(),
+            output: self.output.clone(),
+            saga_input: self.saga_input.clone(),
+            compensation_available: !self.compensation_data.is_empty(),
+        }
+    }
+}
+
 /// Events stored in participant's local journal for durability and recovery.
 #[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum ParticipantEvent {
@@ -473,6 +498,9 @@ pub enum ParticipantEvent {
         reason: Box<str>,
         recorded_at_millis: u64,
     },
+    /// Confirmed forward outcome, including the original input/context for safe
+    /// retransmission. Appended tag 15; unconfirmed result rows are not this proof.
+    ParticipantForwardOutcomeRecorded { outcome: ParticipantForwardOutcome },
 }
 
 /// Terminal classification stored in a participant terminal tombstone.

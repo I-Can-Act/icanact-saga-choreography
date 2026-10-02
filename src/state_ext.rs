@@ -9,8 +9,8 @@
 
 use crate::{
     DedupeError, HasSagaParticipantSupport, JournalError, ParticipantDedupeStore, ParticipantEvent,
-    ParticipantJournal, ParticipantTerminalKind, SagaChoreographyEvent, SagaContext, SagaId,
-    SagaStateEntry,
+    ParticipantForwardOutcome, ParticipantJournal, ParticipantTerminalKind, SagaChoreographyEvent,
+    SagaContext, SagaId, SagaStateEntry,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -63,6 +63,44 @@ impl ParticipantAdmission {
 pub enum RunDedupe {
     First,
     Duplicate,
+}
+
+/// Journal-derived current-run evidence. Confirmation is distinct from a raw
+/// result written before a declared effect dispatch. No volatile cache is authority.
+#[derive(Clone, Debug, Default)]
+pub struct ParticipantRunEvidence {
+    pub forward_intent_open: bool,
+    pub accepted_forward_pending: bool,
+    pub forward_result_recorded: bool,
+    pub forward_outcome: Option<ParticipantForwardOutcome>,
+    pub output: Vec<u8>,
+    pub compensation_data: Vec<u8>,
+    pub undo_intent_open: bool,
+    pub undo_completed: bool,
+    pub quarantined: bool,
+    pub needs_reconciliation: bool,
+    pub last_updated_at_millis: u64,
+}
+
+impl ParticipantRunEvidence {
+    /// A failure may be ordinary only when this participant has no unknown or
+    /// unreversed work. Successful sagas intentionally keep their business effects.
+    pub fn failure_requires_quarantine(&self) -> bool {
+        self.forward_intent_open
+            || self.accepted_forward_pending
+            || self.undo_intent_open
+            || self.quarantined
+            || self.needs_reconciliation
+            || (!self.compensation_data.is_empty() && !self.undo_completed)
+            || (self
+                .forward_outcome
+                .as_ref()
+                .is_some_and(|o| o.effect.is_some())
+                && !self.undo_completed)
+            || (self.forward_result_recorded
+                && self.forward_outcome.is_none()
+                && !self.undo_completed)
+    }
 }
 
 /// Extension trait providing common saga state management operations.
@@ -460,10 +498,38 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
                 entry.event,
                 ParticipantEvent::StepExecutionStarted { .. }
                     | ParticipantEvent::StepExecutionCompleted { .. }
+                    | ParticipantEvent::ParticipantForwardOutcomeRecorded { .. }
                     | ParticipantEvent::Quarantined { .. }
                     | ParticipantEvent::ParticipantReconciliationEvidence { .. }
             )
         }))
+    }
+
+    /// Loads only this run's evidence, separating implicit rows by run records
+    /// and explicit context-bearing rows by identity. Read failures propagate.
+    fn participant_run_evidence_strict(
+        &self,
+        context: &SagaContext,
+    ) -> Result<ParticipantRunEvidence, SagaStateStoreError> {
+        let entries = self
+            .saga_journal()
+            .read(context.saga_id)
+            .map_err(SagaStateStoreError::Journal)?;
+        Ok(run_evidence(&entries, context))
+    }
+
+    /// Durable proof after business/effect success and before completion publication.
+    /// An append error must quarantine; callers may not publish step success.
+    fn record_forward_outcome_strict(
+        &self,
+        outcome: &ParticipantForwardOutcome,
+    ) -> Result<(), SagaStateStoreError> {
+        self.record_event_strict(
+            outcome.context.saga_id,
+            ParticipantEvent::ParticipantForwardOutcomeRecorded {
+                outcome: outcome.clone(),
+            },
+        )
     }
 
     /// Retains typed reconciliation data after a result-write failure. This does
@@ -504,6 +570,17 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
         let previous = scan_runs(&entries)
             .terminal_of(context)
             .map(|(kind, _)| kind);
+        let unsafe_failure = outcome == ParticipantTerminalKind::Failed
+            && run_evidence(&entries, context).failure_requires_quarantine();
+        let outcome = if unsafe_failure {
+            ParticipantTerminalKind::Quarantined
+        } else {
+            outcome
+        };
+        let escalated_reason = unsafe_failure.then(|| {
+            format!("{reason}; unresolved participant intent/effect/undo requires reconciliation")
+        });
+        let reason = escalated_reason.as_deref().unwrap_or(reason);
         if previous.is_none()
             || (outcome == ParticipantTerminalKind::Quarantined
                 && previous != Some(ParticipantTerminalKind::Quarantined))
@@ -595,6 +672,136 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
             .filter(|e| !e.is_terminal())
             .count()
     }
+}
+
+fn run_evidence(entries: &[crate::JournalEntry], context: &SagaContext) -> ParticipantRunEvidence {
+    let mut evidence = ParticipantRunEvidence::default();
+    let legacy = !entries
+        .iter()
+        .any(|entry| matches!(entry.event, ParticipantEvent::ParticipantRunRecorded { .. }));
+    let mut active: Option<(&str, u64)> = None;
+    let mut undo_seen = false;
+    for entry in entries {
+        if let ParticipantEvent::ParticipantRunRecorded {
+            saga_type,
+            saga_started_at_millis,
+            ..
+        } = &entry.event
+        {
+            active = Some((saga_type, *saga_started_at_millis));
+        }
+        let same = |ctx: &SagaContext| {
+            ctx.saga_id == context.saga_id
+                && ctx.saga_type == context.saga_type
+                && ctx.saga_started_at_millis == context.saga_started_at_millis
+        };
+        let belongs = match &entry.event {
+            ParticipantEvent::AcceptedStepRecorded { context, .. }
+            | ParticipantEvent::AcceptedCompensationRecorded { context, .. }
+            | ParticipantEvent::CompensationRequestRecorded { context, .. }
+            | ParticipantEvent::ParticipantReconciliationEvidence { context, .. } => same(context),
+            ParticipantEvent::ParticipantForwardOutcomeRecorded { outcome } => {
+                same(&outcome.context)
+            }
+            ParticipantEvent::ParticipantTerminalRecorded {
+                saga_type,
+                saga_started_at_millis,
+                ..
+            } => {
+                saga_type == &context.saga_type
+                    && *saga_started_at_millis == context.saga_started_at_millis
+            }
+            _ => {
+                legacy
+                    || active == Some((context.saga_type.as_ref(), context.saga_started_at_millis))
+            }
+        };
+        if !belongs {
+            continue;
+        }
+        evidence.last_updated_at_millis = evidence
+            .last_updated_at_millis
+            .max(entry.recorded_at_millis);
+        match &entry.event {
+            ParticipantEvent::StepExecutionStarted { .. } => {
+                evidence.forward_intent_open = true;
+            }
+            ParticipantEvent::AcceptedStepRecorded {
+                compensation_data, ..
+            } => {
+                evidence.accepted_forward_pending = true;
+                evidence.compensation_data = compensation_data.clone();
+            }
+            ParticipantEvent::StepExecutionCompleted {
+                output,
+                compensation_data,
+                ..
+            } => {
+                evidence.forward_intent_open = false;
+                evidence.accepted_forward_pending = false;
+                evidence.forward_result_recorded = true;
+                evidence.forward_outcome = None;
+                evidence.output = output.clone();
+                evidence.compensation_data = compensation_data.clone();
+                if undo_seen {
+                    evidence.needs_reconciliation = true;
+                }
+                evidence.undo_completed = false;
+            }
+            ParticipantEvent::ParticipantForwardOutcomeRecorded { outcome } => {
+                evidence.forward_intent_open = false;
+                evidence.accepted_forward_pending = false;
+                evidence.forward_result_recorded = true;
+                evidence.output = outcome.output.clone();
+                evidence.compensation_data = outcome.compensation_data.clone();
+                evidence.forward_outcome = Some(outcome.clone());
+                if undo_seen {
+                    evidence.needs_reconciliation = true;
+                }
+            }
+            ParticipantEvent::StepExecutionFailed { .. } => {
+                evidence.forward_intent_open = false;
+                // The business error may request undo of earlier steps without
+                // claiming this step owns an effect. Accepted remote work remains
+                // uncertain until a result or authoritative undo resolves it.
+            }
+            ParticipantEvent::CompensationStarted { .. }
+            | ParticipantEvent::AcceptedCompensationRecorded { .. } => {
+                undo_seen = true;
+                evidence.undo_intent_open = true;
+            }
+            ParticipantEvent::CompensationCompleted { .. } => {
+                undo_seen = true;
+                evidence.undo_intent_open = false;
+                evidence.undo_completed = true;
+                evidence.accepted_forward_pending = false;
+                evidence.forward_intent_open = false;
+            }
+            ParticipantEvent::CompensationFailed { .. } => {
+                undo_seen = true;
+                evidence.undo_intent_open = true;
+                evidence.needs_reconciliation = true;
+            }
+            ParticipantEvent::ParticipantReconciliationEvidence {
+                output,
+                compensation_data,
+                ..
+            } => {
+                evidence.needs_reconciliation = true;
+                evidence.output = output.clone();
+                evidence.compensation_data = compensation_data.clone();
+            }
+            ParticipantEvent::Quarantined { .. }
+            | ParticipantEvent::ParticipantTerminalRecorded {
+                outcome: ParticipantTerminalKind::Quarantined,
+                ..
+            } => {
+                evidence.quarantined = true;
+            }
+            _ => {}
+        }
+    }
+    evidence
 }
 
 /// Durable run history of one saga id, derived from journal run/terminal records.

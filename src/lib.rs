@@ -99,8 +99,8 @@ pub use support::{
 
 // Events
 pub use events::{
-    AckStatus, ParticipantEvent, ParticipantTerminalKind, SagaChoreographyEvent,
-    SagaFailureDetails, SagaReplyTo, SagaTerminalOutcome,
+    AckStatus, ParticipantEvent, ParticipantForwardOutcome, ParticipantTerminalKind,
+    SagaChoreographyEvent, SagaFailureDetails, SagaReplyTo, SagaTerminalOutcome,
 };
 
 // Errors
@@ -112,7 +112,9 @@ pub use errors::{
 };
 
 // Traits
-pub use state_ext::{ParticipantAdmission, RunDedupe, SagaStateExt, SagaStateStoreError};
+pub use state_ext::{
+    ParticipantAdmission, ParticipantRunEvidence, RunDedupe, SagaStateExt, SagaStateStoreError,
+};
 pub use traits::{
     AllowsSagaTellIngress, AsyncSagaParticipant, DependencySpec, HasSagaWorkflowParticipants,
     SagaBoxFuture, SagaParticipant, SagaWorkflowParticipant,

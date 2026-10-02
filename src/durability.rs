@@ -1153,6 +1153,7 @@ fn recover_completed_accepted_compensation_from_entries(
     let mut completed = None;
     for entry in entries {
         match &entry.event {
+            ParticipantEvent::ParticipantForwardOutcomeRecorded { .. } => {}
             ParticipantEvent::CompensationRequestRecorded { .. } => {
                 accepted = None;
                 completed = None;
@@ -1220,6 +1221,7 @@ fn recover_failed_accepted_compensation_from_entries(
     let mut failed = None;
     for entry in entries {
         match &entry.event {
+            ParticipantEvent::ParticipantForwardOutcomeRecorded { .. } => {}
             ParticipantEvent::CompensationRequestRecorded { .. } => {
                 accepted = None;
                 failed = None;
@@ -1295,6 +1297,7 @@ fn recover_unstarted_compensation_request_from_entries(
     let mut request = None;
     for entry in entries {
         match &entry.event {
+            ParticipantEvent::ParticipantForwardOutcomeRecorded { .. } => {}
             ParticipantEvent::CompensationRequestRecorded {
                 context,
                 failed_step,
@@ -1351,6 +1354,7 @@ fn recover_completed_step_effect_for_unstarted_compensation(
     let mut effect_at_request = None;
     for entry in entries {
         match &entry.event {
+            ParticipantEvent::ParticipantForwardOutcomeRecorded { .. } => {}
             ParticipantEvent::StepExecutionStarted { .. } => completed = None,
             ParticipantEvent::StepExecutionCompleted {
                 output,
@@ -1391,6 +1395,7 @@ fn recover_accepted_workflow_step_from_entries(
     let mut accepted = None;
     for entry in entries {
         match &entry.event {
+            ParticipantEvent::ParticipantForwardOutcomeRecorded { .. } => {}
             ParticipantEvent::AcceptedStepRecorded {
                 context,
                 participant_id,
@@ -1454,6 +1459,7 @@ fn accepted_step_failure_requiring_compensation(
     let mut failure = None;
     for entry in entries {
         match &entry.event {
+            ParticipantEvent::ParticipantForwardOutcomeRecorded { .. } => {}
             ParticipantEvent::AcceptedStepRecorded { .. } => {
                 failure = None;
             }
@@ -3071,6 +3077,9 @@ pub fn collect_startup_recovery_events_for_saga_type<
 
 fn recorded_saga_type(entries: &[JournalEntry]) -> Option<&str> {
     entries.iter().rev().find_map(|entry| match &entry.event {
+        ParticipantEvent::ParticipantForwardOutcomeRecorded { outcome } => {
+            Some(outcome.context.saga_type.as_ref())
+        }
         ParticipantEvent::SagaRegistered { saga_type, .. }
         | ParticipantEvent::ParticipantRunRecorded { saga_type, .. }
         | ParticipantEvent::ParticipantTerminalRecorded { saga_type, .. } => {
