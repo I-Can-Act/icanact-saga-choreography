@@ -994,7 +994,7 @@ fn balance_compensation_fails_ambiguous_causes_quarantine() {
 // ===========================================================================
 
 #[test]
-fn balance_compensation_fails_safe_to_retry_causes_failed() {
+fn balance_compensation_fails_safe_to_retry_is_not_a_clean_failure() {
     let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
@@ -1032,13 +1032,18 @@ fn balance_compensation_fails_safe_to_retry_causes_failed() {
         payload: vec![42],
     });
 
-    wait_until(TIMEOUT, || query_terminal_counts(&terminal_ref).failed >= 1);
+    // T13P: `SafeToRetry` now reaches the resolver as `CompensationFailedRetryable`. Until the
+    // bounded re-request budget lands (T13R) the resolver treats it as an unresolved effect and
+    // quarantines; it is never reported as a clean `SagaFailed`.
+    wait_until(TIMEOUT, || {
+        query_terminal_counts(&terminal_ref).quarantined >= 1
+    });
     assert_eq!(
         query_terminal_counts(&terminal_ref),
         TerminalCounts {
             completed: 0,
-            failed: 1,
-            quarantined: 0,
+            failed: 0,
+            quarantined: 1,
         }
     );
     p_h.shutdown();

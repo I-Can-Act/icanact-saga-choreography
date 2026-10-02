@@ -1215,6 +1215,10 @@ where
         let participant_id = participant.participant_id_owned();
         return fail_compensation_start_commit(context, step, participant_id, err, emit);
     }
+    let compensation_in_flight = participant
+        .saga_support()
+        .accepted_workflow_compensations
+        .contains_key(&run);
     let state_entry = participant.saga_states().remove(&run);
     let (saga_input, comp_data, new_state) = match state_entry {
         Some(SagaStateEntry::Completed(state)) => {
@@ -1230,12 +1234,31 @@ where
             };
             (saga_input, comp_data, state.start_compensation(now))
         }
+        // ADR-0004 §2.5: a re-request after `CompensationFailedRetryable` re-invokes the undo
+        // with the kept data, unless an accepted async undo is still in flight.
+        Some(SagaStateEntry::Compensating(mut state))
+            if state.state.compensation_data.is_some() && !compensation_in_flight =>
+        {
+            state.state.attempt = context.attempt;
+            let comp_data = state.state.compensation_data.clone().unwrap_or_default();
+            (Vec::new(), comp_data, state)
+        }
         Some(other) => {
+            if matches!(other, SagaStateEntry::Compensating(_)) {
+                tracing::error!(
+                    target: "core::saga",
+                    event = "saga_compensation_rerequest_not_retried",
+                    run = %run,
+                    "compensation re-request ignored: undo data unknown or undo still in flight"
+                );
+            }
             participant.saga_states().insert(run.clone(), other);
             return IngressOutcome::Applied;
         }
         None => return IngressOutcome::Applied,
     };
+    let mut new_state = new_state;
+    new_state.state.compensation_data = Some(comp_data.clone());
     participant
         .saga_states()
         .insert(run.clone(), SagaStateEntry::Compensating(new_state));
@@ -1356,6 +1379,10 @@ where
         let participant_id = participant.participant_id_owned();
         return fail_compensation_start_commit(context, step, participant_id, err, emit);
     }
+    let compensation_in_flight = participant
+        .saga_support()
+        .accepted_workflow_compensations
+        .contains_key(&run);
     let state_entry = participant.saga_states().remove(&run);
     let (saga_input, comp_data, new_state) = match state_entry {
         Some(SagaStateEntry::Completed(state)) => {
@@ -1371,12 +1398,31 @@ where
             };
             (saga_input, comp_data, state.start_compensation(now))
         }
+        // ADR-0004 §2.5: a re-request after `CompensationFailedRetryable` re-invokes the undo
+        // with the kept data, unless an accepted async undo is still in flight.
+        Some(SagaStateEntry::Compensating(mut state))
+            if state.state.compensation_data.is_some() && !compensation_in_flight =>
+        {
+            state.state.attempt = context.attempt;
+            let comp_data = state.state.compensation_data.clone().unwrap_or_default();
+            (Vec::new(), comp_data, state)
+        }
         Some(other) => {
+            if matches!(other, SagaStateEntry::Compensating(_)) {
+                tracing::error!(
+                    target: "core::saga",
+                    event = "saga_compensation_rerequest_not_retried",
+                    run = %run,
+                    "compensation re-request ignored: undo data unknown or undo still in flight"
+                );
+            }
             participant.saga_states().insert(run.clone(), other);
             return IngressOutcome::Applied;
         }
         None => return IngressOutcome::Applied,
     };
+    let mut new_state = new_state;
+    new_state.state.compensation_data = Some(comp_data.clone());
     participant
         .saga_states()
         .insert(run.clone(), SagaStateEntry::Compensating(new_state));
@@ -1428,6 +1474,42 @@ where
     }
 }
 
+/// Outcome context stamped with the request's `attempt`, so the retryable event's identity is
+/// distinct per attempt (`next_step` resets it to 0).
+fn retryable_context(context: &SagaContext, step: Box<str>) -> SagaContext {
+    let mut outcome = context.next_step(step);
+    outcome.attempt = context.attempt;
+    outcome
+}
+
+/// ADR-0004 §2.5: the undo reported `SafeToRetry`. State stays `Compensating` with its undo
+/// data; `CompensationFailedRetryable` is emitted so the resolver can re-request. Not a
+/// quarantine: `on_quarantined` is not called.
+pub(crate) fn emit_compensation_retryable<F>(
+    context: &SagaContext,
+    step: Box<str>,
+    participant_id: Box<str>,
+    reason: &str,
+    emit: &mut F,
+) -> IngressOutcome
+where
+    F: FnMut(SagaChoreographyEvent),
+{
+    tracing::warn!(
+        target: "core::saga",
+        event = "saga_compensation_retryable",
+        run = %context.run_key(),
+        attempt = context.attempt,
+        reason = %reason
+    );
+    emit(SagaChoreographyEvent::CompensationFailedRetryable {
+        context: retryable_context(context, step),
+        participant_id,
+        error: reason.into(),
+    });
+    IngressOutcome::Applied
+}
+
 /// ADR-0002 §2.2 `CompensationStart`: `CompensationStarted` could not be committed, so the undo
 /// was not invoked and nothing changed. The `Completed` state (with its undo data) is kept and a
 /// `CompensationFailedRetryable` is emitted so the resolver can re-request.
@@ -1449,7 +1531,7 @@ where
         error = ?err
     );
     emit(SagaChoreographyEvent::CompensationFailedRetryable {
-        context: context.next_step(step),
+        context: retryable_context(context, step),
         participant_id,
         error: format!("compensation start commit failed: {err}").into(),
     });
@@ -1674,7 +1756,11 @@ where
     F: FnMut(SagaChoreographyEvent),
 {
     let (reason, is_ambiguous) = match error {
-        CompensationError::SafeToRetry { reason } => (reason, false),
+        CompensationError::SafeToRetry { reason } => {
+            let step = participant.step_name().into();
+            let participant_id = participant.participant_id_owned();
+            return emit_compensation_retryable(context, step, participant_id, &reason, emit);
+        }
         CompensationError::Ambiguous { reason } => (reason, true),
         CompensationError::Terminal { reason } => (reason, false),
     };
@@ -1689,7 +1775,7 @@ where
         now,
         emit,
     );
-    if matches!(outcome, IngressOutcome::Applied) {
+    if is_ambiguous && matches!(outcome, IngressOutcome::Applied) {
         participant.on_quarantined(context, &reason);
     }
     outcome
@@ -1707,7 +1793,11 @@ where
     F: FnMut(SagaChoreographyEvent),
 {
     let (reason, is_ambiguous) = match error {
-        CompensationError::SafeToRetry { reason } => (reason, false),
+        CompensationError::SafeToRetry { reason } => {
+            let step = participant.step_name().into();
+            let participant_id = participant.participant_id_owned();
+            return emit_compensation_retryable(context, step, participant_id, &reason, emit);
+        }
         CompensationError::Ambiguous { reason } => (reason, true),
         CompensationError::Terminal { reason } => (reason, false),
     };
@@ -1722,7 +1812,7 @@ where
         now,
         emit,
     );
-    if matches!(outcome, IngressOutcome::Applied) {
+    if is_ambiguous && matches!(outcome, IngressOutcome::Applied) {
         participant.on_quarantined(context, &reason);
     }
     outcome

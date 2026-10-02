@@ -27,6 +27,9 @@ pub struct Failed {
 pub struct Compensating {
     pub started_at_millis: u64,
     pub attempt: u32,
+    /// Undo data kept so a `SafeToRetry` undo can be re-requested (ADR-0004 §2.5). `None` when
+    /// unknown (state rebuilt from the journal); such a run is not retried automatically.
+    pub compensation_data: Option<Vec<u8>>,
 }
 pub struct Compensated {
     pub completed_at_millis: u64,
@@ -154,6 +157,7 @@ impl SagaParticipantState<Executing> {
             state: Compensating {
                 started_at_millis: now_millis,
                 attempt: 1,
+                compensation_data: None,
             },
             events: self.events,
         }
@@ -302,6 +306,7 @@ impl SagaParticipantState<Completed> {
             state: Compensating {
                 started_at_millis: now_millis,
                 attempt: 1,
+                compensation_data: None,
             },
             events: self.events,
         }
