@@ -450,20 +450,36 @@ struct TerminalResolverActor {
 }
 
 impl TerminalResolverActor {
-    fn publish_terminal_events(&mut self, terminal_events: Vec<SagaChoreographyEvent>) {
+    /// Publishes resolver outputs. Replies are NOT resolved here: they follow the
+    /// durable decision when the resolver ingests its own echoed terminal event
+    /// (ADR-0003 §2.4). Returns the events whose publication failed, so the owner
+    /// can retain them; each failure is logged with its `RunKey`.
+    fn publish_terminal_events(
+        &mut self,
+        terminal_events: Vec<SagaChoreographyEvent>,
+    ) -> Vec<SagaChoreographyEvent> {
+        let mut failed = Vec::new();
         for terminal_event in terminal_events {
-            let _ = self
-                .bus
-                .complete_terminal_reply_from_event(&terminal_event, self.responder.as_ref());
-            if let Err(err) = self.bus.publish_strict(terminal_event) {
+            if let Err(err) = self.bus.publish_strict(terminal_event.clone()) {
+                let run = terminal_event.context().run_key();
                 tracing::error!(
                     target: "core::saga",
                     event = "terminal_resolver_publish_failed",
                     saga_type = self.saga_type.as_ref(),
+                    run = %run,
                     error = ?err
                 );
+                // A terminal decision that never reached the bus must not leave the waiter hanging.
+                if terminal_event.terminal_outcome().is_some() {
+                    self.bus.reject_terminal_reply_for_run(
+                        &run,
+                        format!("terminal publish failed: {err:?}"),
+                    );
+                }
+                failed.push(terminal_event);
             }
         }
+        failed
     }
 }
 
@@ -482,27 +498,39 @@ impl SyncActor for TerminalResolverActor {
                 if let Some(journal) = &self.journal
                     && let Err(error) = journal.append((*event).clone())
                 {
+                    let run = event.context().run_key();
                     tracing::error!(
                         target: "core::saga",
                         event = "terminal_resolver_journal_append_failed",
                         saga_type = self.saga_type.as_ref(),
-                        saga_id = %event.context().saga_id,
-                        error = ?error
+                        run = %run,
+                        error = ?error,
+                        "event not ingested: resolver journal append failed"
                     );
-                    if !matches!(*event, SagaChoreographyEvent::SagaQuarantined { .. }) {
-                        let context = event.context().next_step(TERMINAL_RESOLVER_STEP.into());
-                        self.publish_terminal_events(vec![
+                    let quarantine =
+                        if matches!(*event, SagaChoreographyEvent::SagaQuarantined { .. }) {
+                            (*event).clone()
+                        } else {
+                            let context = event.context().next_step(TERMINAL_RESOLVER_STEP.into());
                             SagaChoreographyEvent::SagaQuarantined {
                                 context,
                                 reason: format!("terminal resolver durability failed: {error}")
                                     .into(),
                                 step: TERMINAL_RESOLVER_STEP.into(),
                                 participant_id: self.responder.as_ref().into(),
-                            },
-                        ]);
+                            }
+                        };
+                    // Durability failed: the only honest outcome for the waiter is quarantine.
+                    self.bus
+                        .complete_terminal_reply_from_event(&quarantine, self.responder.as_ref());
+                    if !matches!(*event, SagaChoreographyEvent::SagaQuarantined { .. }) {
+                        self.publish_terminal_events(vec![quarantine]);
                     }
                     return;
                 }
+                // The decision is durable (or no journal): now the reply may resolve.
+                self.bus
+                    .complete_terminal_reply_from_event(&event, self.responder.as_ref());
                 match self
                     .resolver
                     .try_ingest_at(&event, SagaContext::now_millis())
@@ -521,7 +549,7 @@ impl SyncActor for TerminalResolverActor {
             }
             TerminalResolverTell::ActivateRecovery => {
                 let recovery_events = std::mem::take(&mut self.recovery_events);
-                self.publish_terminal_events(recovery_events);
+                self.recovery_events = self.publish_terminal_events(recovery_events);
                 return;
             }
             TerminalResolverTell::PollTimeouts => self.resolver.poll_timeouts(),
@@ -2178,6 +2206,64 @@ mod tests {
             reply.outcome,
             SagaTerminalOutcome::Quarantined { .. }
         ));
+        probe.shutdown();
+    }
+
+    /// Rejects only resolver-originated `SagaCompleted` (the terminal decision).
+    struct RejectingDecisionJournal;
+
+    impl TerminalResolverJournal for RejectingDecisionJournal {
+        fn append(
+            &self,
+            event: SagaChoreographyEvent,
+        ) -> Result<u64, TerminalResolverJournalError> {
+            if matches!(event, SagaChoreographyEvent::SagaCompleted { .. })
+                && event.context().step_name.as_ref() == TERMINAL_RESOLVER_STEP
+            {
+                return Err(TerminalResolverJournalError::Storage(
+                    "injected decision append failure".into(),
+                ));
+            }
+            Ok(0)
+        }
+
+        fn read_all(
+            &self,
+        ) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn terminal_reply_follows_durable_decision() {
+        let bus = SagaChoreographyBus::new();
+        let _resolver = bus
+            .attach_durable_terminal_resolver(
+                TerminalPolicy::order_lifecycle_default(),
+                "terminal-resolver",
+                Arc::new(RejectingDecisionJournal),
+            )
+            .expect("durable resolver should attach");
+        let saga_id = SagaId::new(812);
+        let (pending, probe) = register_pending_reply(bus.clone(), saga_id);
+
+        bus.publish_strict(SagaChoreographyEvent::StepCompleted {
+            context: context("create_order", saga_id.get()),
+            output: Vec::new(),
+            saga_input: Vec::new(),
+            compensation_available: false,
+        })
+        .expect("step completion should reach the resolver");
+
+        let reply = pending
+            .wait()
+            .expect("reply must resolve")
+            .expect("terminal reply");
+        assert!(
+            matches!(reply.outcome, SagaTerminalOutcome::Quarantined { .. }),
+            "a decision whose journal append failed must not be reported as success: {:?}",
+            reply.outcome
+        );
         probe.shutdown();
     }
 
