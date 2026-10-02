@@ -15,8 +15,8 @@ Breaking changes from the run-identity, outbox, resolver and startup-contract wo
   publish_failures }`; `IngressOutcome` is `Applied | Duplicate | Rejected | Failed |
   ReconciliationNeeded`. Callers must inspect both fields.
 - **Plain binders take `steps: &[&str]`.** `bind_*_participant_*` (non-workflow) now tag
-  subscriptions with the steps the actor owns; untagged (empty) subscriptions never satisfy a
-  required step. Strict workflow binders are unchanged.
+  subscriptions with the steps the actor owns; an empty `steps` slice is rejected with `Err`
+  (an untagged subscription could never satisfy a required step). Strict workflow binders are unchanged.
 - **Durable resolvers must be activated.** Until `activate_terminal_resolver_recovery*` runs,
   a durable resolver publishes nothing and `SagaStarted` is rejected with `AdmissionRejected`.
 - **New `SagaBusPublishError` variants / fields:** `AdmissionRejected`, `AbortNotDelivered`,

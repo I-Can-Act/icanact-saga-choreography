@@ -16,7 +16,7 @@ Before publishing `SagaStarted`, register all of the following on the saga bus:
 
 1. workflow contract (`register_workflow_contract_provider`)
 2. durable terminal resolver/policy (`attach_durable_terminal_resolver_for_contract` in production)
-3. participant step bindings: every bound step needs a **participant** subscription tagged with that step. Strict workflow binders (`bind_*_workflow_participant_*_strict`) tag automatically from the workflow contract; plain binders (`bind_*_participant_*`) take a `steps: &[&str]` argument that must list the steps the actor owns (an empty slice is an untagged subscription and never counts). `subscribe_fn` and `subscribe_saga_type_fn` subscribe **observers**, which never count as a participant receipt.
+3. participant step bindings: every bound step needs a **participant** subscription tagged with that step. Strict workflow binders (`bind_*_workflow_participant_*_strict`) tag automatically from the workflow contract; plain binders (`bind_*_participant_*`) take a `steps: &[&str]` argument that must list the steps the actor owns (an empty slice is rejected with `Err`: an untagged subscription could never satisfy a required step). `subscribe_fn` and `subscribe_saga_type_fn` subscribe **observers**, which never count as a participant receipt.
 4. resolver recovery activation (`activate_terminal_resolver_recovery_for_contract`). Until activation a durable resolver publishes nothing, including live decisions, `CompensationRequested` events and terminal replies.
 
 Registering a workflow contract alone is not enough; `attach_terminal_resolver*` must succeed.

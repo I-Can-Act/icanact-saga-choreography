@@ -184,8 +184,8 @@ fallback is published.
 `bind_sync_participant_tell`, `bind_async_participant_channel`, `bind_async_participant_tell`,
 and their `_lazy` variants) take `steps: &[&str]`, the workflow step names the actor owns
 (typically `&[actor.step_name()]`). The names tag the subscription so each accepted delivery
-is a receipt for those steps. An empty slice is accepted but yields an untagged subscription,
-which never satisfies a required step and surfaces at runtime as a shortfall. The strict
+is a receipt for those steps. An empty slice is rejected with `Err` (an untagged subscription could never satisfy a
+required step, so it is refused at bind time instead of surfacing later as a shortfall). The strict
 workflow binders derive the tags from `saga_workflows()`.
 
 **Participants vs observers.** `subscribe_participant_fn` and the binders create participants:

@@ -322,7 +322,8 @@ where
 
 /// `steps` are the workflow step names this participant owns; they tag the
 /// subscriptions so deliveries count as receipts for those required steps.
-/// Untagged subscriptions never satisfy a required step.
+/// An empty `steps` slice is rejected with `Err` (an untagged subscription
+/// could never satisfy a required step).
 pub fn bind_sync_participant_channel_lazy<A, C>(
     bus: &SagaChoreographyBus,
     actor_ref: &icanact_core::local_sync::SyncActorRef<A>,
@@ -381,7 +382,8 @@ where
 
 /// `steps` are the workflow step names this participant owns; they tag the
 /// subscriptions so deliveries count as receipts for those required steps.
-/// Untagged subscriptions never satisfy a required step.
+/// An empty `steps` slice is rejected with `Err` (an untagged subscription
+/// could never satisfy a required step).
 pub fn bind_sync_participant_channel<A, C>(
     bus: &SagaChoreographyBus,
     actor_ref: &icanact_core::local_sync::SyncActorRef<A>,
@@ -516,7 +518,8 @@ where
 
 /// `steps` are the workflow step names this participant owns; they tag the
 /// subscriptions so deliveries count as receipts for those required steps.
-/// Untagged subscriptions never satisfy a required step.
+/// An empty `steps` slice is rejected with `Err` (an untagged subscription
+/// could never satisfy a required step).
 pub fn bind_sync_participant_tell<A, F>(
     bus: &SagaChoreographyBus,
     actor_ref: &icanact_core::local_sync::SyncActorRef<A>,
@@ -603,7 +606,8 @@ where
 
 /// `steps` are the workflow step names this participant owns; they tag the
 /// subscriptions so deliveries count as receipts for those required steps.
-/// Untagged subscriptions never satisfy a required step.
+/// An empty `steps` slice is rejected with `Err` (an untagged subscription
+/// could never satisfy a required step).
 pub fn bind_async_participant_channel_lazy<A, C>(
     bus: &SagaChoreographyBus,
     actor_ref: &icanact_core::local_async::AsyncActorRef<A>,
@@ -662,7 +666,8 @@ where
 
 /// `steps` are the workflow step names this participant owns; they tag the
 /// subscriptions so deliveries count as receipts for those required steps.
-/// Untagged subscriptions never satisfy a required step.
+/// An empty `steps` slice is rejected with `Err` (an untagged subscription
+/// could never satisfy a required step).
 pub fn bind_async_participant_channel<A, C>(
     bus: &SagaChoreographyBus,
     actor_ref: &icanact_core::local_async::AsyncActorRef<A>,
@@ -797,7 +802,8 @@ where
 
 /// `steps` are the workflow step names this participant owns; they tag the
 /// subscriptions so deliveries count as receipts for those required steps.
-/// Untagged subscriptions never satisfy a required step.
+/// An empty `steps` slice is rejected with `Err` (an untagged subscription
+/// could never satisfy a required step).
 pub fn bind_async_participant_tell<A, F>(
     bus: &SagaChoreographyBus,
     actor_ref: &icanact_core::local_async::AsyncActorRef<A>,
