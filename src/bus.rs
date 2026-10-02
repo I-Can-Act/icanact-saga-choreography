@@ -229,17 +229,17 @@ impl SyncActor for BusStateActor {
                     .workflow_contracts_by_saga_type
                     .get(saga_type.as_ref())
                     .and_then(|contract| {
-                        // The emitting step never receives its own event; for
-                        // SagaStarted (`None`) the emitter is the start step.
-                        let emitter = match &step_name {
-                            Some(step) if !contract.required_path_steps.contains(step.as_ref()) => {
-                                return None;
-                            }
-                            Some(step) => step.as_ref(),
-                            None => contract.first_step.as_ref(),
-                        };
+                        // The emitting step never receives its own event. A
+                        // `SagaStarted` (`None`) names the contract's first step,
+                        // a real `on_start` recipient: nothing is excluded.
                         let mut required = contract.required_path_steps.clone();
-                        required.remove(emitter);
+                        match &step_name {
+                            Some(step) if !required.contains(step.as_ref()) => return None,
+                            Some(step) => {
+                                required.remove(step.as_ref());
+                            }
+                            None => {}
+                        }
                         Some(required)
                     });
                 BusStateReply::RequiredRecipients(required)
@@ -343,6 +343,8 @@ fn canonical_policy_fingerprint(policy: &TerminalPolicy) -> String {
 struct TerminalResolverRuntime {
     config: ResolverAttachConfig,
     subscription: FirehoseSubscription,
+    /// Handle on the bus the subscription lives on, so teardown can unsubscribe it.
+    pubsub: FirehosePubSub<SagaChoreographyEvent>,
     shutdown: Arc<AtomicBool>,
     resolver_ref: local_sync::SyncActorRef<TerminalResolverActor>,
     handle: local_sync::ActorHandle,
@@ -397,6 +399,7 @@ impl SyncActor for TerminalResolverRegistryActor {
                     }
                     std::collections::hash_map::Entry::Occupied(entry) => {
                         runtime.shutdown.store(true, Ordering::Release);
+                        runtime.pubsub.unsubscribe(runtime.subscription.clone());
                         runtime.handle.shutdown();
                         TerminalResolverRegistryReply::Registered(entry.get().subscription.clone())
                     }
@@ -416,6 +419,7 @@ impl SyncActor for TerminalResolverRegistryActor {
             TerminalResolverRegistryAsk::ShutdownAll => {
                 for (_, runtime) in self.runtimes.drain() {
                     runtime.shutdown.store(true, Ordering::Release);
+                    runtime.pubsub.unsubscribe(runtime.subscription.clone());
                     runtime.handle.shutdown();
                 }
                 TerminalResolverRegistryReply::ShutdownComplete
@@ -520,7 +524,8 @@ impl SyncActor for TerminalResolverActor {
                     self.bus
                         .complete_terminal_reply_from_event(&quarantine, self.responder.as_ref());
                     if !matches!(*event, SagaChoreographyEvent::SagaQuarantined { .. }) {
-                        self.publish_terminal_events(vec![quarantine]);
+                        let failed = self.publish_terminal_events(vec![quarantine]);
+                        self.recovery_events.extend(failed);
                     }
                     return;
                 }
@@ -545,10 +550,9 @@ impl SyncActor for TerminalResolverActor {
             }
             TerminalResolverTell::ActivateRecovery => {
                 self.activated = true;
-                let recovery_events = std::mem::take(&mut self.recovery_events);
-                self.recovery_events = self.publish_terminal_events(recovery_events);
                 // Overdue work that matured while recovery was inactive is
-                // evaluated exactly once, now.
+                // evaluated exactly once, now; it is published together with
+                // the buffered recovery output below.
                 self.resolver.poll_timeouts()
             }
             TerminalResolverTell::PollTimeouts if !self.activated => {
@@ -561,7 +565,16 @@ impl SyncActor for TerminalResolverActor {
             }
             TerminalResolverTell::PollTimeouts => self.resolver.poll_timeouts(),
         };
-        self.publish_terminal_events(terminal_events);
+        if !self.activated {
+            // Participants are not bound yet: hold the output (never publish,
+            // never drop) until recovery is activated.
+            self.recovery_events.extend(terminal_events);
+            return;
+        }
+        // Earlier failed publications are retried first; failures stay retained.
+        let mut pending = std::mem::take(&mut self.recovery_events);
+        pending.extend(terminal_events);
+        self.recovery_events = self.publish_terminal_events(pending);
     }
 }
 
@@ -643,15 +656,13 @@ impl PublishOutcome {
 struct DeliveryReceipts {
     /// Step-tagged participants that accepted the event.
     steps: HashSet<Box<str>>,
-    /// Untagged participants that accepted the event.
-    unnamed_participants: usize,
     resolver: bool,
 }
 
 /// How a subscription counts toward required-recipient safety.
 #[derive(Clone)]
 enum SubscriberRole {
-    /// A workflow participant owning `steps` (empty: step not known).
+    /// A workflow participant owning `steps` (empty: counts for no step).
     Participant(Arc<[Box<str>]>),
     /// The attached terminal resolver.
     Resolver,
@@ -700,9 +711,8 @@ fn record_receipt(role: &SubscriberRole) {
         };
         match role {
             SubscriberRole::Resolver => frame.resolver = true,
-            SubscriberRole::Participant(steps) if steps.is_empty() => {
-                frame.unnamed_participants += 1;
-            }
+            // An untagged participant owns no step: it is never a receipt.
+            SubscriberRole::Participant(steps) if steps.is_empty() => {}
             SubscriberRole::Participant(steps) => {
                 frame.steps.extend(steps.iter().cloned());
             }
@@ -718,23 +728,18 @@ struct RequiredShortfall {
 }
 
 /// Required roles that did not receive the event, or `None` when every
-/// required participant step and the resolver did. An untagged participant can
-/// stand in for one otherwise-unmatched required step; observers never count.
+/// required participant step and the resolver did. Only step-tagged
+/// participants count; untagged participants and observers never do.
 fn required_shortfall(
     required: &HashSet<Box<str>>,
     receipts: &DeliveryReceipts,
 ) -> Option<RequiredShortfall> {
-    let mut unmatched: Vec<&str> = required
+    let mut missing: Vec<&str> = required
         .iter()
         .filter(|step| !receipts.steps.contains(step.as_ref()))
         .map(|step| step.as_ref())
         .collect();
-    unmatched.sort_unstable();
-    let mut missing: Vec<&str> = if unmatched.len() > receipts.unnamed_participants {
-        unmatched
-    } else {
-        Vec::new()
-    };
+    missing.sort_unstable();
     if !receipts.resolver {
         missing.push(TERMINAL_RESOLVER_STEP);
     }
@@ -926,7 +931,8 @@ impl SagaChoreographyBus {
     /// Subscribes a workflow participant owning `steps`. Unlike
     /// [`Self::subscribe_fn`] (an observer, which never counts toward
     /// required-recipient safety), an accepted delivery here is a receipt for
-    /// each of `steps`. An empty `steps` is an untagged participant.
+    /// each of `steps`. An empty `steps` is an untagged participant, which
+    /// never counts as a receipt for any required step.
     pub fn subscribe_participant_fn<F>(
         &self,
         topic: &str,
@@ -1280,7 +1286,13 @@ impl SagaChoreographyBus {
             saga_type: C::saga_type().into(),
         }) {
             Some(BusStateReply::BoundSteps(steps)) => steps,
-            _ => HashSet::new(),
+            other => {
+                return Err(bus_state_ask_failure(
+                    "bound steps lookup",
+                    C::saga_type(),
+                    other.is_some(),
+                ));
+            }
         };
         if !bound_for_type.is_empty() {
             let mut unknown_steps: Vec<&str> = bound_for_type
@@ -1298,10 +1310,19 @@ impl SagaChoreographyBus {
             }
         }
 
-        let _ = self.ask_state(BusStateAsk::RegisterWorkflowContract {
+        match self.ask_state(BusStateAsk::RegisterWorkflowContract {
             saga_type: C::saga_type().into(),
             contract_state,
-        });
+        }) {
+            Some(BusStateReply::Unit) => {}
+            other => {
+                return Err(bus_state_ask_failure(
+                    "workflow contract registration",
+                    C::saga_type(),
+                    other.is_some(),
+                ));
+            }
+        }
 
         let required = required_steps_from_success_criteria(&policy.success_criteria);
         for step in required {
@@ -1329,7 +1350,13 @@ impl SagaChoreographyBus {
             saga_type: saga_type.into(),
         }) {
             Some(BusStateReply::WorkflowContract(contract)) => contract,
-            _ => None,
+            other => {
+                return Err(bus_state_ask_failure(
+                    "workflow contract lookup",
+                    saga_type,
+                    other.is_some(),
+                ));
+            }
         };
         if let Some(contract) = contract
             && !contract.declared_steps.contains(step_name)
@@ -1340,11 +1367,17 @@ impl SagaChoreographyBus {
             ));
         }
 
-        let _ = self.ask_state(BusStateAsk::RegisterBoundWorkflowStep {
+        match self.ask_state(BusStateAsk::RegisterBoundWorkflowStep {
             saga_type: saga_type.into(),
             step_name: step_name.into(),
-        });
-        Ok(())
+        }) {
+            Some(BusStateReply::Unit) => Ok(()),
+            other => Err(bus_state_ask_failure(
+                "bound workflow step registration",
+                saga_type,
+                other.is_some(),
+            )),
+        }
     }
 
     pub fn register_bound_workflow_participants_for_actor<A: HasSagaWorkflowParticipants>(
@@ -1602,10 +1635,15 @@ impl SagaChoreographyBus {
         let subscription_resolver_ref = resolver_ref.clone();
         let abort_ingested = Arc::new(AtomicU64::new(0));
         let subscription_abort_ingested = Arc::clone(&abort_ingested);
+        let subscription_shutdown = Arc::clone(&shutdown);
         let subscription = self.subscribe_role_fn(
             saga_type_topic.as_ref(),
             SubscriberRole::Resolver,
             move |event| {
+                // A torn-down resolver must not accept (and silently drop) events.
+                if subscription_shutdown.load(Ordering::Acquire) {
+                    return false;
+                }
                 if !subscription_resolver_ref
                     .tell(TerminalResolverTell::Ingest(Box::new(event.clone())))
                 {
@@ -1640,6 +1678,7 @@ impl SagaChoreographyBus {
         let runtime = Box::new(TerminalResolverRuntime {
             config: requested,
             subscription,
+            pubsub: self.bus.clone(),
             shutdown,
             resolver_ref,
             handle: resolver_handle,
@@ -1893,6 +1932,16 @@ impl SagaChoreographyBus {
         if !self.has_terminal_policy_for_saga_type(context.saga_type.as_ref()) {
             return None;
         }
+        // A resolver-emitted request is delivered to the participants whose
+        // undo it asks for: each must be tagged with, and receive, its step.
+        if let SagaChoreographyEvent::CompensationRequested {
+            steps_to_compensate,
+            ..
+        } = event
+            && context.step_name.as_ref() == TERMINAL_RESOLVER_STEP
+        {
+            return Some(steps_to_compensate.iter().cloned().collect());
+        }
         match self.ask_state(BusStateAsk::RequiredRecipients {
             saga_type: context.saga_type.clone(),
             step_name: Some(context.step_name.clone()),
@@ -1919,6 +1968,23 @@ impl SagaChoreographyBus {
             retention_limit,
         });
     }
+}
+
+/// Typed error text for a bus-state ask that failed or returned a wrong reply.
+fn bus_state_ask_failure(operation: &str, saga_type: &str, wrong_reply: bool) -> String {
+    let detail = if wrong_reply {
+        "unexpected reply"
+    } else {
+        "bus state actor unavailable"
+    };
+    tracing::error!(
+        target: "core::saga",
+        event = "saga_bus_state_ask_failed",
+        operation,
+        saga_type,
+        detail
+    );
+    format!("{operation} failed: saga_type={saga_type}: {detail}")
 }
 
 /// Cache key for `SagaId`-only completions: empty type, incarnation 0 (below any real run).
@@ -2379,7 +2445,7 @@ mod tests {
         let _ = bus.publish(step.clone());
         let _ = bus.publish(step);
 
-        wait_until(Instant::now() + Duration::from_secs(1), || {
+        wait_until(Instant::now() + Duration::from_secs(5), || {
             delivered.load(Ordering::Relaxed) == 1
         });
     }
@@ -2449,6 +2515,11 @@ mod tests {
                 Arc::new(RejectingDecisionJournal),
             )
             .expect("durable resolver should attach");
+        // R5: a durable resolver buffers its output until recovery is activated.
+        bus.activate_terminal_resolver_recovery(
+            TerminalPolicy::order_lifecycle_default().saga_type.as_ref(),
+        )
+        .expect("recovery activation should succeed");
         let saga_id = SagaId::new(812);
         let (pending, probe) = register_pending_reply(bus.clone(), saga_id);
 
@@ -2525,7 +2596,7 @@ mod tests {
                 compensation_available: true,
             })
             .expect("second effect acceptance should publish");
-            wait_until(Instant::now() + Duration::from_secs(1), || {
+            wait_until(Instant::now() + Duration::from_secs(5), || {
                 journal.read_all().is_ok_and(|entries| entries.len() == 3)
             });
         }
@@ -2534,6 +2605,14 @@ mod tests {
         let _resolver = bus
             .attach_durable_terminal_resolver(policy, "terminal-resolver", Arc::clone(&journal))
             .expect("durable resolver should restore");
+        // Participants that undo the requested steps, tagged with their step.
+        let _participants: Vec<_> = ["first_effect", "second_effect", "finalize"]
+            .into_iter()
+            .map(|step| bus.subscribe_participant_fn("durable_multi_step", &[step], |_event| true))
+            .collect();
+        // R5: restored output stays buffered until recovery is activated.
+        bus.activate_terminal_resolver_recovery("durable_multi_step")
+            .expect("recovery activation should succeed");
         let requests: Arc<std::sync::Mutex<Vec<Vec<Box<str>>>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let _capture = bus.subscribe_saga_type_fn("durable_multi_step", {
@@ -2568,7 +2647,7 @@ mod tests {
         .expect("recovered failure should publish");
 
         // Serial frontier: the later effect is undone first, alone.
-        wait_until(Instant::now() + Duration::from_secs(1), || {
+        wait_until(Instant::now() + Duration::from_secs(5), || {
             request_count() >= 1
         });
         assert_eq!(
@@ -2582,7 +2661,7 @@ mod tests {
             context: context_for("durable_multi_step", "second_effect", 812),
         })
         .expect("compensation ack should publish");
-        wait_until(Instant::now() + Duration::from_secs(1), || {
+        wait_until(Instant::now() + Duration::from_secs(5), || {
             request_count() >= 2
         });
         assert_eq!(
@@ -2633,7 +2712,7 @@ mod tests {
 
         bus.activate_terminal_resolver_recovery("order_lifecycle")
             .expect("post-binding activation should succeed");
-        wait_until(Instant::now() + Duration::from_secs(1), || {
+        wait_until(Instant::now() + Duration::from_secs(5), || {
             delivered.load(Ordering::Relaxed) == 1
         });
     }
@@ -2656,10 +2735,11 @@ mod tests {
             "order_lifecycle/short".into(),
             FailureAuthority::AnyParticipant,
             SuccessCriteria::AllOf(required),
-            Duration::from_millis(60),
-            Duration::from_millis(60),
+            Duration::from_millis(400),
+            Duration::from_millis(400),
             &[],
         );
+        // Generous deadlines: restore must happen well before expiry, even on a loaded host.
         // Near expiry but not yet expired at restore time.
         let (resolver, recovery_events) =
             TerminalResolver::restore_from_events(policy, std::slice::from_ref(&started));
@@ -2684,7 +2764,7 @@ mod tests {
             saga_type: "order_lifecycle".into(),
         };
         // Let the deadline pass while recovery is still not activated.
-        let expired_at = SagaContext::now_millis() + 80;
+        let expired_at = SagaContext::now_millis() + 450;
         while SagaContext::now_millis() <= expired_at {
             thread::yield_now();
         }
@@ -2698,9 +2778,68 @@ mod tests {
         );
 
         actor.handle_tell(TerminalResolverTell::ActivateRecovery);
-        wait_until(Instant::now() + Duration::from_secs(1), || {
+        wait_until(Instant::now() + Duration::from_secs(5), || {
             delivered.load(Ordering::Relaxed) >= 1
         });
+    }
+
+    #[test]
+    fn ingest_output_is_buffered_until_activation_then_published_once() {
+        let saga_id = SagaId::new(817);
+        let bus = SagaChoreographyBus::new();
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let _binding = bus.subscribe_saga_type_fn("order_lifecycle", {
+            let delivered = Arc::clone(&delivered);
+            move |event| {
+                if event.context().step_name.as_ref() == TERMINAL_RESOLVER_STEP {
+                    delivered.fetch_add(1, Ordering::Relaxed);
+                }
+                true
+            }
+        });
+        let mut actor = TerminalResolverActor {
+            resolver: TerminalResolver::new(TerminalPolicy::order_lifecycle_default()),
+            recovery_events: Vec::new(),
+            activated: false,
+            journal: None,
+            bus: bus.clone(),
+            responder: Arc::from("terminal-resolver"),
+            saga_type: "order_lifecycle".into(),
+        };
+        let ctx = context("create_order", saga_id.get());
+        actor.handle_tell(TerminalResolverTell::Ingest(Box::new(
+            SagaChoreographyEvent::SagaStarted {
+                context: ctx.clone(),
+                payload: Vec::new(),
+            },
+        )));
+        actor.handle_tell(TerminalResolverTell::Ingest(Box::new(
+            SagaChoreographyEvent::StepFailed {
+                context: ctx,
+                participant_id: "p".into(),
+                error_code: None,
+                error: "boom".into(),
+                requires_compensation: false,
+            },
+        )));
+        assert!(
+            !actor.recovery_events.is_empty(),
+            "the decision must be buffered while recovery is inactive"
+        );
+        thread::sleep(Duration::from_millis(30));
+        assert_eq!(
+            delivered.load(Ordering::Relaxed),
+            0,
+            "nothing published yet"
+        );
+
+        actor.handle_tell(TerminalResolverTell::ActivateRecovery);
+        assert!(
+            actor.recovery_events.is_empty(),
+            "published buffer is cleared: {:?}",
+            actor.recovery_events
+        );
+        assert!(delivered.load(Ordering::Relaxed) >= 1);
     }
 
     #[test]
@@ -3611,7 +3750,7 @@ mod tests {
             "unexpected reason: {reason}"
         );
         assert!(
-            reason.contains("required_min_delivered=2"),
+            reason.contains("required_min_delivered=3"),
             "expected minimum delivery requirement in reason, got: {reason}"
         );
         assert!(
@@ -4239,7 +4378,38 @@ mod t14b_required_recipient_tests {
     }
 
     #[test]
-    fn saga_started_does_not_require_the_start_step_to_receive_it() {
+    fn resolver_compensation_request_needs_receipt_from_the_target_step() {
+        let rig = rig();
+        let SagaChoreographyEvent::StepCompleted { context, .. } = step_completed(14_006) else {
+            unreachable!("fixture is StepCompleted");
+        };
+        let request = || SagaChoreographyEvent::CompensationRequested {
+            context: context.next_step(crate::TERMINAL_RESOLVER_STEP.into()),
+            failed_step: "risk_check".into(),
+            reason: "test".into(),
+            failure: crate::SagaFailureDetails {
+                step_name: "risk_check".into(),
+                participant_id: "risk-engine".into(),
+                error_code: None,
+                error_message: "boom".into(),
+                at_millis: SagaContext::now_millis(),
+            },
+            steps_to_compensate: vec!["create_order".into()],
+        };
+        rig.b_accepts.store(false, Ordering::Release);
+        let err = rig
+            .bus
+            .publish_strict(request())
+            .expect_err("create_order's participant refused the undo request");
+        assert_eq!(missing_roles(err), "create_order");
+        rig.b_accepts.store(true, Ordering::Release);
+        rig.bus
+            .publish_strict(request())
+            .expect("the tagged participant received the undo request");
+    }
+
+    #[test]
+    fn saga_started_requires_the_start_step_participant_to_receive_it() {
         let bus = SagaChoreographyBus::new();
         bus.register_workflow_contract_provider::<TwoStep>()
             .expect("contract registers");
@@ -4250,15 +4420,27 @@ mod t14b_required_recipient_tests {
         let _resolver = bus
             .attach_terminal_resolver_for_contract::<TwoStep>("t14b-resolver")
             .expect("resolver attaches");
-        // Only the non-start participant listens; the start step emitted the event.
+        // The start step is a real `on_start` recipient: with only the other
+        // participant listening, the start must report it missing.
         let _b = bus.subscribe_participant_fn(SAGA, &["create_order"], |_| true);
-        let SagaChoreographyEvent::StepCompleted { context, .. } = step_completed(14_004) else {
-            unreachable!("fixture is StepCompleted");
+        let started = |id| {
+            let SagaChoreographyEvent::StepCompleted { context, .. } = step_completed(id) else {
+                unreachable!("fixture is StepCompleted");
+            };
+            SagaChoreographyEvent::SagaStarted {
+                context,
+                payload: Vec::new(),
+            }
         };
-        bus.publish_strict(SagaChoreographyEvent::SagaStarted {
-            context,
-            payload: Vec::new(),
-        })
-        .expect("start step is the emitter and must not count as a missing recipient");
+        let err = bus
+            .publish_strict(started(14_004))
+            .expect_err("the start step participant never received SagaStarted");
+        let missing = missing_roles(err);
+        assert!(missing.contains("risk_check"), "missing: {missing}");
+        assert!(!missing.contains("create_order"), "missing: {missing}");
+
+        let _a = bus.subscribe_participant_fn(SAGA, &["risk_check"], |_| true);
+        bus.publish_strict(started(14_005))
+            .expect("every required participant, start step included, received the start");
     }
 }

@@ -621,7 +621,7 @@ type Terminals = Arc<Mutex<Vec<(RunKey, &'static str)>>>;
 fn capture_terminals(bus: &SagaChoreographyBus, saga_type: &str) -> Terminals {
     let seen: Terminals = Arc::default();
     let sink = Arc::clone(&seen);
-    let sub = bus.subscribe_participant_fn(saga_type, &[], move |event| {
+    let sub = bus.subscribe_fn(saga_type, move |event| {
         let kind = match event {
             SagaChoreographyEvent::SagaCompleted { .. } => "completed",
             SagaChoreographyEvent::SagaFailed { .. } => "failed",
@@ -762,6 +762,14 @@ fn resolver_and_bus_scenario<J: TerminalResolverJournal>(open: impl Fn(&str) -> 
             Arc::clone(&journals[1].1),
         )
         .expect("payment resolver attaches");
+        // The start step's participants: lanes tagged with it receive SagaStarted.
+        for saga_type in [ORDER, PAYMENT] {
+            let lane = bus.subscribe_participant_fn(saga_type, &[STEP], |_event| true);
+            std::mem::forget(lane); // lives as long as the bus
+            // Participants are bound: a durable resolver publishes only once activated.
+            bus.activate_terminal_resolver_recovery(saga_type)
+                .expect("recovery activates");
+        }
     };
     let (order_1, pay_1) = (run_of(ORDER, 7, base), run_of(PAYMENT, 7, base));
     let order_2 = run_of(ORDER, 7, base + 1_000);

@@ -237,10 +237,33 @@ where
     Ok(saga_types)
 }
 
-pub fn bind_sync_participant_channel_lazy<A, C>(
+/// A saga type and the step names tagging its subscription.
+type SagaTypeSteps = (&'static str, Vec<Box<str>>);
+
+/// Saga types of `A`'s workflows, each with the step names of every workflow
+/// joining it. These tag the subscriptions (required-recipient receipts).
+fn checked_workflow_saga_type_steps<A>() -> Result<Vec<SagaTypeSteps>, String>
+where
+    A: HasSagaWorkflowParticipants,
+{
+    let saga_types = checked_workflow_saga_types::<A>()?;
+    Ok(saga_types
+        .into_iter()
+        .map(|saga_type| {
+            let steps = A::saga_workflows()
+                .iter()
+                .filter(|workflow| workflow.saga_types().contains(&saga_type))
+                .map(|workflow| Box::<str>::from(workflow.step_name()))
+                .collect();
+            (saga_type, steps)
+        })
+        .collect())
+}
+
+fn bind_sync_participant_channel_lazy_tagged<A, C>(
     bus: &SagaChoreographyBus,
     actor_ref: &icanact_core::local_sync::SyncActorRef<A>,
-    saga_types: &[&'static str],
+    saga_types: &[SagaTypeSteps],
     channel_name: &str,
     capacity: usize,
 ) -> Result<Vec<FirehoseSubscription>, String>
@@ -258,19 +281,56 @@ where
     )));
     Ok(saga_types
         .iter()
-        .map(|saga_type| {
+        .map(|(saga_type, steps)| {
+            let tags: Vec<&str> = steps.iter().map(|s| s.as_ref()).collect();
             let forwarder = Arc::clone(&forwarder);
-            bus.subscribe_participant_fn(saga_type, &[], move |event| {
+            bus.subscribe_participant_fn(saga_type, &tags, move |event| {
                 lock_or_recover(&forwarder).forward(event.clone())
             })
         })
         .collect())
 }
 
-pub fn bind_sync_participant_channel<A, C>(
+/// `steps` are the workflow step names this participant owns; they tag the
+/// subscriptions so deliveries count as receipts for those required steps.
+/// Untagged subscriptions never satisfy a required step.
+pub fn bind_sync_participant_channel_lazy<A, C>(
     bus: &SagaChoreographyBus,
     actor_ref: &icanact_core::local_sync::SyncActorRef<A>,
     saga_types: &[&'static str],
+    steps: &[&str],
+    channel_name: &str,
+    capacity: usize,
+) -> Result<Vec<FirehoseSubscription>, String>
+where
+    A: icanact_core::local_sync::SyncActor + Send + 'static,
+    <A as icanact_core::local_sync::SyncActor>::Channel: Send + 'static,
+    <A as icanact_core::local_sync::SyncActor>::Channel: From<SagaParticipantChannel<C>>,
+    A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
+    C: Send + 'static,
+{
+    let tagged: Vec<SagaTypeSteps> = saga_types
+        .iter()
+        .map(|saga_type| {
+            (
+                *saga_type,
+                steps.iter().map(|s| Box::<str>::from(*s)).collect(),
+            )
+        })
+        .collect();
+    bind_sync_participant_channel_lazy_tagged::<A, C>(
+        bus,
+        actor_ref,
+        &tagged,
+        channel_name,
+        capacity,
+    )
+}
+
+fn bind_sync_participant_channel_tagged<A, C>(
+    bus: &SagaChoreographyBus,
+    actor_ref: &icanact_core::local_sync::SyncActorRef<A>,
+    saga_types: &[SagaTypeSteps],
     channel_name: &str,
     capacity: usize,
 ) -> Result<Vec<FirehoseSubscription>, String>
@@ -288,13 +348,44 @@ where
     )?));
     Ok(saga_types
         .iter()
-        .map(|saga_type| {
+        .map(|(saga_type, steps)| {
+            let tags: Vec<&str> = steps.iter().map(|s| s.as_ref()).collect();
             let forwarder = Arc::clone(&forwarder);
-            bus.subscribe_participant_fn(saga_type, &[], move |event| {
+            bus.subscribe_participant_fn(saga_type, &tags, move |event| {
                 lock_or_recover(&forwarder).forward(event.clone())
             })
         })
         .collect())
+}
+
+/// `steps` are the workflow step names this participant owns; they tag the
+/// subscriptions so deliveries count as receipts for those required steps.
+/// Untagged subscriptions never satisfy a required step.
+pub fn bind_sync_participant_channel<A, C>(
+    bus: &SagaChoreographyBus,
+    actor_ref: &icanact_core::local_sync::SyncActorRef<A>,
+    saga_types: &[&'static str],
+    steps: &[&str],
+    channel_name: &str,
+    capacity: usize,
+) -> Result<Vec<FirehoseSubscription>, String>
+where
+    A: icanact_core::local_sync::SyncActor + Send + 'static,
+    <A as icanact_core::local_sync::SyncActor>::Channel: Send + 'static,
+    <A as icanact_core::local_sync::SyncActor>::Channel: From<SagaParticipantChannel<C>>,
+    A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
+    C: Send + 'static,
+{
+    let tagged: Vec<SagaTypeSteps> = saga_types
+        .iter()
+        .map(|saga_type| {
+            (
+                *saga_type,
+                steps.iter().map(|s| Box::<str>::from(*s)).collect(),
+            )
+        })
+        .collect();
+    bind_sync_participant_channel_tagged::<A, C>(bus, actor_ref, &tagged, channel_name, capacity)
 }
 
 pub fn bind_sync_workflow_participant_channel<A, C>(
@@ -310,8 +401,14 @@ where
     A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
     C: Send + 'static,
 {
-    let saga_types = checked_workflow_saga_types::<A>()?;
-    bind_sync_participant_channel::<A, C>(bus, actor_ref, &saga_types, channel_name, capacity)
+    let saga_types = checked_workflow_saga_type_steps::<A>()?;
+    bind_sync_participant_channel_tagged::<A, C>(
+        bus,
+        actor_ref,
+        &saga_types,
+        channel_name,
+        capacity,
+    )
 }
 
 pub fn bind_sync_workflow_participant_channel_strict<A, C>(
@@ -346,8 +443,14 @@ where
     A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
     C: Send + 'static,
 {
-    let saga_types = checked_workflow_saga_types::<A>()?;
-    bind_sync_participant_channel_lazy::<A, C>(bus, actor_ref, &saga_types, channel_name, capacity)
+    let saga_types = checked_workflow_saga_type_steps::<A>()?;
+    bind_sync_participant_channel_lazy_tagged::<A, C>(
+        bus,
+        actor_ref,
+        &saga_types,
+        channel_name,
+        capacity,
+    )
 }
 
 pub fn bind_sync_workflow_participant_channel_lazy_strict<A, C>(
@@ -373,10 +476,10 @@ where
     Ok(subs)
 }
 
-pub fn bind_sync_participant_tell<A, F>(
+fn bind_sync_participant_tell_tagged<A, F>(
     bus: &SagaChoreographyBus,
     actor_ref: &icanact_core::local_sync::SyncActorRef<A>,
-    saga_types: &[&'static str],
+    saga_types: &[SagaTypeSteps],
     map_event: F,
 ) -> Result<Vec<FirehoseSubscription>, String>
 where
@@ -387,14 +490,42 @@ where
     let map_event = std::sync::Arc::new(map_event);
     Ok(saga_types
         .iter()
-        .map(|saga_type| {
+        .map(|(saga_type, steps)| {
+            let tags: Vec<&str> = steps.iter().map(|s| s.as_ref()).collect();
             let actor_ref = actor_ref.clone();
             let map_event = std::sync::Arc::clone(&map_event);
-            bus.subscribe_participant_fn(saga_type, &[], move |event| {
+            bus.subscribe_participant_fn(saga_type, &tags, move |event| {
                 actor_ref.try_tell(map_event(event.clone())).is_ok()
             })
         })
         .collect())
+}
+
+/// `steps` are the workflow step names this participant owns; they tag the
+/// subscriptions so deliveries count as receipts for those required steps.
+/// Untagged subscriptions never satisfy a required step.
+pub fn bind_sync_participant_tell<A, F>(
+    bus: &SagaChoreographyBus,
+    actor_ref: &icanact_core::local_sync::SyncActorRef<A>,
+    saga_types: &[&'static str],
+    steps: &[&str],
+    map_event: F,
+) -> Result<Vec<FirehoseSubscription>, String>
+where
+    A: icanact_core::local_sync::SyncActor + AllowsSagaTellIngress + Send + 'static,
+    A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
+    F: Fn(SagaChoreographyEvent) -> A::Tell + Send + Sync + 'static,
+{
+    let tagged: Vec<SagaTypeSteps> = saga_types
+        .iter()
+        .map(|saga_type| {
+            (
+                *saga_type,
+                steps.iter().map(|s| Box::<str>::from(*s)).collect(),
+            )
+        })
+        .collect();
+    bind_sync_participant_tell_tagged::<A, F>(bus, actor_ref, &tagged, map_event)
 }
 
 pub fn bind_sync_workflow_participant_tell<A, F>(
@@ -411,8 +542,8 @@ where
     A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
     F: Fn(SagaChoreographyEvent) -> A::Tell + Send + Sync + 'static,
 {
-    let saga_types = checked_workflow_saga_types::<A>()?;
-    bind_sync_participant_tell(bus, actor_ref, &saga_types, map_event)
+    let saga_types = checked_workflow_saga_type_steps::<A>()?;
+    bind_sync_participant_tell_tagged(bus, actor_ref, &saga_types, map_event)
 }
 
 pub fn bind_sync_workflow_participant_tell_strict<A, F>(
@@ -434,10 +565,10 @@ where
     Ok(subs)
 }
 
-pub fn bind_async_participant_channel_lazy<A, C>(
+fn bind_async_participant_channel_lazy_tagged<A, C>(
     bus: &SagaChoreographyBus,
     actor_ref: &icanact_core::local_async::AsyncActorRef<A>,
-    saga_types: &[&'static str],
+    saga_types: &[SagaTypeSteps],
     channel_name: &str,
     capacity: usize,
 ) -> Result<Vec<FirehoseSubscription>, String>
@@ -455,19 +586,56 @@ where
     )));
     Ok(saga_types
         .iter()
-        .map(|saga_type| {
+        .map(|(saga_type, steps)| {
+            let tags: Vec<&str> = steps.iter().map(|s| s.as_ref()).collect();
             let forwarder = Arc::clone(&forwarder);
-            bus.subscribe_participant_fn(saga_type, &[], move |event| {
+            bus.subscribe_participant_fn(saga_type, &tags, move |event| {
                 lock_or_recover(&forwarder).forward(event.clone())
             })
         })
         .collect())
 }
 
-pub fn bind_async_participant_channel<A, C>(
+/// `steps` are the workflow step names this participant owns; they tag the
+/// subscriptions so deliveries count as receipts for those required steps.
+/// Untagged subscriptions never satisfy a required step.
+pub fn bind_async_participant_channel_lazy<A, C>(
     bus: &SagaChoreographyBus,
     actor_ref: &icanact_core::local_async::AsyncActorRef<A>,
     saga_types: &[&'static str],
+    steps: &[&str],
+    channel_name: &str,
+    capacity: usize,
+) -> Result<Vec<FirehoseSubscription>, String>
+where
+    A: icanact_core::local_async::AsyncActor + Send + 'static,
+    <A as icanact_core::local_async::AsyncActor>::Channel: Send + 'static,
+    <A as icanact_core::local_async::AsyncActor>::Channel: From<SagaParticipantChannel<C>>,
+    A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
+    C: Send + 'static,
+{
+    let tagged: Vec<SagaTypeSteps> = saga_types
+        .iter()
+        .map(|saga_type| {
+            (
+                *saga_type,
+                steps.iter().map(|s| Box::<str>::from(*s)).collect(),
+            )
+        })
+        .collect();
+    bind_async_participant_channel_lazy_tagged::<A, C>(
+        bus,
+        actor_ref,
+        &tagged,
+        channel_name,
+        capacity,
+    )
+}
+
+fn bind_async_participant_channel_tagged<A, C>(
+    bus: &SagaChoreographyBus,
+    actor_ref: &icanact_core::local_async::AsyncActorRef<A>,
+    saga_types: &[SagaTypeSteps],
     channel_name: &str,
     capacity: usize,
 ) -> Result<Vec<FirehoseSubscription>, String>
@@ -485,13 +653,44 @@ where
     )?));
     Ok(saga_types
         .iter()
-        .map(|saga_type| {
+        .map(|(saga_type, steps)| {
+            let tags: Vec<&str> = steps.iter().map(|s| s.as_ref()).collect();
             let forwarder = Arc::clone(&forwarder);
-            bus.subscribe_participant_fn(saga_type, &[], move |event| {
+            bus.subscribe_participant_fn(saga_type, &tags, move |event| {
                 lock_or_recover(&forwarder).forward(event.clone())
             })
         })
         .collect())
+}
+
+/// `steps` are the workflow step names this participant owns; they tag the
+/// subscriptions so deliveries count as receipts for those required steps.
+/// Untagged subscriptions never satisfy a required step.
+pub fn bind_async_participant_channel<A, C>(
+    bus: &SagaChoreographyBus,
+    actor_ref: &icanact_core::local_async::AsyncActorRef<A>,
+    saga_types: &[&'static str],
+    steps: &[&str],
+    channel_name: &str,
+    capacity: usize,
+) -> Result<Vec<FirehoseSubscription>, String>
+where
+    A: icanact_core::local_async::AsyncActor + Send + 'static,
+    <A as icanact_core::local_async::AsyncActor>::Channel: Send + 'static,
+    <A as icanact_core::local_async::AsyncActor>::Channel: From<SagaParticipantChannel<C>>,
+    A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
+    C: Send + 'static,
+{
+    let tagged: Vec<SagaTypeSteps> = saga_types
+        .iter()
+        .map(|saga_type| {
+            (
+                *saga_type,
+                steps.iter().map(|s| Box::<str>::from(*s)).collect(),
+            )
+        })
+        .collect();
+    bind_async_participant_channel_tagged::<A, C>(bus, actor_ref, &tagged, channel_name, capacity)
 }
 
 pub fn bind_async_workflow_participant_channel<A, C>(
@@ -507,8 +706,14 @@ where
     A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
     C: Send + 'static,
 {
-    let saga_types = checked_workflow_saga_types::<A>()?;
-    bind_async_participant_channel::<A, C>(bus, actor_ref, &saga_types, channel_name, capacity)
+    let saga_types = checked_workflow_saga_type_steps::<A>()?;
+    bind_async_participant_channel_tagged::<A, C>(
+        bus,
+        actor_ref,
+        &saga_types,
+        channel_name,
+        capacity,
+    )
 }
 
 pub fn bind_async_workflow_participant_channel_strict<A, C>(
@@ -543,8 +748,14 @@ where
     A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
     C: Send + 'static,
 {
-    let saga_types = checked_workflow_saga_types::<A>()?;
-    bind_async_participant_channel_lazy::<A, C>(bus, actor_ref, &saga_types, channel_name, capacity)
+    let saga_types = checked_workflow_saga_type_steps::<A>()?;
+    bind_async_participant_channel_lazy_tagged::<A, C>(
+        bus,
+        actor_ref,
+        &saga_types,
+        channel_name,
+        capacity,
+    )
 }
 
 pub fn bind_async_workflow_participant_channel_lazy_strict<A, C>(
@@ -570,10 +781,10 @@ where
     Ok(subs)
 }
 
-pub fn bind_async_participant_tell<A, F>(
+fn bind_async_participant_tell_tagged<A, F>(
     bus: &SagaChoreographyBus,
     actor_ref: &icanact_core::local_async::AsyncActorRef<A>,
-    saga_types: &[&'static str],
+    saga_types: &[SagaTypeSteps],
     map_event: F,
 ) -> Result<Vec<FirehoseSubscription>, String>
 where
@@ -584,14 +795,42 @@ where
     let map_event = std::sync::Arc::new(map_event);
     Ok(saga_types
         .iter()
-        .map(|saga_type| {
+        .map(|(saga_type, steps)| {
+            let tags: Vec<&str> = steps.iter().map(|s| s.as_ref()).collect();
             let actor_ref = actor_ref.clone();
             let map_event = std::sync::Arc::clone(&map_event);
-            bus.subscribe_participant_fn(saga_type, &[], move |event| {
+            bus.subscribe_participant_fn(saga_type, &tags, move |event| {
                 actor_ref.try_tell(map_event(event.clone())).is_ok()
             })
         })
         .collect())
+}
+
+/// `steps` are the workflow step names this participant owns; they tag the
+/// subscriptions so deliveries count as receipts for those required steps.
+/// Untagged subscriptions never satisfy a required step.
+pub fn bind_async_participant_tell<A, F>(
+    bus: &SagaChoreographyBus,
+    actor_ref: &icanact_core::local_async::AsyncActorRef<A>,
+    saga_types: &[&'static str],
+    steps: &[&str],
+    map_event: F,
+) -> Result<Vec<FirehoseSubscription>, String>
+where
+    A: icanact_core::local_async::AsyncActor + AllowsSagaTellIngress + Send + 'static,
+    A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
+    F: Fn(SagaChoreographyEvent) -> A::Tell + Send + Sync + 'static,
+{
+    let tagged: Vec<SagaTypeSteps> = saga_types
+        .iter()
+        .map(|saga_type| {
+            (
+                *saga_type,
+                steps.iter().map(|s| Box::<str>::from(*s)).collect(),
+            )
+        })
+        .collect();
+    bind_async_participant_tell_tagged::<A, F>(bus, actor_ref, &tagged, map_event)
 }
 
 #[cfg(test)]
@@ -947,7 +1186,7 @@ mod tests {
                 // delivery; the unset lazy participant channel must not count.
                 crate::SagaBusPublishError::RequiredPathDeliveryShortfall {
                     delivered: 1,
-                    required_min_delivered: 2,
+                    required_min_delivered: 3,
                     ..
                 }
             ),
@@ -955,6 +1194,146 @@ mod tests {
         );
         for sub in subs {
             let _ = bus.unsubscribe(sub);
+        }
+    }
+
+    fn missing_roles(err: crate::SagaBusPublishError) -> String {
+        match err {
+            crate::SagaBusPublishError::RequiredPathDeliveryShortfall { missing_roles, .. } => {
+                missing_roles.to_string()
+            }
+            other => panic!("expected a required-path shortfall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workflow_binder_tags_its_steps_so_only_the_unserved_step_is_missing() {
+        define_saga_workflow_contract! {
+            struct TaggedGateContract {
+                saga_type: "binding_test",
+                first_step: entry_step,
+                failure_authority: any (),
+                required_steps: [entry_step, gate_step],
+                overall_timeout_ms: 30_000,
+                stalled_timeout_ms: 10_000,
+                steps: {
+                    entry_step => {
+                        participant: "entry-actor",
+                        depends_on: on_start ()
+                    },
+                    gate_step => {
+                        participant: "binding-actor",
+                        depends_on: after [entry_step]
+                    }
+                }
+            }
+        }
+        let bus = SagaChoreographyBus::new();
+        bus.register_workflow_contract_provider::<TaggedGateContract>()
+            .expect("workflow contract registration should succeed");
+        let _resolver = bus
+            .attach_terminal_resolver_for_contract::<TaggedGateContract>("binding-resolver")
+            .expect("terminal resolver should attach");
+        bus.register_bound_workflow_step("binding_test", "entry_step")
+            .expect("entry step binding should succeed");
+        let (actor_ref, handle) = local_sync::spawn(BindingActor);
+        let subs = bind_sync_workflow_participant_channel_strict::<BindingActor, ()>(
+            &bus, &actor_ref, "saga", 8,
+        )
+        .expect("strict workflow binding should succeed");
+
+        let err = bus
+            .publish_strict(SagaChoreographyEvent::SagaStarted {
+                context: context("entry_step", 7010),
+                payload: Vec::new(),
+            })
+            .expect_err("nobody serves entry_step, the SagaStarted recipient");
+        assert_eq!(
+            missing_roles(err),
+            "entry_step",
+            "the bound workflow step must be tagged (a receipt), the unserved one missing"
+        );
+        for sub in subs {
+            let _ = bus.unsubscribe(sub);
+        }
+        handle.shutdown();
+    }
+
+    #[test]
+    fn plain_binders_a_b_c_with_closed_c_mailbox_is_a_shortfall_naming_c() {
+        define_saga_workflow_contract! {
+            struct ChainContract {
+                saga_type: "binding_test",
+                first_step: step_a,
+                failure_authority: any (),
+                required_steps: [step_a, step_b, step_c],
+                overall_timeout_ms: 30_000,
+                stalled_timeout_ms: 10_000,
+                steps: {
+                    step_a => {
+                        participant: "a-actor",
+                        depends_on: on_start ()
+                    },
+                    step_b => {
+                        participant: "b-actor",
+                        depends_on: after [step_a]
+                    },
+                    step_c => {
+                        participant: "c-actor",
+                        depends_on: after [step_b]
+                    }
+                }
+            }
+        }
+        let bus = SagaChoreographyBus::new();
+        bus.register_workflow_contract_provider::<ChainContract>()
+            .expect("workflow contract registration should succeed");
+        for step in ["step_a", "step_b", "step_c"] {
+            bus.register_bound_workflow_step("binding_test", step)
+                .expect("step binding should succeed");
+        }
+        let _resolver = bus
+            .attach_terminal_resolver_for_contract::<ChainContract>("binding-resolver")
+            .expect("terminal resolver should attach");
+        let mut subs = Vec::new();
+        let mut handles = Vec::new();
+        let mut c_handle = None;
+        for step in ["step_a", "step_b", "step_c"] {
+            let (actor_ref, handle) = local_sync::spawn(BindingActor);
+            subs.extend(
+                super::bind_sync_participant_channel::<BindingActor, ()>(
+                    &bus,
+                    &actor_ref,
+                    &["binding_test"],
+                    &[step],
+                    "saga",
+                    8,
+                )
+                .expect("plain binding should succeed"),
+            );
+            if step == "step_c" {
+                c_handle = Some(handle);
+            } else {
+                handles.push(handle);
+            }
+        }
+        // C's mailbox closes: its binding can no longer accept deliveries.
+        c_handle.expect("c spawned").shutdown();
+
+        let err = bus
+            .publish_strict(SagaChoreographyEvent::StepCompleted {
+                context: context("step_a", 7011),
+                output: Vec::new(),
+                saga_input: Vec::new(),
+                compensation_available: false,
+            })
+            .expect_err("C never received the event");
+        assert_eq!(missing_roles(err), "step_c");
+        for sub in subs {
+            let _ = bus.unsubscribe(sub);
+        }
+        for handle in handles {
+            handle.shutdown();
         }
     }
 
