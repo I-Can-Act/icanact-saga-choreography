@@ -161,3 +161,54 @@ fn transition_committed_row_roundtrips() {
     ));
     assert_eq!(decoded.event.outbox().len(), 1);
 }
+
+const COMPENSATION_RETRYABLE_GOLDEN: &[u8] = &[
+    117, 110, 100, 111, 32, 98, 97, 99, 107, 101, 110, 100, 32, 98, 117, 115, 121, 0, 0, 0, 0, 0,
+    0, 0, 14, 0, 0, 0, 0, 0, 0, 0, 132, 107, 229, 207, 139, 1, 0, 0, 14, 0, 0, 0, 3, 0, 0, 0, 208,
+    255, 255, 255, 17, 0, 0, 0, 82, 107, 229, 207, 139, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+fn golden_compensation_retryable_entry() -> JournalEntry {
+    JournalEntry {
+        sequence: 14,
+        recorded_at_millis: 1_700_000_000_900,
+        event: ParticipantEvent::CompensationRetryable {
+            attempt: 3,
+            reason: "undo backend busy".into(),
+            retryable_at_millis: 1_700_000_000_850,
+        },
+    }
+}
+
+#[test]
+fn compensation_retryable_golden_bytes_are_stable() {
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&golden_compensation_retryable_entry())
+        .expect("encode");
+    assert_eq!(
+        bytes.as_slice(),
+        COMPENSATION_RETRYABLE_GOLDEN,
+        "CompensationRetryable encoding changed"
+    );
+    let decoded = rkyv::from_bytes::<JournalEntry, rkyv::rancor::Error>(&aligned(
+        COMPENSATION_RETRYABLE_GOLDEN,
+    ))
+    .expect("golden row decodes");
+    assert_eq!(decoded.sequence, 14);
+    assert_eq!(decoded.recorded_at_millis, 1_700_000_000_900);
+    let ParticipantEvent::CompensationRetryable {
+        attempt,
+        reason,
+        retryable_at_millis,
+    } = decoded.event
+    else {
+        panic!("decoded row is not CompensationRetryable");
+    };
+    assert_eq!(attempt, 3);
+    assert_eq!(&*reason, "undo backend busy");
+    assert_eq!(retryable_at_millis, 1_700_000_000_850);
+}
