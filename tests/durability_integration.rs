@@ -647,7 +647,7 @@ fn panic_quarantine_records_journal_marks_dedupe_and_publishes() {
 }
 
 #[test]
-fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
+fn recovery_collection_replays_panic_quarantine_until_sent_and_classifies_states() {
     let journal = InMemoryJournal::new();
     let dedupe = InMemoryDedupe::new();
 
@@ -688,9 +688,12 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
         "mature_pool_refresh",
     )
     .expect("startup recovery should collect");
-    assert!(
-        second.is_empty(),
-        "dedupe should prevent duplicate replay events"
+    // R09/ADR-0003: no pre-marked replay key; the emission is re-derived until it is sent
+    // (receivers are idempotent per RunKey), so a crash before the send cannot lose it.
+    assert_eq!(
+        second.len(),
+        1,
+        "panic quarantine emission must be re-derived on every startup"
     );
 
     let stale_entries = vec![JournalEntry {
