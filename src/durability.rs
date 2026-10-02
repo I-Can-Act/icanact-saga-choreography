@@ -144,12 +144,17 @@ pub fn is_valid_emitted_transition(
         SagaChoreographyEvent::SagaQuarantined { .. } => {
             matches!(entry, Some(SagaStateEntry::Quarantined(_)))
         }
-        // ADR-0002: a failed `CompensationStarted` commit leaves `Completed` (undo data kept) and
-        // emits this event; an undo that started and was refused leaves `Compensating`.
+        // ADR-0002: a failed `CompensationStarted` commit leaves `Completed` (undo data kept) or,
+        // for an accepted step that owns an external effect, `Executing`, and emits this event;
+        // an undo that started and was refused leaves `Compensating`.
         SagaChoreographyEvent::CompensationFailedRetryable { .. } => {
             matches!(
                 entry,
-                Some(SagaStateEntry::Compensating(_) | SagaStateEntry::Completed(_))
+                Some(
+                    SagaStateEntry::Compensating(_)
+                        | SagaStateEntry::Completed(_)
+                        | SagaStateEntry::Executing(_)
+                )
             )
         }
         _ => true,
