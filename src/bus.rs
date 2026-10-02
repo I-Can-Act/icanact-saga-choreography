@@ -510,13 +510,9 @@ impl TerminalResolverActor {
     /// The undo of `step` can never be delivered: journal the decision (so a
     /// restart replays it), then let the resolver settle on it. Returns the
     /// outputs to publish; the decision itself is never published.
-    fn give_up_undo(
-        &mut self,
-        request: &SagaChoreographyEvent,
-        step: &Box<str>,
-    ) -> Vec<RetainedEvent> {
+    fn give_up_undo(&mut self, request: &SagaChoreographyEvent, step: &str) -> Vec<RetainedEvent> {
         let decision = SagaChoreographyEvent::CompensationFailed {
-            context: request.context().next_step(step.clone()),
+            context: request.context().next_step(step.into()),
             participant_id: TERMINAL_RESOLVER_STEP.into(),
             error: "compensation undeliverable".into(),
             is_ambiguous: false,
