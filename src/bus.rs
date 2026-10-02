@@ -507,6 +507,46 @@ impl TerminalResolverActor {
         (!already).then_some(quarantine)
     }
 
+    /// The undo of `step` can never be delivered: journal the decision (so a
+    /// restart replays it), then let the resolver settle on it. Returns the
+    /// outputs to publish; the decision itself is never published.
+    fn give_up_undo(
+        &mut self,
+        request: &SagaChoreographyEvent,
+        step: &Box<str>,
+    ) -> Vec<RetainedEvent> {
+        let decision = SagaChoreographyEvent::CompensationFailed {
+            context: request.context().next_step(step.clone()),
+            participant_id: TERMINAL_RESOLVER_STEP.into(),
+            error: "compensation undeliverable".into(),
+            is_ambiguous: false,
+        };
+        if let Some(journal) = &self.journal
+            && let Err(error) = journal.append(decision.clone())
+        {
+            return self
+                .quarantine_after_journal_failure(&decision, &error)
+                .map(RetainedEvent::new)
+                .into_iter()
+                .collect();
+        }
+        match self
+            .resolver
+            .try_ingest_at(&decision, SagaContext::now_millis())
+        {
+            Ok(events) => events.into_iter().map(RetainedEvent::new).collect(),
+            Err(error) => {
+                tracing::warn!(
+                    target: "core::saga",
+                    event = "terminal_resolver_run_identity_rejected",
+                    run = %decision.context().run_key(),
+                    error = ?error
+                );
+                Vec::new()
+            }
+        }
+    }
+
     /// Publishes resolver outputs. Replies are NOT resolved here: they follow the
     /// durable decision when the resolver ingests its own echoed terminal event
     /// (ADR-0003 §2.4). Returns the events to retain for a later retry; each
@@ -547,67 +587,52 @@ impl TerminalResolverActor {
                     format!("terminal publish failed: {err:?}"),
                 );
             }
-            if let (
-                SagaChoreographyEvent::CompensationRequested {
-                    steps_to_compensate,
-                    ..
-                },
-                SagaBusPublishError::RequiredPathDeliveryShortfall { missing_roles, .. },
-            ) = (&retained.event, &err)
-                && is_resolver_compensation_request(&retained.event)
-            {
-                let missing: Vec<&str> = missing_roles.split(',').collect();
-                let gone: Vec<&Box<str>> = steps_to_compensate
-                    .iter()
-                    .filter(|step| missing.contains(&step.as_ref()))
-                    .collect();
-                if !gone.is_empty() {
-                    // The undo can never be delivered: the resolver gives the
-                    // step up and settles (quarantine), instead of retrying.
-                    for step in gone {
-                        let decision = SagaChoreographyEvent::CompensationFailed {
-                            context: retained.event.context().next_step(step.clone()),
-                            participant_id: TERMINAL_RESOLVER_STEP.into(),
-                            error: "compensation undeliverable".into(),
-                            is_ambiguous: false,
-                        };
-                        // The give-up must be durable so a restart replays it.
-                        if let Some(journal) = &self.journal
-                            && let Err(error) = journal.append(decision.clone())
-                        {
-                            queue.extend(
-                                self.quarantine_after_journal_failure(&decision, &error)
-                                    .map(RetainedEvent::new),
-                            );
-                            continue;
-                        }
-                        match self
-                            .resolver
-                            .try_ingest_at(&decision, SagaContext::now_millis())
-                        {
-                            Ok(events) => queue.extend(events.into_iter().map(RetainedEvent::new)),
-                            Err(error) => tracing::warn!(
-                                target: "core::saga",
-                                event = "terminal_resolver_run_identity_rejected",
-                                run = %run,
-                                error = ?error
-                            ),
-                        }
-                    }
-                    continue;
+            // Steps of the resolver's own undo request the bus could not reach.
+            // A full mailbox looks the same as a departed participant, so this
+            // only decides the outcome once the retries are exhausted.
+            let unreached: Vec<Box<str>> = match (&retained.event, &err) {
+                (
+                    SagaChoreographyEvent::CompensationRequested {
+                        steps_to_compensate,
+                        ..
+                    },
+                    SagaBusPublishError::RequiredPathDeliveryShortfall { missing_roles, .. },
+                ) if is_resolver_compensation_request(&retained.event) => {
+                    let missing: Vec<&str> = missing_roles.split(',').collect();
+                    steps_to_compensate
+                        .iter()
+                        .filter(|step| missing.contains(&step.as_ref()))
+                        .cloned()
+                        .collect()
                 }
-            }
+                _ => Vec::new(),
+            };
             retained.attempts += 1;
             if retained.attempts >= RESOLVER_PUBLISH_MAX_ATTEMPTS {
-                tracing::error!(
-                    target: "core::saga",
-                    event = "terminal_resolver_publish_abandoned",
-                    saga_type = self.saga_type.as_ref(),
-                    run = %run,
-                    event_type = retained.event.event_type(),
-                    attempts = retained.attempts,
-                    "publish attempts exhausted; event dropped (kept in the resolver journal)"
-                );
+                if unreached.is_empty() {
+                    tracing::error!(
+                        target: "core::saga",
+                        event = "terminal_resolver_publish_abandoned",
+                        saga_type = self.saga_type.as_ref(),
+                        run = %run,
+                        event_type = retained.event.event_type(),
+                        attempts = retained.attempts,
+                        "publish attempts exhausted; event dropped (kept in the resolver journal)"
+                    );
+                } else {
+                    tracing::error!(
+                        target: "core::saga",
+                        event = "terminal_resolver_compensation_undeliverable",
+                        saga_type = self.saga_type.as_ref(),
+                        run = %run,
+                        steps = ?unreached,
+                        attempts = retained.attempts,
+                        "compensation request undeliverable after retries; giving the undo up"
+                    );
+                    for step in &unreached {
+                        queue.extend(self.give_up_undo(&retained.event, step));
+                    }
+                }
                 continue;
             }
             failed.push(retained);
@@ -3223,11 +3248,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn compensation_request_to_gone_participant_quarantines_naming_the_step() {
+    /// Policy requiring `B`; a failure after `A` completed owes an undo of `A`.
+    fn undo_a_policy() -> TerminalPolicy {
         let mut required = HashSet::new();
         required.insert(Box::<str>::from("B"));
-        let policy = TerminalPolicy::new(
+        TerminalPolicy::new(
             "order_lifecycle".into(),
             "undeliverable_comp/test".into(),
             FailureAuthority::AnyParticipant,
@@ -3235,11 +3260,52 @@ mod tests {
             Duration::from_secs(3_600),
             Duration::from_secs(3_600),
             &[],
-        );
+        )
+    }
+
+    /// Activated in-memory resolver actor on `bus`, driven by explicit tells.
+    /// Also binds a resolver-role lane (the real resolver subscription, which
+    /// the strict publish needs a receipt from) that the caller keeps alive.
+    fn undo_actor(bus: &SagaChoreographyBus) -> (TerminalResolverActor, FirehoseSubscription) {
+        let resolver_lane =
+            bus.subscribe_role_fn("order_lifecycle", super::SubscriberRole::Resolver, |_| true);
+        let actor = TerminalResolverActor {
+            resolver: TerminalResolver::new(undo_a_policy()),
+            recovery_events: Vec::new(),
+            activated: true,
+            journal: None,
+            bus: bus.clone(),
+            responder: Arc::from("terminal-resolver"),
+            saga_type: "order_lifecycle".into(),
+        };
+        (actor, resolver_lane)
+    }
+
+    /// `A` completed (undoable), then `C` fails: the actor owes an undo of `A`
+    /// and attempts its first publication.
+    fn start_rollback_owing_a(actor: &mut TerminalResolverActor, saga_id: u64) {
+        actor.handle_tell(TerminalResolverTell::Ingest(Box::new(
+            SagaChoreographyEvent::StepCompleted {
+                context: context("A", saga_id),
+                output: Vec::new(),
+                saga_input: Vec::new(),
+                compensation_available: true,
+            },
+        )));
+        actor.handle_tell(TerminalResolverTell::Ingest(Box::new(
+            SagaChoreographyEvent::StepFailed {
+                context: context("C", saga_id),
+                participant_id: "c".into(),
+                error_code: None,
+                error: "c failed".into(),
+                requires_compensation: true,
+            },
+        )));
+    }
+
+    #[test]
+    fn compensation_request_to_gone_participant_quarantines_after_the_cap() {
         let bus = SagaChoreographyBus::new();
-        let _resolver = bus
-            .attach_terminal_resolver(policy, "terminal-resolver")
-            .expect("resolver attaches");
         // Participant A existed, then went away: its subscription is closed.
         let gone = bus.subscribe_participant_fn("order_lifecycle", &["A"], |_| true);
         assert!(bus.unsubscribe(gone));
@@ -3267,32 +3333,82 @@ mod tests {
                 true
             }
         });
-        let _ = bus.publish(SagaChoreographyEvent::StepCompleted {
-            context: context("A", 902),
-            output: Vec::new(),
-            saga_input: Vec::new(),
-            compensation_available: true,
-        });
-        let _ = bus.publish(SagaChoreographyEvent::StepFailed {
-            context: context("C", 902),
-            participant_id: "c".into(),
-            error_code: None,
-            error: "c failed".into(),
-            requires_compensation: true,
-        });
-        wait_until(Instant::now() + Duration::from_secs(5), || {
-            !quarantined.lock().expect("lock").is_empty()
-        });
-        thread::sleep(Duration::from_millis(300));
+        let (mut actor, _resolver_lane) = undo_actor(&bus);
+        start_rollback_owing_a(&mut actor, 902);
+        let cap = super::RESOLVER_PUBLISH_MAX_ATTEMPTS as usize;
+        for _ in 0..cap - 2 {
+            actor.handle_tell(TerminalResolverTell::PollTimeouts);
+        }
+        assert!(
+            quarantined.lock().expect("lock").is_empty(),
+            "below the cap the undo is retried, not given up"
+        );
+        actor.handle_tell(TerminalResolverTell::PollTimeouts);
         assert_eq!(
             quarantined.lock().expect("lock").as_slice(),
-            [Box::<str>::from("A")]
+            [Box::<str>::from("A")],
+            "at the cap the run quarantines naming the undeliverable step"
         );
+        assert!(actor.recovery_events.is_empty(), "nothing left to retry");
         assert_eq!(aborts.load(Ordering::Relaxed), 0, "no abort flood");
+        assert_eq!(requests.load(Ordering::Relaxed), cap);
+    }
+
+    #[test]
+    fn compensation_request_refused_by_a_busy_participant_is_retried_and_delivered() {
+        let bus = SagaChoreographyBus::new();
+        let cap = super::RESOLVER_PUBLISH_MAX_ATTEMPTS as usize;
+        let refusals = cap - 2;
+        let offered = Arc::new(AtomicUsize::new(0));
+        let delivered = Arc::new(AtomicUsize::new(0));
+        // A full mailbox refuses the first deliveries, then has room again.
+        let _participant = bus.subscribe_participant_fn("order_lifecycle", &["A"], {
+            let offered = Arc::clone(&offered);
+            let delivered = Arc::clone(&delivered);
+            move |event| {
+                if matches!(event, SagaChoreographyEvent::CompensationRequested { .. }) {
+                    if offered.fetch_add(1, Ordering::Relaxed) < refusals {
+                        return false;
+                    }
+                    delivered.fetch_add(1, Ordering::Relaxed);
+                }
+                true
+            }
+        });
+        let terminal: Arc<std::sync::Mutex<Vec<&'static str>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _observer = bus.subscribe_saga_type_fn("order_lifecycle", {
+            let terminal = Arc::clone(&terminal);
+            move |event| {
+                if event.terminal_outcome().is_some() {
+                    terminal.lock().expect("lock").push(event.event_type());
+                }
+                true
+            }
+        });
+        let (mut actor, _resolver_lane) = undo_actor(&bus);
+        start_rollback_owing_a(&mut actor, 904);
+        for _ in 0..refusals {
+            actor.handle_tell(TerminalResolverTell::PollTimeouts);
+        }
+        assert_eq!(delivered.load(Ordering::Relaxed), 1, "the undo arrived");
         assert!(
-            requests.load(Ordering::Relaxed) <= super::RESOLVER_PUBLISH_MAX_ATTEMPTS as usize,
-            "requests={}",
-            requests.load(Ordering::Relaxed)
+            actor.recovery_events.is_empty(),
+            "delivered; nothing retained"
+        );
+        assert!(
+            terminal.lock().expect("lock").is_empty(),
+            "no quarantine while the undo is pending"
+        );
+        actor.handle_tell(TerminalResolverTell::Ingest(Box::new(
+            SagaChoreographyEvent::CompensationCompleted {
+                context: context("A", 904),
+            },
+        )));
+        assert_eq!(
+            terminal.lock().expect("lock").as_slice(),
+            ["saga_failed"],
+            "the executed undo settles the rollback cleanly"
         );
     }
 
