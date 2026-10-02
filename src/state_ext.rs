@@ -851,6 +851,64 @@ where
     })
 }
 
+/// W4-review R6 (NO SILENT FAILURES): a `CompensationRequested` found a state it cannot undo from.
+/// `entry` is put back, then:
+/// * settled states (`Compensated`, `Failed`, `Quarantined`) and an accepted async undo still in
+///   flight answer [`IngressOutcome::Duplicate`] with a `warn!`;
+/// * anything else (`Executing` without accepted undo data, `Compensating` without undo data, ...)
+///   has unknown undo ownership: `error!` with the RunKey and the run is quarantined through
+///   [`missing_completed_state_outcome`] (`ReconciliationNeeded`).
+pub(crate) fn unexpected_compensation_state_outcome<A, F>(
+    actor: &mut A,
+    context: &SagaContext,
+    entry: SagaStateEntry,
+    (step, participant_id, in_flight): (Box<str>, Box<str>, bool),
+    now: u64,
+    emit: &mut F,
+) -> IngressOutcome
+where
+    A: SagaStateExt + ?Sized,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let run = context.run_key();
+    let settled = matches!(
+        entry,
+        SagaStateEntry::Compensated(_) | SagaStateEntry::Failed(_) | SagaStateEntry::Quarantined(_)
+    ) || (in_flight && matches!(entry, SagaStateEntry::Compensating(_)));
+    let state = match &entry {
+        SagaStateEntry::Idle(_) => "idle",
+        SagaStateEntry::Triggered(_) => "triggered",
+        SagaStateEntry::Executing(_) => "executing",
+        SagaStateEntry::Completed(_) => "completed",
+        SagaStateEntry::Failed(_) => "failed",
+        SagaStateEntry::Compensating(_) => "compensating",
+        SagaStateEntry::Compensated(_) => "compensated",
+        SagaStateEntry::Quarantined(_) => "quarantined",
+    };
+    actor.saga_states().insert(run.clone(), entry);
+    if settled {
+        tracing::warn!(
+            target: "core::saga",
+            event = "saga_compensation_request_not_applicable",
+            run = %run,
+            step = %step,
+            state = state,
+            in_flight = in_flight,
+            "compensation request ignored: nothing to undo or undo already in flight"
+        );
+        return IngressOutcome::Duplicate;
+    }
+    tracing::error!(
+        target: "core::saga",
+        event = "saga_compensation_request_unexpected_state",
+        run = %run,
+        step = %step,
+        state = state,
+        "compensation request found a state with unknown undo ownership"
+    );
+    missing_completed_state_outcome(actor, context, (step, participant_id), now, emit)
+}
+
 /// Finalizes a `Completed`/`Failed` run after its terminal event (ADR-0001 §2.5, §2.7).
 ///
 /// On a journal failure the run's memory is kept, the failure is logged with the run key, and the

@@ -1245,10 +1245,16 @@ where
         }
         Some(SagaStateEntry::Executing(state)) => {
             let Some((saga_input, comp_data)) = accepted_recovery_data else {
-                participant
-                    .saga_states()
-                    .insert(run.clone(), SagaStateEntry::Executing(state));
-                return IngressOutcome::Applied;
+                let step = participant.step_name().into();
+                let participant_id = participant.participant_id_owned();
+                return crate::state_ext::unexpected_compensation_state_outcome(
+                    participant,
+                    context,
+                    SagaStateEntry::Executing(state),
+                    (step, participant_id, compensation_in_flight),
+                    now,
+                    emit,
+                );
             };
             (saga_input, comp_data, state.start_compensation(now))
         }
@@ -1262,16 +1268,16 @@ where
             (Vec::new(), comp_data, state)
         }
         Some(other) => {
-            if matches!(other, SagaStateEntry::Compensating(_)) {
-                tracing::error!(
-                    target: "core::saga",
-                    event = "saga_compensation_rerequest_not_retried",
-                    run = %run,
-                    "compensation re-request ignored: undo data unknown or undo still in flight"
-                );
-            }
-            participant.saga_states().insert(run.clone(), other);
-            return IngressOutcome::Applied;
+            let step = participant.step_name().into();
+            let participant_id = participant.participant_id_owned();
+            return crate::state_ext::unexpected_compensation_state_outcome(
+                participant,
+                context,
+                other,
+                (step, participant_id, compensation_in_flight),
+                now,
+                emit,
+            );
         }
         None => {
             let step = participant.step_name().into();
@@ -1427,10 +1433,16 @@ where
         }
         Some(SagaStateEntry::Executing(state)) => {
             let Some((saga_input, comp_data)) = accepted_recovery_data else {
-                participant
-                    .saga_states()
-                    .insert(run.clone(), SagaStateEntry::Executing(state));
-                return IngressOutcome::Applied;
+                let step = participant.step_name().into();
+                let participant_id = participant.participant_id_owned();
+                return crate::state_ext::unexpected_compensation_state_outcome(
+                    participant,
+                    context,
+                    SagaStateEntry::Executing(state),
+                    (step, participant_id, compensation_in_flight),
+                    now,
+                    emit,
+                );
             };
             (saga_input, comp_data, state.start_compensation(now))
         }
@@ -1444,16 +1456,16 @@ where
             (Vec::new(), comp_data, state)
         }
         Some(other) => {
-            if matches!(other, SagaStateEntry::Compensating(_)) {
-                tracing::error!(
-                    target: "core::saga",
-                    event = "saga_compensation_rerequest_not_retried",
-                    run = %run,
-                    "compensation re-request ignored: undo data unknown or undo still in flight"
-                );
-            }
-            participant.saga_states().insert(run.clone(), other);
-            return IngressOutcome::Applied;
+            let step = participant.step_name().into();
+            let participant_id = participant.participant_id_owned();
+            return crate::state_ext::unexpected_compensation_state_outcome(
+                participant,
+                context,
+                other,
+                (step, participant_id, compensation_in_flight),
+                now,
+                emit,
+            );
         }
         None => {
             let step = participant.step_name().into();
