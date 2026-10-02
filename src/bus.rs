@@ -27,6 +27,9 @@ struct WorkflowContractState {
     required_path_description: Box<str>,
 }
 
+/// Bus-owned read/write state. Shared behind a short-held `Mutex` rather than
+/// an actor: publishes run on icanact-core scheduler workers, where a blocking
+/// actor `ask` is refused (`AskError::SchedulerBlocked`).
 #[derive(Default)]
 struct BusStateActor {
     terminal_replies: HashMap<RunKey, SagaReplyTo>,
@@ -161,16 +164,8 @@ impl BusStateActor {
     }
 }
 
-impl SyncActor for BusStateActor {
-    type Contract = local_sync::contract::AskOnly;
-    type Tell = ();
-    type Ask = BusStateAsk;
-    type Reply = BusStateReply;
-    type Channel = ();
-    type PubSub = ();
-    type Broadcast = ();
-
-    fn handle_ask(&mut self, msg: Self::Ask) -> Self::Reply {
+impl BusStateActor {
+    fn handle(&mut self, msg: BusStateAsk) -> BusStateReply {
         match msg {
             BusStateAsk::RegisterTerminalPolicy {
                 saga_type,
@@ -730,6 +725,8 @@ struct PublishOutcome {
     rejected: Option<Box<str>>,
     /// Required recipients that did not receive the event.
     shortfall: Option<RequiredShortfall>,
+    /// A bus-state lookup failed: the event was NOT published.
+    state_failure: Option<StateLookupFailed>,
 }
 
 impl PublishOutcome {
@@ -738,6 +735,19 @@ impl PublishOutcome {
             stats,
             rejected: None,
             shortfall: None,
+            state_failure: None,
+        }
+    }
+
+    fn state_failed(failure: StateLookupFailed) -> Self {
+        Self {
+            stats: PublishStats {
+                attempted: 0,
+                delivered: 0,
+            },
+            rejected: None,
+            shortfall: None,
+            state_failure: Some(failure),
         }
     }
 
@@ -746,6 +756,7 @@ impl PublishOutcome {
             stats,
             rejected: Some(reason),
             shortfall: None,
+            state_failure: None,
         }
     }
 }
@@ -856,7 +867,8 @@ pub struct SagaChoreographyBus {
     pending_replies: CorrelationRegistry<RunKey, SagaReplyToResult>,
     /// Waiters registered by bare `SagaId` (no run known); see `complete_terminal_reply_for_run`.
     legacy_pending_replies: CorrelationRegistry<SagaId, SagaReplyToResult>,
-    state_ref: local_sync::SyncActorRef<BusStateActor>,
+    /// Never held across a publish, a callback or another lock.
+    state: Arc<std::sync::Mutex<BusStateActor>>,
     terminal_resolver_registry_ref: local_sync::SyncActorRef<TerminalResolverRegistryActor>,
     /// Serializes resolver attach so setup/commit is atomic per bus.
     resolver_attach_lock: Arc<std::sync::Mutex<()>>,
@@ -877,7 +889,6 @@ pub struct SagaChoreographyBus {
 struct BusActorLifecycle {
     pending_replies: CorrelationRegistry<RunKey, SagaReplyToResult>,
     legacy_pending_replies: CorrelationRegistry<SagaId, SagaReplyToResult>,
-    state_handle: Option<local_sync::ActorHandle>,
     terminal_resolver_registry_ref: local_sync::SyncActorRef<TerminalResolverRegistryActor>,
     terminal_resolver_registry_handle: Option<local_sync::ActorHandle>,
 }
@@ -888,9 +899,6 @@ impl Drop for BusActorLifecycle {
             .terminal_resolver_registry_ref
             .ask(TerminalResolverRegistryAsk::ShutdownAll);
         if let Some(handle) = self.terminal_resolver_registry_handle.take() {
-            handle.shutdown();
-        }
-        if let Some(handle) = self.state_handle.take() {
             handle.shutdown();
         }
 
@@ -952,6 +960,13 @@ pub enum SagaBusPublishError {
         attempted: u32,
         delivered: u32,
     },
+    /// A bus-state lookup the publish depends on (policy, required recipients,
+    /// terminal-outcome cache) failed; the event was not published.
+    StateLookupFailed {
+        saga_id: SagaId,
+        saga_type: Box<str>,
+        operation: &'static str,
+    },
     /// A `SagaAbortRequested` reached no attached resolver; a terminal
     /// `SagaFailed` fallback was published instead.
     AbortNotDelivered {
@@ -982,7 +997,6 @@ pub enum SagaBusPublishError {
 impl SagaChoreographyBus {
     pub fn new() -> Self {
         ensure_saga_sync_pool_capacity();
-        let (state_ref, state_handle) = local_sync::spawn(BusStateActor::default());
         let (terminal_resolver_registry_ref, terminal_resolver_registry_handle) =
             local_sync::spawn(TerminalResolverRegistryActor::default());
         let pending_replies = CorrelationRegistry::new();
@@ -990,7 +1004,6 @@ impl SagaChoreographyBus {
         let lifecycle = Arc::new(BusActorLifecycle {
             pending_replies: pending_replies.clone(),
             legacy_pending_replies: legacy_pending_replies.clone(),
-            state_handle: Some(state_handle),
             terminal_resolver_registry_ref: terminal_resolver_registry_ref.clone(),
             terminal_resolver_registry_handle: Some(terminal_resolver_registry_handle),
         });
@@ -998,7 +1011,7 @@ impl SagaChoreographyBus {
             bus: FirehosePubSub::new(),
             pending_replies,
             legacy_pending_replies,
-            state_ref,
+            state: Arc::new(std::sync::Mutex::new(BusStateActor::default())),
             terminal_resolver_registry_ref,
             resolver_attach_lock: Arc::new(std::sync::Mutex::new(())),
             resolver_abort_ingest: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1009,18 +1022,43 @@ impl SagaChoreographyBus {
         }
     }
 
+    /// `None` only if the state lock is poisoned (a state handler panicked);
+    /// callers must treat that as a failure, never as "check passed".
     fn ask_state(&self, msg: BusStateAsk) -> Option<BusStateReply> {
-        match self.state_ref.ask(msg) {
-            Ok(reply) => Some(reply),
-            Err(err) => {
+        match self.state.lock() {
+            Ok(mut state) => Some(state.handle(msg)),
+            Err(_) => {
                 tracing::error!(
                     target: "core::saga",
-                    event = "saga_bus_state_actor_unavailable",
-                    error = ?err
+                    event = "saga_bus_state_unavailable",
+                    "bus state lock poisoned"
                 );
                 None
             }
         }
+    }
+
+    /// `ask_state` whose failure or wrong reply is a typed lookup error.
+    fn lookup_state<T>(
+        &self,
+        operation: &'static str,
+        msg: BusStateAsk,
+        extract: impl FnOnce(BusStateReply) -> Option<T>,
+    ) -> Result<T, StateLookupFailed> {
+        self.ask_state(msg)
+            .and_then(extract)
+            .ok_or(StateLookupFailed { operation })
+    }
+
+    /// Test hook: poisons the state lock so every later lookup on any clone fails.
+    #[cfg(test)]
+    fn break_state_for_test(&self) {
+        let state = Arc::clone(&self.state);
+        let poisoner = thread::spawn(move || {
+            let _guard = state.lock();
+            panic!("poison bus state for test");
+        });
+        assert!(poisoner.join().is_err());
     }
 
     pub fn subscribe_fn<F>(&self, topic: &str, f: F) -> FirehoseSubscription
@@ -1089,15 +1127,35 @@ impl SagaChoreographyBus {
     /// Publishes `event`; the second value is the rejection reason when a
     /// `SagaStarted` was refused and replaced by a diagnostic `SagaFailed`.
     fn publish_with_admission(&self, event: SagaChoreographyEvent) -> PublishOutcome {
+        let context = event.context().clone();
+        match self.admit_and_publish(event) {
+            Ok(outcome) => outcome,
+            Err(failure) => {
+                tracing::error!(
+                    target: "core::saga",
+                    event = "saga_publish_state_lookup_failed",
+                    run = ?context.run_key(),
+                    operation = failure.operation,
+                    "bus state lookup failed; event not published"
+                );
+                PublishOutcome::state_failed(failure)
+            }
+        }
+    }
+
+    fn admit_and_publish(
+        &self,
+        event: SagaChoreographyEvent,
+    ) -> Result<PublishOutcome, StateLookupFailed> {
         if matches!(event, SagaChoreographyEvent::SagaAbortRequested { .. }) {
-            return PublishOutcome::delivered(self.publish_abort_event(event).0);
+            return Ok(PublishOutcome::delivered(self.publish_abort_event(event).0));
         }
         let event_type = event.event_type();
         let mut required_recipients: Option<HashSet<Box<str>>> = None;
         let mut expected_required_path: Box<str> = "".into();
         let mut expected_context: Option<crate::SagaContext> = None;
         if let SagaChoreographyEvent::SagaStarted { context, .. } = &event {
-            if !self.has_terminal_policy_for_saga_type(context.saga_type.as_ref()) {
+            if !self.has_terminal_policy_for_saga_type(context.saga_type.as_ref())? {
                 let reason: Box<str> = format!(
                     "terminal policy is required before saga start; saga_type={} saga_id={}",
                     context.saga_type,
@@ -1110,9 +1168,12 @@ impl SagaChoreographyBus {
                     failure: None,
                 };
                 if let Some(outcome) = terminal.terminal_outcome() {
-                    self.store_terminal_outcome(terminal.context().run_key(), outcome);
+                    self.store_terminal_outcome(terminal.context().run_key(), outcome)?;
                 }
-                return PublishOutcome::rejected(self.publish_event(terminal), reason);
+                return Ok(PublishOutcome::rejected(
+                    self.publish_event(terminal),
+                    reason,
+                ));
             }
             if self
                 .resolver_unactivated
@@ -1139,11 +1200,14 @@ impl SagaChoreographyBus {
                     failure: None,
                 };
                 if let Some(outcome) = terminal.terminal_outcome() {
-                    self.store_terminal_outcome(terminal.context().run_key(), outcome);
+                    self.store_terminal_outcome(terminal.context().run_key(), outcome)?;
                 }
-                return PublishOutcome::rejected(self.publish_event(terminal), reason);
+                return Ok(PublishOutcome::rejected(
+                    self.publish_event(terminal),
+                    reason,
+                ));
             }
-            if let Some(reason) = self.saga_start_contract_violation_reason(context) {
+            if let Some(reason) = self.saga_start_contract_violation_reason(context)? {
                 let reason: Box<str> = reason.into();
                 let terminal = SagaChoreographyEvent::SagaFailed {
                     context: context.next_step(TERMINAL_RESOLVER_STEP.into()),
@@ -1151,27 +1215,31 @@ impl SagaChoreographyBus {
                     failure: None,
                 };
                 if let Some(outcome) = terminal.terminal_outcome() {
-                    self.store_terminal_outcome(terminal.context().run_key(), outcome);
+                    self.store_terminal_outcome(terminal.context().run_key(), outcome)?;
                 }
-                return PublishOutcome::rejected(self.publish_event(terminal), reason);
+                return Ok(PublishOutcome::rejected(
+                    self.publish_event(terminal),
+                    reason,
+                ));
             }
-            required_recipients = self.saga_start_required_recipients(context.saga_type.as_ref());
+            required_recipients =
+                self.saga_start_required_recipients(context.saga_type.as_ref())?;
             expected_required_path = self
-                .required_path_description(context.saga_type.as_ref())
+                .required_path_description(context.saga_type.as_ref())?
                 .into();
             expected_context = Some(context.clone());
-        } else if let Some(required) = self.required_recipients_for_event(&event) {
+        } else if let Some(required) = self.required_recipients_for_event(&event)? {
             required_recipients = Some(required);
             expected_required_path = if is_resolver_compensation_request(&event) {
                 "resolver compensation request".into()
             } else {
-                self.required_path_description(event.context().saga_type.as_ref())
+                self.required_path_description(event.context().saga_type.as_ref())?
                     .into()
             };
             expected_context = Some(event.context().clone());
         }
         if let Some(outcome) = event.terminal_outcome() {
-            self.store_terminal_outcome(event.context().run_key(), outcome);
+            self.store_terminal_outcome(event.context().run_key(), outcome)?;
         }
         let own_compensation_request = is_resolver_compensation_request(&event);
         let (stats, receipts) = self.publish_event_collecting(event);
@@ -1208,11 +1276,12 @@ impl SagaChoreographyBus {
             }
             shortfall = Some(missing);
         }
-        PublishOutcome {
+        Ok(PublishOutcome {
             stats,
             rejected: None,
             shortfall,
-        }
+            state_failure: None,
+        })
     }
 
     /// Requests a resolver-driven abort (ADR-0004 §2.6).
@@ -1289,8 +1358,18 @@ impl SagaChoreographyBus {
             reason,
             failure: None,
         };
-        if let Some(outcome) = terminal.terminal_outcome() {
-            self.store_terminal_outcome(terminal.context().run_key(), outcome);
+        if let Some(outcome) = terminal.terminal_outcome()
+            && let Err(failure) = self.store_terminal_outcome(terminal.context().run_key(), outcome)
+        {
+            // Fallback path: the terminal is still published (the waiter must
+            // not hang); the lookup failure is logged, not swallowed.
+            tracing::error!(
+                target: "core::saga",
+                event = "saga_abort_fallback_outcome_not_cached",
+                run = ?terminal.context().run_key(),
+                operation = failure.operation,
+                "terminal outcome could not be cached"
+            );
         }
         (self.publish_event(terminal), false)
     }
@@ -1316,7 +1395,16 @@ impl SagaChoreographyBus {
             stats,
             rejected,
             shortfall,
+            state_failure,
         } = self.publish_with_admission(event.clone());
+        if let Some(failure) = state_failure {
+            let context = event.context();
+            return Err(SagaBusPublishError::StateLookupFailed {
+                saga_id: context.saga_id,
+                saga_type: context.saga_type.clone(),
+                operation: failure.operation,
+            });
+        }
         if let Some(reason) = rejected {
             // The diagnostic SagaFailed was already published; the start itself
             // was not admitted, so the caller must not see success.
@@ -1340,7 +1428,9 @@ impl SagaChoreographyBus {
                 required_path: if is_resolver_compensation_request(&event) {
                     "resolver compensation request".into()
                 } else {
+                    // Cosmetic detail of an error already being returned.
                     self.required_path_description(context.saga_type.as_ref())
+                        .unwrap_or_else(|failure| format!("<{} failed>", failure.operation))
                         .into()
                 },
                 missing_roles: missing.roles,
@@ -2000,44 +2090,62 @@ impl SagaChoreographyBus {
         })
     }
 
-    fn has_terminal_policy_for_saga_type(&self, saga_type: &str) -> bool {
-        match self.ask_state(BusStateAsk::HasTerminalPolicy {
-            saga_type: saga_type.into(),
-        }) {
-            Some(BusStateReply::Bool(has_policy)) => has_policy,
-            _ => false,
-        }
+    fn has_terminal_policy_for_saga_type(
+        &self,
+        saga_type: &str,
+    ) -> Result<bool, StateLookupFailed> {
+        self.lookup_state(
+            "terminal policy lookup",
+            BusStateAsk::HasTerminalPolicy {
+                saga_type: saga_type.into(),
+            },
+            |reply| match reply {
+                BusStateReply::Bool(has_policy) => Some(has_policy),
+                _ => None,
+            },
+        )
     }
 
-    fn saga_start_contract_violation_reason(&self, context: &crate::SagaContext) -> Option<String> {
+    fn saga_start_contract_violation_reason(
+        &self,
+        context: &crate::SagaContext,
+    ) -> Result<Option<String>, StateLookupFailed> {
         let saga_type = context.saga_type.as_ref();
-        let contract = match self.ask_state(BusStateAsk::WorkflowContract {
-            saga_type: saga_type.into(),
-        }) {
-            Some(BusStateReply::WorkflowContract(contract)) => contract,
-            _ => None,
-        };
+        let contract = self.lookup_state(
+            "workflow contract lookup",
+            BusStateAsk::WorkflowContract {
+                saga_type: saga_type.into(),
+            },
+            |reply| match reply {
+                BusStateReply::WorkflowContract(contract) => Some(contract),
+                _ => None,
+            },
+        )?;
         let Some(contract) = contract else {
-            return Some(format!(
+            return Ok(Some(format!(
                 "workflow contract is required before saga start; saga_type={} saga_id={}",
                 saga_type,
                 context.saga_id.get()
-            ));
+            )));
         };
 
         if context.step_name.as_ref() != contract.first_step.as_ref() {
-            return Some(format!(
+            return Ok(Some(format!(
                 "workflow contract first_step mismatch at saga start; saga_type={} expected_first_step={} received_first_step={}",
                 saga_type, contract.first_step, context.step_name
-            ));
+            )));
         }
 
-        let bound_for_type = match self.ask_state(BusStateAsk::BoundSteps {
-            saga_type: saga_type.into(),
-        }) {
-            Some(BusStateReply::BoundSteps(steps)) => steps,
-            _ => HashSet::new(),
-        };
+        let bound_for_type = self.lookup_state(
+            "bound steps lookup",
+            BusStateAsk::BoundSteps {
+                saga_type: saga_type.into(),
+            },
+            |reply| match reply {
+                BusStateReply::BoundSteps(steps) => Some(steps),
+                _ => None,
+            },
+        )?;
         let mut missing_steps: Vec<&str> = contract
             .declared_steps
             .iter()
@@ -2046,39 +2154,58 @@ impl SagaChoreographyBus {
             .collect();
         missing_steps.sort_unstable();
         if !missing_steps.is_empty() {
-            return Some(format!(
+            return Ok(Some(format!(
                 "workflow contract violation: unbound participant steps; saga_type={} missing_steps={}",
                 saga_type,
                 missing_steps.join(",")
-            ));
+            )));
         }
 
-        None
+        Ok(None)
     }
 
-    fn saga_start_required_recipients(&self, saga_type: &str) -> Option<HashSet<Box<str>>> {
-        match self.ask_state(BusStateAsk::RequiredRecipients {
-            saga_type: saga_type.into(),
-            step_name: None,
-        }) {
-            Some(BusStateReply::RequiredRecipients(required)) => required,
-            _ => None,
-        }
+    fn required_recipients_lookup(
+        &self,
+        saga_type: &str,
+        step_name: Option<Box<str>>,
+    ) -> Result<Option<HashSet<Box<str>>>, StateLookupFailed> {
+        self.lookup_state(
+            "required recipients lookup",
+            BusStateAsk::RequiredRecipients {
+                saga_type: saga_type.into(),
+                step_name,
+            },
+            |reply| match reply {
+                BusStateReply::RequiredRecipients(required) => Some(required),
+                _ => None,
+            },
+        )
     }
 
-    fn required_path_description(&self, saga_type: &str) -> String {
-        match self.ask_state(BusStateAsk::RequiredPathDescription {
-            saga_type: saga_type.into(),
-        }) {
-            Some(BusStateReply::String(description)) => description,
-            _ => String::new(),
-        }
+    fn saga_start_required_recipients(
+        &self,
+        saga_type: &str,
+    ) -> Result<Option<HashSet<Box<str>>>, StateLookupFailed> {
+        self.required_recipients_lookup(saga_type, None)
+    }
+
+    fn required_path_description(&self, saga_type: &str) -> Result<String, StateLookupFailed> {
+        self.lookup_state(
+            "required path description lookup",
+            BusStateAsk::RequiredPathDescription {
+                saga_type: saga_type.into(),
+            },
+            |reply| match reply {
+                BusStateReply::String(description) => Some(description),
+                _ => None,
+            },
+        )
     }
 
     fn required_recipients_for_event(
         &self,
         event: &SagaChoreographyEvent,
-    ) -> Option<HashSet<Box<str>>> {
+    ) -> Result<Option<HashSet<Box<str>>>, StateLookupFailed> {
         if matches!(
             event,
             SagaChoreographyEvent::SagaCompleted { .. }
@@ -2086,32 +2213,25 @@ impl SagaChoreographyBus {
                 | SagaChoreographyEvent::SagaQuarantined { .. }
                 | SagaChoreographyEvent::SagaAbortRequested { .. }
         ) {
-            return None;
+            return Ok(None);
         }
 
         let context = event.context();
         // A resolver-emitted request is delivered to the participants whose
         // undo it asks for: each must be tagged with, and receive, its step.
-        // Decided from the event alone: it is published from the resolver's
-        // actor thread, which must not block on a bus-state ask.
+        // Decided from the event alone.
         if let SagaChoreographyEvent::CompensationRequested {
             steps_to_compensate,
             ..
         } = event
             && is_resolver_compensation_request(event)
         {
-            return Some(steps_to_compensate.iter().cloned().collect());
+            return Ok(Some(steps_to_compensate.iter().cloned().collect()));
         }
-        if !self.has_terminal_policy_for_saga_type(context.saga_type.as_ref()) {
-            return None;
+        if !self.has_terminal_policy_for_saga_type(context.saga_type.as_ref())? {
+            return Ok(None);
         }
-        match self.ask_state(BusStateAsk::RequiredRecipients {
-            saga_type: context.saga_type.clone(),
-            step_name: Some(context.step_name.clone()),
-        }) {
-            Some(BusStateReply::RequiredRecipients(required)) => required,
-            _ => None,
-        }
+        self.required_recipients_lookup(context.saga_type.as_ref(), Some(context.step_name.clone()))
     }
 
     fn store_terminal_reply(&self, run: RunKey, reply: SagaReplyTo) {
@@ -2123,14 +2243,28 @@ impl SagaChoreographyBus {
         });
     }
 
-    fn store_terminal_outcome(&self, run: RunKey, outcome: SagaTerminalOutcome) {
+    fn store_terminal_outcome(
+        &self,
+        run: RunKey,
+        outcome: SagaTerminalOutcome,
+    ) -> Result<(), StateLookupFailed> {
         let retention_limit = self.terminal_retention_limit();
-        let _ = self.ask_state(BusStateAsk::StoreTerminalOutcome {
-            run,
-            outcome,
-            retention_limit,
-        });
+        self.lookup_state(
+            "terminal outcome store",
+            BusStateAsk::StoreTerminalOutcome {
+                run,
+                outcome,
+                retention_limit,
+            },
+            |reply| matches!(reply, BusStateReply::Unit).then_some(()),
+        )
     }
+}
+
+/// A bus-state lookup a publish depends on could not be answered.
+#[derive(Debug, Clone, Copy)]
+struct StateLookupFailed {
+    operation: &'static str,
 }
 
 /// Typed error text for a bus-state ask that failed or returned a wrong reply.
@@ -2138,7 +2272,7 @@ fn bus_state_ask_failure(operation: &str, saga_type: &str, wrong_reply: bool) ->
     let detail = if wrong_reply {
         "unexpected reply"
     } else {
-        "bus state actor unavailable"
+        "bus state unavailable"
     };
     tracing::error!(
         target: "core::saga",
@@ -2219,7 +2353,7 @@ impl Clone for SagaChoreographyBus {
             bus: self.bus.clone(),
             pending_replies: self.pending_replies.clone(),
             legacy_pending_replies: self.legacy_pending_replies.clone(),
-            state_ref: self.state_ref.clone(),
+            state: Arc::clone(&self.state),
             terminal_resolver_registry_ref: self.terminal_resolver_registry_ref.clone(),
             resolver_attach_lock: Arc::clone(&self.resolver_attach_lock),
             resolver_abort_ingest: Arc::clone(&self.resolver_abort_ingest),
@@ -2258,7 +2392,7 @@ mod tests {
         TerminalResolverJournalEntry, TerminalResolverJournalError, WorkflowDependencySpec,
     };
 
-    use super::{BusStateAsk, DEFAULT_TERMINAL_RETENTION_LIMIT, SagaChoreographyBus};
+    use super::{DEFAULT_TERMINAL_RETENTION_LIMIT, SagaChoreographyBus};
     use crate::AbortSource;
     use icanact_core::local::FirehoseSubscription;
 
@@ -2287,6 +2421,13 @@ mod tests {
 
     fn context(step_name: &str, saga_id: u64) -> SagaContext {
         context_for("order_lifecycle", step_name, saga_id)
+    }
+
+    impl SagaChoreographyBus {
+        fn policy_registered(&self, saga_type: &str) -> bool {
+            self.has_terminal_policy_for_saga_type(saga_type)
+                .expect("bus state readable")
+        }
     }
 
     fn wait_until(deadline: Instant, mut pred: impl FnMut() -> bool) {
@@ -2466,7 +2607,7 @@ mod tests {
         );
         assert!(failed.is_err(), "unreadable journal must fail the attach");
         assert!(
-            !bus.has_terminal_policy_for_saga_type("order_lifecycle"),
+            !bus.policy_registered("order_lifecycle"),
             "failed attach must not leave a registered terminal policy"
         );
         // A later attach with a healthy journal then succeeds from a clean slate.
@@ -2478,7 +2619,7 @@ mod tests {
                 Arc::clone(&journal),
             )
             .expect("retry after a failed attach must succeed");
-        assert!(bus.has_terminal_policy_for_saga_type("order_lifecycle"));
+        assert!(bus.policy_registered("order_lifecycle"));
         // Same configuration is idempotent.
         let again = bus
             .attach_durable_terminal_resolver(
@@ -3452,20 +3593,8 @@ mod tests {
 
     #[test]
     fn attach_fails_when_readiness_cannot_be_registered() {
-        let mut bus = SagaChoreographyBus::new();
-        Arc::get_mut(&mut bus._lifecycle)
-            .expect("sole lifecycle owner")
-            .state_handle
-            .take()
-            .expect("state handle")
-            .shutdown();
-        wait_until(Instant::now() + Duration::from_millis(500), || {
-            bus.state_ref
-                .ask(BusStateAsk::HasTerminalPolicy {
-                    saga_type: "x".into(),
-                })
-                .is_err()
-        });
+        let bus = SagaChoreographyBus::new();
+        bus.break_state_for_test();
         let result = bus.attach_terminal_resolver(
             TerminalPolicy::order_lifecycle_default(),
             "terminal-resolver",
@@ -3590,9 +3719,8 @@ mod tests {
         // Model a first attempt that registered the runtime but failed
         // readiness: same registry, readiness state that never saw it.
         let mut retry_bus = bus.clone();
-        let (fresh_state, _fresh_handle) = local_sync::spawn(super::BusStateActor::default());
-        retry_bus.state_ref = fresh_state;
-        assert!(!retry_bus.has_terminal_policy_for_saga_type("order_lifecycle"));
+        retry_bus.state = Arc::new(std::sync::Mutex::new(super::BusStateActor::default()));
+        assert!(!retry_bus.policy_registered("order_lifecycle"));
         retry_bus
             .attach_terminal_resolver(
                 TerminalPolicy::order_lifecycle_default(),
@@ -3600,7 +3728,7 @@ mod tests {
             )
             .expect("retry attach");
         assert!(
-            retry_bus.has_terminal_policy_for_saga_type("order_lifecycle"),
+            retry_bus.policy_registered("order_lifecycle"),
             "retry returned Ok so readiness must be present"
         );
     }
@@ -4631,6 +4759,115 @@ mod tests {
         assert!(
             reason.as_ref().contains("stalled_timeout"),
             "expected stalled_timeout reason, got: {reason}"
+        );
+    }
+
+    /// Runs `publish` on an icanact-core scheduler worker (like the terminal
+    /// resolver and participant actors), where blocking asks are refused.
+    struct SchedulerPublisher;
+
+    impl SyncActor for SchedulerPublisher {
+        type Contract = local_sync::contract::TellOnly;
+        type Tell = (
+            SagaChoreographyBus,
+            SagaChoreographyEvent,
+            std::sync::mpsc::Sender<Result<super::PublishStats, super::SagaBusPublishError>>,
+        );
+        type Ask = ();
+        type Reply = ();
+        type Channel = ();
+        type PubSub = ();
+        type Broadcast = ();
+
+        fn handle_tell(&mut self, (bus, event, done): Self::Tell) {
+            let _ = done.send(bus.publish_strict(event));
+        }
+    }
+
+    fn publish_strict_on_scheduler_worker(
+        bus: &SagaChoreographyBus,
+        event: SagaChoreographyEvent,
+    ) -> Result<super::PublishStats, super::SagaBusPublishError> {
+        let (actor, handle) = local_sync::spawn(SchedulerPublisher);
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(
+            actor.tell((bus.clone(), event, tx)),
+            "tell must be accepted"
+        );
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("scheduler-thread publish must finish");
+        handle.shutdown();
+        result
+    }
+
+    /// R14: a resolver-authored `SagaCompleted` must land in the terminal
+    /// outcome cache even though the resolver runs on a scheduler worker.
+    #[test]
+    fn resolver_authored_completion_is_retrievable_as_terminal_outcome() {
+        let bus = SagaChoreographyBus::new();
+        let _resolver = bus
+            .attach_terminal_resolver(
+                TerminalPolicy::order_lifecycle_default(),
+                "terminal-resolver",
+            )
+            .expect("terminal resolver should attach");
+        let saga_id = SagaId::new(95_001);
+        bus.publish_strict(SagaChoreographyEvent::StepCompleted {
+            context: context("create_order", saga_id.get()),
+            output: Vec::new(),
+            saga_input: Vec::new(),
+            compensation_available: false,
+        })
+        .expect("step reaches the resolver");
+        assert!(
+            matches!(
+                take_outcome_eventually(&bus, saga_id),
+                Some(SagaTerminalOutcome::Completed { .. })
+            ),
+            "resolver-authored SagaCompleted must be cached"
+        );
+    }
+
+    /// R14: the required-recipient check must give the same answer on a
+    /// scheduler worker as on a plain thread.
+    #[test]
+    fn required_recipient_shortfall_is_detected_on_scheduler_worker() {
+        let bus = shortfall_bus();
+        let _resolver = bus
+            .attach_terminal_resolver_for_contract::<MultiStepOrderLifecycleContract>(
+                "test-resolver",
+            )
+            .expect("terminal resolver should attach");
+        let err = publish_strict_on_scheduler_worker(&bus, shortfall_event(95_002))
+            .expect_err("missing required recipient must be reported");
+        assert!(
+            matches!(
+                err,
+                super::SagaBusPublishError::RequiredPathDeliveryShortfall { .. }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// R14 / NO SILENT FAILURES: when bus state cannot be read, publish must
+    /// fail instead of proceeding as if every check passed.
+    #[test]
+    fn failed_state_lookup_makes_publish_strict_fail() {
+        let bus = shortfall_bus();
+        let _resolver = bus
+            .attach_terminal_resolver_for_contract::<MultiStepOrderLifecycleContract>(
+                "test-resolver",
+            )
+            .expect("terminal resolver should attach");
+        bus.break_state_for_test();
+        let result = bus.publish_strict(shortfall_event(95_003));
+        assert!(
+            matches!(
+                result,
+                Err(super::SagaBusPublishError::StateLookupFailed { .. })
+            ),
+            "publish with unreadable bus state must be a typed Err, got {result:?}"
         );
     }
 }
