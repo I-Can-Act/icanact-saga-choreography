@@ -878,11 +878,11 @@ fn order_fails_require_compensation_triggers_full_compensation() {
 }
 
 // ===========================================================================
-// Test 6: Position compensation fails Terminal -> SagaFailed
+// Test 6: Position compensation fails Terminal -> SagaQuarantined (Q9)
 // ===========================================================================
 
 #[test]
-fn position_compensation_fails_terminal_causes_saga_failed() {
+fn position_compensation_fails_terminal_quarantines() {
     let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
@@ -917,7 +917,7 @@ fn position_compensation_fails_terminal_causes_saga_failed() {
         requires_compensation: true,
     });
 
-    wait_until(TIMEOUT, || query_terminal_counts(&terminal_ref).failed >= 1);
+    wait_until(TIMEOUT, || query_terminal_counts(&terminal_ref).quarantined >= 1);
 
     wait_until(TIMEOUT, || query_state(&p_ref).compensated_count >= 1);
 
@@ -925,8 +925,8 @@ fn position_compensation_fails_terminal_causes_saga_failed() {
         query_terminal_counts(&terminal_ref),
         TerminalCounts {
             completed: 0,
-            failed: 1,
-            quarantined: 0,
+            failed: 0,
+            quarantined: 1,
         }
     );
     assert_eq!(
@@ -1009,7 +1009,7 @@ fn balance_compensation_fails_safe_to_retry_is_not_a_clean_failure() {
         &bus,
         ConfigurableParticipant::new(STEP_POSITION, DependencySpec::OnSagaStart),
     );
-    let (_b_ref, b_h) = spawn_and_subscribe(
+    let (b_ref, b_h) = spawn_and_subscribe(
         &world,
         &bus,
         ConfigurableParticipant::new(STEP_BALANCE, DependencySpec::OnSagaStart)
@@ -1033,9 +1033,9 @@ fn balance_compensation_fails_safe_to_retry_is_not_a_clean_failure() {
         payload: vec![42],
     });
 
-    // T13P: `SafeToRetry` now reaches the resolver as `CompensationFailedRetryable`. Until the
-    // bounded re-request budget lands (T13R) the resolver treats it as an unresolved effect and
-    // quarantines; it is never reported as a clean `SagaFailed`.
+    // T13P/T13R: `SafeToRetry` reaches the resolver as `CompensationFailedRetryable`, which is
+    // re-requested within the retry budget; once the participant keeps failing the budget is
+    // exhausted and the saga is quarantined (never a clean `SagaFailed`).
     wait_until(TIMEOUT, || {
         query_terminal_counts(&terminal_ref).quarantined >= 1
     });
@@ -1046,6 +1046,12 @@ fn balance_compensation_fails_safe_to_retry_is_not_a_clean_failure() {
             failed: 0,
             quarantined: 1,
         }
+    );
+    // One initial attempt plus the default budget of 3 re-requests.
+    assert_eq!(
+        query_state(&b_ref).compensated_count,
+        4,
+        "balance undo is retried up to the budget before quarantine"
     );
     p_h.shutdown();
     b_h.shutdown();

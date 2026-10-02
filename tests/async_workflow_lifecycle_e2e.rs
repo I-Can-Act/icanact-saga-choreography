@@ -1771,17 +1771,12 @@ fn accepted_compensation_failure_leaves_no_compensating_state() {
         let mut resolver = TerminalResolver::new(terminal_policy());
         assert!(resolver.ingest(&recovery_events[0]).is_empty());
         let terminal = resolver.ingest(&recovery_events[1]);
-        if is_ambiguous {
-            assert!(matches!(
-                terminal.as_slice(),
-                [SagaChoreographyEvent::SagaQuarantined { .. }]
-            ));
-        } else {
-            assert!(matches!(
-                terminal.as_slice(),
-                [SagaChoreographyEvent::SagaFailed { .. }]
-            ));
-        }
+        // Q9: a failed compensation leaves an unresolved effect, so the resolver quarantines
+        // whether or not the failure was flagged ambiguous; it is never a clean SagaFailed.
+        assert!(matches!(
+            terminal.as_slice(),
+            [SagaChoreographyEvent::SagaQuarantined { .. }]
+        ));
     }
 }
 
