@@ -63,12 +63,11 @@ enum BusStateAsk {
     RequiredPathDescription {
         saga_type: Box<str>,
     },
-    RequiredPathExpectedMinDelivery {
+    /// Required-path step names whose participants must receive an event of
+    /// `saga_type`; `step_name: None` asks for the saga-start set.
+    RequiredRecipients {
         saga_type: Box<str>,
-        step_name: Box<str>,
-    },
-    SagaStartExpectedMinDelivery {
-        saga_type: Box<str>,
+        step_name: Option<Box<str>>,
     },
     StoreTerminalReply {
         run: RunKey,
@@ -107,7 +106,7 @@ enum BusStateReply {
     WorkflowContract(Option<WorkflowContractState>),
     BoundSteps(HashSet<Box<str>>),
     String(String),
-    OptionalU32(Option<u32>),
+    RequiredRecipients(Option<HashSet<Box<str>>>),
     TerminalReply(Option<SagaReplyTo>),
     TerminalOutcome(Option<SagaTerminalOutcome>),
 }
@@ -222,34 +221,18 @@ impl SyncActor for BusStateActor {
                     .unwrap_or_default();
                 BusStateReply::String(description)
             }
-            BusStateAsk::RequiredPathExpectedMinDelivery {
+            BusStateAsk::RequiredRecipients {
                 saga_type,
                 step_name,
             } => {
-                let expected = self
+                let required = self
                     .workflow_contracts_by_saga_type
                     .get(saga_type.as_ref())
-                    .and_then(|contract| {
-                        if contract.required_path_steps.contains(step_name.as_ref()) {
-                            Some(saturating_u32_from_usize(
-                                contract.required_path_steps.len().saturating_add(1),
-                            ))
-                        } else {
-                            None
-                        }
+                    .and_then(|contract| match &step_name {
+                        Some(step) if !contract.required_path_steps.contains(step.as_ref()) => None,
+                        _ => Some(contract.required_path_steps.clone()),
                     });
-                BusStateReply::OptionalU32(expected)
-            }
-            BusStateAsk::SagaStartExpectedMinDelivery { saga_type } => {
-                let expected = self
-                    .workflow_contracts_by_saga_type
-                    .get(saga_type.as_ref())
-                    .map(|contract| {
-                        saturating_u32_from_usize(
-                            contract.required_path_steps.len().saturating_add(1),
-                        )
-                    });
-                BusStateReply::OptionalU32(expected)
+                BusStateReply::RequiredRecipients(required)
             }
             BusStateAsk::StoreTerminalReply {
                 run,
@@ -443,6 +426,9 @@ impl icanact_core::TellAskTell for TerminalResolverTell {}
 struct TerminalResolverActor {
     resolver: TerminalResolver,
     recovery_events: Vec<SagaChoreographyEvent>,
+    /// Set by `ActivateRecovery`; until then the watchdog must not publish
+    /// restored deadlines (the participants are not bound yet).
+    activated: bool,
     journal: Option<Arc<dyn TerminalResolverJournal>>,
     bus: SagaChoreographyBus,
     responder: Arc<str>,
@@ -450,20 +436,36 @@ struct TerminalResolverActor {
 }
 
 impl TerminalResolverActor {
-    fn publish_terminal_events(&mut self, terminal_events: Vec<SagaChoreographyEvent>) {
+    /// Publishes resolver outputs. Replies are NOT resolved here: they follow the
+    /// durable decision when the resolver ingests its own echoed terminal event
+    /// (ADR-0003 §2.4). Returns the events whose publication failed, so the owner
+    /// can retain them; each failure is logged with its `RunKey`.
+    fn publish_terminal_events(
+        &mut self,
+        terminal_events: Vec<SagaChoreographyEvent>,
+    ) -> Vec<SagaChoreographyEvent> {
+        let mut failed = Vec::new();
         for terminal_event in terminal_events {
-            let _ = self
-                .bus
-                .complete_terminal_reply_from_event(&terminal_event, self.responder.as_ref());
-            if let Err(err) = self.bus.publish_strict(terminal_event) {
+            if let Err(err) = self.bus.publish_strict(terminal_event.clone()) {
+                let run = terminal_event.context().run_key();
                 tracing::error!(
                     target: "core::saga",
                     event = "terminal_resolver_publish_failed",
                     saga_type = self.saga_type.as_ref(),
+                    run = %run,
                     error = ?err
                 );
+                // A terminal decision that never reached the bus must not leave the waiter hanging.
+                if terminal_event.terminal_outcome().is_some() {
+                    self.bus.reject_terminal_reply_for_run(
+                        &run,
+                        format!("terminal publish failed: {err:?}"),
+                    );
+                }
+                failed.push(terminal_event);
             }
         }
+        failed
     }
 }
 
@@ -482,27 +484,39 @@ impl SyncActor for TerminalResolverActor {
                 if let Some(journal) = &self.journal
                     && let Err(error) = journal.append((*event).clone())
                 {
+                    let run = event.context().run_key();
                     tracing::error!(
                         target: "core::saga",
                         event = "terminal_resolver_journal_append_failed",
                         saga_type = self.saga_type.as_ref(),
-                        saga_id = %event.context().saga_id,
-                        error = ?error
+                        run = %run,
+                        error = ?error,
+                        "event not ingested: resolver journal append failed"
                     );
-                    if !matches!(*event, SagaChoreographyEvent::SagaQuarantined { .. }) {
-                        let context = event.context().next_step(TERMINAL_RESOLVER_STEP.into());
-                        self.publish_terminal_events(vec![
+                    let quarantine =
+                        if matches!(*event, SagaChoreographyEvent::SagaQuarantined { .. }) {
+                            (*event).clone()
+                        } else {
+                            let context = event.context().next_step(TERMINAL_RESOLVER_STEP.into());
                             SagaChoreographyEvent::SagaQuarantined {
                                 context,
                                 reason: format!("terminal resolver durability failed: {error}")
                                     .into(),
                                 step: TERMINAL_RESOLVER_STEP.into(),
                                 participant_id: self.responder.as_ref().into(),
-                            },
-                        ]);
+                            }
+                        };
+                    // Durability failed: the only honest outcome for the waiter is quarantine.
+                    self.bus
+                        .complete_terminal_reply_from_event(&quarantine, self.responder.as_ref());
+                    if !matches!(*event, SagaChoreographyEvent::SagaQuarantined { .. }) {
+                        self.publish_terminal_events(vec![quarantine]);
                     }
                     return;
                 }
+                // The decision is durable (or no journal): now the reply may resolve.
+                self.bus
+                    .complete_terminal_reply_from_event(&event, self.responder.as_ref());
                 match self
                     .resolver
                     .try_ingest_at(&event, SagaContext::now_millis())
@@ -520,8 +534,19 @@ impl SyncActor for TerminalResolverActor {
                 }
             }
             TerminalResolverTell::ActivateRecovery => {
+                self.activated = true;
                 let recovery_events = std::mem::take(&mut self.recovery_events);
-                self.publish_terminal_events(recovery_events);
+                self.recovery_events = self.publish_terminal_events(recovery_events);
+                // Overdue work that matured while recovery was inactive is
+                // evaluated exactly once, now.
+                self.resolver.poll_timeouts()
+            }
+            TerminalResolverTell::PollTimeouts if !self.activated => {
+                tracing::debug!(
+                    target: "core::saga",
+                    event = "terminal_watchdog_poll_deferred_until_recovery_activation",
+                    saga_type = self.saga_type.as_ref()
+                );
                 return;
             }
             TerminalResolverTell::PollTimeouts => self.resolver.poll_timeouts(),
@@ -574,6 +599,142 @@ impl Drop for AttachLockGuard<'_> {
             });
         }
     }
+}
+
+/// Result of [`SagaChoreographyBus::publish_with_admission`].
+struct PublishOutcome {
+    stats: PublishStats,
+    /// Rejection reason when a `SagaStarted` was refused.
+    rejected: Option<Box<str>>,
+    /// Required recipients that did not receive the event.
+    shortfall: Option<RequiredShortfall>,
+}
+
+impl PublishOutcome {
+    fn delivered(stats: PublishStats) -> Self {
+        Self {
+            stats,
+            rejected: None,
+            shortfall: None,
+        }
+    }
+
+    fn rejected(stats: PublishStats, reason: Box<str>) -> Self {
+        Self {
+            stats,
+            rejected: Some(reason),
+            shortfall: None,
+        }
+    }
+}
+
+/// Which subscriber roles accepted one publish. Observers are never recorded.
+#[derive(Default)]
+struct DeliveryReceipts {
+    /// Step-tagged participants that accepted the event.
+    steps: HashSet<Box<str>>,
+    /// Untagged participants that accepted the event.
+    unnamed_participants: usize,
+    resolver: bool,
+}
+
+/// How a subscription counts toward required-recipient safety.
+#[derive(Clone)]
+enum SubscriberRole {
+    /// A workflow participant owning `steps` (empty: step not known).
+    Participant(Arc<[Box<str>]>),
+    /// The attached terminal resolver.
+    Resolver,
+}
+
+thread_local! {
+    /// Receipt frames of in-flight publishes on this thread. Subscriber
+    /// callbacks run synchronously inside `publish`, so the innermost frame
+    /// belongs to the publish that is delivering; nested publishes push their own.
+    static RECEIPT_FRAMES: std::cell::RefCell<Vec<DeliveryReceipts>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+struct ReceiptFrame {
+    open: bool,
+}
+
+impl ReceiptFrame {
+    fn open() -> Self {
+        RECEIPT_FRAMES.with(|frames| frames.borrow_mut().push(DeliveryReceipts::default()));
+        Self { open: true }
+    }
+
+    fn close(mut self) -> DeliveryReceipts {
+        self.open = false;
+        RECEIPT_FRAMES
+            .with(|frames| frames.borrow_mut().pop())
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for ReceiptFrame {
+    fn drop(&mut self) {
+        if self.open {
+            // A publish unwound: drop its frame so outer frames stay aligned.
+            RECEIPT_FRAMES.with(|frames| frames.borrow_mut().pop());
+        }
+    }
+}
+
+fn record_receipt(role: &SubscriberRole) {
+    RECEIPT_FRAMES.with(|frames| {
+        let mut frames = frames.borrow_mut();
+        let Some(frame) = frames.last_mut() else {
+            return;
+        };
+        match role {
+            SubscriberRole::Resolver => frame.resolver = true,
+            SubscriberRole::Participant(steps) if steps.is_empty() => {
+                frame.unnamed_participants += 1;
+            }
+            SubscriberRole::Participant(steps) => {
+                frame.steps.extend(steps.iter().cloned());
+            }
+        }
+    });
+}
+
+struct RequiredShortfall {
+    /// Comma-separated missing required roles (step names / terminal resolver).
+    roles: Box<str>,
+    /// Required participants plus the resolver.
+    required_min_delivered: u32,
+}
+
+/// Required roles that did not receive the event, or `None` when every
+/// required participant step and the resolver did. An untagged participant can
+/// stand in for one otherwise-unmatched required step; observers never count.
+fn required_shortfall(
+    required: &HashSet<Box<str>>,
+    receipts: &DeliveryReceipts,
+) -> Option<RequiredShortfall> {
+    let mut unmatched: Vec<&str> = required
+        .iter()
+        .filter(|step| !receipts.steps.contains(step.as_ref()))
+        .map(|step| step.as_ref())
+        .collect();
+    unmatched.sort_unstable();
+    let mut missing: Vec<&str> = if unmatched.len() > receipts.unnamed_participants {
+        unmatched
+    } else {
+        Vec::new()
+    };
+    if !receipts.resolver {
+        missing.push(TERMINAL_RESOLVER_STEP);
+    }
+    if missing.is_empty() {
+        return None;
+    }
+    Some(RequiredShortfall {
+        roles: missing.join(",").into(),
+        required_min_delivered: saturating_u32_from_usize(required.len().saturating_add(1)),
+    })
 }
 
 pub struct SagaChoreographyBus {
@@ -696,6 +857,7 @@ pub enum SagaBusPublishError {
         delivered: u32,
         required_min_delivered: u32,
         required_path: Box<str>,
+        missing_roles: Box<str>,
     },
 }
 
@@ -751,6 +913,36 @@ impl SagaChoreographyBus {
             .unwrap_or_else(|err| panic!("invalid saga topic '{topic}': {err}"))
     }
 
+    /// Subscribes a workflow participant owning `steps`. Unlike
+    /// [`Self::subscribe_fn`] (an observer, which never counts toward
+    /// required-recipient safety), an accepted delivery here is a receipt for
+    /// each of `steps`. An empty `steps` is an untagged participant.
+    pub fn subscribe_participant_fn<F>(
+        &self,
+        topic: &str,
+        steps: &[&str],
+        f: F,
+    ) -> FirehoseSubscription
+    where
+        F: Fn(&SagaChoreographyEvent) -> bool + Send + Sync + 'static,
+    {
+        let role = SubscriberRole::Participant(steps.iter().map(|s| Box::from(*s)).collect());
+        self.subscribe_role_fn(topic, role, f)
+    }
+
+    fn subscribe_role_fn<F>(&self, topic: &str, role: SubscriberRole, f: F) -> FirehoseSubscription
+    where
+        F: Fn(&SagaChoreographyEvent) -> bool + Send + Sync + 'static,
+    {
+        self.subscribe_fn(topic, move |event| {
+            let accepted = f(event);
+            if accepted {
+                record_receipt(&role);
+            }
+            accepted
+        })
+    }
+
     pub fn unsubscribe(&self, sub: FirehoseSubscription) -> bool {
         self.bus.unsubscribe(sub)
     }
@@ -760,21 +952,28 @@ impl SagaChoreographyBus {
         self.publish_to_saga_type(saga_type.as_ref(), event)
     }
 
+    /// Publishes `event` and returns which subscriber roles accepted it.
+    fn publish_event_collecting(
+        &self,
+        event: SagaChoreographyEvent,
+    ) -> (PublishStats, DeliveryReceipts) {
+        let frame = ReceiptFrame::open();
+        let stats = self.publish_event(event);
+        (stats, frame.close())
+    }
+
     pub fn publish(&self, event: SagaChoreographyEvent) -> PublishStats {
-        self.publish_with_admission(event).0
+        self.publish_with_admission(event).stats
     }
 
     /// Publishes `event`; the second value is the rejection reason when a
     /// `SagaStarted` was refused and replaced by a diagnostic `SagaFailed`.
-    fn publish_with_admission(
-        &self,
-        event: SagaChoreographyEvent,
-    ) -> (PublishStats, Option<Box<str>>) {
+    fn publish_with_admission(&self, event: SagaChoreographyEvent) -> PublishOutcome {
         if matches!(event, SagaChoreographyEvent::SagaAbortRequested { .. }) {
-            return (self.publish_abort_event(event).0, None);
+            return PublishOutcome::delivered(self.publish_abort_event(event).0);
         }
         let event_type = event.event_type();
-        let mut expected_min_delivery: Option<u32> = None;
+        let mut required_recipients: Option<HashSet<Box<str>>> = None;
         let mut expected_required_path: Box<str> = "".into();
         let mut expected_context: Option<crate::SagaContext> = None;
         if let SagaChoreographyEvent::SagaStarted { context, .. } = &event {
@@ -793,7 +992,7 @@ impl SagaChoreographyBus {
                 if let Some(outcome) = terminal.terminal_outcome() {
                     self.store_terminal_outcome(terminal.context().run_key(), outcome);
                 }
-                return (self.publish_event(terminal), Some(reason));
+                return PublishOutcome::rejected(self.publish_event(terminal), reason);
             }
             if let Some(reason) = self.saga_start_contract_violation_reason(context) {
                 let reason: Box<str> = reason.into();
@@ -805,18 +1004,15 @@ impl SagaChoreographyBus {
                 if let Some(outcome) = terminal.terminal_outcome() {
                     self.store_terminal_outcome(terminal.context().run_key(), outcome);
                 }
-                return (self.publish_event(terminal), Some(reason));
+                return PublishOutcome::rejected(self.publish_event(terminal), reason);
             }
-            expected_min_delivery =
-                self.saga_start_expected_min_delivery(context.saga_type.as_ref());
+            required_recipients = self.saga_start_required_recipients(context.saga_type.as_ref());
             expected_required_path = self
                 .required_path_description(context.saga_type.as_ref())
                 .into();
             expected_context = Some(context.clone());
-        } else if let Some(required_min_delivery) =
-            self.required_path_expected_min_delivery_for_event(&event)
-        {
-            expected_min_delivery = Some(required_min_delivery);
+        } else if let Some(required) = self.required_recipients_for_event(&event) {
+            required_recipients = Some(required);
             expected_required_path = self
                 .required_path_description(event.context().saga_type.as_ref())
                 .into();
@@ -825,25 +1021,40 @@ impl SagaChoreographyBus {
         if let Some(outcome) = event.terminal_outcome() {
             self.store_terminal_outcome(event.context().run_key(), outcome);
         }
-        let stats = self.publish_event(event);
-        if let (Some(required_min_delivery), Some(context)) =
-            (expected_min_delivery, expected_context)
-            && stats.delivered < required_min_delivery
+        let (stats, receipts) = self.publish_event_collecting(event);
+        let mut shortfall = None;
+        if let (Some(required), Some(context)) = (required_recipients, expected_context)
+            && let Some(missing) = required_shortfall(&required, &receipts)
         {
             let reason: Box<str> = format!(
-                "required_path_delivery_shortfall: saga_type={} event_type={} step={} delivered={} attempted={} required_min_delivered={} required_path={}",
+                "required_path_delivery_shortfall: saga_type={} event_type={} step={} delivered={} attempted={} required_min_delivered={} missing_roles={} required_path={}",
                 context.saga_type,
                 event_type,
                 context.step_name,
                 stats.delivered,
                 stats.attempted,
-                required_min_delivery,
+                missing.required_min_delivered,
+                missing.roles,
                 expected_required_path
             )
             .into();
+            tracing::error!(
+                target: "core::saga",
+                event = "required_path_delivery_shortfall",
+                run = ?context.run_key(),
+                missing_roles = %missing.roles,
+                delivered = stats.delivered,
+                attempted = stats.attempted,
+                "required recipient did not receive the event"
+            );
             let _ = self.publish_abort_or_fail(&context, reason, AbortSource::DeliveryShortfall);
+            shortfall = Some(missing);
         }
-        (stats, None)
+        PublishOutcome {
+            stats,
+            rejected: None,
+            shortfall,
+        }
     }
 
     /// Requests a resolver-driven abort (ADR-0004 §2.6).
@@ -943,7 +1154,11 @@ impl SagaChoreographyBus {
             }
             return Ok(stats);
         }
-        let (stats, rejected) = self.publish_with_admission(event.clone());
+        let PublishOutcome {
+            stats,
+            rejected,
+            shortfall,
+        } = self.publish_with_admission(event.clone());
         if let Some(reason) = rejected {
             // The diagnostic SagaFailed was already published; the start itself
             // was not admitted, so the caller must not see success.
@@ -954,10 +1169,7 @@ impl SagaChoreographyBus {
                 reason,
             });
         }
-        if let Some(required_min_delivery) =
-            self.required_path_expected_min_delivery_for_event(&event)
-            && stats.delivered < required_min_delivery
-        {
+        if let Some(missing) = shortfall {
             let context = event.context();
             return Err(SagaBusPublishError::RequiredPathDeliveryShortfall {
                 saga_id: context.saga_id,
@@ -966,10 +1178,11 @@ impl SagaChoreographyBus {
                 event_type: event.event_type(),
                 attempted: stats.attempted,
                 delivered: stats.delivered,
-                required_min_delivered: required_min_delivery,
+                required_min_delivered: missing.required_min_delivered,
                 required_path: self
                     .required_path_description(context.saga_type.as_ref())
                     .into(),
+                missing_roles: missing.roles,
             });
         }
         if stats.attempted == stats.delivered {
@@ -1361,6 +1574,8 @@ impl SagaChoreographyBus {
         let (resolver_ref, resolver_handle) = local_sync::spawn(TerminalResolverActor {
             resolver,
             recovery_events,
+            // Nothing is restored without a journal: no activation gate needed.
+            activated: journal.is_none(),
             journal,
             bus: bus.clone(),
             responder: Arc::clone(&responder),
@@ -1377,24 +1592,28 @@ impl SagaChoreographyBus {
         let subscription_resolver_ref = resolver_ref.clone();
         let abort_ingested = Arc::new(AtomicU64::new(0));
         let subscription_abort_ingested = Arc::clone(&abort_ingested);
-        let subscription = self.subscribe_fn(saga_type_topic.as_ref(), move |event| {
-            if !subscription_resolver_ref
-                .tell(TerminalResolverTell::Ingest(Box::new(event.clone())))
-            {
-                tracing::error!(
-                    target: "core::saga",
-                    event = "terminal_resolver_ingest_failed",
-                    saga_type = subscription_saga_type.as_ref(),
-                    run = ?event.context().run_key(),
-                    "resolver subscription could not hand the event to the resolver actor"
-                );
-                return false;
-            }
-            if matches!(event, SagaChoreographyEvent::SagaAbortRequested { .. }) {
-                subscription_abort_ingested.fetch_add(1, Ordering::AcqRel);
-            }
-            true
-        });
+        let subscription = self.subscribe_role_fn(
+            saga_type_topic.as_ref(),
+            SubscriberRole::Resolver,
+            move |event| {
+                if !subscription_resolver_ref
+                    .tell(TerminalResolverTell::Ingest(Box::new(event.clone())))
+                {
+                    tracing::error!(
+                        target: "core::saga",
+                        event = "terminal_resolver_ingest_failed",
+                        saga_type = subscription_saga_type.as_ref(),
+                        run = ?event.context().run_key(),
+                        "resolver subscription could not hand the event to the resolver actor"
+                    );
+                    return false;
+                }
+                if matches!(event, SagaChoreographyEvent::SagaAbortRequested { .. }) {
+                    subscription_abort_ingested.fetch_add(1, Ordering::AcqRel);
+                }
+                true
+            },
+        );
         #[cfg(test)]
         {
             let hook = self
@@ -1627,11 +1846,12 @@ impl SagaChoreographyBus {
         None
     }
 
-    fn saga_start_expected_min_delivery(&self, saga_type: &str) -> Option<u32> {
-        match self.ask_state(BusStateAsk::SagaStartExpectedMinDelivery {
+    fn saga_start_required_recipients(&self, saga_type: &str) -> Option<HashSet<Box<str>>> {
+        match self.ask_state(BusStateAsk::RequiredRecipients {
             saga_type: saga_type.into(),
+            step_name: None,
         }) {
-            Some(BusStateReply::OptionalU32(expected)) => expected,
+            Some(BusStateReply::RequiredRecipients(required)) => required,
             _ => None,
         }
     }
@@ -1645,10 +1865,10 @@ impl SagaChoreographyBus {
         }
     }
 
-    fn required_path_expected_min_delivery_for_event(
+    fn required_recipients_for_event(
         &self,
         event: &SagaChoreographyEvent,
-    ) -> Option<u32> {
+    ) -> Option<HashSet<Box<str>>> {
         if matches!(
             event,
             SagaChoreographyEvent::SagaCompleted { .. }
@@ -1663,11 +1883,11 @@ impl SagaChoreographyBus {
         if !self.has_terminal_policy_for_saga_type(context.saga_type.as_ref()) {
             return None;
         }
-        match self.ask_state(BusStateAsk::RequiredPathExpectedMinDelivery {
+        match self.ask_state(BusStateAsk::RequiredRecipients {
             saga_type: context.saga_type.clone(),
-            step_name: context.step_name.clone(),
+            step_name: Some(context.step_name.clone()),
         }) {
-            Some(BusStateReply::OptionalU32(expected)) => expected,
+            Some(BusStateReply::RequiredRecipients(required)) => required,
             _ => None,
         }
     }
@@ -1786,7 +2006,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use icanact_core::local_sync;
+    use icanact_core::local_sync::SyncActor;
 
+    use super::{TerminalResolverActor, TerminalResolverTell};
+    use crate::TerminalResolver;
     use crate::{
         AcceptedStepTimeoutOutcome, FailureAuthority, InMemoryTerminalResolverJournal,
         SagaChoreographyEvent, SagaContext, SagaId, SagaReplyToResult, SagaTerminalOutcome,
@@ -2181,6 +2404,64 @@ mod tests {
         probe.shutdown();
     }
 
+    /// Rejects only resolver-originated `SagaCompleted` (the terminal decision).
+    struct RejectingDecisionJournal;
+
+    impl TerminalResolverJournal for RejectingDecisionJournal {
+        fn append(
+            &self,
+            event: SagaChoreographyEvent,
+        ) -> Result<u64, TerminalResolverJournalError> {
+            if matches!(event, SagaChoreographyEvent::SagaCompleted { .. })
+                && event.context().step_name.as_ref() == TERMINAL_RESOLVER_STEP
+            {
+                return Err(TerminalResolverJournalError::Storage(
+                    "injected decision append failure".into(),
+                ));
+            }
+            Ok(0)
+        }
+
+        fn read_all(
+            &self,
+        ) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn terminal_reply_follows_durable_decision() {
+        let bus = SagaChoreographyBus::new();
+        let _resolver = bus
+            .attach_durable_terminal_resolver(
+                TerminalPolicy::order_lifecycle_default(),
+                "terminal-resolver",
+                Arc::new(RejectingDecisionJournal),
+            )
+            .expect("durable resolver should attach");
+        let saga_id = SagaId::new(812);
+        let (pending, probe) = register_pending_reply(bus.clone(), saga_id);
+
+        bus.publish_strict(SagaChoreographyEvent::StepCompleted {
+            context: context("create_order", saga_id.get()),
+            output: Vec::new(),
+            saga_input: Vec::new(),
+            compensation_available: false,
+        })
+        .expect("step completion should reach the resolver");
+
+        let reply = pending
+            .wait()
+            .expect("reply must resolve")
+            .expect("terminal reply");
+        assert!(
+            matches!(reply.outcome, SagaTerminalOutcome::Quarantined { .. }),
+            "a decision whose journal append failed must not be reported as success: {:?}",
+            reply.outcome
+        );
+        probe.shutdown();
+    }
+
     #[test]
     fn durable_resolver_restart_preserves_complete_compensation_scope() {
         let journal = Arc::new(InMemoryTerminalResolverJournal::default());
@@ -2195,8 +2476,11 @@ mod tests {
                     .expect("step binding should succeed");
             }
             // Live participant lanes so the strict start meets its required delivery.
-            let _participants: Vec<_> = (0..3)
-                .map(|_| bus.subscribe_saga_type_fn("durable_multi_step", |_event| true))
+            let _participants: Vec<_> = ["first_effect", "second_effect", "finalize"]
+                .into_iter()
+                .map(|step| {
+                    bus.subscribe_participant_fn("durable_multi_step", &[step], |_event| true)
+                })
                 .collect();
             let _resolver = bus
                 .attach_durable_terminal_resolver(
@@ -2331,6 +2615,71 @@ mod tests {
             .expect("post-binding activation should succeed");
         wait_until(Instant::now() + Duration::from_secs(1), || {
             delivered.load(Ordering::Relaxed) == 1
+        });
+    }
+
+    #[test]
+    fn restored_deadlines_do_not_publish_before_recovery_activation() {
+        let saga_id = SagaId::new(816);
+        let started = SagaChoreographyEvent::SagaStarted {
+            context: SagaContext {
+                saga_started_at_millis: SagaContext::now_millis(),
+                event_timestamp_millis: SagaContext::now_millis(),
+                ..context("create_order", saga_id.get())
+            },
+            payload: Vec::new(),
+        };
+        let mut required: HashSet<Box<str>> = HashSet::new();
+        required.insert("create_order".into());
+        let policy = TerminalPolicy::new(
+            "order_lifecycle".into(),
+            "order_lifecycle/short".into(),
+            FailureAuthority::AnyParticipant,
+            SuccessCriteria::AllOf(required),
+            Duration::from_millis(60),
+            Duration::from_millis(60),
+            &[],
+        );
+        // Near expiry but not yet expired at restore time.
+        let (resolver, recovery_events) =
+            TerminalResolver::restore_from_events(policy, std::slice::from_ref(&started));
+        assert!(recovery_events.is_empty(), "{recovery_events:?}");
+
+        let bus = SagaChoreographyBus::new();
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let _binding = bus.subscribe_saga_type_fn("order_lifecycle", {
+            let delivered = Arc::clone(&delivered);
+            move |_| {
+                delivered.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+        });
+        let mut actor = TerminalResolverActor {
+            resolver,
+            recovery_events,
+            activated: false,
+            journal: None,
+            bus: bus.clone(),
+            responder: Arc::from("terminal-resolver"),
+            saga_type: "order_lifecycle".into(),
+        };
+        // Let the deadline pass while recovery is still not activated.
+        let expired_at = SagaContext::now_millis() + 80;
+        while SagaContext::now_millis() <= expired_at {
+            thread::yield_now();
+        }
+
+        actor.handle_tell(TerminalResolverTell::PollTimeouts);
+        thread::sleep(Duration::from_millis(30));
+        assert_eq!(
+            delivered.load(Ordering::Relaxed),
+            0,
+            "watchdog must not publish before ActivateRecovery"
+        );
+
+        actor.handle_tell(TerminalResolverTell::ActivateRecovery);
+        wait_until(Instant::now() + Duration::from_secs(1), || {
+            delivered.load(Ordering::Relaxed) >= 1
         });
     }
 
@@ -3295,8 +3644,10 @@ mod tests {
                 "test-resolver",
             )
             .expect("terminal resolver should attach");
-        let _risk_sub = bus.subscribe_saga_type_fn("order_lifecycle", |_event| true);
-        let order_sub = bus.subscribe_saga_type_fn("order_lifecycle", |_event| true);
+        let _risk_sub =
+            bus.subscribe_participant_fn("order_lifecycle", &["risk_check"], |_event| true);
+        let order_sub =
+            bus.subscribe_participant_fn("order_lifecycle", &["create_order"], |_event| true);
 
         let saga_id = SagaId::new(90052);
         let started = SagaChoreographyEvent::SagaStarted {
@@ -3690,8 +4041,10 @@ mod tests {
         let _resolver_sub = bus
             .attach_terminal_resolver(policy, "terminal-resolver")
             .expect("terminal resolver should attach");
-        let _risk_sub = bus.subscribe_saga_type_fn("order_lifecycle", |_event| true);
-        let _order_sub = bus.subscribe_saga_type_fn("order_lifecycle", |_event| true);
+        let _risk_sub =
+            bus.subscribe_participant_fn("order_lifecycle", &["risk_check"], |_event| true);
+        let _order_sub =
+            bus.subscribe_participant_fn("order_lifecycle", &["create_order"], |_event| true);
         let saga_id = SagaId::new(8_001);
         let _ = bus.publish(SagaChoreographyEvent::SagaStarted {
             context: context("risk_check", saga_id.get()),
@@ -3714,6 +4067,154 @@ mod tests {
         assert!(
             reason.as_ref().contains("stalled_timeout"),
             "expected stalled_timeout reason, got: {reason}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod t14b_required_recipient_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::{SagaBusPublishError, SagaChoreographyBus, TerminalResolverRegistryAsk};
+    use crate::{
+        SagaChoreographyEvent, SagaContext, SagaId, SagaWorkflowContract, SagaWorkflowStepContract,
+        TerminalPolicy, WorkflowDependencySpec,
+    };
+
+    const SAGA: &str = "order_lifecycle";
+
+    struct TwoStep;
+
+    impl SagaWorkflowContract for TwoStep {
+        fn saga_type() -> &'static str {
+            SAGA
+        }
+        fn first_step() -> &'static str {
+            "risk_check"
+        }
+        fn steps() -> &'static [SagaWorkflowStepContract] {
+            &[
+                SagaWorkflowStepContract {
+                    step_name: "risk_check",
+                    participant_id: "risk-engine",
+                    depends_on: WorkflowDependencySpec::OnSagaStart,
+                },
+                SagaWorkflowStepContract {
+                    step_name: "create_order",
+                    participant_id: "order-manager",
+                    depends_on: WorkflowDependencySpec::After("risk_check"),
+                },
+            ]
+        }
+        fn terminal_policy() -> TerminalPolicy {
+            TerminalPolicy::order_lifecycle_default()
+        }
+    }
+
+    struct Rig {
+        bus: SagaChoreographyBus,
+        b_accepts: Arc<AtomicBool>,
+        _subs: Vec<icanact_core::local::FirehoseSubscription>,
+    }
+
+    /// Required A (`risk_check`) and B (`create_order`), the resolver, and an
+    /// observer that always accepts.
+    fn rig() -> Rig {
+        let bus = SagaChoreographyBus::new();
+        bus.register_workflow_contract_provider::<TwoStep>()
+            .expect("contract registers");
+        bus.register_bound_workflow_step(SAGA, "risk_check")
+            .expect("bind A");
+        bus.register_bound_workflow_step(SAGA, "create_order")
+            .expect("bind B");
+        let resolver = bus
+            .attach_terminal_resolver_for_contract::<TwoStep>("t14b-resolver")
+            .expect("resolver attaches");
+        let b_accepts = Arc::new(AtomicBool::new(true));
+        let b_flag = Arc::clone(&b_accepts);
+        let subs = vec![
+            resolver,
+            bus.subscribe_participant_fn(SAGA, &["risk_check"], |_| true),
+            bus.subscribe_participant_fn(SAGA, &["create_order"], move |_| {
+                b_flag.load(Ordering::Acquire)
+            }),
+            bus.subscribe_saga_type_fn(SAGA, |_| true),
+        ];
+        Rig {
+            bus,
+            b_accepts,
+            _subs: subs,
+        }
+    }
+
+    fn step_completed(saga_id: u64) -> SagaChoreographyEvent {
+        let now = SagaContext::now_millis();
+        SagaChoreographyEvent::StepCompleted {
+            context: SagaContext {
+                saga_id: SagaId::new(saga_id),
+                saga_type: SAGA.into(),
+                step_name: "risk_check".into(),
+                correlation_id: saga_id,
+                causation_id: saga_id,
+                trace_id: saga_id,
+                step_index: 0,
+                attempt: 0,
+                initiator_peer_id: [0; 32],
+                saga_started_at_millis: now,
+                event_timestamp_millis: now,
+            },
+            output: Vec::new(),
+            saga_input: Vec::new(),
+            compensation_available: false,
+        }
+    }
+
+    fn missing_roles(err: SagaBusPublishError) -> String {
+        match err {
+            SagaBusPublishError::RequiredPathDeliveryShortfall { missing_roles, .. } => {
+                missing_roles.to_string()
+            }
+            other => panic!("expected RequiredPathDeliveryShortfall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn all_required_roles_receiving_is_success() {
+        let rig = rig();
+        rig.bus
+            .publish_strict(step_completed(14_001))
+            .expect("A, B and the resolver all received the event");
+    }
+
+    #[test]
+    fn observer_delivery_cannot_mask_missing_required_participant() {
+        let rig = rig();
+        rig.b_accepts.store(false, Ordering::Release);
+        let err = rig
+            .bus
+            .publish_strict(step_completed(14_002))
+            .expect_err("the observer must not stand in for the failed participant B");
+        let missing = missing_roles(err);
+        assert!(missing.contains("create_order"), "missing: {missing}");
+        assert!(!missing.contains("risk_check"), "missing: {missing}");
+    }
+
+    #[test]
+    fn observer_delivery_cannot_mask_closed_resolver() {
+        let rig = rig();
+        let _ = rig
+            .bus
+            .terminal_resolver_registry_ref
+            .ask(TerminalResolverRegistryAsk::ShutdownAll);
+        let err = rig
+            .bus
+            .publish_strict(step_completed(14_003))
+            .expect_err("the observer must not stand in for the closed resolver");
+        let missing = missing_roles(err);
+        assert!(
+            missing.contains(crate::TERMINAL_RESOLVER_STEP),
+            "missing: {missing}"
         );
     }
 }
