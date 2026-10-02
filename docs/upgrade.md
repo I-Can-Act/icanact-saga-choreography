@@ -20,7 +20,8 @@ Breaking changes from the run-identity, outbox, resolver and startup-contract wo
 - **Durable resolvers must be activated.** Until `activate_terminal_resolver_recovery*` runs,
   a durable resolver publishes nothing and `SagaStarted` is rejected with `AdmissionRejected`.
 - **New `SagaBusPublishError` variants / fields:** `AdmissionRejected`, `AbortNotDelivered`,
-  and `RequiredPathDeliveryShortfall.missing_roles`. Exhaustive matches must be updated.
+  `StateLookupFailed`, and `RequiredPathDeliveryShortfall.missing_roles`. The enum is not
+  `#[non_exhaustive]`, so exhaustive matches must be updated.
 - **Legacy LMDB journals must be drained** (see [Run identity](#run-identity)).
 - **New journal row variants.** The participant journal can now contain rows (for example
   `ParticipantEvent::CompensationRetryable`) that older binaries cannot decode. There is no
