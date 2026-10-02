@@ -1,5 +1,31 @@
 # Upgrade notes
 
+## Upgrade notes (0.x → next)
+
+Breaking changes from the run-identity, outbox, resolver and startup-contract work:
+
+- **Required run-scoped trait methods.** `ParticipantJournal` now requires `append_run`,
+  `read_run`, `list_runs`, `finalize_run`, `run_tombstones` and `prune_expired_tombstones`
+  (`commit_inbox` / `commit_with_outbox` have defaults). `ParticipantDedupeStore` now requires
+  `check_and_mark_run`, `contains_run`, `mark_processed_run`, `remove_processed_run`,
+  `prune_run`, `list_runs`, `keys_run` and `prune_expired`. Custom backends must implement them.
+- **`TerminalPolicy` is `#[non_exhaustive]`.** Struct-literal construction no longer compiles
+  outside the crate; use `TerminalPolicy::new(...)` and its builder-style setters.
+- **Ingress return types.** Ingress helpers return `IngressReport { outcome: IngressOutcome,
+  publish_failures }`; `IngressOutcome` is `Applied | Duplicate | Rejected | Failed |
+  ReconciliationNeeded`. Callers must inspect both fields.
+- **Plain binders take `steps: &[&str]`.** `bind_*_participant_*` (non-workflow) now tag
+  subscriptions with the steps the actor owns; untagged (empty) subscriptions never satisfy a
+  required step. Strict workflow binders are unchanged.
+- **Durable resolvers must be activated.** Until `activate_terminal_resolver_recovery*` runs,
+  a durable resolver publishes nothing and `SagaStarted` is rejected with `AdmissionRejected`.
+- **New `SagaBusPublishError` variants / fields:** `AdmissionRejected`, `AbortNotDelivered`,
+  and `RequiredPathDeliveryShortfall.missing_roles`. Exhaustive matches must be updated.
+- **Legacy LMDB journals must be drained** (see [Run identity](#run-identity)).
+- **New journal row variants.** The participant journal can now contain rows (for example
+  `ParticipantEvent::CompensationRetryable`) that older binaries cannot decode. There is no
+  downgrade once a newer binary has written to a journal.
+
 ## Run identity
 
 Participant state is now keyed by run (`RunKey = (saga_type, saga_id, incarnation)`,
