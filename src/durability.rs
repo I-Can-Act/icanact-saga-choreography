@@ -1194,10 +1194,11 @@ where
             && let Some((compensation_data, started_at_millis)) =
                 recover_retryable_compensation_from_entries(&entries)
         {
-            // R13: an undo was started but never settled (a `SafeToRetry` outcome writes no
-            // row). Rehydrate `Compensating` with the durable undo data so the resolver's
-            // re-request re-invokes the undo instead of stalling. The undo may therefore run
-            // again after a crash mid-undo: undo handlers must be idempotent.
+            // R13/R2: a `SafeToRetry` undo outcome writes a durable `CompensationRetryable` row
+            // that closes its `CompensationStarted`. Only such a closed attempt is rehydrated as
+            // `Compensating` with the durable undo data, so the resolver's re-request re-invokes
+            // the undo. A dangling `CompensationStarted` (no retryable/completion row) is
+            // quarantined above instead; no undo-idempotency contract is assumed.
             let context = recovery_context_for_run(&run, step_name);
             let mut state = crate::SagaParticipantState::new(
                 saga_id,
