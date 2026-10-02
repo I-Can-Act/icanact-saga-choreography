@@ -594,7 +594,7 @@ fn ingress_suppresses_invalid_emitted_transition_when_state_is_missing() {
 }
 
 #[test]
-fn panic_quarantine_records_journal_marks_dedupe_and_publishes() {
+fn panic_quarantine_records_journal_publishes_and_leaves_no_dedupe_mark() {
     let mut participant = TestParticipant::new(TEST_STEP, ExecuteMode::Normal);
 
     let bus = SagaChoreographyBus::new();
@@ -637,8 +637,10 @@ fn panic_quarantine_records_journal_marks_dedupe_and_publishes() {
         .expect("panic quarantine reason should be recorded");
     assert!(is_panic_quarantine_reason(panic_reason.as_ref()));
 
+    // ADR-0003 §2.3 / W4-review R6: publication is never marked; the quarantine is re-derived
+    // from the journal on every startup.
     assert!(
-        participant
+        !participant
             .saga
             .dedupe
             .contains(saga_context.saga_id, PANIC_QUARANTINE_PUBLISH_KEY,)

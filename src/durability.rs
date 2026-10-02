@@ -3465,20 +3465,8 @@ fn publish_panic_quarantine_event<J, D>(
         return;
     };
     match bus.publish_strict(emitted) {
-        Ok(stats) => {
-            if stats.delivered > 0
-                && let Err(err) = saga
-                    .dedupe
-                    .mark_processed(context.saga_id, PANIC_QUARANTINE_PUBLISH_KEY)
-            {
-                tracing::error!(
-                    target: "core::saga",
-                    event = "panic_quarantine_dedupe_mark_failed",
-                    run = %context.run_key(),
-                    error = %err
-                );
-            }
-        }
+        // ADR-0003 §2.3: no post-publish mark; the quarantine is re-derived from the journal.
+        Ok(_) => {}
         Err(err) => {
             tracing::error!(
                 target: "core::saga",
@@ -3596,7 +3584,18 @@ pub fn collect_startup_recovery_events_for_saga_type<
     step_name: &'static str,
     saga_type: &'static str,
 ) -> Result<Vec<SagaChoreographyEvent>, RecoveryCollectionError> {
-    collect_startup_recovery_events_for_saga_type_inner(journal, saga_type, dedupe, step_name, true)
+    // ADR-0003: durable obligations first (so a custom durable journal gets them too), then the
+    // re-derived recovery events.
+    let mut events = collect_outbox_replay_events(
+        journal,
+        &[saga_type],
+        crate::ReplayHorizon::PARTICIPANT_DEFAULT,
+        SagaContext::now_millis(),
+    )?;
+    events.append(&mut collect_startup_recovery_events_for_saga_type_inner(
+        journal, saga_type, dedupe, step_name, true,
+    )?);
+    Ok(events)
 }
 
 /// Durable outbound obligations of the non-finalized runs of `saga_types` inside the replay
