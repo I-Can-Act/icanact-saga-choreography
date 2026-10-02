@@ -49,11 +49,11 @@ Cost: startup replay volume = obligations of active + in-horizon quarantined run
 
 ### 2.3 Recovery emissions
 
-Panic-recovery and stale-recovery emissions are re-derived from the journal on every startup; the `PANIC_QUARANTINE_PUBLISH_KEY` pre-mark is removed (`T09D`). `ActivateRecovery` keeps undelivered events: failed `publish_strict` results are put back, not dropped (`T09B`/`T16B`).
+Panic-recovery and stale-recovery emissions are re-derived from the journal on every startup; the `PANIC_QUARANTINE_PUBLISH_KEY` pre-mark is removed (`T09D`). Failed `publish_strict` results of resolver output are retained, not dropped (`T09B`/`T16B`), and retried only on `PollTimeouts` and `ActivateRecovery` (never on `Ingest`, which would re-trigger on the resolver's own echo). Each retained event has a capped attempt count; at the cap it is dropped with `error!` carrying the `RunKey`. Evidence stays in the resolver journal.
 
 ### 2.4 Resolver: reply follows the durable decision (T09B)
 
-`publish_terminal_events` stops resolving replies; the `Ingest` arm resolves the pending reply when it receives a resolver-originated terminal event (`context.step_name == TERMINAL_RESOLVER_STEP`) **after** a successful resolver-journal append (or immediately when no journal is attached). Publish errors of resolver outputs are logged with the `RunKey` and retained for `ActivateRecovery`, not swallowed.
+`publish_terminal_events` stops resolving replies; the `Ingest` arm resolves the pending reply when it receives a resolver-originated terminal event (`context.step_name == TERMINAL_RESOLVER_STEP`) **after** a successful resolver-journal append (or immediately when no journal is attached). Publish errors of resolver outputs are logged with the `RunKey` and retained for retry on poll/activation (capped, then dropped with `error!`), not swallowed.
 
 ### 2.5 `CompletedWithEffect` (R21)
 
@@ -66,9 +66,9 @@ Fail closed (ADR-0002 §2.2): `ReconciliationNeeded { cause: UnsupportedEffect }
 | `commit_with_outbox` fails (post-effect) | ADR-0002 `Result` row: `ReconciliationNeeded { ResultCommitFailed }` | `error!` | `SagaQuarantined` (published directly) |
 | nested row / foreign-run outbox event | `Err(JournalError::Storage(..))` from `commit_with_outbox` → same as above | `error!` | same as above |
 | `outbox_for_replay` fails at open | open / recovery returns `Err` (the participant does not start with unknown obligations) | `error!` | none — no bus is attached yet |
-| replayed or live publish fails | `IngressReport.publish_failures` / recovery report; event retained (row or `ActivateRecovery` buffer) | `error!` per event | the event itself is retried at next activation/startup |
+| replayed or live publish fails | `IngressReport.publish_failures` / recovery report; event retained (row, or resolver buffer retried on poll/activation, capped) | `error!` per event | the event itself is retried at next poll/activation/startup |
 | obligations of a non-finalized run older than the cutoff | not replayed; listed in the recovery report | `warn!` per run | none — receivers would reject them as expired |
-| resolver output publish fails | logged, retained for `ActivateRecovery` | `error!` | retried |
+| resolver output publish fails | logged, retained; retried only on poll/activation, capped then dropped with `error!` (evidence stays in the resolver journal) | `error!` | retried until cap |
 
 ## 3. Exact Rust signatures (W1 `TSK`)
 

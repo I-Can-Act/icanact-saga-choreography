@@ -93,6 +93,8 @@ A step `S ∈ owed − compensated − requested` is **ready** when no other ste
 ### 2.5 Retryable compensation (R13)
 
 - Wire variant `CompensationFailedRetryable { context, participant_id, error }` emitted by participants for `CompensationError::SafeToRetry` and for a `CompensationStart` commit failure (ADR-0002). Participant state stays `Compensating` (undo data kept); `on_quarantined` only for quarantine (`T13P`). The participant stamps `context.attempt` of its compensation outcome with the request's `attempt`.
+- Durability: `SafeToRetry` writes a durable `CompensationRetryable` participant row (last `ParticipantEvent` variant) and each retry commits `CompensationStarted{attempt}` before the undo runs. On open, a `CompensationStarted` with no later completion/failure/retryable marker is a *dangling start* (crash mid-undo, effect unknown) → the run is `Quarantined` and `SagaQuarantined` is re-derived; it is never retried automatically. Retryable rehydration requires the marker. A crash after the marker re-applies the pending request.
+- Dangling start at the resolver level → quarantine. An undeliverable `CompensationRequested` (target participant gone) is reported as given up, so settlement quarantines immediately naming the step.
 - Budget: `TerminalPolicy::compensation_retry_limit()` (default `DEFAULT_COMPENSATION_RETRY_LIMIT = 3`, `0` = no retry; §2.8). Exhaustion → `unresolved` → `Quarantined`.
 
 ### 2.6 Abort input (R03)
