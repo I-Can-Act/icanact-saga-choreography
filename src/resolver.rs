@@ -200,6 +200,7 @@ pub enum TerminalPolicyError {
     ZeroOverallTimeout,
     ZeroStalledTimeout,
     ReplayHorizonShorterThanOverallTimeout,
+    CyclicWorkflowSteps,
 }
 
 impl std::fmt::Display for TerminalPolicyError {
@@ -215,6 +216,7 @@ impl std::fmt::Display for TerminalPolicyError {
             Self::ReplayHorizonShorterThanOverallTimeout => {
                 "replay_horizon is shorter than overall_timeout"
             }
+            Self::CyclicWorkflowSteps => "workflow_steps dependency graph contains a cycle",
         })
     }
 }
@@ -246,6 +248,9 @@ impl TerminalPolicy {
                 return Err(TerminalPolicyError::QuorumExceedsGroup);
             }
             _ => {}
+        }
+        if workflow_steps_are_cyclic(self.workflow_steps) {
+            return Err(TerminalPolicyError::CyclicWorkflowSteps);
         }
         if self.overall_timeout.is_zero() {
             return Err(TerminalPolicyError::ZeroOverallTimeout);
@@ -295,6 +300,9 @@ struct SagaResolutionState {
     phase: ResolverPhase,
     /// Effects that completed during rollback and cannot be undone.
     unresolved: Vec<Box<str>>,
+    /// Steps whose undo was terminally failed or ran out of retry budget.
+    /// While non-empty, no step they depend on is released for undo.
+    given_up_undos: Vec<Box<str>>,
     /// `CompensationFailedRetryable` count per step (retry budget, ADR-0004).
     compensation_retries: HashMap<Box<str>, u32>,
     /// Set for internal aborts (timeouts, `SagaAbortRequested`): the settled
@@ -360,6 +368,7 @@ impl SagaResolutionState {
             compensable_steps: Vec::new(),
             phase: ResolverPhase::Running,
             unresolved: Vec::new(),
+            given_up_undos: Vec::new(),
             compensation_retries: HashMap::new(),
             abort_reason: None,
             aborting_since_millis: None,
@@ -720,6 +729,9 @@ impl TerminalResolver {
                     .insert(context.step_name.clone());
                 // A successful (retried) undo resolves an earlier retryable failure.
                 state.unresolved.retain(|step| step != &context.step_name);
+                state
+                    .given_up_undos
+                    .retain(|step| step != &context.step_name);
                 if state.phase == ResolverPhase::Aborting {
                     retire_compensation(state, context.step_name.as_ref());
                     release_compensation_frontier(
@@ -762,6 +774,9 @@ impl TerminalResolver {
                     retire_compensation(state, context.step_name.as_ref());
                     if !state.unresolved.contains(&context.step_name) {
                         state.unresolved.push(context.step_name.clone());
+                    }
+                    if !state.given_up_undos.contains(&context.step_name) {
+                        state.given_up_undos.push(context.step_name.clone());
                     }
                     release_compensation_frontier(
                         self.policy.workflow_steps,
@@ -905,6 +920,9 @@ impl TerminalResolver {
                         );
                         if !state.unresolved.contains(&step) {
                             state.unresolved.push(step.clone());
+                        }
+                        if !state.given_up_undos.contains(&step) {
+                            state.given_up_undos.push(step.clone());
                         }
                         if state.phase == ResolverPhase::Aborting {
                             retire_compensation(state, step.as_ref());
@@ -1541,10 +1559,19 @@ fn settle(
     clean_reason: Option<&str>,
     out: &mut Vec<SagaChoreographyEvent>,
 ) {
-    if state.terminal_latched || !state.pending_compensation_steps.is_empty() {
+    if state.terminal_latched {
+        return;
+    }
+    // Owed steps held back because an undo was given up are never requested;
+    // once nothing is outstanding they are reported, not waited on.
+    let held_back = !state.pending_compensation_steps.is_empty()
+        && state.requested_compensation_steps.is_empty()
+        && !state.given_up_undos.is_empty();
+    if !state.pending_compensation_steps.is_empty() && !held_back {
         return;
     }
     let mut stuck: Vec<Box<str>> = state.unresolved.clone();
+    stuck.extend(state.pending_compensation_steps.iter().cloned());
     stuck.extend(in_flight_steps(state));
     stuck.sort();
     stuck.dedup();
@@ -1985,6 +2012,13 @@ fn depends_transitively(
     false
 }
 
+/// Whether the declared dependency graph contains a cycle.
+fn workflow_steps_are_cyclic(workflow_steps: &[SagaWorkflowStepContract]) -> bool {
+    workflow_steps
+        .iter()
+        .any(|c| depends_transitively(workflow_steps, c.step_name, c.step_name))
+}
+
 /// Emit one `CompensationRequested` per *ready* owed step (ADR-0004 §2.4).
 /// A step is ready when no other un-acknowledged owed step depends on it. With
 /// no declared graph undo is strictly serial, newest completion first.
@@ -2020,8 +2054,18 @@ fn release_compensation_frontier(
     rest.sort();
     owed.extend(rest);
 
-    let ready: Vec<Box<str>> = if workflow_steps.is_empty() {
-        if state.requested_compensation_steps.is_empty() {
+    let cyclic = workflow_steps_are_cyclic(workflow_steps);
+    if cyclic {
+        error!(
+            event = "saga_workflow_steps_cyclic",
+            run = %context.run_key(),
+            "workflow_steps contains a dependency cycle; falling back to serial undo"
+        );
+    }
+    let given_up = &state.given_up_undos;
+    let ready: Vec<Box<str>> = if workflow_steps.is_empty() || cyclic {
+        // Serial: an undo that was given up halts further releases.
+        if state.requested_compensation_steps.is_empty() && given_up.is_empty() {
             owed.first().cloned().into_iter().collect()
         } else {
             Vec::new()
@@ -2029,6 +2073,11 @@ fn release_compensation_frontier(
     } else {
         owed.iter()
             .filter(|step| !state.requested_compensation_steps.contains(*step))
+            .filter(|step| {
+                !given_up
+                    .iter()
+                    .any(|gone| gone != *step && depends_transitively(workflow_steps, gone, step))
+            })
             .filter(|step| {
                 !owed.iter().any(|other| {
                     other != *step && depends_transitively(workflow_steps, other, step)
@@ -3541,27 +3590,123 @@ mod tests {
     }
 
     #[test]
-    fn terminal_compensation_failure_quarantines_after_pending_undo_settles() {
+    fn terminal_compensation_failure_stops_releasing_and_quarantines_listing_unreleased() {
         let (mut resolver, _) = rolling_back();
         let late = resolver.ingest_at(&completed("B", 1_030, true), 1_030);
         // Serial undo (Q10): B is owed but queued behind A's outstanding undo.
         assert!(late.is_empty(), "late B queued behind A: {late:?}");
-        // A's undo fails terminally while B's undo is still pending: nothing
-        // is latched yet and never a SagaFailed.
+        // A's undo is given up on: B is never released, and with nothing
+        // outstanding the run is quarantined (never a SagaFailed).
         let out = resolver.ingest_at(&terminal_undo_failure("A", 1_040), 1_040);
-        assert_eq!(requested_steps(&out), vec![vec!["B"]], "{out:?}");
-        assert!(
-            !out.iter().any(is_terminal_event),
-            "B still pending: {out:?}"
-        );
-        let end = resolver.ingest_at(&undo_ack("B", 1_050), 1_050);
         assert!(
             matches!(
-                end.as_slice(),
-                [SagaChoreographyEvent::SagaQuarantined { step, .. }] if step.as_ref() == "A"
+                out.as_slice(),
+                [SagaChoreographyEvent::SagaQuarantined { step, reason, .. }]
+                    if step.as_ref() == "A" && reason.contains('B')
             ),
-            "an effect remains in the world: {end:?}"
+            "an effect remains; unreleased B must be listed: {out:?}"
         );
+    }
+
+    static HAZARD_STEPS: &[SagaWorkflowStepContract] = &[
+        SagaWorkflowStepContract {
+            step_name: "A",
+            participant_id: "a",
+            depends_on: WorkflowDependencySpec::OnSagaStart,
+        },
+        SagaWorkflowStepContract {
+            step_name: "B",
+            participant_id: "b",
+            depends_on: WorkflowDependencySpec::After("A"),
+        },
+    ];
+
+    static CYCLIC_STEPS: &[SagaWorkflowStepContract] = &[
+        SagaWorkflowStepContract {
+            step_name: "A",
+            participant_id: "a",
+            depends_on: WorkflowDependencySpec::After("B"),
+        },
+        SagaWorkflowStepContract {
+            step_name: "B",
+            participant_id: "b",
+            depends_on: WorkflowDependencySpec::After("A"),
+        },
+    ];
+
+    fn steps_policy(steps: &'static [SagaWorkflowStepContract]) -> TerminalPolicy {
+        let mut required = HashSet::new();
+        required.insert(Box::<str>::from("Z"));
+        TerminalPolicy::new(
+            "order_lifecycle".into(),
+            "hazard/test".into(),
+            FailureAuthority::AnyParticipant,
+            SuccessCriteria::AllOf(required),
+            Duration::from_secs(3_600),
+            Duration::from_secs(3_600),
+            steps,
+        )
+    }
+
+    #[test]
+    fn given_up_undo_does_not_release_the_step_it_depends_on() {
+        let mut resolver = TerminalResolver::new(steps_policy(HAZARD_STEPS));
+        resolver.ingest_at(&completed("A", 1_010, true), 1_010);
+        resolver.ingest_at(&completed("B", 1_015, true), 1_015);
+        let first = resolver.ingest_at(&step_failed("C", 1_020, true), 1_020);
+        // B After(A): B is the leaf and is undone first.
+        assert_eq!(requested_steps(&first), vec![vec!["B"]], "{first:?}");
+        let out = resolver.ingest_at(&terminal_undo_failure("B", 1_030), 1_030);
+        assert!(
+            !out.iter()
+                .any(|e| matches!(e, SagaChoreographyEvent::CompensationRequested { .. })),
+            "A must not be undone while B's effect is live: {out:?}"
+        );
+        assert!(
+            matches!(
+                out.as_slice(),
+                [SagaChoreographyEvent::SagaQuarantined { reason, .. }]
+                    if reason.contains('A') && reason.contains('B')
+            ),
+            "quarantine must list B and the unreleased A: {out:?}"
+        );
+    }
+
+    #[test]
+    fn serial_rollback_stops_releasing_after_an_undo_is_given_up() {
+        let mut resolver = TerminalResolver::new(rollback_policy());
+        resolver.ingest_at(&completed("A", 1_010, true), 1_010);
+        resolver.ingest_at(&completed("D", 1_012, true), 1_012);
+        let first = resolver.ingest_at(&step_failed("C", 1_020, true), 1_020);
+        assert_eq!(requested_steps(&first), vec![vec!["D"]], "{first:?}");
+        let out = resolver.ingest_at(&terminal_undo_failure("D", 1_030), 1_030);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [SagaChoreographyEvent::SagaQuarantined { reason, .. }] if reason.contains('A')
+            ),
+            "serial rollback must stop and quarantine naming A: {out:?}"
+        );
+    }
+
+    #[test]
+    fn cyclic_graph_at_rollback_falls_back_to_serial_undo() {
+        let mut resolver = TerminalResolver::new(steps_policy(CYCLIC_STEPS));
+        resolver.ingest_at(&completed("A", 1_010, true), 1_010);
+        resolver.ingest_at(&completed("B", 1_015, true), 1_015);
+        let first = resolver.ingest_at(&step_failed("C", 1_020, true), 1_020);
+        assert_eq!(requested_steps(&first), vec![vec!["B"]], "{first:?}");
+        let next = resolver.ingest_at(&undo_ack("B", 1_030), 1_030);
+        assert_eq!(requested_steps(&next), vec![vec!["A"]], "{next:?}");
+    }
+
+    #[test]
+    fn terminal_policy_validate_rejects_cyclic_workflow_steps() {
+        assert_eq!(
+            steps_policy(CYCLIC_STEPS).validate(),
+            Err(super::TerminalPolicyError::CyclicWorkflowSteps)
+        );
+        assert_eq!(steps_policy(HAZARD_STEPS).validate(), Ok(()));
     }
 
     #[test]
