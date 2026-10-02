@@ -129,11 +129,11 @@ where
             IngressOutcome::Applied
         }
 
-        // Quarantined runs are never finalized: journal rows and dedupe marks stay as evidence.
+        // Quarantined runs are never finalized or pruned: journal rows, dedupe marks and the
+        // in-memory quarantine entry stay as evidence for reconciliation.
         SagaChoreographyEvent::SagaQuarantined { reason, .. } => {
             participant.latch_terminal_saga(&run);
             participant.on_quarantined(&context, &reason);
-            participant.clear_in_memory_saga_run_tracking(&run);
             IngressOutcome::Applied
         }
 
@@ -270,7 +270,6 @@ where
         SagaChoreographyEvent::SagaQuarantined { reason, .. } => {
             participant.latch_terminal_saga(&run);
             participant.on_quarantined(&context, &reason);
-            participant.clear_in_memory_saga_run_tracking(&run);
             IngressOutcome::Applied
         }
         _ => IngressOutcome::Applied,
@@ -2182,7 +2181,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_saga_event_latches_and_prunes_on_quarantine() {
+    fn handle_saga_event_latches_and_retains_on_quarantine() {
         let mut participant = TestParticipant::default();
         let started = started_event();
         let saga_id = started.context().saga_id;
@@ -2206,7 +2205,10 @@ mod tests {
         );
 
         assert!(participant.is_terminal_saga_latched(&run));
-        assert!(!participant.saga_states().contains_key(&run));
+        assert!(
+            participant.saga_states().contains_key(&run),
+            "quarantine evidence (prior_state/compensation_data) must be retained"
+        );
 
         handle_saga_event_with_emit(
             &mut participant,
@@ -2226,6 +2228,32 @@ mod tests {
             participant.executed, 1,
             "post-quarantine replay should be ignored once the saga is terminal-latched"
         );
+    }
+
+    #[test]
+    fn quarantined_run_stays_fenced_after_terminal_latch_eviction() {
+        let mut participant = TestParticipant::default();
+        let started = started_event();
+        let run = started.context().run_key();
+        handle_saga_event_with_emit(&mut participant, started.clone(), |_| {});
+        handle_saga_event_with_emit(
+            &mut participant,
+            SagaChoreographyEvent::SagaQuarantined {
+                context: started.context().clone(),
+                reason: "uncertain".into(),
+                step: "risk_check".into(),
+                participant_id: "risk_check".into(),
+            },
+            |_| {},
+        );
+        // Simulate bounded-latch eviction.
+        participant.unlatch_terminal_saga(&run);
+        handle_saga_event_with_emit(&mut participant, started, |_| {});
+        assert_eq!(
+            participant.executed, 1,
+            "quarantined run must not re-execute"
+        );
+        assert!(participant.saga_states().contains_key(&run));
     }
 
     fn started_event_at(started_at_millis: u64) -> SagaChoreographyEvent {
