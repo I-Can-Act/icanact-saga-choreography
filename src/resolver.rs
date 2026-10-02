@@ -307,7 +307,11 @@ struct SagaResolutionState {
     completed_steps: HashSet<Box<str>>,
     failed_steps: HashSet<Box<str>>,
     compensable_steps: Vec<Box<str>>,
+    /// Owed undos not yet durably acknowledged (requested or still queued).
     pending_compensation_steps: HashSet<Box<str>>,
+    /// Subset of `pending_compensation_steps` whose request has been emitted
+    /// and not yet acknowledged (ADR-0004 §2.4 frontier).
+    requested_compensation_steps: HashSet<Box<str>>,
     completed_compensation_steps: HashSet<Box<str>>,
     /// Steps whose `CompensationStarted` was observed (duplicate detection).
     started_compensation_steps: HashSet<Box<str>>,
@@ -360,6 +364,7 @@ impl SagaResolutionState {
             abort_reason: None,
             aborting_since_millis: None,
             pending_compensation_steps: HashSet::new(),
+            requested_compensation_steps: HashSet::new(),
             completed_compensation_steps: HashSet::new(),
             started_compensation_steps: HashSet::new(),
             pending_failure: None,
@@ -562,7 +567,14 @@ impl TerminalResolver {
                 if state.phase == ResolverPhase::Aborting && *compensation_available {
                     // An accepted compensable step may produce an effect: it is
                     // owed an undo exactly like a late completion.
-                    apply_late_completion(state, context, step_name, true, &mut out);
+                    apply_late_completion(
+                        self.policy.workflow_steps,
+                        state,
+                        context,
+                        step_name,
+                        true,
+                        &mut out,
+                    );
                     return out;
                 }
                 if *compensation_available
@@ -621,6 +633,7 @@ impl TerminalResolver {
                 if state.phase == ResolverPhase::Aborting {
                     // Late forward effect during rollback: never a success.
                     apply_late_completion(
+                        self.policy.workflow_steps,
                         state,
                         context,
                         step_name,
@@ -671,6 +684,7 @@ impl TerminalResolver {
                 }
 
                 apply_step_failure(
+                    self.policy.workflow_steps,
                     state,
                     context,
                     participant_id.clone(),
@@ -707,9 +721,13 @@ impl TerminalResolver {
                 // A successful (retried) undo resolves an earlier retryable failure.
                 state.unresolved.retain(|step| step != &context.step_name);
                 if state.phase == ResolverPhase::Aborting {
-                    state
-                        .pending_compensation_steps
-                        .remove(context.step_name.as_ref());
+                    retire_compensation(state, context.step_name.as_ref());
+                    release_compensation_frontier(
+                        self.policy.workflow_steps,
+                        state,
+                        terminal_context(context),
+                        &mut out,
+                    );
                     settle(state, context, None, &mut out);
                 }
             }
@@ -741,12 +759,16 @@ impl TerminalResolver {
                         %error,
                         "compensation failed terminally; effect remains unresolved"
                     );
-                    state
-                        .pending_compensation_steps
-                        .remove(context.step_name.as_ref());
+                    retire_compensation(state, context.step_name.as_ref());
                     if !state.unresolved.contains(&context.step_name) {
                         state.unresolved.push(context.step_name.clone());
                     }
+                    release_compensation_frontier(
+                        self.policy.workflow_steps,
+                        state,
+                        terminal_context(context),
+                        &mut out,
+                    );
                     settle(state, context, None, &mut out);
                 }
             }
@@ -773,10 +795,23 @@ impl TerminalResolver {
                     .cloned()
                     .collect();
                 if state.phase == ResolverPhase::Aborting {
-                    // Per-step requests (late effects) extend the owed set.
+                    // Per-step requests extend the owed set.
+                    state
+                        .requested_compensation_steps
+                        .extend(newly_pending.iter().cloned());
                     state.pending_compensation_steps.extend(newly_pending);
                 } else {
+                    state.requested_compensation_steps = newly_pending.iter().cloned().collect();
                     state.pending_compensation_steps = newly_pending.into_iter().collect();
+                    if failed_step.as_ref() == TERMINAL_RESOLVER_STEP {
+                        // The journaled request is only the first frontier:
+                        // every other compensable effect is still owed.
+                        for step in &state.compensable_steps {
+                            if !state.completed_compensation_steps.contains(step) {
+                                state.pending_compensation_steps.insert(step.clone());
+                            }
+                        }
+                    }
                 }
                 state.phase = ResolverPhase::Aborting;
                 state.aborting_since_millis.get_or_insert(now_millis);
@@ -803,6 +838,7 @@ impl TerminalResolver {
             } => {
                 if state.phase == ResolverPhase::Running {
                     begin_internal_abort(
+                        self.policy.workflow_steps,
                         state,
                         terminal_context(context),
                         &format!("{source:?}"),
@@ -871,7 +907,13 @@ impl TerminalResolver {
                             state.unresolved.push(step.clone());
                         }
                         if state.phase == ResolverPhase::Aborting {
-                            state.pending_compensation_steps.remove(step.as_ref());
+                            retire_compensation(state, step.as_ref());
+                            release_compensation_frontier(
+                                self.policy.workflow_steps,
+                                state,
+                                terminal_context(context),
+                                &mut out,
+                            );
                             settle(state, context, None, &mut out);
                         }
                     }
@@ -1317,6 +1359,7 @@ fn accepted_step_timeout_events(
                 state.started_steps.insert(step_name.clone());
                 state.failed_steps.insert(step_name);
                 apply_step_failure(
+                    policy.workflow_steps,
                     state,
                     &context,
                     accepted.participant_id,
@@ -1358,6 +1401,7 @@ fn sync_terminal_phase(state: &mut SagaResolutionState) {
 /// effects become owed an undo; the rest stay `unresolved` until settlement
 /// quarantines the run. Never evaluates success criteria.
 fn apply_late_completion(
+    workflow_steps: &[SagaWorkflowStepContract],
     state: &mut SagaResolutionState,
     context: &SagaContext,
     step_name: Box<str>,
@@ -1366,21 +1410,15 @@ fn apply_late_completion(
 ) {
     let failure = state.pending_failure.clone();
     match failure {
-        Some(failure) if compensation_available => {
+        Some(_) if compensation_available => {
             if state.completed_compensation_steps.contains(&step_name) {
                 return;
             }
             if !state.compensable_steps.contains(&step_name) {
                 state.compensable_steps.push(step_name.clone());
             }
-            state.pending_compensation_steps.insert(step_name.clone());
-            out.push(SagaChoreographyEvent::CompensationRequested {
-                context: terminal_context(context),
-                failed_step: failure.step_name.clone(),
-                reason: "late_effect_during_rollback".into(),
-                failure,
-                steps_to_compensate: vec![step_name],
-            });
+            state.pending_compensation_steps.insert(step_name);
+            release_compensation_frontier(workflow_steps, state, terminal_context(context), out);
         }
         _ => {
             error!(
@@ -1396,7 +1434,11 @@ fn apply_late_completion(
     }
 }
 
+// The graph slice is the one input beyond the pre-existing state/event
+// parameters; bundling them would only move the arguments into a struct.
+#[allow(clippy::too_many_arguments)]
 fn apply_step_failure(
+    workflow_steps: &[SagaWorkflowStepContract],
     state: &mut SagaResolutionState,
     context: &SagaContext,
     participant_id: Box<str>,
@@ -1434,19 +1476,25 @@ fn apply_step_failure(
         for step in &steps_to_compensate {
             state.accepted_steps.remove(step.as_ref());
         }
-        state.pending_compensation_steps = steps_to_compensate.iter().cloned().collect();
+        state.pending_compensation_steps = steps_to_compensate.into_iter().collect();
+        state.requested_compensation_steps.clear();
         state.phase = ResolverPhase::Aborting;
         state
             .aborting_since_millis
             .get_or_insert(context.event_timestamp_millis);
 
-        out.push(SagaChoreographyEvent::CompensationRequested {
-            context: terminal_context(context),
-            failed_step: context.step_name.clone(),
-            reason: error.clone(),
-            failure,
-            steps_to_compensate,
-        });
+        if state.pending_compensation_steps.is_empty() {
+            // Nothing owed: still record the failure cause on the wire.
+            out.push(SagaChoreographyEvent::CompensationRequested {
+                context: terminal_context(context),
+                failed_step: context.step_name.clone(),
+                reason: error.clone(),
+                failure,
+                steps_to_compensate: Vec::new(),
+            });
+        } else {
+            release_compensation_frontier(workflow_steps, state, terminal_context(context), out);
+        }
 
         settle(
             state,
@@ -1804,7 +1852,14 @@ fn timeout_abort_events(
     match state.phase {
         ResolverPhase::Running => {
             begin_internal_abort(
-                state, context, code, reason, now_millis, now_millis, &mut out,
+                policy.workflow_steps,
+                state,
+                context,
+                code,
+                reason,
+                now_millis,
+                now_millis,
+                &mut out,
             );
         }
         ResolverPhase::Aborting => {
@@ -1857,7 +1912,11 @@ fn latch_event(
 /// Begin an internal abort (timeout / `SagaAbortRequested`): undo every known
 /// compensable effect, then fail only at clean settlement. Nothing owed and
 /// nothing in flight fails directly; unknown in-flight effects quarantine.
+// The graph slice is the one input beyond the pre-existing state/event
+// parameters; bundling them would only move the arguments into a struct.
+#[allow(clippy::too_many_arguments)]
 fn begin_internal_abort(
+    workflow_steps: &[SagaWorkflowStepContract],
     state: &mut SagaResolutionState,
     context: SagaContext,
     code: &str,
@@ -1888,17 +1947,106 @@ fn begin_internal_abort(
     };
     state.pending_failure = Some(failure.clone());
     state.abort_reason = Some(reason.clone());
-    state.pending_compensation_steps = owed.iter().cloned().collect();
+    state.pending_compensation_steps = owed.into_iter().collect();
+    state.requested_compensation_steps.clear();
     state.phase = ResolverPhase::Aborting;
     state.aborting_since_millis = Some(now_millis);
     state.last_progress_at_millis = now_millis;
-    out.push(SagaChoreographyEvent::CompensationRequested {
-        context,
-        failed_step: TERMINAL_RESOLVER_STEP.into(),
-        reason,
-        failure,
-        steps_to_compensate: owed,
-    });
+    release_compensation_frontier(workflow_steps, state, context, out);
+}
+
+/// An owed undo is finished (acknowledged, or terminally given up on).
+fn retire_compensation(state: &mut SagaResolutionState, step: &str) {
+    state.pending_compensation_steps.remove(step);
+    state.requested_compensation_steps.remove(step);
+}
+
+/// Whether `dependent` transitively depends on `step` under the declared graph.
+fn depends_transitively(
+    workflow_steps: &[SagaWorkflowStepContract],
+    dependent: &str,
+    step: &str,
+) -> bool {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut stack = vec![dependent];
+    while let Some(current) = stack.pop() {
+        if !seen.insert(current) {
+            continue;
+        }
+        for contract in workflow_steps.iter().filter(|c| c.step_name == current) {
+            for dependency in dependency_names(contract.depends_on) {
+                if dependency == step {
+                    return true;
+                }
+                stack.push(dependency);
+            }
+        }
+    }
+    false
+}
+
+/// Emit one `CompensationRequested` per *ready* owed step (ADR-0004 §2.4).
+/// A step is ready when no other un-acknowledged owed step depends on it. With
+/// no declared graph undo is strictly serial, newest completion first.
+fn release_compensation_frontier(
+    workflow_steps: &[SagaWorkflowStepContract],
+    state: &mut SagaResolutionState,
+    context: SagaContext,
+    out: &mut Vec<SagaChoreographyEvent>,
+) {
+    if state.terminal_latched || state.pending_compensation_steps.is_empty() {
+        return;
+    }
+    let Some(failure) = state.pending_failure.clone() else {
+        return;
+    };
+    let reason: Box<str> = state
+        .abort_reason
+        .clone()
+        .unwrap_or_else(|| failure.error_message.clone());
+    let mut owed: Vec<Box<str>> = state
+        .compensable_steps
+        .iter()
+        .rev()
+        .filter(|step| state.pending_compensation_steps.contains(*step))
+        .cloned()
+        .collect();
+    let mut rest: Vec<Box<str>> = state
+        .pending_compensation_steps
+        .iter()
+        .filter(|step| !owed.contains(step))
+        .cloned()
+        .collect();
+    rest.sort();
+    owed.extend(rest);
+
+    let ready: Vec<Box<str>> = if workflow_steps.is_empty() {
+        if state.requested_compensation_steps.is_empty() {
+            owed.first().cloned().into_iter().collect()
+        } else {
+            Vec::new()
+        }
+    } else {
+        owed.iter()
+            .filter(|step| !state.requested_compensation_steps.contains(*step))
+            .filter(|step| {
+                !owed.iter().any(|other| {
+                    other != *step && depends_transitively(workflow_steps, other, step)
+                })
+            })
+            .cloned()
+            .collect()
+    };
+    for step in ready {
+        state.requested_compensation_steps.insert(step.clone());
+        out.push(SagaChoreographyEvent::CompensationRequested {
+            context: context.clone(),
+            failed_step: failure.step_name.clone(),
+            reason: reason.clone(),
+            failure: failure.clone(),
+            steps_to_compensate: vec![step],
+        });
+    }
 }
 
 #[cfg(test)]
@@ -2928,10 +3076,21 @@ mod tests {
                 [SagaChoreographyEvent::CompensationRequested {
                     steps_to_compensate,
                     ..
-                }] if steps_to_compensate.as_slice()
-                    == [Box::<str>::from("second_effect"), Box::<str>::from("first_effect")]
+                }] if steps_to_compensate.as_slice() == [Box::<str>::from("second_effect")]
             ),
             "unexpected recovery output: {emitted:?}"
+        );
+        // Serial undo: the rest of the restored scope follows the ack.
+        let next = restored.ingest_at(
+            &SagaChoreographyEvent::CompensationCompleted {
+                context: ctx_at("second_effect", 41, now, now.saturating_add(4)),
+            },
+            now.saturating_add(4),
+        );
+        assert_eq!(
+            requested_steps(&next),
+            vec![vec!["first_effect"]],
+            "{next:?}"
         );
     }
 
@@ -3000,16 +3159,10 @@ mod tests {
         let (mut resolver, _) = rolling_back();
         let late = resolver.ingest_at(&completed("B", 1_030, true), 1_030);
         assert!(no_completed(&late), "success during rollback: {late:?}");
-        assert!(
-            matches!(
-                late.as_slice(),
-                [SagaChoreographyEvent::CompensationRequested { steps_to_compensate, .. }]
-                    if steps_to_compensate.as_slice() == [Box::<str>::from("B")]
-            ),
-            "late compensable B must be owed an undo: {late:?}"
-        );
-        // A's ack alone must not settle: B's undo is still owed.
-        assert!(resolver.ingest_at(&undo_ack("A", 1_040), 1_040).is_empty());
+        assert!(late.is_empty(), "late B queued behind A: {late:?}");
+        // A's ack releases B but must not settle: B's undo is still owed.
+        let next = resolver.ingest_at(&undo_ack("A", 1_040), 1_040);
+        assert_eq!(requested_steps(&next), vec![vec!["B"]], "{next:?}");
         let end = resolver.ingest_at(&undo_ack("B", 1_050), 1_050);
         assert!(matches!(
             end.as_slice(),
@@ -3242,15 +3395,9 @@ mod tests {
     fn accepted_compensable_step_during_rollback_is_owed_an_undo() {
         let (mut resolver, _) = rolling_back();
         let out = resolver.ingest_at(&accepted("B", 1_030, 9_000, 9_500, true), 1_030);
-        assert!(
-            matches!(
-                out.as_slice(),
-                [SagaChoreographyEvent::CompensationRequested { steps_to_compensate, .. }]
-                    if steps_to_compensate.as_slice() == [Box::<str>::from("B")]
-            ),
-            "{out:?}"
-        );
-        assert!(resolver.ingest_at(&undo_ack("A", 1_040), 1_040).is_empty());
+        assert!(out.is_empty(), "B queued behind A's undo: {out:?}");
+        let next = resolver.ingest_at(&undo_ack("A", 1_040), 1_040);
+        assert_eq!(requested_steps(&next), vec![vec!["B"]], "{next:?}");
         let end = resolver.ingest_at(&undo_ack("B", 1_050), 1_050);
         assert!(
             matches!(end.as_slice(), [SagaChoreographyEvent::SagaFailed { .. }]),
@@ -3312,11 +3459,13 @@ mod tests {
         let (mut resolver, _) = rolling_back();
         // B completes late and is owed an undo, so the run keeps rolling back.
         let late = resolver.ingest_at(&completed("B", 1_030, true), 1_030);
-        assert_eq!(late.len(), 1, "late B owed an undo: {late:?}");
+        // Serial undo (Q10): B is owed but queued behind A's outstanding undo.
+        assert!(late.is_empty(), "late B queued behind A: {late:?}");
         let retry = resolver.ingest_at(&retryable("A", 1_040), 1_040);
         assert_eq!(re_requests_of(&retry, "A"), vec![1], "{retry:?}");
         // A's undo is retried and succeeds: no longer unresolved.
-        assert!(resolver.ingest_at(&undo_ack("A", 1_050), 1_050).is_empty());
+        let next = resolver.ingest_at(&undo_ack("A", 1_050), 1_050);
+        assert_eq!(requested_steps(&next), vec![vec!["B"]], "{next:?}");
         let end = resolver.ingest_at(&undo_ack("B", 1_060), 1_060);
         assert!(
             matches!(end.as_slice(), [SagaChoreographyEvent::SagaFailed { .. }]),
@@ -3354,7 +3503,8 @@ mod tests {
         let (mut resolver, _) = rolling_back();
         // B completes late: undo of A and B both owed.
         let late = resolver.ingest_at(&completed("B", 1_030, true), 1_030);
-        assert_eq!(late.len(), 1, "late B owed an undo: {late:?}");
+        // Serial undo (Q10): B is owed but queued behind A's outstanding undo.
+        assert!(late.is_empty(), "late B queued behind A: {late:?}");
         // A's undo fails retryably: re-request A with attempt 1, no terminal.
         let retry = resolver.ingest_at(&retryable("A", 1_040), 1_040);
         assert_eq!(re_requests_of(&retry, "A"), vec![1], "{retry:?}");
@@ -3362,9 +3512,10 @@ mod tests {
             !retry.iter().any(is_terminal_event),
             "no terminal while undo remains: {retry:?}"
         );
-        // B's ack alone must not settle: A is still pending its retry.
-        assert!(resolver.ingest_at(&undo_ack("B", 1_050), 1_050).is_empty());
-        let end = resolver.ingest_at(&undo_ack("A", 1_060), 1_060);
+        // A's retried ack releases B; only B's ack settles.
+        let next = resolver.ingest_at(&undo_ack("A", 1_050), 1_050);
+        assert_eq!(requested_steps(&next), vec![vec!["B"]], "{next:?}");
+        let end = resolver.ingest_at(&undo_ack("B", 1_060), 1_060);
         assert!(
             matches!(end.as_slice(), [SagaChoreographyEvent::SagaFailed { .. }]),
             "{end:?}"
@@ -3393,11 +3544,16 @@ mod tests {
     fn terminal_compensation_failure_quarantines_after_pending_undo_settles() {
         let (mut resolver, _) = rolling_back();
         let late = resolver.ingest_at(&completed("B", 1_030, true), 1_030);
-        assert_eq!(late.len(), 1, "late B owed an undo: {late:?}");
+        // Serial undo (Q10): B is owed but queued behind A's outstanding undo.
+        assert!(late.is_empty(), "late B queued behind A: {late:?}");
         // A's undo fails terminally while B's undo is still pending: nothing
         // is latched yet and never a SagaFailed.
         let out = resolver.ingest_at(&terminal_undo_failure("A", 1_040), 1_040);
-        assert!(out.is_empty(), "other undo still pending: {out:?}");
+        assert_eq!(requested_steps(&out), vec![vec!["B"]], "{out:?}");
+        assert!(
+            !out.iter().any(is_terminal_event),
+            "B still pending: {out:?}"
+        );
         let end = resolver.ingest_at(&undo_ack("B", 1_050), 1_050);
         assert!(
             matches!(
@@ -3600,6 +3756,124 @@ mod tests {
         assert!(
             !resolver.poll_timeouts_at(1_151).is_empty(),
             "duplicate CompensationStarted must not extend the stall deadline"
+        );
+    }
+
+    static DEPENDENT_STEPS: &[SagaWorkflowStepContract] = &[
+        SagaWorkflowStepContract {
+            step_name: "A",
+            participant_id: "a",
+            depends_on: WorkflowDependencySpec::OnSagaStart,
+        },
+        SagaWorkflowStepContract {
+            step_name: "B",
+            participant_id: "b",
+            depends_on: WorkflowDependencySpec::After("A"),
+        },
+    ];
+
+    static INDEPENDENT_STEPS: &[SagaWorkflowStepContract] = &[
+        SagaWorkflowStepContract {
+            step_name: "A",
+            participant_id: "a",
+            depends_on: WorkflowDependencySpec::OnSagaStart,
+        },
+        SagaWorkflowStepContract {
+            step_name: "B",
+            participant_id: "b",
+            depends_on: WorkflowDependencySpec::OnSagaStart,
+        },
+    ];
+
+    fn frontier_policy(steps: &'static [SagaWorkflowStepContract]) -> TerminalPolicy {
+        let mut required = HashSet::new();
+        required.insert(Box::<str>::from("Z"));
+        TerminalPolicy::new(
+            "order_lifecycle".into(),
+            "frontier/test".into(),
+            FailureAuthority::AnyParticipant,
+            SuccessCriteria::AllOf(required),
+            Duration::from_secs(3_600),
+            Duration::from_secs(3_600),
+            steps,
+        )
+    }
+
+    /// Every `CompensationRequested` in `events`, as its step list.
+    fn requested_steps(events: &[SagaChoreographyEvent]) -> Vec<Vec<&str>> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                SagaChoreographyEvent::CompensationRequested {
+                    steps_to_compensate,
+                    ..
+                } => Some(steps_to_compensate.iter().map(AsRef::as_ref).collect()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn rollback_after(
+        policy: TerminalPolicy,
+        done: &[&str],
+    ) -> (TerminalResolver, Vec<SagaChoreographyEvent>) {
+        let mut resolver = TerminalResolver::new(policy);
+        let mut at = 1_010;
+        for step in done {
+            assert!(
+                resolver
+                    .ingest_at(&completed(step, at, true), at)
+                    .is_empty()
+            );
+            at += 10;
+        }
+        let out = resolver.ingest_at(&step_failed("F", at, true), at);
+        (resolver, out)
+    }
+
+    #[test]
+    fn dependent_compensation_waits_for_successor_undo_ack() {
+        let (mut resolver, first) = rollback_after(frontier_policy(DEPENDENT_STEPS), &["A", "B"]);
+        assert_eq!(
+            requested_steps(&first),
+            vec![vec!["B"]],
+            "only the ready frontier (B) may be requested first: {first:?}"
+        );
+        let next = resolver.ingest_at(&undo_ack("B", 2_000), 2_000);
+        assert_eq!(requested_steps(&next), vec![vec!["A"]], "{next:?}");
+        let end = resolver.ingest_at(&undo_ack("A", 2_010), 2_010);
+        assert!(
+            matches!(end.as_slice(), [SagaChoreographyEvent::SagaFailed { .. }]),
+            "{end:?}"
+        );
+    }
+
+    #[test]
+    fn independent_steps_are_requested_together_one_request_each() {
+        let (mut resolver, first) = rollback_after(frontier_policy(INDEPENDENT_STEPS), &["A", "B"]);
+        let mut requested = requested_steps(&first);
+        requested.sort();
+        assert_eq!(requested, vec![vec!["A"], vec!["B"]], "{first:?}");
+        assert!(resolver.ingest_at(&undo_ack("A", 2_000), 2_000).is_empty());
+        let end = resolver.ingest_at(&undo_ack("B", 2_010), 2_010);
+        assert!(
+            matches!(end.as_slice(), [SagaChoreographyEvent::SagaFailed { .. }]),
+            "{end:?}"
+        );
+    }
+
+    #[test]
+    fn undeclared_graph_undoes_strictly_serially_newest_first() {
+        let (mut resolver, first) = rollback_after(frontier_policy(&[]), &["A", "B", "C"]);
+        assert_eq!(requested_steps(&first), vec![vec!["C"]], "{first:?}");
+        for (acked, expect, at) in [("C", "B", 2_000), ("B", "A", 2_010)] {
+            let next = resolver.ingest_at(&undo_ack(acked, at), at);
+            assert_eq!(requested_steps(&next), vec![vec![expect]], "{next:?}");
+        }
+        let end = resolver.ingest_at(&undo_ack("A", 2_020), 2_020);
+        assert!(
+            matches!(end.as_slice(), [SagaChoreographyEvent::SagaFailed { .. }]),
+            "{end:?}"
         );
     }
 }
