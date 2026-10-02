@@ -260,7 +260,7 @@ where
         .iter()
         .map(|saga_type| {
             let forwarder = Arc::clone(&forwarder);
-            bus.subscribe_saga_type_fn(saga_type, move |event| {
+            bus.subscribe_participant_fn(saga_type, &[], move |event| {
                 lock_or_recover(&forwarder).forward(event.clone())
             })
         })
@@ -290,7 +290,7 @@ where
         .iter()
         .map(|saga_type| {
             let forwarder = Arc::clone(&forwarder);
-            bus.subscribe_saga_type_fn(saga_type, move |event| {
+            bus.subscribe_participant_fn(saga_type, &[], move |event| {
                 lock_or_recover(&forwarder).forward(event.clone())
             })
         })
@@ -390,7 +390,7 @@ where
         .map(|saga_type| {
             let actor_ref = actor_ref.clone();
             let map_event = std::sync::Arc::clone(&map_event);
-            bus.subscribe_saga_type_fn(saga_type, move |event| {
+            bus.subscribe_participant_fn(saga_type, &[], move |event| {
                 actor_ref.try_tell(map_event(event.clone())).is_ok()
             })
         })
@@ -457,7 +457,7 @@ where
         .iter()
         .map(|saga_type| {
             let forwarder = Arc::clone(&forwarder);
-            bus.subscribe_saga_type_fn(saga_type, move |event| {
+            bus.subscribe_participant_fn(saga_type, &[], move |event| {
                 lock_or_recover(&forwarder).forward(event.clone())
             })
         })
@@ -487,7 +487,7 @@ where
         .iter()
         .map(|saga_type| {
             let forwarder = Arc::clone(&forwarder);
-            bus.subscribe_saga_type_fn(saga_type, move |event| {
+            bus.subscribe_participant_fn(saga_type, &[], move |event| {
                 lock_or_recover(&forwarder).forward(event.clone())
             })
         })
@@ -587,7 +587,7 @@ where
         .map(|saga_type| {
             let actor_ref = actor_ref.clone();
             let map_event = std::sync::Arc::clone(&map_event);
-            bus.subscribe_saga_type_fn(saga_type, move |event| {
+            bus.subscribe_participant_fn(saga_type, &[], move |event| {
                 actor_ref.try_tell(map_event(event.clone())).is_ok()
             })
         })
