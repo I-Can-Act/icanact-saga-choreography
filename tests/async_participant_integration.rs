@@ -10,6 +10,14 @@ use icanact_saga_choreography::{
     complete_accepted_workflow_step,
 };
 
+/// Fixtures use fixed 2023 timestamps; a horizon this long keeps them inside the replay window.
+fn fixture_horizon() -> icanact_saga_choreography::ReplayHorizon {
+    icanact_saga_choreography::ReplayHorizon::new(std::time::Duration::from_secs(
+        100 * 365 * 24 * 3600,
+    ))
+    .expect("horizon above the floor")
+}
+
 struct AsyncTestParticipant {
     saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
     dependency_spec: DependencySpec,
@@ -22,7 +30,8 @@ struct AsyncTestParticipant {
 impl Default for AsyncTestParticipant {
     fn default() -> Self {
         Self {
-            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new())
+                .with_replay_horizon(fixture_horizon()),
             dependency_spec: DependencySpec::OnSagaStart,
             execute_output: Ok(StepOutput::Completed {
                 output: b"ok".to_vec(),
@@ -103,8 +112,8 @@ fn test_context(saga_id: u64) -> SagaContext {
         step_index: 0,
         attempt: 0,
         initiator_peer_id: PeerId::default(),
-        saga_started_at_millis: 1_700_000_000_000,
-        event_timestamp_millis: 1_700_000_000_000,
+        saga_started_at_millis: fixture_millis(0),
+        event_timestamp_millis: fixture_millis(0),
     }
 }
 
@@ -245,13 +254,10 @@ async fn async_ingress_non_ambiguous_compensation_failure_keeps_local_failed_sta
         .read(SagaId::new(1))
         .expect("journal read should succeed");
     assert!(matches!(
-        entries.last(),
-        Some(icanact_saga_choreography::JournalEntry {
-            event: ParticipantEvent::CompensationFailed {
-                error,
-                is_ambiguous: false,
-                ..
-            },
+        entries.last().map(|entry| entry.event.transition()),
+        Some(ParticipantEvent::CompensationFailed {
+            error,
+            is_ambiguous: false,
             ..
         }) if error.as_ref() == "undo failed"
     ));
@@ -318,4 +324,11 @@ async fn async_ingress_tombstones_an_accepted_step_after_terminal_timeout() {
         late,
         Err(AcceptedStepError::AlreadyResolved { .. })
     ));
+}
+
+/// Process-constant, recent base for run fixtures: the resolver admits runs against the real
+/// clock, so fixture incarnations must be recent and constant across one run.
+fn fixture_millis(offset: u64) -> u64 {
+    static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BASE.get_or_init(SagaContext::now_millis) + offset
 }

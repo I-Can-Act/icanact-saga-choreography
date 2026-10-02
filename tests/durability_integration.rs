@@ -18,8 +18,8 @@ use icanact_saga_choreography::{
 };
 use icanact_saga_choreography::{
     CompensationError, DependencySpec, HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal,
-    JournalEntry, ParticipantDedupeStore, ParticipantEvent, ParticipantJournal,
-    SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant,
+    JournalEntry, ParticipantDedupeStore, ParticipantEvent, ParticipantJournal, RunIncarnation,
+    RunKey, SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant,
     SagaParticipantState, SagaParticipantSupport, SagaStateEntry, SagaStateExt, StepError,
     StepExecutionId, StepOutput,
 };
@@ -132,7 +132,7 @@ impl SagaParticipant for TestParticipant {
 }
 
 fn context(saga_id: u64, saga_type: &'static str, step_name: &'static str) -> SagaContext {
-    let now = SagaContext::now_millis();
+    let now = run_start_millis();
     SagaContext {
         saga_id: SagaId::new(saga_id),
         saga_type: saga_type.into(),
@@ -146,6 +146,17 @@ fn context(saga_id: u64, saga_type: &'static str, step_name: &'static str) -> Sa
         saga_started_at_millis: now,
         event_timestamp_millis: now,
     }
+}
+
+/// State of the (only) run of `saga_id`; run keys embed the start time, so tests look up by id.
+fn state_of_saga(
+    states: &std::collections::HashMap<icanact_saga_choreography::RunKey, SagaStateEntry>,
+    saga_id: u64,
+) -> Option<&SagaStateEntry> {
+    states
+        .iter()
+        .find(|(run, _)| run.saga_id() == SagaId::new(saga_id))
+        .map(|(_, entry)| entry)
 }
 
 #[cfg(feature = "lmdb")]
@@ -270,12 +281,12 @@ fn lmdb_open_recovers_accepted_steps_for_each_declared_saga_type() {
     assert!(
         support
             .accepted_workflow_steps
-            .contains_key(&open_context.saga_id)
+            .contains_key(&open_context.run_key())
     );
     assert!(
         support
             .accepted_workflow_steps
-            .contains_key(&close_context.saga_id)
+            .contains_key(&close_context.run_key())
     );
 }
 
@@ -306,10 +317,15 @@ fn lmdb_multi_saga_open_only_replays_stale_journal_with_exact_type_evidence() {
             },
         )
         .expect("untyped legacy event should persist");
+    let typed_run = RunKey::new(
+        OPEN_POSITION,
+        SagaId::new(193),
+        RunIncarnation::new(SagaContext::now_millis()),
+    );
     support
         .journal
-        .append(
-            SagaId::new(193),
+        .append_run(
+            &typed_run,
             ParticipantEvent::SagaRegistered {
                 saga_type: OPEN_POSITION.into(),
                 step_name: TEST_STEP.into(),
@@ -319,8 +335,8 @@ fn lmdb_multi_saga_open_only_replays_stale_journal_with_exact_type_evidence() {
         .expect("typed registration should persist");
     support
         .journal
-        .append(
-            SagaId::new(193),
+        .append_run(
+            &typed_run,
             ParticipantEvent::Quarantined {
                 reason: panic_quarantine_reason(
                     ActiveSagaExecutionPhase::StepExecution,
@@ -458,7 +474,7 @@ fn lmdb_open_rehydrates_expired_compensable_step_with_forward_tombstone() {
     assert_eq!(
         support
             .accepted_workflow_steps
-            .get(&ctx.saga_id)
+            .get(&ctx.run_key())
             .expect("expired compensable step must recover")
             .compensation_data,
         b"cancel-order-92"
@@ -531,7 +547,7 @@ fn ingress_applies_side_effects_and_publishes_valid_emitted_events() {
     assert_eq!(emitted_transition_calls, 2);
     assert_eq!(DELIVERED_STEP_COMPLETED.load(Ordering::Relaxed), 1);
     assert!(matches!(
-        participant.saga_states_ref().get(&SagaId::new(10)),
+        state_of_saga(participant.saga_states_ref(), 10),
         Some(SagaStateEntry::Completed(_))
     ));
 }
@@ -574,16 +590,11 @@ fn ingress_suppresses_invalid_emitted_transition_when_state_is_missing() {
     assert_eq!(invalid_transition_calls, 1);
     assert_eq!(emitted_transition_calls, 1);
     assert_eq!(DELIVERED_STEP_COMPLETED.load(Ordering::Relaxed), 0);
-    assert!(
-        participant
-            .saga_states_ref()
-            .get(&SagaId::new(11))
-            .is_none()
-    );
+    assert!(state_of_saga(participant.saga_states_ref(), 11).is_none());
 }
 
 #[test]
-fn panic_quarantine_records_journal_marks_dedupe_and_publishes() {
+fn panic_quarantine_records_journal_publishes_and_leaves_no_dedupe_mark() {
     let mut participant = TestParticipant::new(TEST_STEP, ExecuteMode::Normal);
 
     let bus = SagaChoreographyBus::new();
@@ -626,8 +637,10 @@ fn panic_quarantine_records_journal_marks_dedupe_and_publishes() {
         .expect("panic quarantine reason should be recorded");
     assert!(is_panic_quarantine_reason(panic_reason.as_ref()));
 
+    // ADR-0003 §2.3 / W4-review R6: publication is never marked; the quarantine is re-derived
+    // from the journal on every startup.
     assert!(
-        participant
+        !participant
             .saga
             .dedupe
             .contains(saga_context.saga_id, PANIC_QUARANTINE_PUBLISH_KEY,)
@@ -636,15 +649,19 @@ fn panic_quarantine_records_journal_marks_dedupe_and_publishes() {
 }
 
 #[test]
-fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
+fn recovery_collection_replays_panic_quarantine_until_sent_and_classifies_states() {
     let journal = InMemoryJournal::new();
     let dedupe = InMemoryDedupe::new();
 
     let saga_id = SagaId::new(13);
     let reason = panic_quarantine_reason(ActiveSagaExecutionPhase::CompensationExecution, "boom");
     journal
-        .append(
-            saga_id,
+        .append_run(
+            &RunKey::new(
+                "mature_pool_refresh",
+                saga_id,
+                RunIncarnation::new(SagaContext::now_millis()),
+            ),
             ParticipantEvent::Quarantined {
                 reason,
                 quarantined_at_millis: SagaContext::now_millis(),
@@ -673,9 +690,12 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
         "mature_pool_refresh",
     )
     .expect("startup recovery should collect");
-    assert!(
-        second.is_empty(),
-        "dedupe should prevent duplicate replay events"
+    // R09/ADR-0003: no pre-marked replay key; the emission is re-derived until it is sent
+    // (receivers are idempotent per RunKey), so a crash before the send cannot lose it.
+    assert_eq!(
+        second.len(),
+        1,
+        "panic quarantine emission must be re-derived on every startup"
     );
 
     let stale_entries = vec![JournalEntry {
@@ -880,8 +900,14 @@ fn base_state(
         saga_id.get(),
         saga_id.get(),
         [0; 32],
-        SagaContext::now_millis(),
+        run_start_millis(),
     )
+}
+
+/// One start time per process, so every context/state built for a saga lands in the same run.
+fn run_start_millis() -> u64 {
+    static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BASE.get_or_init(SagaContext::now_millis)
 }
 
 fn completed_entry(saga_id: SagaId, saga_type: &str, step_name: &str) -> SagaStateEntry {
@@ -969,11 +995,24 @@ impl icanact_saga_choreography::durability::SagaLmdbBackedActor for FailingLmdbB
 #[derive(Clone)]
 struct StaticJournal {
     rows: Vec<(SagaId, Vec<JournalEntry>)>,
+    runs: Vec<(RunKey, Vec<JournalEntry>)>,
 }
 
 impl StaticJournal {
+    /// Legacy `SagaId` rows (no run identity).
     fn new(rows: Vec<(SagaId, Vec<JournalEntry>)>) -> Self {
-        Self { rows }
+        Self {
+            rows,
+            runs: Vec::new(),
+        }
+    }
+
+    /// Run-scoped rows.
+    fn new_runs(runs: Vec<(RunKey, Vec<JournalEntry>)>) -> Self {
+        Self {
+            rows: Vec::new(),
+            runs,
+        }
     }
 }
 
@@ -992,20 +1031,83 @@ impl ParticipantJournal for StaticJournal {
         &self,
         saga_id: SagaId,
     ) -> Result<Vec<JournalEntry>, icanact_saga_choreography::JournalError> {
-        Ok(self
+        let mut entries: Vec<JournalEntry> = self
             .rows
             .iter()
             .find(|(id, _)| *id == saga_id)
             .map(|(_, entries)| entries.clone())
-            .unwrap_or_default())
+            .unwrap_or_default();
+        for (run, run_entries) in &self.runs {
+            if run.saga_id() == saga_id {
+                entries.extend(run_entries.iter().cloned());
+            }
+        }
+        Ok(entries)
     }
 
     fn list_sagas(&self) -> Result<Vec<SagaId>, icanact_saga_choreography::JournalError> {
-        Ok(self.rows.iter().map(|(id, _)| *id).collect())
+        let mut ids: Vec<SagaId> = self.rows.iter().map(|(id, _)| *id).collect();
+        ids.extend(self.runs.iter().map(|(run, _)| run.saga_id()));
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
     }
 
     fn prune(&self, _saga_id: SagaId) -> Result<(), icanact_saga_choreography::JournalError> {
         Ok(())
+    }
+
+    fn append_run(
+        &self,
+        _run: &icanact_saga_choreography::RunKey,
+        _event: ParticipantEvent,
+    ) -> Result<u64, icanact_saga_choreography::JournalError> {
+        Err(icanact_saga_choreography::JournalError::Storage(
+            "append not supported in StaticJournal".into(),
+        ))
+    }
+
+    fn read_run(
+        &self,
+        run: &icanact_saga_choreography::RunKey,
+    ) -> Result<Vec<JournalEntry>, icanact_saga_choreography::JournalError> {
+        Ok(self
+            .runs
+            .iter()
+            .find(|(candidate, _)| candidate == run)
+            .map(|(_, entries)| entries.clone())
+            .unwrap_or_default())
+    }
+
+    fn list_runs(
+        &self,
+    ) -> Result<Vec<icanact_saga_choreography::RunKey>, icanact_saga_choreography::JournalError>
+    {
+        Ok(self.runs.iter().map(|(run, _)| run.clone()).collect())
+    }
+
+    fn finalize_run(
+        &self,
+        _tombstone: &icanact_saga_choreography::RunTombstone,
+        _cutoff: icanact_saga_choreography::RunIncarnation,
+    ) -> Result<(), icanact_saga_choreography::JournalError> {
+        Ok(())
+    }
+
+    fn run_tombstones(
+        &self,
+        _saga_type: &str,
+        _saga_id: SagaId,
+    ) -> Result<Vec<icanact_saga_choreography::RunTombstone>, icanact_saga_choreography::JournalError>
+    {
+        Ok(Vec::new())
+    }
+
+    fn prune_expired_tombstones(
+        &self,
+        _cutoff: icanact_saga_choreography::RunIncarnation,
+    ) -> Result<u64, icanact_saga_choreography::JournalError> {
+        Ok(0)
     }
 }
 
@@ -1092,7 +1194,7 @@ fn helper_and_wrapper_apis_cover_default_branches() {
         |_invalid| {},
     );
     assert!(matches!(
-        participant.saga_states_ref().get(&SagaId::new(77)),
+        state_of_saga(participant.saga_states_ref(), 77),
         Some(SagaStateEntry::Completed(_))
     ));
 
@@ -1174,8 +1276,12 @@ fn helper_and_wrapper_apis_cover_default_branches() {
 #[test]
 fn startup_recovery_collectors_cover_default_and_stale_paths() {
     let stale_saga = SagaId::new(88);
-    let stale_journal = StaticJournal::new(vec![(
-        stale_saga,
+    let stale_journal = StaticJournal::new_runs(vec![(
+        RunKey::new(
+            "mature_pool_refresh",
+            stale_saga,
+            RunIncarnation::new(SagaContext::now_millis()),
+        ),
         vec![JournalEntry {
             sequence: 1,
             recorded_at_millis: 0,
@@ -1195,17 +1301,22 @@ fn startup_recovery_collectors_cover_default_and_stale_paths() {
     assert_eq!(stale_events.len(), 1);
     assert!(matches!(
         &stale_events[0],
-        SagaChoreographyEvent::SagaFailed { context, reason, .. }
+        SagaChoreographyEvent::SagaAbortRequested { context, reason, source }
             if context.saga_type.as_ref() == "mature_pool_refresh"
                 && context.saga_id == stale_saga
-                && reason.as_ref().contains("startup recovery quarantined stale saga")
+                && *source == icanact_saga_choreography::AbortSource::StaleRecovery
+                && reason.as_ref().contains("stale saga")
     ));
 
     let default_saga = SagaId::new(89);
     let default_journal = InMemoryJournal::new();
     default_journal
-        .append(
-            default_saga,
+        .append_run(
+            &RunKey::new(
+                DEFAULT_RECOVERY_SAGA_TYPE,
+                default_saga,
+                RunIncarnation::new(SagaContext::now_millis()),
+            ),
             ParticipantEvent::Quarantined {
                 reason: panic_quarantine_reason(ActiveSagaExecutionPhase::StepExecution, "boom"),
                 quarantined_at_millis: SagaContext::now_millis(),

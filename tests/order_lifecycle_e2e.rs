@@ -9,6 +9,8 @@
 //! panics, idempotency, dependency gating, and terminal latch.
 
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use icanact_core::local_sync;
@@ -321,7 +323,10 @@ impl SagaParticipant for ConfigurableParticipant {
 // ---------------------------------------------------------------------------
 
 fn context_for(saga_id: u64) -> SagaContext {
-    let now = SagaContext::now_millis();
+    let now = {
+        static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *BASE.get_or_init(SagaContext::now_millis)
+    };
     SagaContext {
         saga_id: SagaId::new(saga_id),
         saga_type: SAGA_TYPE.into(),
@@ -354,15 +359,15 @@ fn test_policy() -> TerminalPolicy {
     required.insert(STEP_POSITION.into());
     required.insert(STEP_BALANCE.into());
     required.insert(STEP_ORDER.into());
-    TerminalPolicy {
-        saga_type: SAGA_TYPE.into(),
-        policy_id: "order_lifecycle/e2e_test".into(),
-        failure_authority: FailureAuthority::AnyParticipant,
-        success_criteria: SuccessCriteria::AllOf(required),
-        overall_timeout: Duration::from_secs(60),
-        stalled_timeout: Duration::from_secs(60),
-        workflow_steps: OrderLifecycleE2eContract::steps(),
-    }
+    TerminalPolicy::new(
+        SAGA_TYPE.into(),
+        "order_lifecycle/e2e_test".into(),
+        FailureAuthority::AnyParticipant,
+        SuccessCriteria::AllOf(required),
+        Duration::from_secs(60),
+        Duration::from_secs(60),
+        OrderLifecycleE2eContract::steps(),
+    )
 }
 
 struct OrderLifecycleE2eContract;
@@ -414,7 +419,20 @@ fn new_e2e_bus() -> SagaChoreographyBus {
         bus.register_bound_workflow_step(SAGA_TYPE, step)
             .expect("order lifecycle test step binding should succeed");
     }
+    // The saga initiator's lane: `start` is the contract's first step, a real
+    // recipient of SagaStarted, so it needs a participant tagged with it.
+    let _ = bus.subscribe_participant_fn(SAGA_TYPE, &[STEP_START], |_event| true);
     bus
+}
+
+/// A passive lane for a required step this test does not spawn (the step is
+/// driven by hand or emitted manually): a participant tagged with the step that
+/// accepts deliveries. Untagged receipts never stand in for a required step.
+fn serve_step(
+    bus: &SagaChoreographyBus,
+    step: &'static str,
+) -> icanact_core::local::FirehoseSubscription {
+    bus.subscribe_participant_fn(SAGA_TYPE, &[step], |_event| true)
 }
 
 /// Mailbox capacity large enough for synchronous re-entrant bus dispatch cascades.
@@ -432,6 +450,7 @@ fn spawn_and_subscribe(
     SpawnedParticipant,
 ) {
     participant.attach_bus(bus.clone());
+    let step_name = participant.step_name;
     let opts = local_sync::SpawnOpts {
         mailbox_capacity: MAILBOX_CAPACITY,
         ..Default::default()
@@ -442,6 +461,7 @@ fn spawn_and_subscribe(
         bus,
         &actor_ref,
         &[SAGA_TYPE],
+        &[step_name],
         "saga",
         MAILBOX_CAPACITY,
     )
@@ -470,7 +490,7 @@ fn spawn_terminal_probe(
     let (probe_ref, handle) = world.spawn_sync_with_opts(TerminalProbe::new(), opts);
     handle.wait_for_startup();
     let ref_clone = probe_ref.clone();
-    let probe = bus.subscribe_saga_type_fn(SAGA_TYPE, move |event: &SagaChoreographyEvent| {
+    let probe = bus.subscribe_fn(SAGA_TYPE, move |event: &SagaChoreographyEvent| {
         let _ = ref_clone.try_tell(TerminalProbeMsg(event.clone()));
         true
     });
@@ -872,20 +892,20 @@ fn order_fails_require_compensation_triggers_full_compensation() {
 }
 
 // ===========================================================================
-// Test 6: Position compensation fails Terminal -> SagaFailed
+// Test 6: Position compensation fails Terminal -> SagaQuarantined (Q9)
 // ===========================================================================
 
 #[test]
-fn position_compensation_fails_terminal_causes_saga_failed() {
+fn position_compensation_fails_terminal_quarantines() {
     let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
+    let _lane_0 = serve_step(&bus, STEP_BALANCE);
+    let _lane_1 = serve_step(&bus, STEP_ORDER);
     let _resolver = bus
         .attach_terminal_resolver(test_policy(), "e2e-resolver")
         .expect("terminal resolver should attach");
     let (terminal_ref, terminal_h) = spawn_terminal_probe(&world, &bus);
-    let _pad_sub_a = bus.subscribe_saga_type_fn(SAGA_TYPE, |_event| true);
-    let _pad_sub_b = bus.subscribe_saga_type_fn(SAGA_TYPE, |_event| true);
 
     let (p_ref, p_h) = spawn_and_subscribe(
         &world,
@@ -911,7 +931,9 @@ fn position_compensation_fails_terminal_causes_saga_failed() {
         requires_compensation: true,
     });
 
-    wait_until(TIMEOUT, || query_terminal_counts(&terminal_ref).failed >= 1);
+    wait_until(TIMEOUT, || {
+        query_terminal_counts(&terminal_ref).quarantined >= 1
+    });
 
     wait_until(TIMEOUT, || query_state(&p_ref).compensated_count >= 1);
 
@@ -919,8 +941,8 @@ fn position_compensation_fails_terminal_causes_saga_failed() {
         query_terminal_counts(&terminal_ref),
         TerminalCounts {
             completed: 0,
-            failed: 1,
-            quarantined: 0,
+            failed: 0,
+            quarantined: 1,
         }
     );
     assert_eq!(
@@ -989,7 +1011,7 @@ fn balance_compensation_fails_ambiguous_causes_quarantine() {
 // ===========================================================================
 
 #[test]
-fn balance_compensation_fails_safe_to_retry_causes_failed() {
+fn balance_compensation_fails_safe_to_retry_is_not_a_clean_failure() {
     let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
@@ -1003,7 +1025,7 @@ fn balance_compensation_fails_safe_to_retry_causes_failed() {
         &bus,
         ConfigurableParticipant::new(STEP_POSITION, DependencySpec::OnSagaStart),
     );
-    let (_b_ref, b_h) = spawn_and_subscribe(
+    let (b_ref, b_h) = spawn_and_subscribe(
         &world,
         &bus,
         ConfigurableParticipant::new(STEP_BALANCE, DependencySpec::OnSagaStart)
@@ -1027,14 +1049,25 @@ fn balance_compensation_fails_safe_to_retry_causes_failed() {
         payload: vec![42],
     });
 
-    wait_until(TIMEOUT, || query_terminal_counts(&terminal_ref).failed >= 1);
+    // T13P/T13R: `SafeToRetry` reaches the resolver as `CompensationFailedRetryable`, which is
+    // re-requested within the retry budget; once the participant keeps failing the budget is
+    // exhausted and the saga is quarantined (never a clean `SagaFailed`).
+    wait_until(TIMEOUT, || {
+        query_terminal_counts(&terminal_ref).quarantined >= 1
+    });
     assert_eq!(
         query_terminal_counts(&terminal_ref),
         TerminalCounts {
             completed: 0,
-            failed: 1,
-            quarantined: 0,
+            failed: 0,
+            quarantined: 1,
         }
+    );
+    // One initial attempt plus the default budget of 3 re-requests.
+    assert_eq!(
+        query_state(&b_ref).compensated_count,
+        4,
+        "balance undo is retried up to the budget before quarantine"
     );
     p_h.shutdown();
     b_h.shutdown();
@@ -1168,10 +1201,19 @@ fn order_panics_after_both_succeed() {
     let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
+    let _lane_0 = serve_step(&bus, STEP_ORDER);
     let _resolver = bus
         .attach_terminal_resolver(test_policy(), "e2e-resolver")
         .expect("terminal resolver should attach");
     let (terminal_ref, terminal_h) = spawn_terminal_probe(&world, &bus);
+    let aborted = Arc::new(AtomicBool::new(false));
+    let aborted_probe = Arc::clone(&aborted);
+    let _observer = bus.subscribe_fn(SAGA_TYPE, move |event| {
+        if matches!(event, SagaChoreographyEvent::SagaAbortRequested { .. }) {
+            aborted_probe.store(true, Ordering::SeqCst);
+        }
+        true
+    });
 
     let (p_ref, p_h) = spawn_and_subscribe(
         &world,
@@ -1219,6 +1261,10 @@ fn order_panics_after_both_succeed() {
     wait_until(TIMEOUT, || {
         query_terminal_counts(&terminal_ref).quarantined >= 1
     });
+    assert!(
+        !aborted.load(Ordering::SeqCst),
+        "setup must not trigger a delivery-shortfall abort: it races step completion and makes the resolver compensate"
+    );
     assert_eq!(
         query_state(&p_ref).compensated_count,
         0,
@@ -1478,12 +1524,11 @@ fn duplicate_compensation_request_is_deduped() {
     let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
+    let _lane_0 = serve_step(&bus, STEP_BALANCE);
+    let _lane_1 = serve_step(&bus, STEP_ORDER);
     let _resolver = bus
         .attach_terminal_resolver(test_policy(), "e2e-resolver")
         .expect("terminal resolver should attach");
-    let _pad_sub_a = bus.subscribe_saga_type_fn(SAGA_TYPE, |_event| true);
-    let _pad_sub_b = bus.subscribe_saga_type_fn(SAGA_TYPE, |_event| true);
-    let _pad_sub_c = bus.subscribe_saga_type_fn(SAGA_TYPE, |_event| true);
 
     let (p_ref, p_h) = spawn_and_subscribe(
         &world,

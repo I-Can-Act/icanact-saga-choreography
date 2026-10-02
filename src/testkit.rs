@@ -5,6 +5,13 @@ use crate::{
     SagaStateExt, apply_sync_workflow_participant_saga_ingress, handle_saga_event_with_emit,
 };
 
+/// Process-constant recent run incarnation: terminal resolvers fence runs against the real
+/// clock, so a fixed epoch would be rejected as an expired incarnation.
+fn fixture_start_millis() -> u64 {
+    static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BASE.get_or_init(SagaContext::now_millis)
+}
+
 /// Small deterministic builder for saga test contexts.
 #[derive(Debug, Clone)]
 pub struct DeterministicContextBuilder {
@@ -27,8 +34,8 @@ impl Default for DeterministicContextBuilder {
             correlation_id: 1,
             causation_id: 1,
             trace_id: 1,
-            started_at_millis: 1_700_000_000_000,
-            event_at_millis: 1_700_000_000_000,
+            started_at_millis: fixture_start_millis(),
+            event_at_millis: fixture_start_millis(),
         }
     }
 }
@@ -516,8 +523,14 @@ impl SagaTestWorld {
     {
         actor.attach_saga_bus(self.bus.clone());
         let saga_types: Vec<&'static str> = actor.saga_types().to_vec();
+        let step_name = actor.step_name().to_string();
         let (actor_ref, handle) = icanact_core::local_sync::spawn_with_opts(actor, opts);
-        self.register_sync_subscriptions(actor_ref.clone(), &saga_types, map_event);
+        self.register_sync_subscriptions(
+            actor_ref.clone(),
+            &saga_types,
+            &[step_name.as_str()],
+            map_event,
+        );
         SyncSagaParticipantHandle { actor_ref, handle }
     }
 
@@ -535,11 +548,13 @@ impl SagaTestWorld {
     {
         actor.attach_saga_bus(self.bus.clone());
         let saga_types: Vec<&'static str> = actor.saga_types().to_vec();
+        let step_name = actor.step_name().to_string();
         let (actor_ref, handle) = icanact_core::local_sync::spawn(actor);
         let subs = bind_sync_participant_channel::<A, C>(
             &self.bus,
             &actor_ref,
             &saga_types,
+            &[step_name.as_str()],
             channel_name,
             channel_capacity,
         )
@@ -645,8 +660,14 @@ impl SagaTestWorld {
     {
         actor.attach_saga_bus(self.bus.clone());
         let saga_types: Vec<&'static str> = actor.saga_types().to_vec();
+        let step_name = actor.step_name().to_string();
         let (actor_ref, handle) = icanact_core::local_async::spawn_with_opts(actor, opts).await;
-        self.register_async_subscriptions(actor_ref.clone(), &saga_types, map_event);
+        self.register_async_subscriptions(
+            actor_ref.clone(),
+            &saga_types,
+            &[step_name.as_str()],
+            map_event,
+        );
         AsyncSagaParticipantHandle { actor_ref, handle }
     }
 
@@ -664,6 +685,7 @@ impl SagaTestWorld {
     {
         actor.attach_saga_bus(self.bus.clone());
         let saga_types: Vec<&'static str> = actor.saga_types().to_vec();
+        let step_name = actor.step_name().to_string();
         let (actor_ref, handle) = icanact_core::local_async::spawn_with_opts(
             actor,
             icanact_core::local_async::SpawnOpts::default(),
@@ -673,6 +695,7 @@ impl SagaTestWorld {
             &self.bus,
             &actor_ref,
             &saga_types,
+            &[step_name.as_str()],
             channel_name,
             channel_capacity,
         )
@@ -740,6 +763,7 @@ impl SagaTestWorld {
         &self,
         actor_ref: icanact_core::local_sync::SyncActorRef<A>,
         saga_types: &[&'static str],
+        steps: &[&str],
         map_event: F,
     ) where
         A: icanact_core::local_sync::SyncActor,
@@ -751,9 +775,11 @@ impl SagaTestWorld {
             self.ensure_capture_saga_type(saga_type);
             let actor_ref = actor_ref.clone();
             let map_event = Arc::clone(&map_event);
-            let sub = self.bus.subscribe_saga_type_fn(saga_type, move |event| {
-                actor_ref.tell(map_event(event.clone()))
-            });
+            let sub = self
+                .bus
+                .subscribe_participant_fn(saga_type, steps, move |event| {
+                    actor_ref.tell(map_event(event.clone()))
+                });
             let _ = sub;
         }
     }
@@ -762,6 +788,7 @@ impl SagaTestWorld {
         &self,
         actor_ref: icanact_core::local_async::AsyncActorRef<A>,
         saga_types: &[&'static str],
+        steps: &[&str],
         map_event: F,
     ) where
         A: icanact_core::local_async::AsyncActor,
@@ -773,9 +800,11 @@ impl SagaTestWorld {
             self.ensure_capture_saga_type(saga_type);
             let actor_ref = actor_ref.clone();
             let map_event = Arc::clone(&map_event);
-            let sub = self.bus.subscribe_saga_type_fn(saga_type, move |event| {
-                actor_ref.tell(map_event(event.clone()))
-            });
+            let sub = self
+                .bus
+                .subscribe_participant_fn(saga_type, steps, move |event| {
+                    actor_ref.tell(map_event(event.clone()))
+                });
             let _ = sub;
         }
     }
@@ -859,7 +888,14 @@ mod tests {
     impl Default for TestParticipant {
         fn default() -> Self {
             Self {
-                saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+                saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new())
+                    // fixtures use fixed 2023 timestamps; keep them inside the replay window
+                    .with_replay_horizon(
+                        crate::ReplayHorizon::new(std::time::Duration::from_secs(
+                            100 * 365 * 24 * 3600,
+                        ))
+                        .expect("horizon above the floor"),
+                    ),
                 called: false,
             }
         }

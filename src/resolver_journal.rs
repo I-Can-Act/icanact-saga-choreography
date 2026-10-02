@@ -205,14 +205,25 @@ pub mod lmdb {
             let mut entries = Vec::new();
             for row in iter {
                 let (_, bytes) = row.map_err(storage_error)?;
-                let entry =
-                    rkyv::from_bytes::<TerminalResolverJournalEntry, rkyv::rancor::Error>(bytes)
-                        .map_err(storage_error)?;
+                let entry = decode_entry(bytes).inspect_err(|error| {
+                    tracing::error!(error = %error, "terminal resolver journal row failed to decode");
+                })?;
                 entries.push(entry);
             }
             entries.sort_by_key(|entry| entry.sequence);
             Ok(entries)
         }
+    }
+
+    /// Decodes a row from LMDB's mmap bytes, which carry no alignment guarantee,
+    /// by first copying into an aligned buffer.
+    pub(super) fn decode_entry(
+        raw: &[u8],
+    ) -> Result<TerminalResolverJournalEntry, TerminalResolverJournalError> {
+        let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(raw.len());
+        aligned.extend_from_slice(raw);
+        rkyv::from_bytes::<TerminalResolverJournalEntry, rkyv::rancor::Error>(&aligned)
+            .map_err(storage_error)
     }
 
     fn storage_error(error: impl std::fmt::Display) -> TerminalResolverJournalError {
@@ -267,5 +278,22 @@ mod tests {
         let result = journal.append(event(2));
         assert!(result.is_err(), "existing key must not be overwritten");
         assert_eq!(before, journal.raw_rows_for_test());
+    }
+
+    #[test]
+    fn decode_entry_accepts_misaligned_bytes() {
+        let entry = super::TerminalResolverJournalEntry {
+            sequence: 7,
+            event: event(3),
+        };
+        let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&entry).unwrap();
+        for offset in 1..8 {
+            let mut backing = rkyv::util::AlignedVec::<16>::new();
+            backing.resize(offset + encoded.len(), 0);
+            backing[offset..].copy_from_slice(&encoded);
+            let decoded = super::lmdb::decode_entry(&backing[offset..])
+                .unwrap_or_else(|e| panic!("offset {offset}: {e:?}"));
+            assert_eq!(decoded.sequence, 7);
+        }
     }
 }

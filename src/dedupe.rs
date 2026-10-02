@@ -13,11 +13,18 @@
 //! semantics despite the possibility of duplicate message delivery.
 
 use super::SagaId;
-use std::collections::HashSet;
+use crate::{RunIncarnation, RunKey};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Mutex;
 
 type DedupeKey = (u64, Box<str>);
-type DedupeSet = HashSet<DedupeKey>;
+
+/// Legacy `SagaId`-partition marks plus run-scoped marks (ADR-0001 §2.4).
+#[derive(Default)]
+struct DedupeState {
+    legacy: HashSet<DedupeKey>,
+    runs: BTreeMap<RunKey, BTreeSet<Box<str>>>,
+}
 
 /// A trait for participant deduplication storage implementations.
 ///
@@ -129,6 +136,30 @@ pub trait ParticipantDedupeStore: Send + Sync + 'static {
     ///
     /// Returns [`DedupeError::Storage`] if the underlying storage fails.
     fn prune(&self, saga_id: SagaId) -> Result<(), DedupeError>;
+
+    /// Run-scoped `check_and_mark` (ADR-0001).
+    fn check_and_mark_run(&self, run: &RunKey, key: &str) -> Result<bool, DedupeError>;
+
+    /// Run-scoped `contains` (ADR-0001).
+    fn contains_run(&self, run: &RunKey, key: &str) -> Result<bool, DedupeError>;
+
+    /// Run-scoped `mark_processed` (ADR-0001).
+    fn mark_processed_run(&self, run: &RunKey, key: &str) -> Result<(), DedupeError>;
+
+    /// Run-scoped `remove_processed` (ADR-0001).
+    fn remove_processed_run(&self, run: &RunKey, key: &str) -> Result<(), DedupeError>;
+
+    /// Delete every mark of one run (ADR-0001).
+    fn prune_run(&self, run: &RunKey) -> Result<(), DedupeError>;
+
+    /// Runs that currently have marks, sorted (ADR-0001).
+    fn list_runs(&self) -> Result<Vec<RunKey>, DedupeError>;
+
+    /// Keys marked for one run (ADR-0005 upgrade scan).
+    fn keys_run(&self, run: &RunKey) -> Result<Vec<Box<str>>, DedupeError>;
+
+    /// Delete all marks of runs with `incarnation < cutoff`; returns how many runs (ADR-0001).
+    fn prune_expired(&self, cutoff: RunIncarnation) -> Result<u64, DedupeError>;
 }
 
 /// Errors that can occur during deduplication operations.
@@ -170,18 +201,18 @@ pub enum DedupeError {
 /// thread or perform a blocking actor ask, so it is safe to call from either
 /// sync scheduler workers or async participants.
 pub struct InMemoryDedupe {
-    seen: Mutex<DedupeSet>,
+    seen: Mutex<DedupeState>,
 }
 
 impl InMemoryDedupe {
     /// Creates a new empty in-memory deduplication store.
     pub fn new() -> Self {
         Self {
-            seen: Mutex::new(HashSet::new()),
+            seen: Mutex::new(DedupeState::default()),
         }
     }
 
-    fn seen(&self) -> Result<std::sync::MutexGuard<'_, DedupeSet>, DedupeError> {
+    fn seen(&self) -> Result<std::sync::MutexGuard<'_, DedupeState>, DedupeError> {
         self.seen
             .lock()
             .map_err(|_| DedupeError::Storage("in-memory dedupe lock poisoned".into()))
@@ -190,30 +221,98 @@ impl InMemoryDedupe {
 
 impl ParticipantDedupeStore for InMemoryDedupe {
     fn check_and_mark(&self, saga_id: SagaId, key: &str) -> Result<bool, DedupeError> {
-        Ok(self.seen()?.insert((saga_id.0, key.into())))
+        Ok(self.seen()?.legacy.insert((saga_id.0, key.into())))
     }
 
     fn contains(&self, saga_id: SagaId, key: &str) -> Result<bool, DedupeError> {
         Ok(self
             .seen()?
+            .legacy
             .iter()
             .any(|(id, stored_key)| *id == saga_id.0 && stored_key.as_ref() == key))
     }
 
     fn mark_processed(&self, saga_id: SagaId, key: &str) -> Result<(), DedupeError> {
-        self.seen()?.insert((saga_id.0, key.into()));
+        self.seen()?.legacy.insert((saga_id.0, key.into()));
         Ok(())
     }
 
     fn remove_processed(&self, saga_id: SagaId, key: &str) -> Result<(), DedupeError> {
         self.seen()?
+            .legacy
             .retain(|(id, stored_key)| *id != saga_id.0 || stored_key.as_ref() != key);
         Ok(())
     }
 
+    /// Removes the legacy partition and every run with this id (ADR-0001 §2.4).
     fn prune(&self, saga_id: SagaId) -> Result<(), DedupeError> {
-        self.seen()?.retain(|(id, _)| *id != saga_id.0);
+        let mut state = self.seen()?;
+        state.legacy.retain(|(id, _)| *id != saga_id.0);
+        state.runs.retain(|run, _| run.saga_id() != saga_id);
         Ok(())
+    }
+
+    fn check_and_mark_run(&self, run: &RunKey, key: &str) -> Result<bool, DedupeError> {
+        let mut state = self.seen()?;
+        let keys = state.runs.entry(run.clone()).or_default();
+        if keys.contains(key) {
+            return Ok(false);
+        }
+        keys.insert(key.into());
+        Ok(true)
+    }
+
+    fn contains_run(&self, run: &RunKey, key: &str) -> Result<bool, DedupeError> {
+        Ok(self
+            .seen()?
+            .runs
+            .get(run)
+            .is_some_and(|keys| keys.contains(key)))
+    }
+
+    fn mark_processed_run(&self, run: &RunKey, key: &str) -> Result<(), DedupeError> {
+        self.seen()?
+            .runs
+            .entry(run.clone())
+            .or_default()
+            .insert(key.into());
+        Ok(())
+    }
+
+    fn remove_processed_run(&self, run: &RunKey, key: &str) -> Result<(), DedupeError> {
+        let mut state = self.seen()?;
+        if let Some(keys) = state.runs.get_mut(run) {
+            keys.remove(key);
+            if keys.is_empty() {
+                state.runs.remove(run);
+            }
+        }
+        Ok(())
+    }
+
+    fn prune_run(&self, run: &RunKey) -> Result<(), DedupeError> {
+        self.seen()?.runs.remove(run);
+        Ok(())
+    }
+
+    fn list_runs(&self) -> Result<Vec<RunKey>, DedupeError> {
+        Ok(self.seen()?.runs.keys().cloned().collect())
+    }
+
+    fn keys_run(&self, run: &RunKey) -> Result<Vec<Box<str>>, DedupeError> {
+        Ok(self
+            .seen()?
+            .runs
+            .get(run)
+            .map(|keys| keys.iter().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    fn prune_expired(&self, cutoff: RunIncarnation) -> Result<u64, DedupeError> {
+        let mut state = self.seen()?;
+        let before = state.runs.len();
+        state.runs.retain(|run, _| run.incarnation() >= cutoff);
+        Ok((before - state.runs.len()) as u64)
     }
 }
 
@@ -245,6 +344,38 @@ where
 
     fn prune(&self, saga_id: SagaId) -> Result<(), DedupeError> {
         (**self).prune(saga_id)
+    }
+
+    fn check_and_mark_run(&self, run: &RunKey, key: &str) -> Result<bool, DedupeError> {
+        (**self).check_and_mark_run(run, key)
+    }
+
+    fn contains_run(&self, run: &RunKey, key: &str) -> Result<bool, DedupeError> {
+        (**self).contains_run(run, key)
+    }
+
+    fn mark_processed_run(&self, run: &RunKey, key: &str) -> Result<(), DedupeError> {
+        (**self).mark_processed_run(run, key)
+    }
+
+    fn remove_processed_run(&self, run: &RunKey, key: &str) -> Result<(), DedupeError> {
+        (**self).remove_processed_run(run, key)
+    }
+
+    fn prune_run(&self, run: &RunKey) -> Result<(), DedupeError> {
+        (**self).prune_run(run)
+    }
+
+    fn list_runs(&self) -> Result<Vec<RunKey>, DedupeError> {
+        (**self).list_runs()
+    }
+
+    fn keys_run(&self, run: &RunKey) -> Result<Vec<Box<str>>, DedupeError> {
+        (**self).keys_run(run)
+    }
+
+    fn prune_expired(&self, cutoff: RunIncarnation) -> Result<u64, DedupeError> {
+        (**self).prune_expired(cutoff)
     }
 }
 

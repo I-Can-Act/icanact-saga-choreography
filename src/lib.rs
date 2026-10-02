@@ -44,6 +44,9 @@ mod context;
 pub mod durability;
 mod errors;
 mod events;
+mod inbox;
+mod outbox;
+mod run_identity;
 mod state;
 mod support;
 
@@ -99,20 +102,31 @@ pub use support::{
 
 // Events
 pub use events::{
-    AckStatus, ParticipantEvent, SagaChoreographyEvent, SagaFailureDetails, SagaReplyTo,
-    SagaTerminalOutcome,
+    AbortSource, AckStatus, ParticipantEvent, RetainedEffectDisposition, SagaChoreographyEvent,
+    SagaFailureDetails, SagaReplyTo, SagaTerminalOutcome,
 };
 
 // Errors
 pub use errors::{
     AcceptedCompensationCompletion, AcceptedCompensationFailure, AcceptedStepCompletion,
     AcceptedStepError, AcceptedStepFailure, AcceptedStepPolicy, AcceptedStepPolicyError,
-    AcceptedStepTimeoutOutcome, CompensationError, CompensationOutput, StepError, StepExecutionId,
-    StepOutput,
+    AcceptedStepTimeoutOutcome, CommitStage, CompensationError, CompensationOutput, StepError,
+    StepExecutionId, StepOutput,
+};
+pub use errors::{
+    IngressFailure, IngressOutcome, IngressRejection, IngressReport, ReconciliationCause,
+    ReconciliationNeeded,
+};
+pub use inbox::{InboxState, InboxTxn, StepExecutionIntent};
+pub use outbox::{OutboxId, OutboxRecord};
+pub use run_identity::{
+    DEFAULT_PARTICIPANT_REPLAY_HORIZON, KnownRuns, MIN_REPLAY_HORIZON, ReplayHorizon,
+    ReplayHorizonError, RunAdmission, RunIdentityError, RunIncarnation, RunKey, RunStatus,
+    RunTerminalOutcome, RunTombstone, admit_run, event_identity,
 };
 
 // Traits
-pub use state_ext::SagaStateExt;
+pub use state_ext::{SagaStateExt, SagaStateStoreError};
 pub use traits::{
     AllowsSagaTellIngress, AsyncSagaParticipant, DependencySpec, HasSagaWorkflowParticipants,
     SagaBoxFuture, SagaParticipant, SagaWorkflowParticipant,
@@ -130,7 +144,8 @@ pub use stats::{ParticipantStats, ParticipantStatsSnapshot};
 pub use helpers::{handle_async_saga_event_with_emit, handle_saga_event_with_emit};
 pub use reply_registry::{SagaReplyToHandle, SagaReplyToResult};
 pub use resolver::{
-    FailureAuthority, SuccessCriteria, TERMINAL_RESOLVER_STEP, TerminalPolicy, TerminalResolver,
+    DEFAULT_COMPENSATION_RETRY_LIMIT, FailureAuthority, LoserPolicy, SuccessCriteria,
+    TERMINAL_RESOLVER_STEP, TerminalPolicy, TerminalPolicyError, TerminalResolver,
 };
 #[cfg(feature = "lmdb")]
 pub use resolver_journal::lmdb::LmdbTerminalResolverJournal;

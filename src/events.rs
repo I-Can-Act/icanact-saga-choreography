@@ -1,6 +1,7 @@
 //! Saga events
 
 use super::{AcceptedStepTimeoutOutcome, SagaContext, StepExecutionId};
+use crate::StepExecutionIntent;
 use icanact_core::ActorId;
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -10,6 +11,38 @@ pub struct SagaFailureDetails {
     pub error_code: Option<Box<str>>,
     pub error_message: Box<str>,
     pub at_millis: u64,
+}
+
+/// Why infrastructure requested an abort (ADR-0004).
+#[non_exhaustive]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub enum AbortSource {
+    /// Fewer participants received the start than required (ADR-0004).
+    DeliveryShortfall,
+    /// Only part of the participants received the start (ADR-0004).
+    PartialDelivery,
+    /// The overall saga timeout elapsed (ADR-0004).
+    OverallTimeout,
+    /// The saga stalled without progress (ADR-0004).
+    StalledTimeout,
+    /// Recovery found a stale run (ADR-0004).
+    StaleRecovery,
+}
+
+/// Why an effect remains in the world after a terminal decision (ADR-0004).
+#[non_exhaustive]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub enum RetainedEffectDisposition {
+    /// Kept deliberately by the loser policy (ADR-0004).
+    KeptByPolicy,
+    /// The step has no compensation (ADR-0004).
+    NotCompensable,
+    /// The undo was attempted and failed (ADR-0004).
+    UndoFailed,
 }
 
 /// Events published via the local saga event bus.
@@ -153,6 +186,33 @@ pub enum SagaChoreographyEvent {
         /// The status of the acknowledgment.
         status: AckStatus,
     },
+    /// Infrastructure requests rollback of the run; resolver input, participants ignore it (ADR-0004).
+    SagaAbortRequested {
+        /// The saga context containing identifiers and metadata.
+        context: SagaContext,
+        /// Human-readable abort reason.
+        reason: Box<str>,
+        /// Why the abort was requested.
+        source: AbortSource,
+    },
+    /// Compensation failed without side effects and may be retried (ADR-0004).
+    CompensationFailedRetryable {
+        /// The saga context containing identifiers and metadata.
+        context: SagaContext,
+        /// Participant whose compensation failed.
+        participant_id: Box<str>,
+        /// The error that caused the failure.
+        error: Box<str>,
+    },
+    /// Effects that remain after a terminal decision, recorded instead of a contradictory terminal (ADR-0004).
+    SagaEffectsRetained {
+        /// The saga context containing identifiers and metadata.
+        context: SagaContext,
+        /// Steps whose effects remain.
+        steps: Vec<Box<str>>,
+        /// Why the effects remain.
+        disposition: RetainedEffectDisposition,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -254,6 +314,9 @@ impl SagaChoreographyEvent {
             Self::CompensationFailed { context, .. } => context,
             Self::SagaQuarantined { context, .. } => context,
             Self::StepAck { context, .. } => context,
+            Self::SagaAbortRequested { context, .. } => context,
+            Self::CompensationFailedRetryable { context, .. } => context,
+            Self::SagaEffectsRetained { context, .. } => context,
         }
     }
 
@@ -276,6 +339,9 @@ impl SagaChoreographyEvent {
             Self::CompensationFailed { .. } => "compensation_failed",
             Self::SagaQuarantined { .. } => "saga_quarantined",
             Self::StepAck { .. } => "step_ack",
+            Self::SagaAbortRequested { .. } => "saga_abort_requested",
+            Self::CompensationFailedRetryable { .. } => "compensation_failed_retryable",
+            Self::SagaEffectsRetained { .. } => "saga_effects_retained",
         }
     }
 
@@ -326,6 +392,15 @@ pub enum AckStatus {
 
 /// Events stored in participant's local journal for durability and recovery.
 #[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[rkyv(serialize_bounds(
+    __S: rkyv::ser::Writer + rkyv::ser::Allocator,
+    __S::Error: rkyv::rancor::Source,
+))]
+#[rkyv(deserialize_bounds(__D::Error: rkyv::rancor::Source))]
+#[rkyv(bytecheck(bounds(
+    __C: rkyv::validation::ArchiveContext,
+    __C::Error: rkyv::rancor::Source,
+)))]
 pub enum ParticipantEvent {
     /// Emitted when a participant registers to handle a step in a saga type.
     SagaRegistered {
@@ -445,4 +520,46 @@ pub enum ParticipantEvent {
         deadline_at_millis: u64,
         hard_deadline_at_millis: u64,
     },
+    /// Atomic inbox commit: admitted input, join progress and optional execution intent (ADR-0005).
+    InboxCommitted {
+        input_key: Box<str>,
+        dependency_step: Option<Box<str>>,
+        execution_intent: Option<StepExecutionIntent>,
+        admitted_at_millis: u64,
+    },
+    /// A transition committed together with the outbound events it obliges, in one row (ADR-0003).
+    TransitionCommitted {
+        #[rkyv(omit_bounds)]
+        transition: Box<ParticipantEvent>,
+        outbox: Vec<SagaChoreographyEvent>,
+    },
+    /// The undo reported `SafeToRetry` (ADR-0004 §2.5): it did not take effect and the resolver may
+    /// re-request it. Closes the preceding `CompensationStarted`; without it a `CompensationStarted`
+    /// that never settled means the undo may have run (crash mid-undo) and the run is quarantined.
+    CompensationRetryable {
+        /// The attempt of the request whose undo reported `SafeToRetry`.
+        attempt: u32,
+        /// Why the undo is retryable.
+        reason: Box<str>,
+        /// The timestamp (in milliseconds since epoch) of the retryable outcome.
+        retryable_at_millis: u64,
+    },
+}
+
+impl ParticipantEvent {
+    /// The state transition of this row: the wrapped transition of `TransitionCommitted`, else `self` (ADR-0003).
+    pub fn transition(&self) -> &ParticipantEvent {
+        match self {
+            Self::TransitionCommitted { transition, .. } => transition,
+            other => other,
+        }
+    }
+
+    /// Outbound obligations embedded in this row; empty for every other variant (ADR-0003).
+    pub fn outbox(&self) -> &[SagaChoreographyEvent] {
+        match self {
+            Self::TransitionCommitted { outbox, .. } => outbox,
+            _ => &[],
+        }
+    }
 }

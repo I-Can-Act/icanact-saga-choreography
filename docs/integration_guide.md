@@ -173,11 +173,31 @@ For actors implementing `HasSagaWorkflowParticipants`, prefer:
 - `bind_async_workflow_participant_channel_strict(...)`
 
 These bind the subscriber path and auto-register workflow steps as bound.
-Do not register steps as bound unless a real participant is wired for that step; otherwise the saga can still stall after start.
-Production restart recovery requires the durable resolver attachment above. The
+Do not register steps as bound unless a real participant is wired for that step. If a required
+step has no live participant, the bus does not stall silently: publishing fails with
+`SagaBusPublishError::RequiredPathDeliveryShortfall` (its `missing_roles` names the steps with
+no receipt), logged with the saga id, and a `SagaAbortRequested` is sent to the resolver. If the
+abort itself reaches no resolver the error is `AbortNotDelivered` and a terminal `SagaFailed`
+fallback is published.
+
+**Plain binders and `steps`.** The plain binders (`bind_sync_participant_channel`,
+`bind_sync_participant_tell`, `bind_async_participant_channel`, `bind_async_participant_tell`,
+and their `_lazy` variants) take `steps: &[&str]`, the workflow step names the actor owns
+(typically `&[actor.step_name()]`). The names tag the subscription so each accepted delivery
+is a receipt for those steps. An empty slice is rejected with `Err` (an untagged subscription could never satisfy a
+required step, so it is refused at bind time instead of surfacing later as a shortfall). The strict
+workflow binders derive the tags from `saga_workflows()`.
+
+**Participants vs observers.** `subscribe_participant_fn` and the binders create participants:
+a delivery counts as a receipt for their tagged steps. `subscribe_fn` and
+`subscribe_saga_type_fn` create observers (taps, probes, capture): they see events but never
+count toward required-recipient checks, so an observer cannot mask a missing participant.
+
+**Activation.** Production restart recovery requires the durable resolver attachment above. The
 non-durable attachment used by `SagaTestWorld` is intentionally scoped to isolated tests.
-Activate recovery only after strict participant binding is complete; attachment retains
-unpublished recovery output until that explicit boundary.
+Activate recovery only after participant binding is complete. Until
+`activate_terminal_resolver_recovery*` runs, a durable resolver buffers all output (restored
+and live) and `SagaStarted` for its saga type is rejected with `AdmissionRejected`.
 
 ## Event Flow
 
@@ -187,7 +207,12 @@ Typical flow:
 2. `step_a` receives it and emits `StepCompleted`
 3. `step_b` reacts to `StepCompleted` from `step_a` and emits its own `StepCompleted`
 4. `step_c` reacts to `StepCompleted` from `step_b`
-5. if a step fails with compensation required, `CompensationRequested` is published and earlier participants compensate
+5. if a step fails with compensation required, the resolver publishes one `CompensationRequested` per step to undo (each names a single step in `steps_to_compensate`) and earlier participants compensate
+
+Delivery requirements:
+
+- The first-step participant must receive `SagaStarted`; the emitter is not excluded for `SagaStarted`, so a missing first participant is a shortfall rather than being hidden.
+- Each `CompensationRequested` needs a receipt from the tagged participant of its target step. A missing receipt (participant gone, or its mailbox full) is not decided on the spot: the resolver retains the request and retries it on its watchdog polls. A full mailbox that drains is delivered normally. Only after `RESOLVER_PUBLISH_MAX_ATTEMPTS` (5) failed attempts does the resolver log an `error!`, journal an "undeliverable" give-up for that step and settle: the run is quarantined with `SagaQuarantined` naming the step (once any other in-flight undos finish), rather than waiting for the rollback timeout or reporting rollback complete. The give-up is journaled, so a durable resolver replays it after a restart.
 
 At step 1, the bus validates startup invariants:
 

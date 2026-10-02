@@ -23,7 +23,8 @@ At saga start, framework enforcement is fail-fast:
 - Missing workflow contract for the saga type: immediate `SagaFailed`.
 - `SagaStarted.context.step_name` does not match contract `first_step`: immediate `SagaFailed`.
 - Any declared contract step is not bound to a participant: immediate `SagaFailed` with `missing_steps=...`.
-- Live start-event fanout below contract minimum (`declared_steps + terminal_resolver`): immediate `SagaFailed` (prevents latent stalls from stale/unwired subscribers).
+- Live start-event fanout below contract minimum (`declared_steps + terminal_resolver`), judged by tagged required-path receipts (each declared step's participant plus the resolver): the bus publishes `SagaAbortRequested` so the resolver rolls the run back. `SagaFailed` is only a fallback when no resolver receives the abort (prevents latent stalls from stale/unwired subscribers).
+- Durable resolver activation gate: until `activate_terminal_resolver_recovery` runs for the saga type, a durable resolver publishes nothing, and `SagaStarted` is rejected with `SagaBusPublishError::AdmissionRejected`. An in-memory resolver is active immediately.
 - Invalid workflow contracts are rejected at registration (duplicate steps, undeclared dependencies, cycles, required terminal steps missing).
 
 This prevents runtime “partial wiring” where a saga starts and then stalls waiting for steps that can never run.
@@ -62,7 +63,7 @@ flowchart LR
 | Start gating | Saga bus enforces registered contract + terminal policy + bound steps before accepting `SagaStarted` | Ensure startup registers all required contracts/bindings |
 | State access contract | `HasSagaParticipantSupport` + blanket `SagaStateExt` | Expose the embedded `saga` field |
 | Persistence contract | `ParticipantJournal` and `ParticipantDedupeStore` traits | Provide concrete backend (in-memory, LMDB/Heed, etc.) |
-| Runtime helpers | `apply_sync_participant_saga_ingress`, `apply_async_participant_saga_ingress`, strict workflow binding helpers (`bind_*_workflow_participant_*_strict`) | Wire ingress helpers into actor message handling and bind workflow participants strictly |
+| Runtime helpers | `apply_sync_participant_saga_ingress`, `apply_async_participant_saga_ingress`, strict workflow binding helpers (`bind_*_workflow_participant_*_strict`), plain binders (`bind_*_participant_*`, which tag subscriptions with the owned `steps`) | Wire ingress helpers into actor message handling; bind participants with step-tagged subscriptions (observers do not count as receipts) |
 | Observability | `ParticipantStats`, `SagaObserver` | Export metrics and connect observer implementation |
 | E2E test harness | `SagaTestWorld`, transcript capture, terminal waits | Spawn real actors and assert through actor refs, transcript, and shared stores |
 
@@ -135,9 +136,21 @@ sequenceDiagram
 ## Storage and Idempotency
 
 - Journal records participant-local events in append order (`ParticipantEvent`).
-- Dedupe store prevents duplicate processing for the same saga event.
-- The framework uses a dedupe key of `trace_id:saga_started_at_millis:event_type:step_name`
-  when handling incoming events, with `failed_step` appended for compensation requests.
+- A run is identified by `RunKey = (saga_type, saga_id, incarnation)` where the incarnation is
+  `saga_started_at_millis`; a caller reusing a `SagaId` must use a strictly greater start time.
+  Participant state, journal rows, and dedupe marks are all keyed by `RunKey`, so a newer run of
+  the same saga id coexists with an older active one (a `warn!` and `concurrent_runs_admitted` count it).
+- Dedupe store prevents duplicate processing of the same event within a run. The key is
+  `event_identity` (event type, step, attempt and a per-variant discriminator); `trace_id` is not
+  part of it, so a re-minted trace cannot defeat dedupe or reset an active run.
+- Admission (`admit_run`): a replayed start of a known run is ignored, a start older than a known
+  newer run is rejected as stale (`runs_rejected_stale`), and an unknown run older than
+  `now - replay_horizon` is rejected as expired (`runs_rejected_expired`), never admitted as new.
+  A failed status/tombstone lookup quarantines the run (`admission_lookup_failed`).
+- Finalizing a completed or failed run writes a tombstone, deletes the run's rows and expires old
+  tombstones in one journal call, then clears memory, then prunes the run's dedupe marks. Tombstones
+  are kept only for the replay horizon (participant default 24 h, floor 1 h). Quarantined runs are
+  never finalized; their rows and marks stay as evidence.
 - In this repository, in-memory implementations are available for tests/examples.
 - For production, use a durable backend by implementing the storage traits (for example LMDB/Heed).
 - Accepted-step metadata, original saga input, and compensation data are journaled before `StepAccepted` is published so restart recovery can rehydrate pending external executions.
