@@ -1118,6 +1118,33 @@ where
                 .insert(run.clone(), accepted);
             continue;
         }
+        if run.saga_type() == saga_type
+            && !support.saga_states.contains_key(&run)
+            && recover_accepted_workflow_step_from_entries(&entries).is_none()
+            && let Some((output, compensation_data, completed_at_millis)) =
+                recover_live_completed_step_from_entries(&entries)
+        {
+            // R02: the effect completed before the restart; keep its undo ownership so a later
+            // compensation request finds a `Completed` state instead of silently returning.
+            let context = recovery_context_for_run(&run, step_name);
+            let state = crate::SagaParticipantState::new(
+                saga_id,
+                context.saga_type.clone(),
+                context.step_name.clone(),
+                context.correlation_id,
+                context.trace_id,
+                context.initiator_peer_id,
+                context.saga_started_at_millis,
+            )
+            .trigger("step_recovered", completed_at_millis)
+            .start_execution(completed_at_millis)
+            .complete(output, compensation_data, completed_at_millis);
+            support
+                .saga_states
+                .insert(run.clone(), SagaStateEntry::Completed(state));
+            support.admitted_runs.insert(run.clone());
+            continue;
+        }
         if let Some(accepted) = recover_accepted_workflow_step_from_entries(&entries) {
             let expired = accepted.deadline_at_millis < now_millis
                 || accepted.hard_deadline_at_millis < now_millis;
@@ -1474,6 +1501,51 @@ fn recover_completed_step_effect_for_unstarted_compensation(
         }
     }
     effect_at_request
+}
+
+/// Ordinary completed-step effect that is still live at the end of the journal: the last
+/// `StepExecutionCompleted` with no later restart of execution, failure, compensation or
+/// quarantine (R02). Accepted-step rows are handled by their own recovery path.
+fn recover_live_completed_step_from_entries(
+    entries: &[JournalEntry],
+) -> Option<(Vec<u8>, Vec<u8>, u64)> {
+    let mut completed = None;
+    for entry in entries {
+        match entry.event.transition() {
+            ParticipantEvent::StepExecutionCompleted {
+                output,
+                compensation_data,
+                completed_at_millis,
+            } => {
+                completed = Some((
+                    output.clone(),
+                    compensation_data.clone(),
+                    *completed_at_millis,
+                ));
+            }
+            ParticipantEvent::StepExecutionStarted { .. }
+            | ParticipantEvent::InboxCommitted {
+                execution_intent: Some(_),
+                ..
+            }
+            | ParticipantEvent::StepExecutionFailed { .. }
+            | ParticipantEvent::AcceptedStepRecorded { .. }
+            | ParticipantEvent::CompensationStarted { .. }
+            | ParticipantEvent::AcceptedCompensationRecorded { .. }
+            | ParticipantEvent::CompensationCompleted { .. }
+            | ParticipantEvent::CompensationFailed { .. }
+            | ParticipantEvent::Quarantined { .. } => completed = None,
+            ParticipantEvent::SagaRegistered { .. }
+            | ParticipantEvent::StepTriggered { .. }
+            | ParticipantEvent::CompensationRequestRecorded { .. }
+            | ParticipantEvent::InboxCommitted {
+                execution_intent: None,
+                ..
+            }
+            | ParticipantEvent::TransitionCommitted { .. } => {}
+        }
+    }
+    completed
 }
 
 fn recover_accepted_workflow_step_from_entries(
