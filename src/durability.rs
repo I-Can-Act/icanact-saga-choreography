@@ -1442,7 +1442,8 @@ fn recover_completed_accepted_compensation_from_entries(
     let mut completed = None;
     for entry in entries {
         match &entry.event {
-            ParticipantEvent::ParticipantForwardOutcomeRecorded { .. } => {}
+            ParticipantEvent::ParticipantForwardOutcomeRecorded { .. }
+            | ParticipantEvent::ParticipantDependencyCompletedRecorded { .. } => {}
             ParticipantEvent::CompensationRequestRecorded { .. } => {
                 accepted = None;
                 completed = None;
@@ -1510,7 +1511,8 @@ fn recover_failed_accepted_compensation_from_entries(
     let mut failed = None;
     for entry in entries {
         match &entry.event {
-            ParticipantEvent::ParticipantForwardOutcomeRecorded { .. } => {}
+            ParticipantEvent::ParticipantForwardOutcomeRecorded { .. }
+            | ParticipantEvent::ParticipantDependencyCompletedRecorded { .. } => {}
             ParticipantEvent::CompensationRequestRecorded { .. } => {
                 accepted = None;
                 failed = None;
@@ -1586,7 +1588,8 @@ fn recover_unstarted_compensation_request_from_entries(
     let mut request = None;
     for entry in entries {
         match &entry.event {
-            ParticipantEvent::ParticipantForwardOutcomeRecorded { .. } => {}
+            ParticipantEvent::ParticipantForwardOutcomeRecorded { .. }
+            | ParticipantEvent::ParticipantDependencyCompletedRecorded { .. } => {}
             ParticipantEvent::CompensationRequestRecorded {
                 context,
                 failed_step,
@@ -1643,7 +1646,8 @@ fn recover_completed_step_effect_for_unstarted_compensation(
     let mut effect_at_request = None;
     for entry in entries {
         match &entry.event {
-            ParticipantEvent::ParticipantForwardOutcomeRecorded { .. } => {}
+            ParticipantEvent::ParticipantForwardOutcomeRecorded { .. }
+            | ParticipantEvent::ParticipantDependencyCompletedRecorded { .. } => {}
             ParticipantEvent::StepExecutionStarted { .. } => completed = None,
             ParticipantEvent::StepExecutionCompleted {
                 output,
@@ -1684,7 +1688,8 @@ fn recover_accepted_workflow_step_from_entries(
     let mut accepted = None;
     for entry in entries {
         match &entry.event {
-            ParticipantEvent::ParticipantForwardOutcomeRecorded { .. } => {}
+            ParticipantEvent::ParticipantForwardOutcomeRecorded { .. }
+            | ParticipantEvent::ParticipantDependencyCompletedRecorded { .. } => {}
             ParticipantEvent::AcceptedStepRecorded {
                 context,
                 participant_id,
@@ -1748,7 +1753,8 @@ fn accepted_step_failure_requiring_compensation(
     let mut failure = None;
     for entry in entries {
         match &entry.event {
-            ParticipantEvent::ParticipantForwardOutcomeRecorded { .. } => {}
+            ParticipantEvent::ParticipantForwardOutcomeRecorded { .. }
+            | ParticipantEvent::ParticipantDependencyCompletedRecorded { .. } => {}
             ParticipantEvent::AcceptedStepRecorded { .. } => {
                 failure = None;
             }
@@ -3688,7 +3694,8 @@ fn recorded_saga_type(entries: &[JournalEntry]) -> Option<&str> {
         ParticipantEvent::CompensationRequestRecorded { context, .. }
         | ParticipantEvent::AcceptedStepRecorded { context, .. }
         | ParticipantEvent::AcceptedCompensationRecorded { context, .. }
-        | ParticipantEvent::ParticipantReconciliationEvidence { context, .. } => {
+        | ParticipantEvent::ParticipantReconciliationEvidence { context, .. }
+        | ParticipantEvent::ParticipantDependencyCompletedRecorded { context, .. } => {
             Some(context.saga_type.as_ref())
         }
         ParticipantEvent::StepTriggered { .. }

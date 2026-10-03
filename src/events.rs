@@ -501,6 +501,14 @@ pub enum ParticipantEvent {
     /// Confirmed forward outcome, including the original input/context for safe
     /// retransmission. Appended tag 15; unconfirmed result rows are not this proof.
     ParticipantForwardOutcomeRecorded { outcome: ParticipantForwardOutcome },
+    /// Durable observation that an incoming dependency step completed for this
+    /// run. The context names the dependency step (`context.step_name`) and the
+    /// exact run identity. Appended tag 16. This is receipt metadata, not
+    /// execution evidence: a history of only these rows is idle.
+    ParticipantDependencyCompletedRecorded {
+        context: SagaContext,
+        recorded_at_millis: u64,
+    },
 }
 
 /// Terminal classification stored in a participant terminal tombstone.

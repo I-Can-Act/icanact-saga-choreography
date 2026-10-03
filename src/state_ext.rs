@@ -76,6 +76,9 @@ pub struct ParticipantRunEvidence {
     pub output: Vec<u8>,
     pub compensation_data: Vec<u8>,
     pub undo_intent_open: bool,
+    /// An owned undo request or compensating accepted failure remains unresolved
+    /// even before execution of the undo has started.
+    pub undo_required: bool,
     pub undo_completed: bool,
     pub quarantined: bool,
     pub needs_reconciliation: bool,
@@ -89,6 +92,7 @@ impl ParticipantRunEvidence {
         self.forward_intent_open
             || self.accepted_forward_pending
             || self.undo_intent_open
+            || (self.undo_required && !self.undo_completed)
             || self.quarantined
             || self.needs_reconciliation
             || (!self.compensation_data.is_empty() && !self.undo_completed)
@@ -436,9 +440,13 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
             .map_err(SagaStateStoreError::Journal)?;
         let runs = scan_runs(&entries);
         if runs.runs.is_empty()
-            && entries
-                .iter()
-                .any(|entry| !matches!(entry.event, ParticipantEvent::SagaRegistered { .. }))
+            && entries.iter().any(|entry| {
+                !matches!(
+                    entry.event,
+                    ParticipantEvent::SagaRegistered { .. }
+                        | ParticipantEvent::ParticipantDependencyCompletedRecorded { .. }
+                )
+            })
         {
             return Ok(ParticipantAdmission::LegacyHistory);
         }
@@ -530,6 +538,48 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
                 outcome: outcome.clone(),
             },
         )
+    }
+
+    /// Durably records, before the caller treats it as seen, that the incoming
+    /// dependency step named by `context.step_name` completed for this exact run.
+    /// Storage failure is `Err`; it never authorizes or implies step execution.
+    fn record_dependency_completion_strict(
+        &self,
+        context: &SagaContext,
+    ) -> Result<(), SagaStateStoreError> {
+        self.record_event_strict(
+            context.saga_id,
+            ParticipantEvent::ParticipantDependencyCompletedRecorded {
+                context: context.clone(),
+                recorded_at_millis: self.now_millis(),
+            },
+        )
+    }
+
+    /// Dependency step names durably recorded for exactly this run
+    /// (saga type, id and start time). Other runs' observations are excluded.
+    fn completed_dependency_steps_strict(
+        &self,
+        context: &SagaContext,
+    ) -> Result<HashSet<Box<str>>, SagaStateStoreError> {
+        let entries = self
+            .saga_journal()
+            .read(context.saga_id)
+            .map_err(SagaStateStoreError::Journal)?;
+        Ok(entries
+            .iter()
+            .filter_map(|entry| match &entry.event {
+                ParticipantEvent::ParticipantDependencyCompletedRecorded {
+                    context: seen, ..
+                } if seen.saga_id == context.saga_id
+                    && seen.saga_type == context.saga_type
+                    && seen.saga_started_at_millis == context.saga_started_at_millis =>
+                {
+                    Some(seen.step_name.clone())
+                }
+                _ => None,
+            })
+            .collect())
     }
 
     /// Retains typed reconciliation data after a result-write failure. This does
@@ -699,7 +749,10 @@ fn run_evidence(entries: &[crate::JournalEntry], context: &SagaContext) -> Parti
             ParticipantEvent::AcceptedStepRecorded { context, .. }
             | ParticipantEvent::AcceptedCompensationRecorded { context, .. }
             | ParticipantEvent::CompensationRequestRecorded { context, .. }
-            | ParticipantEvent::ParticipantReconciliationEvidence { context, .. } => same(context),
+            | ParticipantEvent::ParticipantReconciliationEvidence { context, .. }
+            | ParticipantEvent::ParticipantDependencyCompletedRecorded { context, .. } => {
+                same(context)
+            }
             ParticipantEvent::ParticipantForwardOutcomeRecorded { outcome } => {
                 same(&outcome.context)
             }
@@ -732,6 +785,9 @@ fn run_evidence(entries: &[crate::JournalEntry], context: &SagaContext) -> Parti
                 evidence.accepted_forward_pending = true;
                 evidence.compensation_data = compensation_data.clone();
             }
+            ParticipantEvent::CompensationRequestRecorded { .. } => {
+                evidence.undo_required = true;
+            }
             ParticipantEvent::StepExecutionCompleted {
                 output,
                 compensation_data,
@@ -759,19 +815,39 @@ fn run_evidence(entries: &[crate::JournalEntry], context: &SagaContext) -> Parti
                     evidence.needs_reconciliation = true;
                 }
             }
-            ParticipantEvent::StepExecutionFailed { .. } => {
+            ParticipantEvent::StepExecutionFailed {
+                requires_compensation,
+                ..
+            } => {
                 evidence.forward_intent_open = false;
-                // The business error may request undo of earlier steps without
-                // claiming this step owns an effect. Accepted remote work remains
-                // uncertain until a result or authoritative undo resolves it.
+                // A durable authoritative failure without compensation is the
+                // definitive rejection of accepted forward work: no effect
+                // materialised. Compensation bytes stored at acceptance are only
+                // potential metadata, so they stop being an obligation unless a
+                // real result/outcome or reconciliation evidence exists. A failure
+                // that requires compensation keeps the obligation until undo.
+                if *requires_compensation && evidence.accepted_forward_pending {
+                    evidence.undo_required = true;
+                }
+                if !*requires_compensation {
+                    evidence.accepted_forward_pending = false;
+                    if !evidence.forward_result_recorded
+                        && !evidence.needs_reconciliation
+                        && !evidence.undo_required
+                    {
+                        evidence.compensation_data.clear();
+                    }
+                }
             }
             ParticipantEvent::CompensationStarted { .. }
             | ParticipantEvent::AcceptedCompensationRecorded { .. } => {
                 undo_seen = true;
+                evidence.undo_required = true;
                 evidence.undo_intent_open = true;
             }
             ParticipantEvent::CompensationCompleted { .. } => {
                 undo_seen = true;
+                evidence.undo_required = true;
                 evidence.undo_intent_open = false;
                 evidence.undo_completed = true;
                 evidence.accepted_forward_pending = false;
@@ -779,6 +855,7 @@ fn run_evidence(entries: &[crate::JournalEntry], context: &SagaContext) -> Parti
             }
             ParticipantEvent::CompensationFailed { .. } => {
                 undo_seen = true;
+                evidence.undo_required = true;
                 evidence.undo_intent_open = true;
                 evidence.needs_reconciliation = true;
             }
