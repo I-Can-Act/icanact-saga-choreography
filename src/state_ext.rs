@@ -82,6 +82,13 @@ pub struct ParticipantRunEvidence {
     pub undo_completed: bool,
     pub quarantined: bool,
     pub needs_reconciliation: bool,
+    /// An authoritative `StepExecutionFailed { requires_compensation: false }`
+    /// for accepted forward work proves no materialised effect needs undo (it is
+    /// not physical remote cancellation). Derived only from exact-run durable
+    /// history; later intent, acceptance, results, compensating failures, undo
+    /// activity, reconciliation or quarantine never leave a misleading `true`.
+    /// An owned compensation request alone does not clear it.
+    pub forward_definitively_rejected: bool,
     pub last_updated_at_millis: u64,
 }
 
@@ -731,6 +738,8 @@ fn run_evidence(entries: &[crate::JournalEntry], context: &SagaContext) -> Parti
         .any(|entry| matches!(entry.event, ParticipantEvent::ParticipantRunRecorded { .. }));
     let mut active: Option<(&str, u64)> = None;
     let mut undo_seen = false;
+    // An authoritative `requires_compensation: true` forward failure was seen.
+    let mut forward_compensation_required = false;
     for entry in entries {
         if let ParticipantEvent::ParticipantRunRecorded {
             saga_type,
@@ -778,10 +787,12 @@ fn run_evidence(entries: &[crate::JournalEntry], context: &SagaContext) -> Parti
         match &entry.event {
             ParticipantEvent::StepExecutionStarted { .. } => {
                 evidence.forward_intent_open = true;
+                evidence.forward_definitively_rejected = false;
             }
             ParticipantEvent::AcceptedStepRecorded {
                 compensation_data, ..
             } => {
+                evidence.forward_definitively_rejected = false;
                 evidence.accepted_forward_pending = true;
                 evidence.compensation_data = compensation_data.clone();
             }
@@ -795,6 +806,7 @@ fn run_evidence(entries: &[crate::JournalEntry], context: &SagaContext) -> Parti
             } => {
                 evidence.forward_intent_open = false;
                 evidence.accepted_forward_pending = false;
+                evidence.forward_definitively_rejected = false;
                 evidence.forward_result_recorded = true;
                 evidence.forward_outcome = None;
                 evidence.output = output.clone();
@@ -807,6 +819,7 @@ fn run_evidence(entries: &[crate::JournalEntry], context: &SagaContext) -> Parti
             ParticipantEvent::ParticipantForwardOutcomeRecorded { outcome } => {
                 evidence.forward_intent_open = false;
                 evidence.accepted_forward_pending = false;
+                evidence.forward_definitively_rejected = false;
                 evidence.forward_result_recorded = true;
                 evidence.output = outcome.output.clone();
                 evidence.compensation_data = outcome.compensation_data.clone();
@@ -826,10 +839,27 @@ fn run_evidence(entries: &[crate::JournalEntry], context: &SagaContext) -> Parti
                 // potential metadata, so they stop being an obligation unless a
                 // real result/outcome or reconciliation evidence exists. A failure
                 // that requires compensation keeps the obligation until undo.
-                if *requires_compensation && evidence.accepted_forward_pending {
+                if *requires_compensation {
+                    // Authoritative: the obligation holds even with no accepted
+                    // work currently pending (generic or repeated failure).
+                    forward_compensation_required = true;
                     evidence.undo_required = true;
-                }
-                if !*requires_compensation {
+                    evidence.undo_completed = false;
+                    evidence.forward_definitively_rejected = false;
+                } else {
+                    // Only accepted forward work with no actual result, prior
+                    // compensating failure, undo activity or reconciliation is
+                    // provably rejected. Missing evidence is never rejection; a
+                    // repeated rejection preserves an already derived marker.
+                    if evidence.accepted_forward_pending
+                        && !evidence.forward_result_recorded
+                        && !evidence.needs_reconciliation
+                        && !evidence.quarantined
+                        && !forward_compensation_required
+                        && !undo_seen
+                    {
+                        evidence.forward_definitively_rejected = true;
+                    }
                     evidence.accepted_forward_pending = false;
                     if !evidence.forward_result_recorded
                         && !evidence.needs_reconciliation
@@ -844,6 +874,7 @@ fn run_evidence(entries: &[crate::JournalEntry], context: &SagaContext) -> Parti
                 undo_seen = true;
                 evidence.undo_required = true;
                 evidence.undo_intent_open = true;
+                evidence.forward_definitively_rejected = false;
             }
             ParticipantEvent::CompensationCompleted { .. } => {
                 undo_seen = true;
@@ -858,6 +889,7 @@ fn run_evidence(entries: &[crate::JournalEntry], context: &SagaContext) -> Parti
                 evidence.undo_required = true;
                 evidence.undo_intent_open = true;
                 evidence.needs_reconciliation = true;
+                evidence.forward_definitively_rejected = false;
             }
             ParticipantEvent::ParticipantReconciliationEvidence {
                 output,
@@ -865,6 +897,7 @@ fn run_evidence(entries: &[crate::JournalEntry], context: &SagaContext) -> Parti
                 ..
             } => {
                 evidence.needs_reconciliation = true;
+                evidence.forward_definitively_rejected = false;
                 evidence.output = output.clone();
                 evidence.compensation_data = compensation_data.clone();
             }
@@ -874,6 +907,7 @@ fn run_evidence(entries: &[crate::JournalEntry], context: &SagaContext) -> Parti
                 ..
             } => {
                 evidence.quarantined = true;
+                evidence.forward_definitively_rejected = false;
             }
             _ => {}
         }
