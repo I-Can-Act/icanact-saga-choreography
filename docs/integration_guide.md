@@ -27,8 +27,10 @@ To make a workflow startup-safe (required for non-test runtime):
 2. register the contract on startup (`register_workflow_contract_provider`)
 3. attach terminal resolver/policy for that contract
 4. register bound participant steps before any `SagaStarted`
+5. activate resolver recovery after participant hydration/binding is live
 
-If any of these are missing, `SagaStarted` is rejected immediately with terminal failure instead of allowing a latent stall.
+Missing wiring rejects `SagaStarted` before business fanout. A refused start must not
+poison an existing owner; a live delivery shortfall quarantines possible delivered work.
 `register_workflow_contract_provider` does not implicitly attach a resolver; resolver attachment must succeed explicitly.
 
 ## Generic Example Workflow
@@ -213,7 +215,12 @@ For runtime publishing paths, prefer `publish_strict(...)` so partial delivery i
   A declared effect with no undo is irreversible: later failure needs reconciliation.
 - `fail_accepted_workflow_step(..., requires_compensation=false)` and `FailStep(false)` assert a
   safe/no-undo remote contract, not physical cancellation. Use compensation or
-  `QuarantineSaga` when late remote effects are possible.
+  `QuarantineSaga` when late remote effects are possible. During rollback, only an
+  unrequested potential queue obligation is removed. An already-owned request for exact-run
+  proven rejection is completed durably before acknowledgement without calling business
+  undo; real results, prior compensation-requiring failure or unresolved undo remain owed.
+  Completion hooks include this logical no-op. Never hand-build a no-effect completion
+  from absent rows; persistence errors quarantine and send no acknowledgement.
 - `SagaFailed` waiter replies can be superseded by quarantine on later evidence. Managed
   ingress publishes `StepStarted` before running your step; keep hooks idempotent.
 - Upgrading from baseline: drain all in-flight sagas first ([migration.md](migration.md)).
@@ -329,6 +336,17 @@ actor.shutdown();
 ## Recovery
 
 On startup or restart, enumerate participant journal state through your durability layer and decide how your application should resume or reconcile non-terminal workflows. Terminal and quarantine fences are durable, so managed ingress rejects replayed events for finished sagas (application hooks must still be idempotent); rollback runs serialized in reverse order. Follow [operations.md](operations.md).
+
+## Observing resource release
+
+Keep `let released = bus.release_waiter();` before dropping public bus owners. After
+stopping application-owned actors and dropping every public clone, call
+`released.wait_timeout(std::time::Duration::from_secs(5))` from an **off-actor,
+off-callback** context. True means actual bus-owned actor/gate/subscriber resources and
+backend references have been destroyed, not merely shutdown requested. False is not
+permission to reopen a store. The waiter owns only completion coordination; it does not
+shut down work, resolve a saga or cancel external execution. Drop every application-owned
+journal clone before store close/reopen. See [operations.md](operations.md).
 
 ## Timeout Model
 

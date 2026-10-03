@@ -172,6 +172,51 @@ still asserts immediate disappearance of public ownership and bounded release of
 journal: pinned pooled shutdown from a scheduler callback does not promise an immediate
 join. Native callback-drop coverage is characterization, not behavioral RED.
 
+## Re-challenge of `d35b58e`: compaction, rollback and release assertions
+
+The latest completed same-reviewer report returned **BLOCK** (P1-C and P2-1..3; no
+P0). Report delivery and the five returned review4 writers were not safety acceptance.
+The shared rejection foundation is `ccd4f83`; the following integrated assertions and
+fresh parent gates address that report, pending the next committed-tree re-challenge.
+
+- **P1-C, closed reconstruction:** `tests/qa_review4_bus.rs` uses real LMDB failed
+  parallel rollback, compact/close/reopen and a second restart. Activation invents no
+  terminal/undo output or waiter result, exact known fingerprints remain replay-safe,
+  and a permitted successor still runs. Parent tests add failure compacted **before** a
+  later quarantine, plus a WAL quarantine crash boundary fencing an already-admitted
+  active successor. Actual quarantine rows propagate fences without re-deriving success
+  or rollback from gapped detail; admission still reads full retained history.
+- **P2-1, rollback rejection:** `resolver::tests` removes only an unrequested rejected
+  potential step, preserving a real sibling's undo and already-requested ownership.
+  `tests/qa_review4_state.rs` derives default-false exact-run rejection, preserves request
+  bytes/true-failure obligations, and rejects real result, undo, quarantine and ambiguous
+  evidence. `tests/qa_review4_participants.rs` covers sync/async generic and workflow
+  no-effect completion with strict proof before ack and no business undo, write-error
+  quarantine/hooks, cold resend, startup request/proof recovery, and negative evidence.
+  Parent guards cover a stale accepted cache and conflicting startup histories. Physical
+  undo that is actually proved complete remains a valid acknowledgement; absence is not.
+- **P2-2, pressure:** `bus::admission_tests` reclaims reloadable failed fingerprints,
+  protects the current ID's complete history and recovers temporary durable pressure
+  only after real room. Parent direct merge tests preserve old/new phases, quarantine
+  and prejournaled flags with one bounded lookup/no global scan. Ephemeral and
+  unrepresented/unpersisted overflow remain conservative. A parent storage-fault test
+  proves published quarantine cannot downgrade after storage returns; a known quarantine
+  fence is persisted before later retained evidence.
+- **P2-3, release and limits:** `SagaBusReleaseWaiter` owns coordination only. Tests
+  cover live-owner timeout, multiple clones/contracts, native callback drop and real
+  LMDB reopen after completion. A parent blocked subscriber-destructor regression proves
+  true is delayed until bus-owned resources finish destruction. Documentation describes
+  off-actor use, application-owned references/work and irreducible capacity/retention costs.
+
+Genuine parent assertion REDs are `review4-bus-parent-red.log` (false replayed success
+and premature release) and `review4-bus-storage-parent-red.log` (quarantine downgrade).
+Worker state/resolver/no-effect first-ack and write-error/startup failures were behavioral
+RED. The worker duplicate-ack expectation, its wrong-trace bus baseline attempt, new API
+release tests, passing parent guards and compiler-only fixture corrections are **not**
+acceptance RED. Corrected duplicate tests require no repeated work; cold resend uses a
+fresh ingress dedupe and durable proof. Failed logs/reports remain preserved; only fresh
+SHA-bound parent final gates establish implementation verification, not release readiness.
+
 ## Evidence and limits
 
 Behavior-bearing writers supplied pre-change RED/characterization logs. Parent inspection

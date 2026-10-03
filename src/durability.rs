@@ -1702,6 +1702,71 @@ fn recover_completed_step_effect_for_unstarted_compensation(
     effect_at_request
 }
 
+/// True only for durable, exact-run evidence that the forward step was
+/// definitively rejected with no effect and nothing since could make an undo or a
+/// reconciliation necessary. Missing evidence is never rejection. This asserts safe
+/// rejection, not physical remote cancellation.
+pub(crate) fn no_effect_rejection_proven(evidence: &crate::ParticipantRunEvidence) -> bool {
+    evidence.forward_definitively_rejected
+        && !evidence.forward_intent_open
+        && !evidence.accepted_forward_pending
+        && !evidence.forward_result_recorded
+        && evidence.forward_outcome.is_none()
+        && !evidence.undo_intent_open
+        && !evidence.undo_completed
+        && !evidence.needs_reconciliation
+        && !evidence.quarantined
+}
+
+/// Entry-level mirror of the rejection marker for startup recovery, which has no
+/// actor. Deliberately conservative: any real result, compensating failure, undo
+/// activity, reconciliation, quarantine or foreign-run row yields `false`.
+/// Owned requests and a no-op completion proof do not clear a rejection.
+fn rejected_without_effect_in_entries(entries: &[JournalEntry], run: (&str, u64)) -> bool {
+    let mut accepted = false;
+    let mut rejected = false;
+    let mut dirty = false;
+    for entry in entries {
+        match &entry.event {
+            ParticipantEvent::AcceptedStepRecorded { context, .. } => {
+                if context.saga_type.as_ref() != run.0 || context.saga_started_at_millis != run.1 {
+                    return false;
+                }
+                rejected = false;
+                accepted = true;
+            }
+            ParticipantEvent::StepExecutionStarted { .. } => rejected = false,
+            ParticipantEvent::StepExecutionCompleted { .. }
+            | ParticipantEvent::ParticipantForwardOutcomeRecorded { .. }
+            | ParticipantEvent::StepExecutionFailed {
+                requires_compensation: true,
+                ..
+            } => {
+                rejected = false;
+                dirty = true;
+            }
+            ParticipantEvent::StepExecutionFailed {
+                requires_compensation: false,
+                ..
+            } => {
+                if accepted && !dirty {
+                    rejected = true;
+                }
+                accepted = false;
+            }
+            ParticipantEvent::CompensationCompleted { .. } => dirty = true,
+            ParticipantEvent::CompensationStarted { .. }
+            | ParticipantEvent::AcceptedCompensationRecorded { .. }
+            | ParticipantEvent::CompensationFailed { .. }
+            | ParticipantEvent::ParticipantReconciliationEvidence { .. }
+            | ParticipantEvent::Quarantined { .. }
+            | ParticipantEvent::ParticipantTerminalRecorded { .. } => return false,
+            _ => {}
+        }
+    }
+    rejected
+}
+
 /// The acknowledgement of an owned undo that is durably complete, if (and only
 /// if) the history is unambiguous: the retained request names this step and the
 /// run identity, the undo started and completed, and nothing after it reopened
@@ -1714,6 +1779,8 @@ fn recover_proven_undo_acknowledgement(
     step_name: &str,
 ) -> Option<SagaChoreographyEvent> {
     let (run_type, run_started) = identity?;
+    // A no-op completion (definitively rejected forward step) has no undo intent.
+    let no_effect = rejected_without_effect_in_entries(entries, (run_type, run_started));
     let mut request: Option<&SagaContext> = None;
     let mut started = false;
     let mut completed = false;
@@ -1737,7 +1804,9 @@ fn recover_proven_undo_acknowledgement(
                 started = true;
                 completed = false;
             }
-            ParticipantEvent::CompensationCompleted { .. } if started => completed = true,
+            ParticipantEvent::CompensationCompleted { .. } if started || no_effect => {
+                completed = true;
+            }
             ParticipantEvent::AcceptedCompensationRecorded { .. }
             | ParticipantEvent::CompensationFailed { .. }
             | ParticipantEvent::Quarantined { .. }
@@ -3287,6 +3356,10 @@ fn compensate_workflow_with_emit<A, F>(
             )
         });
     match actor.participant_run_evidence_strict(context) {
+        Ok(evidence) if no_effect_rejection_proven(&evidence) => {
+            complete_no_effect_workflow_compensation(actor, workflow, context, now, emit);
+            return;
+        }
         Ok(evidence)
             if evidence.undo_completed
                 && !evidence.undo_intent_open
@@ -3422,6 +3495,59 @@ fn compensate_workflow_with_emit<A, F>(
         },
         Err(error) => fail_workflow_compensation(actor, workflow, context, error, now, emit),
     }
+}
+
+/// Answers an owned request for a durably rejected (no-effect) forward step: the
+/// completion proof is strictly persisted BEFORE publication and no business undo
+/// runs. A failed append quarantines and publishes nothing; the request stays owned.
+fn complete_no_effect_workflow_compensation<A, F>(
+    actor: &mut A,
+    workflow: &'static dyn SagaWorkflowParticipant<A>,
+    context: &SagaContext,
+    now: u64,
+    emit: &mut F,
+) where
+    A: HasSagaParticipantSupport,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let saga_id = context.saga_id;
+    if let Err(error) = actor.record_event_strict(
+        saga_id,
+        ParticipantEvent::CompensationCompleted {
+            completed_at_millis: now,
+        },
+    ) {
+        quarantine_workflow_step_failure(
+            actor,
+            workflow,
+            context,
+            format!("no-effect compensation proof persistence failed: {error}").into(),
+            now,
+            emit,
+        );
+        return;
+    }
+    let state = crate::SagaParticipantState::new(
+        saga_id,
+        context.saga_type.clone(),
+        workflow.step_name().into(),
+        context.correlation_id,
+        context.trace_id,
+        context.initiator_peer_id,
+        context.saga_started_at_millis,
+    )
+    .trigger("no_effect_rejection", now)
+    .start_execution(now)
+    .complete(Vec::new(), Vec::new(), now)
+    .start_compensation(now)
+    .complete_compensation(now);
+    actor
+        .saga_states()
+        .insert(saga_id, SagaStateEntry::Compensated(state));
+    emit(SagaChoreographyEvent::CompensationCompleted {
+        context: context.next_step(workflow.step_name().into()),
+    });
+    workflow.on_compensation_completed(actor, context);
 }
 
 fn complete_workflow_compensation<A, F>(
@@ -4127,7 +4253,12 @@ fn collect_startup_recovery_events_for_saga_type_inner<
             let completed_effect =
                 recover_completed_step_effect_for_unstarted_compensation(entries)
                     .is_some_and(|(_, compensation_data, _)| !compensation_data.is_empty());
-            if !accepted_effect && !completed_effect {
+            let no_effect_rejection = run.identity.is_some_and(|identity| {
+                request.context().saga_type.as_ref() == identity.0
+                    && request.context().saga_started_at_millis == identity.1
+                    && rejected_without_effect_in_entries(entries, identity)
+            });
+            if !accepted_effect && !completed_effect && !no_effect_rejection {
                 out.push(SagaChoreographyEvent::SagaQuarantined {
                     context: request.context().clone(),
                     reason: "unstarted compensation recovery missing durable compensation state"

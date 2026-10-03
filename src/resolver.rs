@@ -1232,15 +1232,23 @@ fn close_definitive_accepted_potential(
     context: &SagaContext,
     requires_compensation: bool,
 ) {
-    if !requires_compensation
-        && state.accepted_participants.contains_key(&context.step_name)
-        && !state.completed_steps.contains(&context.step_name)
-        && !state.rollback_owns(&context.step_name)
+    if requires_compensation
+        || !state.accepted_participants.contains_key(&context.step_name)
+        || state.completed_steps.contains(&context.step_name)
     {
-        state
-            .compensable_steps
-            .retain(|step| step != &context.step_name);
+        return;
     }
+    let step = context.step_name.as_ref();
+    match state.rollback.as_mut() {
+        // Requested (or accepted) undo stays owned until acknowledged.
+        Some(plan) if plan.requested.iter().any(|s| s.as_ref() == step) => return,
+        // Queued but never requested: only a potential obligation, drop it.
+        Some(plan) => plan.queue.retain(|s| s.as_ref() != step),
+        None => {}
+    }
+    state
+        .compensable_steps
+        .retain(|candidate| candidate.as_ref() != step);
 }
 
 fn apply_step_failure(
@@ -2865,5 +2873,98 @@ mod tests {
             matches!(out.as_slice(), [SagaChoreographyEvent::SagaQuarantined { step, .. }] if step.as_ref() == "risk_check"),
             "unexpected output: {out:?}"
         );
+    }
+
+    // --- Review4 P2-1: a safe rejection is not an undo effect -------------
+
+    fn accepted_potential(base: &SagaContext, step: &str) -> SagaChoreographyEvent {
+        SagaChoreographyEvent::StepAccepted {
+            context: base.next_step(step.into()),
+            participant_id: step.into(),
+            execution_id: StepExecutionId::new(format!("exec-{step}")),
+            deadline_at_millis: u64::MAX / 2,
+            hard_deadline_at_millis: u64::MAX / 2,
+            timeouts_enabled: true,
+            timeout_outcome: AcceptedStepTimeoutOutcome::QuarantineSaga,
+            compensation_available: true,
+        }
+    }
+
+    fn safe_rejection(base: &SagaContext, step: &str) -> SagaChoreographyEvent {
+        SagaChoreographyEvent::StepFailed {
+            context: base.next_step(step.into()),
+            participant_id: step.into(),
+            error_code: None,
+            error: "safe rejection".into(),
+            requires_compensation: false,
+        }
+    }
+
+    fn undone(base: &SagaContext, step: &str) -> SagaChoreographyEvent {
+        SagaChoreographyEvent::CompensationCompleted {
+            context: base.next_step(step.into()),
+        }
+    }
+
+    #[test]
+    fn queued_safe_rejection_is_not_requested_and_real_sibling_undo_stays() {
+        let mut resolver = TerminalResolver::new(TerminalPolicy::order_lifecycle_default());
+        let base = ctx_at("a", 70, 1_000, 1_000);
+        // b is only potential and queued behind the real effect a.
+        let _ = resolver.ingest_at(&accepted_potential(&base, "b"), 1_001);
+        let _ = resolver.ingest_at(&completed_effect(&base, "a"), 1_002);
+        let first = resolver.ingest_at(&compensating_failure(&base, "x"), 1_003);
+        assert!(singleton_request("a")(&first), "{first:?}");
+        assert!(
+            resolver
+                .ingest_at(&safe_rejection(&base, "b"), 1_004)
+                .is_empty()
+        );
+        let out = resolver.ingest_at(&undone(&base, "a"), 1_005);
+        match out.as_slice() {
+            [
+                SagaChoreographyEvent::SagaFailed {
+                    failure: Some(failure),
+                    ..
+                },
+            ] => assert_eq!(failure.step_name.as_ref(), "x", "first failure kept"),
+            other => panic!("rejected b must not be requested: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn requested_undo_stays_owned_after_a_later_safe_rejection() {
+        let mut resolver = TerminalResolver::new(TerminalPolicy::order_lifecycle_default());
+        let base = ctx_at("a", 71, 1_000, 1_000);
+        let _ = resolver.ingest_at(&completed_effect(&base, "a"), 1_001);
+        let _ = resolver.ingest_at(&accepted_potential(&base, "b"), 1_002);
+        let first = resolver.ingest_at(&compensating_failure(&base, "x"), 1_003);
+        assert!(singleton_request("b")(&first), "{first:?}");
+        assert!(
+            resolver
+                .ingest_at(&safe_rejection(&base, "b"), 1_004)
+                .is_empty()
+        );
+        let next = resolver.ingest_at(&undone(&base, "b"), 1_005);
+        assert!(singleton_request("a")(&next), "{next:?}");
+        let done = resolver.ingest_at(&undone(&base, "a"), 1_006);
+        assert!(matches!(
+            done.as_slice(),
+            [SagaChoreographyEvent::SagaFailed { .. }]
+        ));
+    }
+
+    #[test]
+    fn completed_effect_survives_a_queued_false_rejection() {
+        let mut resolver = TerminalResolver::new(TerminalPolicy::order_lifecycle_default());
+        let base = ctx_at("a", 72, 1_000, 1_000);
+        let _ = resolver.ingest_at(&accepted_potential(&base, "b"), 1_001);
+        let _ = resolver.ingest_at(&completed_effect(&base, "b"), 1_002);
+        let _ = resolver.ingest_at(&completed_effect(&base, "a"), 1_003);
+        let first = resolver.ingest_at(&compensating_failure(&base, "x"), 1_004);
+        assert!(singleton_request("a")(&first), "{first:?}");
+        let _ = resolver.ingest_at(&safe_rejection(&base, "b"), 1_005);
+        let next = resolver.ingest_at(&undone(&base, "a"), 1_006);
+        assert!(singleton_request("b")(&next), "{next:?}");
     }
 }

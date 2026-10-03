@@ -1191,6 +1191,9 @@ enum CompensationStart {
     Skip,
     /// The undo already completed durably; only its acknowledgement is resent.
     Acknowledge,
+    /// Forward work was durably and definitively rejected: persist a no-op
+    /// completion proof (no business undo), then acknowledge.
+    NoEffect,
     Quarantined(Box<str>),
 }
 
@@ -1199,6 +1202,8 @@ enum UndoRecovery {
     /// Confirmed forward work: completed state rebuilt; carries its undo data.
     Rebuilt(Vec<u8>),
     Acknowledge,
+    /// Durably rejected forward step with no effect evidence.
+    NoEffect,
     /// No forward work or undo obligation exists for this participant.
     Nothing,
     Unsafe(Box<str>),
@@ -1241,6 +1246,9 @@ where
             .saga_states()
             .insert(context.saga_id, SagaStateEntry::Compensated(state));
         return UndoRecovery::Acknowledge;
+    }
+    if crate::durability::no_effect_rejection_proven(&evidence) {
+        return UndoRecovery::NoEffect;
     }
     if evidence.needs_reconciliation {
         return UndoRecovery::Unsafe(
@@ -1351,6 +1359,7 @@ where
         None => match recover_for_undo(actor, who, context, now) {
             UndoRecovery::Rebuilt(data) => (Vec::new(), data),
             UndoRecovery::Acknowledge => return CompensationStart::Acknowledge,
+            UndoRecovery::NoEffect => return CompensationStart::NoEffect,
             UndoRecovery::Nothing => return CompensationStart::Skip,
             UndoRecovery::Unsafe(reason) => {
                 quarantine_run(actor, who, context, reason.clone(), now, emit);
@@ -1416,6 +1425,13 @@ async fn compensate_wrapper_with_emit_async<P, F>(
             CompensationStart::Skip => return,
             CompensationStart::Acknowledge => {
                 resend_compensation_ack(&who, context, emit);
+                return;
+            }
+            CompensationStart::NoEffect => {
+                match complete_no_effect_compensation(participant, &who, context, now, emit) {
+                    Ok(()) => participant.on_compensation_completed(context),
+                    Err(reason) => participant.on_quarantined(context, &reason),
+                }
                 return;
             }
             CompensationStart::Quarantined(reason) => {
@@ -1492,6 +1508,13 @@ fn compensate_wrapper_with_emit<P, F>(
                 resend_compensation_ack(&who, context, emit);
                 return;
             }
+            CompensationStart::NoEffect => {
+                match complete_no_effect_compensation(participant, &who, context, now, emit) {
+                    Ok(()) => participant.on_compensation_completed(context),
+                    Err(reason) => participant.on_quarantined(context, &reason),
+                }
+                return;
+            }
             CompensationStart::Quarantined(reason) => {
                 participant.on_quarantined(context, &reason);
                 return;
@@ -1540,6 +1563,53 @@ fn compensate_wrapper_with_emit<P, F>(
             participant.on_quarantined(context, &reason);
         }
     }
+}
+
+/// Persists the completion proof of a durably rejected (no-effect) forward step
+/// before acknowledging it. No business undo ran; a failed append quarantines and
+/// publishes nothing, leaving the owned request unanswered.
+fn complete_no_effect_compensation<A, F>(
+    actor: &mut A,
+    who: &Who,
+    context: &SagaContext,
+    now: u64,
+    emit: &mut F,
+) -> Result<(), Box<str>>
+where
+    A: SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
+{
+    let saga_id = context.saga_id;
+    if let Err(error) = actor.record_event_strict(
+        saga_id,
+        ParticipantEvent::CompensationCompleted {
+            completed_at_millis: now,
+        },
+    ) {
+        let reason: Box<str> =
+            format!("no-effect compensation proof persistence failed: {error:?}").into();
+        quarantine_run(actor, who, context, reason.clone(), now, emit);
+        return Err(reason);
+    }
+    let state = SagaParticipantState::new(
+        saga_id,
+        context.saga_type.clone(),
+        who.step.clone(),
+        context.correlation_id,
+        context.trace_id,
+        context.initiator_peer_id,
+        context.saga_started_at_millis,
+    )
+    .trigger("no_effect_rejection", now)
+    .start_execution(now)
+    .complete(Vec::new(), Vec::new(), now)
+    .start_compensation(now)
+    .complete_compensation(now);
+    actor
+        .saga_states()
+        .insert(saga_id, SagaStateEntry::Compensated(state));
+    resend_compensation_ack(who, context, emit);
+    Ok(())
 }
 
 /// Records and publishes compensation completion only after the result is durable;

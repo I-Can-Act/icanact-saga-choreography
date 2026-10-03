@@ -9,8 +9,10 @@ Nothing in these notes authorizes publication or certifies production operation.
 
 1. **Exhaustive enums grew.** `ParticipantEvent` and `TerminalResolverJournalError` gained
    variants. Update exhaustive downstream matches; recovery evidence is not success.
-   `ParticipantRunEvidence` also gained fields including `undo_required`; update explicit
-   struct literals or construct with `Default` before setting the needed evidence.
+   `ParticipantRunEvidence` also gained `undo_required` and
+   `forward_definitively_rejected` (default false, derived exact-run evidence); update
+   explicit struct literals or construct with `Default`. Rejection is not physical
+   cancellation and no archive field/tag was added for this derived marker.
 2. **Archive tags are appended.** Original tags 0–11 are not renumbered; appended tags
    12–14 retain run, terminal and reconciliation records. Tag 15 is
    `ParticipantForwardOutcomeRecorded { outcome: ParticipantForwardOutcome }`. The proof
@@ -77,6 +79,17 @@ Nothing in these notes authorizes publication or certifies production operation.
     `StepStarted` before business execution. With an attached bus, helper emit sinks
     observe an already-published start; do not forward that event to the bus again.
     Managed sync/async wrappers suppress the duplicate bus send, not the observer hook.
+13. **Owned no-effect rollback is durably acknowledged.** Definitive accepted rejection
+    can remove only an unrequested potential queue entry. Requested undo remains owned;
+    exact-run rejection without conflicting effect/undo evidence allows strict
+    `CompensationCompleted` before acknowledgement without business undo. Completion
+    hooks include this logical no-op. Failed completion persistence quarantines and sends
+    no acknowledgement. Duplicate/cold/startup resend needs proof, not missing rows.
+14. **Release completion is observable.** `SagaBusReleaseWaiter`, returned by
+    `SagaChoreographyBus::release_waiter()`, exposes `wait_timeout(Duration) -> bool`.
+    Obtain it before dropping public owners and wait only off-actor/off-callback. True
+    observes actual bus-owned resource destruction; it does not shut down work, resolve
+    sagas, close application-held journal clones or physically cancel external work.
 
 ## Drain before upgrading from baseline
 
@@ -101,8 +114,17 @@ expect a built-in safe-clear.
 - Managed attached-bus `StepStarted` is published strictly before business execution;
   hooks stay application-idempotent.
 - ID-scoped compatibility waiters bind to the unique known active run after admission.
-- Ephemeral resolvers refuse new admission at capacity; durable caches are bounded with
-  lookups on miss, while permanent fences retain irreducible storage cost.
+- Closed full-run history is classified before reconstruction. Compacted ordinary
+  terminals cannot invent success/failure/undo/timeouts; even a later quarantine uses
+  actual quarantine rows rather than gapped detail, preserving older-run successor fencing.
+- Ephemeral resolvers refuse new admission at capacity; durable caches reclaim reloadable
+  ordinary terminals/failed fingerprints while protecting the whole current ID. Temporary
+  durable shortage recovers only after real room and a complete bounded history merge.
+  Active/quarantined ownership, oversize IDs, non-indexed/ephemeral lifetime fences and
+  unrepresented/unpersisted uncertainty still fail closed; permanent storage is not bounded.
+- A resolver write failure latches live quarantine before loopback. Once writable,
+  a known quarantine fence precedes retained new evidence. Unwritable storage cannot
+  produce durable proof: application/external evidence and reconciliation remain necessary.
 
 ## Blocked legacy history and quarantine
 

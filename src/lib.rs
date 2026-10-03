@@ -83,7 +83,9 @@ pub use binding::{
     bind_sync_workflow_participant_channel_strict, bind_sync_workflow_participant_tell,
     bind_sync_workflow_participant_tell_strict, checked_workflow_saga_types, workflow_saga_types,
 };
-pub use bus::{SagaBusPublishError, SagaChoreographyBus, global_saga_choreography_bus};
+pub use bus::{
+    SagaBusPublishError, SagaBusReleaseWaiter, SagaChoreographyBus, global_saga_choreography_bus,
+};
 pub use context::{PeerId, SagaContext, SagaId, StepId};
 pub use durability::*;
 

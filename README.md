@@ -20,7 +20,9 @@ Before publishing `SagaStarted`, register all of the following on the saga bus:
 4. resolver recovery activation (`activate_terminal_resolver_recovery_for_contract`)
 
 Registering a workflow contract alone is not enough; `attach_terminal_resolver*` must succeed.
-If startup wiring is incomplete, saga start is failed immediately with a terminal event instead of stalling.
+Incomplete startup wiring rejects starts before business fanout; contract diagnostics
+must not overwrite an existing owner's durable terminal/quarantine fence. A live delivery
+shortfall quarantines because some owners may already have received the start.
 
 ## Minimal Startup Example
 
@@ -87,6 +89,14 @@ use stable external idempotency keys and reconciliation. See
 - Success keeps business effects; late evidence after failure quarantines, and a `SagaFailed`
   reply may be superseded by quarantine. Declared effects without undo are irreversible.
 - `FailStep(requires_compensation=false)` is a safe/no-undo remote contract, not cancellation.
+  Definitive rejection during rollback removes only unrequested potential work; an owned
+  request needs durable no-effect completion before acknowledgement, without business undo.
+- Closed/compacted history cannot generate fresh terminal or undo output on restart;
+  actual quarantine still fences active successors. Durable capacity recovery never forgets
+  current-ID authority, and active/quarantined/ephemeral retention has irreducible cost.
+- Obtain `bus.release_waiter()` before dropping public bus owners. Its
+  `wait_timeout(Duration)` observes actual bus-owned resource destruction; wait only
+  off-actor/off-callback. It neither cancels work nor closes application-owned journal clones.
 - Drain all in-flight sagas before upgrading from baseline; see
   [docs/migration.md](docs/migration.md). No repair/safe-clear API exists.
 

@@ -32,7 +32,8 @@ but cannot retain fences across process restart. Required-delivery shortfalls, i
 an effect owner may already have received the event. Always handle `publish_strict`
 and participant-support publication errors; do not treat best-effort publish statistics
 as a delivery guarantee. Shut down application actor handles before releasing stores.
-Dropping the last public bus initiates shutdown of its resolver runtimes and releases journal ownership.
+Dropping the last public bus initiates shutdown of its resolver runtimes. Observe actual
+bus-owned resource release with the completion waiter described below before closing stores.
 
 ## Run identity and retained evidence
 
@@ -87,10 +88,21 @@ An accepted deadline does not physically cancel remote work. `FailStep` with
 `requires_compensation=false` (and `fail_accepted_workflow_step(..., false)`) is an
 **explicit safe/no-undo remote contract**: the application asserts that the remote side
 rejected the work or that any late effect is harmless. It is not physical cancellation.
-An authoritative durable `StepExecutionFailed` then closes the accepted forward work and
-the saga may fail ordinarily. Potential compensation bytes carried by acceptance are only
-metadata, not a materialized effect. A real result/outcome, a requires-compensation
-failure or a requested/open undo remains an obligation until resolved. An unrelated
+An authoritative durable `StepExecutionFailed(false)` then closes the accepted forward
+work. `ParticipantRunEvidence.forward_definitively_rejected` is default-false, derived
+from exact-run accepted metadata and that disposition—not missing rows or cancellation.
+Potential compensation bytes carried by acceptance are metadata, not a materialized effect.
+During rollback, an unrequested potential queue entry can be removed; a real completed
+effect or already-requested/accepted undo cannot. An owned request for proven no-effect
+rejection still needs one strict exact-run `CompensationCompleted` append before its
+acknowledgement, but invokes no business undo. Failed persistence quarantines, calls the
+quarantine hook and sends no acknowledgement. Duplicate/cold requests and startup may
+resend only a proved completion, never repeat physical undo. Completion hooks describe
+logical obligation completion, including this proved no-op, not necessarily physical work.
+Real results/proofs, any compensation-requiring failure, open/real undo, new forward
+intent/acceptance, reconciliation or quarantine invalidate rejection. An owned request
+alone does not: it remains owed until completion. Any `StepExecutionFailed(true)` retains
+undo and invalidates earlier undo completion even without pending accepted metadata. An unrelated
 `SagaFailed` never closes unresolved accepted work, and a genuinely late result after an
 authoritative failure becomes original-run reconciliation evidence (quarantine). Genuinely
 unknown remote work, or a policy that cannot make late effects safe, must use compensation
@@ -137,11 +149,30 @@ execution IDs must remain stable within a run and distinguish different runs; a 
 that names multiple retained runs requires explicit application reconciliation. Panic
 quarantine does not establish whether an external effect happened.
 
-Pooled actor shutdown initiated inside a scheduler callback can drain asynchronously
-in the pinned core runtime. The public lifecycle must disappear without an ownership
-cycle, but backend ownership is released as that drain completes, not necessarily at
-the instant the last bus clone is dropped. Coordinate explicit store close/reopen with
-runtime completion; the journal-release regression checks bounded eventual release.
+## Observing bus-owned resource release
+
+Pooled shutdown initiated inside a scheduler callback may drain asynchronously. Obtain
+`SagaBusReleaseWaiter` with `SagaChoreographyBus::release_waiter()` before dropping the
+last public owner; call `wait_timeout(Duration) -> bool` **off-actor and off-callback**:
+
+```rust,ignore
+let released = bus.release_waiter();
+// Stop/shut down application-owned actors and drop every public bus clone first.
+drop(bus);
+if !released.wait_timeout(std::time::Duration::from_secs(5)) {
+    return Err("bus resources are not yet released".into());
+}
+// Drop all application-owned journal clones before actually closing/reopening stores.
+```
+
+True means the last public owner and actual bus-owned actor/gate/subscriber resources
+have been destroyed and bus-held backend references released—not merely that shutdown
+was requested. Drop guards notify after their owning fields are destroyed. The waiter
+retains only completion coordination, not public lifecycle, actors or journals. Timeout
+is not permission to reopen. It neither shuts down work nor resolves a saga or physically
+cancels external execution. Waiting inside a runtime callback can deadlock the drain;
+application-owned actors, journal clones, callback jobs and remote work remain the
+application's responsibility.
 
 ## Capacity and maintenance
 
@@ -152,9 +183,14 @@ runtime completion; the journal-release regression checks bounded eventual relea
 - `TerminalResolverJournal::compact_terminal_detail()` returns removed-row count.
   LMDB removes obsolete detail of ordinarily resolved runs but keeps their terminal
   fences and monotonic sequence. Every unresolved **or quarantined** run keeps all
-  evidence, even with contradictory ordinary terminal rows. Failed runs also keep
-  known compensable-completion/acceptance fingerprints, distinguishing harmless
-  replay from new uncertainty after compaction/reopen. Corruption aborts maintenance. Journals without maintenance return `Unsupported`, not pretend success.
+  still-retained evidence, even with contradictory ordinary terminals. Detail may already
+  have been compacted before a failed run later quarantines. Restoration first computes
+  final full-run phase: ordinary closed detail never drives live work/success; closed
+  quarantine retains actual quarantine rows for fencing and active-successor propagation,
+  not fresh outputs from gapped detail. Failed runs keep known compensable-completion/
+  acceptance fingerprints, distinguishing harmless replay from new uncertainty after
+  compaction/reopen. Corruption aborts maintenance. Unsupported journals return
+  `Unsupported`, not pretend success.
 - In-process admission caches (runs, completions, accepted fingerprints) are bounded and
   miss to bounded durable point/range lookups instead of scanning all history. An
   ephemeral resolver cannot forget replay fences, so at capacity it **refuses new
@@ -168,10 +204,26 @@ runtime completion; the journal-release regression checks bounded eventual relea
   scans retained history once, so startup time/temporary memory require planning.
   Durable starts still fsync under per-type admission serialization; that cost protects
   admission authority and is not removable without replacing the fence.
+  Reloadable ordinary terminals, including failed-run fingerprints, can be reclaimed
+  before live fingerprint admission while every run of the current ID stays protected.
+  A small bounded fingerprint reserve (`min(budget / 4, 64)`) reduces avoidable pressure;
+  genuinely active/quarantined ownership is not evictable. Temporary durable capacity
+  refusal can recover only after real room returns and a complete bounded per-ID reload
+  merges all history in place, preserving prejournaled flags. Remaining oversize/read
+  errors still refuse; ephemeral overflow and unrepresented/unpersisted uncertainty may
+  remain conservatively sticky. Free space, a fresh timestamp or restart is not reconciliation.
 - Compaction does not bound permanent fence count. Storage has irreducible per-run
   replay-fence cost; capacity exhaustion is an error, never permission to forget IDs.
   Participant journals have no automatic safe-compaction API. Alert on storage errors,
-  quarantine growth and held recovery output before capacity is exhausted.
+  quarantine growth and held recovery output before capacity is exhausted. Active and
+  quarantined resident ownership, non-indexed/ephemeral lifetime fences, per-ID histories,
+  and retained failed fingerprints all have irreducible costs; no hard limit guarantees
+  every workload fits. Cache recovery is not a safe-clear API.
+- A resolver write failure latches live quarantine before publication/loopback; restored
+  storage cannot downgrade it to success. Before retaining later evidence for a known
+  quarantined run, its quarantine fence is persisted first. An unwritable store cannot
+  durably retain that fence/evidence: preserve application/external records and reconcile
+  before restart/admission. An emitted quarantine or log is not itself a durable receipt.
 - `prune_saga`/`prune_saga_strict` and backend `prune` are destructive administrative
   primitives: they remove replay protection and are **not** routine terminal cleanup.
   Do not use them to unblock a saga or replace safe resolver compaction.
