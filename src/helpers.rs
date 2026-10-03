@@ -1334,6 +1334,39 @@ where
         return CompensationStart::Quarantined(reason);
     }
 
+    // Volatile Completed/Executing(accepted) cache is never authority: a durably
+    // rejected forward step can still look live when the post-append cleanup read
+    // failed. Strict exact-run evidence is consulted first; an unreadable journal
+    // quarantines instead of falling back to the cache.
+    if matches!(
+        actor.saga_states_ref().get(&saga_id),
+        Some(SagaStateEntry::Completed(_) | SagaStateEntry::Executing(_))
+    ) {
+        match actor.participant_run_evidence_strict(context) {
+            Ok(evidence) if crate::durability::no_effect_rejection_proven(&evidence) => {
+                if let Some(accepted) = actor
+                    .saga_support_mut()
+                    .accepted_workflow_steps
+                    .remove(&saga_id)
+                {
+                    crate::durability::mark_accepted_step_resolved(
+                        actor,
+                        saga_id,
+                        accepted.execution_id,
+                    );
+                }
+                return CompensationStart::NoEffect;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let reason: Box<str> =
+                    format!("undo evidence unavailable before local cache use: {error}").into();
+                quarantine_run(actor, who, context, reason.clone(), now, emit);
+                return CompensationStart::Quarantined(reason);
+            }
+        }
+    }
+
     let local = match actor.saga_states_ref().get(&saga_id) {
         Some(SagaStateEntry::Completed(state)) => {
             Some((Vec::new(), state.state.compensation_data.clone()))
