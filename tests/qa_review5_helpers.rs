@@ -510,9 +510,12 @@ fn managed_lag_duplicate_and_cold_restart_resend_without_repeating_work() {
     for mode in MODES {
         let world = World::new();
         let mut actor = managed_rejection_with_lagging_cache(&world, mode);
-        drive(mode, &mut actor, request_event());
+        let first = drive(mode, &mut actor, request_event());
+        assert_eq!(acks(&first), 1, "{mode:?}: {first:?}");
         let dup = drive(mode, &mut actor, request_event());
-        assert!(acks(&dup) <= 1, "{mode:?}: {dup:?}");
+        // Hot ingress dedupe suppresses the whole duplicate request; a lost
+        // acknowledgement is resent from durable proof by cold/startup recovery.
+        assert_eq!(acks(&dup), 0, "{mode:?}: hot duplicate: {dup:?}");
         let mut cold = world.restarted_actor();
         let again = drive(mode, &mut cold, request_event());
         assert_eq!(acks(&again), 1, "{mode:?}: {again:?}");

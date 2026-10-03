@@ -279,6 +279,41 @@ irreducible retention/capacity costs remain explicit operational limits. Fresh S
 parent gates and the same retained reviewer's committed-tree recommendation—not writer
 self-checks or this ledger—determine local remediation acceptance.
 
+## Re-challenge of `5bd6816`: final observations
+
+The completed same-lineage reviewer marked N1–N6 resolved and recommended **OK with
+notes**. Its O1 was explicitly labelled P2 despite the introductory no-P2 statement;
+the parent treated that reachable waiter gap as an implementation finding. The aggregate
+runner failed after the child delivered: its failure and missing receipt remain preserved,
+not relabelled as successful workflow settlement or repaired by rerunning completed review.
+
+- **O1, evicted known-run waiters:** `bus::admission_tests` actually resolves and evicts an
+  ordinary ID, registers a later full-run waiter, and quarantines the retained run. The
+  bounded actor regression first failed on unchanged production. Known-run classification
+  now consults complete bounded per-ID durable history **before** ingesting the incoming
+  quarantine; that input cannot vouch for itself. Exact-run isolation and failed-lookup
+  guards remain, with parent checks for one successful point reload/no global scan,
+  resident authority during outage, absent/different-run evidence and oversized history.
+  Waiter registration is observed through a bounded channel, not assumed after a sleep.
+  Existing activation-held/duplicate activation, legacy binding, delivery and successor
+  regressions still govern. A missing or unreadable owner is not guessed by this path;
+  resolver-generated capacity/refusal quarantine remains a separate conservative authority.
+- **O2, successor policy:** the README now explicitly states that older uncertainty can
+  supersede an admitted successor's already-returned `SagaCompleted`, even after ordinary
+  detail/cache loss. It does not imply cancellation, automatic undo or safe-clear.
+- **O3, hot duplicate acknowledgement:** the existing managed sync/async regression pins
+  one first ack, **zero** hot-duplicate acks, and one cold durable-proof resend, with no
+  repeated business undo or proof append. This is passing characterization of unchanged
+  ingress dedupe, not a behavioral repair RED; startup proof resend remains separately tested.
+
+Parent `review6-bus-parent-red.log` has two compiled bounded waiter assertion failures
+and two passing guards before production edits. The writer's earlier different-input
+quarantine draft also reached the existing capacity-generated reply path; that draft
+failure is preserved but is not accepted O1 RED. Native `checked` authoring evidence,
+parent verification, the new committed-tree recommendation and production certification
+remain separate boundaries. No failed aggregate or historical count substitutes for
+fresh SHA-bound gates or the retained reviewer's next challenge.
+
 ## Evidence and limits
 
 Behavior-bearing writers supplied pre-change RED/characterization logs. Parent inspection

@@ -1208,6 +1208,22 @@ impl ResolverGate {
         self.index().phase(context)
     }
 
+    /// Run authority within this resolver's saga type: preserve a resident hit,
+    /// otherwise consult complete bounded durable history before the incoming
+    /// event is journaled. Failed/oversize lookup or absent exact-run evidence
+    /// cannot prove ownership; the incoming event cannot vouch for itself.
+    fn known_run(&self, context: &SagaContext) -> bool {
+        let mut index = self.index();
+        if index.phase(context).is_some() {
+            return true;
+        }
+        if let Err(reason) = self.ensure_resident(&mut index, context.saga_id) {
+            tracing::error!(target: "core::saga", event = "terminal_resolver_known_run_lookup_failed", reason = %reason);
+            return false;
+        }
+        index.phase(context).is_some()
+    }
+
     fn raise(&self, context: &SagaContext, phase: RunPhase) {
         self.index()
             .raise(context.saga_id, context.saga_started_at_millis, phase);
@@ -1710,7 +1726,7 @@ impl SyncActor for TerminalResolverActor {
                 // waiters whoever raised it (participant, delivery shortfall, ...).
                 let known_quarantine =
                     matches!(*event, SagaChoreographyEvent::SagaQuarantined { .. })
-                        && self.gate.phase(event.context()).is_some();
+                        && self.gate.known_run(event.context());
                 self.ingest_event(&event);
                 if known_quarantine {
                     if self.activated {
@@ -5685,5 +5701,213 @@ mod admission_tests {
         let reason =
             rejected_reason(bus.publish_strict(started(&ctx("adm_chain", 714, "a", base))));
         assert!(reason.contains("capacity"), "{reason}");
+    }
+
+    // ------------------------------------------- evicted known-run quarantine
+
+    /// Registers a full-run waiter from an off-actor probe and waits for it on a
+    /// helper thread, so the test thread only ever uses bounded receives.
+    fn register_run_waiter(
+        bus: &SagaChoreographyBus,
+        context: &SagaContext,
+    ) -> std::sync::mpsc::Receiver<Result<SagaReplyToResult, String>> {
+        let (registered_tx, registered_rx) = std::sync::mpsc::channel();
+        let (probe, handle) = local_sync::mpsc::spawn(
+            8,
+            move |(bus, context, reply): (SagaChoreographyBus, SagaContext, SagaReplyToHandle)| {
+                let _ = registered_tx.send(bus.register_terminal_reply_for_run(&context, reply));
+            },
+        );
+        let pending = probe
+            .ask_delegated(|reply| (bus.clone(), context.clone(), reply))
+            .expect("run waiter enqueued");
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _keep = handle;
+            let _ = tx.send(pending.wait().map_err(|error| format!("{error:?}")));
+        });
+        registered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("run waiter registration observed")
+            .expect("run waiter registered");
+        rx
+    }
+
+    fn participant_quarantine(c: &SagaContext, reason: &str) -> SagaChoreographyEvent {
+        SagaChoreographyEvent::SagaQuarantined {
+            context: c.next_step("a".into()),
+            reason: reason.into(),
+            step: "a".into(),
+            participant_id: "a".into(),
+        }
+    }
+
+    /// Resolves run `first_id` ordinarily, then resolves enough newer ids that
+    /// `first_id` is evicted from the bounded resident index.
+    fn evicted_resolved_run(
+        journal: &Arc<LookupJournal>,
+        first_id: u64,
+        base: u64,
+    ) -> (SagaChoreographyBus, SagaContext) {
+        let (bus, seen) = bus_with::<Chain>(
+            Some(Arc::clone(journal) as Arc<dyn TerminalResolverJournal>),
+            limits(2, 1_000),
+        );
+        let run = ctx("adm_chain", first_id, "a", base);
+        for (n, id) in (first_id..first_id + 4).enumerate() {
+            complete_chain(&bus, &ctx("adm_chain", id, "a", base), &seen, n + 1);
+            thread::sleep(Duration::from_millis(30));
+        }
+        let gate = bus
+            .gates
+            .lock()
+            .unwrap()
+            .get("adm_chain")
+            .and_then(std::sync::Weak::upgrade)
+            .unwrap();
+        assert!(
+            !gate.index().contains(run.saga_id),
+            "the ordinarily resolved run must be genuinely evicted"
+        );
+        (bus, run)
+    }
+
+    fn quarantine_reply(rx: &std::sync::mpsc::Receiver<Result<SagaReplyToResult, String>>) -> bool {
+        match rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(Ok(Ok(reply))) => matches!(reply.outcome, SagaTerminalOutcome::Quarantined { .. }),
+            _ => false,
+        }
+    }
+
+    fn unresolved(rx: &std::sync::mpsc::Receiver<Result<SagaReplyToResult, String>>) -> bool {
+        matches!(
+            rx.recv_timeout(Duration::from_millis(400)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        )
+    }
+
+    #[test]
+    fn participant_quarantine_of_evicted_resolved_run_resolves_later_run_waiter() {
+        let journal = Arc::new(LookupJournal::default());
+        let base = SagaContext::now_millis();
+        let (bus, run) = evicted_resolved_run(&journal, 1_100, base);
+        let waiter = register_run_waiter(&bus, &run);
+        let global_reads = journal.read_alls.load(Ordering::SeqCst);
+        let point_reads = journal.lookups.load(Ordering::SeqCst);
+
+        bus.publish_strict(participant_quarantine(&run, "late participant uncertainty"))
+            .unwrap();
+
+        assert!(
+            quarantine_reply(&waiter),
+            "durable history proves the run, so its later waiter must be quarantined"
+        );
+        assert_eq!(
+            journal.read_alls.load(Ordering::SeqCst),
+            global_reads,
+            "classification is a bounded point read, never a global scan"
+        );
+        assert_eq!(
+            journal.lookups.load(Ordering::SeqCst),
+            point_reads + 1,
+            "the complete resident-miss reload serves classification and ingestion"
+        );
+    }
+
+    #[test]
+    fn evicted_run_quarantine_resolves_only_the_proven_full_run() {
+        let journal = Arc::new(LookupJournal::default());
+        let base = SagaContext::now_millis();
+        let (bus, run) = evicted_resolved_run(&journal, 1_200, base);
+        let unknown = ctx("adm_chain", 1_299, "a", base);
+        let successor = ctx("adm_chain", run.saga_id.get(), "a", base + 9);
+        let run_rx = register_run_waiter(&bus, &run);
+        let unknown_rx = register_run_waiter(&bus, &unknown);
+        let successor_rx = register_run_waiter(&bus, &successor);
+
+        bus.publish_strict(participant_quarantine(&run, "proven run uncertainty"))
+            .unwrap();
+
+        assert!(quarantine_reply(&run_rx), "the proven full run resolves");
+        assert!(
+            unresolved(&unknown_rx),
+            "an unknown id is not guessed owned"
+        );
+        assert!(
+            unresolved(&successor_rx),
+            "a different full run of the same id is not the proven run"
+        );
+    }
+
+    #[test]
+    fn known_run_lookup_preserves_resident_authority_and_refuses_unproved_history() {
+        let journal = Arc::new(LookupJournal::default());
+        let (bus, _) = bus_with::<Chain>(
+            Some(Arc::clone(&journal) as Arc<dyn TerminalResolverJournal>),
+            limits(2, 8),
+        );
+        let gate = bus
+            .gates
+            .lock()
+            .unwrap()
+            .get("adm_chain")
+            .and_then(std::sync::Weak::upgrade)
+            .unwrap();
+        let base = SagaContext::now_millis();
+        let run = ctx("adm_chain", 1_400, "a", base);
+        journal.inner.append(started(&run)).unwrap();
+        journal
+            .inner
+            .append(SagaChoreographyEvent::SagaCompleted {
+                context: run.next_step(TERMINAL_RESOLVER_STEP.into()),
+            })
+            .unwrap();
+        let global_reads = journal.read_alls.load(Ordering::SeqCst);
+        let point_reads = journal.lookups.load(Ordering::SeqCst);
+        assert!(!gate.index().contains(run.saga_id));
+        assert!(gate.known_run(&run));
+        assert_eq!(gate.phase(&run), Some(RunPhase::Completed));
+        assert_eq!(journal.lookups.load(Ordering::SeqCst), point_reads + 1);
+
+        // An outage cannot erase an already represented exact-run owner.
+        journal.fail_lookup.store(true, Ordering::SeqCst);
+        assert!(gate.known_run(&run));
+        let different_run = ctx("adm_chain", 1_400, "a", base + 9);
+        assert!(!gate.known_run(&different_run));
+        assert_eq!(journal.lookups.load(Ordering::SeqCst), point_reads + 1);
+        let absent = ctx("adm_chain", 1_499, "a", base);
+        assert!(!gate.known_run(&absent));
+        assert!(!gate.index().contains(absent.saga_id));
+        journal.fail_lookup.store(false, Ordering::SeqCst);
+        assert!(!gate.known_run(&absent));
+
+        // The row budget is max_ids + max_fingerprints = 10. An oversized
+        // history must fail before any partial run can become authority.
+        let oversized = ctx("adm_chain", 1_500, "a", base + 100);
+        for n in 0..11 {
+            journal
+                .inner
+                .append(started(&ctx("adm_chain", 1_500, "a", base + 100 + n)))
+                .unwrap();
+        }
+        assert!(!gate.known_run(&oversized));
+        assert!(!gate.index().contains(oversized.saga_id));
+        assert!(gate.known_run(&run));
+        assert_eq!(journal.read_alls.load(Ordering::SeqCst), global_reads);
+    }
+
+    #[test]
+    fn evicted_run_quarantine_with_failed_lookup_stays_fail_closed() {
+        let journal = Arc::new(LookupJournal::default());
+        let base = SagaContext::now_millis();
+        let (bus, run) = evicted_resolved_run(&journal, 1_300, base);
+        let waiter = register_run_waiter(&bus, &run);
+        journal.fail_lookup.store(true, Ordering::SeqCst);
+        bus.publish_strict(participant_quarantine(&run, "lookup is down"))
+            .unwrap();
+        assert!(
+            unresolved(&waiter),
+            "unreadable durable history never proves ownership"
+        );
     }
 }

@@ -87,12 +87,14 @@ use stable external idempotency keys and reconciliation. See
 ## Safety Policies (summary)
 
 - Success keeps business effects; late evidence after failure quarantines, and a `SagaFailed`
-  reply may be superseded by quarantine. Declared effects without undo are irreversible.
+  reply may be superseded by quarantine. Older-run uncertainty can also supersede an admitted
+  successor's `SagaCompleted`, even after its ordinary detail/cache is gone. Declared effects
+  without undo are irreversible.
 - `FailStep(requires_compensation=false)` is a safe/no-undo remote contract, not cancellation.
   Definitive rejection during rollback removes only unrequested potential work; an owned
   request needs durable no-effect completion before acknowledgement, without business undo.
-- Closed/compacted history cannot generate fresh terminal or undo output on restart;
-  actual quarantine still fences active successors. Durable capacity recovery never forgets
+- Closed/compacted ordinary history cannot invent fresh terminal or undo output on restart;
+  actual quarantine still fences admitted newer successors, including ordinarily resolved ones. Durable capacity recovery never forgets
   current-ID authority, and active/quarantined/ephemeral retention has irreducible cost.
 - Obtain `bus.release_waiter()` before dropping public bus owners. Its
   `wait_timeout(Duration)` observes actual bus-owned resource destruction; wait only
