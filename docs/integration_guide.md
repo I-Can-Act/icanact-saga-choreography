@@ -206,6 +206,18 @@ At step 1, the bus validates startup invariants:
 
 For runtime publishing paths, prefer `publish_strict(...)` so partial delivery is surfaced immediately as an error instead of being silently ignored.
 
+## Safety policies for step authors
+
+- `StepOutput::Completed` is proven by one strict journal append; `CompletedWithEffect`
+  persists result/compensation, calls `dispatch_effect`, then records proof after durable handoff.
+  A declared effect with no undo is irreversible: later failure needs reconciliation.
+- `fail_accepted_workflow_step(..., requires_compensation=false)` and `FailStep(false)` assert a
+  safe/no-undo remote contract, not physical cancellation. Use compensation or
+  `QuarantineSaga` when late remote effects are possible.
+- `SagaFailed` waiter replies can be superseded by quarantine on later evidence. Managed
+  ingress publishes `StepStarted` before running your step; keep hooks idempotent.
+- Upgrading from baseline: drain all in-flight sagas first ([migration.md](migration.md)).
+
 ## Async Accepted-Step Model
 
 Saga choreography is async by nature. A sync actor or async actor can participate in the same workflow because the bus carries choreography events, not runtime-specific calls.

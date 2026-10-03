@@ -272,9 +272,11 @@ fn failed_intent_write_prevents_workflow_effect_and_quarantines_visibly() {
 #[test]
 fn failed_result_write_cannot_publish_workflow_success() {
     let (journal, dedupe) = stores();
+    // Plain completion now persists its full result in the single proof append;
+    // fault that authoritative write rather than a raw row which no longer exists.
     journal.fail_once(
         support::JournalOp::Append,
-        FaultTrigger::EventKind("StepExecutionCompleted"),
+        FaultTrigger::EventKind("ParticipantForwardOutcomeRecorded"),
     );
     let mut actor = Actor::new(&journal, &dedupe);
     let delivery = deliver(&mut actor, started(&ctx("wf_pay", "pay", 100)));
@@ -490,10 +492,10 @@ fn quarantined_run_retains_evidence_and_is_not_auto_resolved_or_reused() {
     assert!(
         entries.iter().any(|e| matches!(
             &e.event,
-            ParticipantEvent::StepExecutionCompleted { compensation_data, .. }
-                if compensation_data == b"refund"
+            ParticipantEvent::ParticipantForwardOutcomeRecorded { outcome }
+                if outcome.compensation_data == b"refund"
         )),
-        "accepted compensation evidence must be retained: {entries:?}"
+        "the single plain proof must retain compensation evidence: {entries:?}"
     );
     assert!(entries.iter().any(|e| matches!(
         &e.event,

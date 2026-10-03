@@ -15,7 +15,7 @@ use crate::{
     AsyncSagaParticipant, CompensationError, CompensationOutput, DependencySpec,
     EffectDispatchOutcome, EffectDispatchRequest, ParticipantAdmission, ParticipantEvent,
     ParticipantForwardOutcome, ParticipantTerminalKind, RunDedupe, SagaChoreographyEvent,
-    SagaContext, SagaFailureDetails, SagaId, SagaParticipant, SagaParticipantState, SagaStateEntry,
+    SagaContext, SagaFailureDetails, SagaParticipant, SagaParticipantState, SagaStateEntry,
     SagaStateExt, StepError, StepOutput,
 };
 
@@ -46,7 +46,8 @@ pub fn handle_saga_event_with_emit<P, F>(
         return;
     }
     let who = Who::sync(participant);
-    if !admit_event(participant, &event, &who, &mut emit) {
+    let dependencies = participant.depends_on();
+    if !admit_event(participant, &event, &who, &dependencies, &mut emit) {
         return;
     }
     let context = event.context().clone();
@@ -82,11 +83,13 @@ pub fn handle_saga_event_with_emit<P, F>(
             ..
         } => {
             let dependency_spec = participant.depends_on();
-            if dependency_should_fire(
+            if dependency_ready(
                 participant,
-                context.saga_id,
+                &who,
+                &step_ctx,
                 &dependency_spec,
-                &step_ctx.step_name,
+                now,
+                &mut emit,
             ) && !forward_already_confirmed(participant, &context)
             {
                 let next_context = context.next_step(participant.step_name().into());
@@ -148,7 +151,8 @@ pub async fn handle_async_saga_event_with_emit<P, F>(
         return;
     }
     let who = Who::asynchronous(participant);
-    if !admit_event(participant, &event, &who, &mut emit) {
+    let dependencies = participant.depends_on();
+    if !admit_event(participant, &event, &who, &dependencies, &mut emit) {
         return;
     }
     let context = event.context().clone();
@@ -185,11 +189,13 @@ pub async fn handle_async_saga_event_with_emit<P, F>(
             ..
         } => {
             let dependency_spec = participant.depends_on();
-            if dependency_should_fire(
+            if dependency_ready(
                 participant,
-                context.saga_id,
+                &who,
+                &step_ctx,
                 &dependency_spec,
-                &step_ctx.step_name,
+                now,
+                &mut emit,
             ) && !forward_already_confirmed(participant, &context)
             {
                 let next_context = context.next_step(participant.step_name().into());
@@ -284,7 +290,13 @@ fn is_terminal_event(event: &SagaChoreographyEvent) -> bool {
 /// Durable admission plus run-scoped dedupe. Returns whether the event may be
 /// processed. Replay/stale events are ignored; ambiguous ownership and storage
 /// failures quarantine visibly before any effect.
-fn admit_event<A, F>(actor: &mut A, event: &SagaChoreographyEvent, who: &Who, emit: &mut F) -> bool
+fn admit_event<A, F>(
+    actor: &mut A,
+    event: &SagaChoreographyEvent,
+    who: &Who,
+    dependencies: &DependencySpec,
+    emit: &mut F,
+) -> bool
 where
     A: SagaStateExt,
     F: FnMut(SagaChoreographyEvent),
@@ -350,6 +362,34 @@ where
     // Terminal events are idempotent: the durable tombstone is their replay fence.
     if is_terminal_event(event) {
         return true;
+    }
+    // Persist a relevant AllOf input before its input marker can consume it.
+    // A crash after marking but before recording must not silently lose a branch.
+    // Duplicate observations are harmless, but avoid growing the journal on replay.
+    if matches!(event, SagaChoreographyEvent::StepCompleted { .. })
+        && matches!(dependencies, DependencySpec::AllOf(steps)
+            if steps.contains(&context.step_name.as_ref()))
+    {
+        let observed = actor
+            .completed_dependency_steps_strict(context)
+            .and_then(|seen| {
+                if seen.contains(&context.step_name) {
+                    Ok(())
+                } else {
+                    actor.record_dependency_completion_strict(context)
+                }
+            });
+        if let Err(error) = observed {
+            quarantine_run(
+                actor,
+                who,
+                context,
+                format!("dependency observation unavailable; step not run: {error}").into(),
+                actor.now_millis(),
+                emit,
+            );
+            return false;
+        }
     }
     match actor.check_run_dedupe_strict(context, &dedupe_key_for_event(event)) {
         Ok(RunDedupe::First) => {}
@@ -483,39 +523,66 @@ where
         })
 }
 
-fn dependency_should_fire<A>(
+/// Decides whether this completed dependency completes the participant's trigger.
+///
+/// `AllOf` observations are durable: each relevant completion is strictly appended
+/// (exact run context) *before* it counts, and the seen set is rebuilt from the
+/// journal for this exact run, so a restart between branches cannot stall the step.
+/// A storage failure quarantines visibly and never authorizes execution.
+fn dependency_ready<A, F>(
     actor: &mut A,
-    saga_id: SagaId,
+    who: &Who,
+    completed: &SagaContext,
     dependency_spec: &DependencySpec,
-    completed_step: &str,
+    now: u64,
+    emit: &mut F,
 ) -> bool
 where
     A: SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
 {
+    let saga_id = completed.saga_id;
+    let completed_step = completed.step_name.as_ref();
     match dependency_spec {
         DependencySpec::OnSagaStart => false,
         DependencySpec::After(step) => {
-            if completed_step != *step {
-                return false;
-            }
-            actor.dependency_fired().insert(saga_id)
+            completed_step == *step && actor.dependency_fired().insert(saga_id)
         }
         DependencySpec::AnyOf(steps) => {
-            if !steps.contains(&completed_step) {
-                return false;
-            }
-            actor.dependency_fired().insert(saga_id)
+            steps.contains(&completed_step) && actor.dependency_fired().insert(saga_id)
         }
         DependencySpec::AllOf(steps) => {
             if !steps.contains(&completed_step) {
                 return false;
             }
-            {
-                let seen = actor.dependency_completions().entry(saga_id).or_default();
-                seen.insert(completed_step.into());
-                if !steps.iter().all(|step| seen.contains(*step)) {
+            // Admission already persisted this observation before input dedupe.
+            let observed = actor.completed_dependency_steps_strict(completed);
+            let observed = match observed {
+                Ok(observed) => observed,
+                Err(error) => {
+                    tracing::error!(
+                        target: "core::saga",
+                        event = "saga_dependency_observation_failed",
+                        saga_id = saga_id.get(),
+                        step = completed_step,
+                        error = %error
+                    );
+                    quarantine_run(
+                        actor,
+                        who,
+                        completed,
+                        format!("dependency observation unavailable; step not run: {error}").into(),
+                        now,
+                        emit,
+                    );
                     return false;
                 }
+            };
+            let seen = actor.dependency_completions().entry(saga_id).or_default();
+            seen.extend(observed);
+            seen.insert(completed_step.into());
+            if !steps.iter().all(|step| seen.contains(*step)) {
+                return false;
             }
             actor.dependency_fired().insert(saga_id)
         }
@@ -609,9 +676,34 @@ where
     actor
         .saga_states()
         .insert(saga_id, SagaStateEntry::Executing(state));
-    emit(SagaChoreographyEvent::StepStarted {
+    let started = SagaChoreographyEvent::StepStarted {
         context: context.next_step(who.step.clone()),
-    });
+    };
+    // With an attached bus the start must be visible to the resolver *before* the
+    // business callback can outlive its deadlines. A failed publication means the
+    // run's liveness cannot be proven, so the effect is not run (intent stays as
+    // evidence). The sink still receives the event for observers; ingress wrappers
+    // must not publish it a second time.
+    if let Some(bus) = actor.saga_support().bus.clone()
+        && let Err(error) = bus.publish_strict(started.clone())
+    {
+        tracing::error!(
+            target: "core::saga",
+            event = "saga_step_start_publication_failed",
+            saga_id = saga_id.get(),
+            error = ?error
+        );
+        quarantine_run(
+            actor,
+            who,
+            context,
+            format!("step start publication failed; effect not run: {error:?}").into(),
+            now,
+            emit,
+        );
+        return false;
+    }
+    emit(started);
     true
 }
 
@@ -770,6 +862,10 @@ fn log_dispatch_receipt(
 /// Persists the confirmed forward proof (after business and declared-effect success)
 /// and only then publishes the original `StepCompleted`. A failed append quarantines
 /// and publishes no success.
+///
+/// A plain result (no declared effect) has no earlier raw-result row: the proof
+/// append is its only durable record, so a failure retains the business bytes as
+/// typed reconciliation evidence, and success completes the in-memory state.
 fn finish_step<A, F>(
     actor: &mut A,
     who: &Who,
@@ -783,6 +879,7 @@ where
     A: SagaStateExt,
     F: FnMut(SagaChoreographyEvent),
 {
+    let plain = result.effect.is_none();
     let outcome = ParticipantForwardOutcome {
         context: context.next_step(who.step.clone()),
         output: result.output,
@@ -794,8 +891,38 @@ where
     };
     if let Err(error) = actor.record_forward_outcome_strict(&outcome) {
         let reason: Box<str> = format!("forward outcome persistence failed: {error}").into();
+        if plain
+            && let Err(evidence_error) = actor.retain_reconciliation_evidence_strict(
+                context,
+                &outcome.output,
+                &outcome.compensation_data,
+                &reason,
+            )
+        {
+            tracing::error!(target: "core::saga", event = "saga_reconciliation_evidence_failed",
+                saga_id = context.saga_id.get(), error = %evidence_error);
+        }
         quarantine_run(actor, who, context, reason.clone(), now, emit);
         return Err(reason);
+    }
+    if plain {
+        let saga_id = context.saga_id;
+        match actor.saga_states().remove(&saga_id) {
+            Some(SagaStateEntry::Executing(state)) => {
+                let done = state.complete(
+                    outcome.output.clone(),
+                    outcome.compensation_data.clone(),
+                    now,
+                );
+                actor
+                    .saga_states()
+                    .insert(saga_id, SagaStateEntry::Completed(done));
+            }
+            Some(other) => {
+                actor.saga_states().insert(saga_id, other);
+            }
+            None => {}
+        }
     }
     emit(outcome.completion_event());
     Ok(())
@@ -895,6 +1022,14 @@ async fn execute_step_wrapper_with_emit_async<P, F>(
             return;
         }
     };
+    // A plain result is made durable by the single strict forward-proof append; only
+    // a declared effect needs the raw result persisted before its dispatch.
+    if result.effect.is_none() {
+        if let Err(reason) = finish_step(participant, &who, &context, input, result, now, emit) {
+            participant.on_quarantined(&context, &reason);
+        }
+        return;
+    }
     if let Err(reason) = persist_result(participant, &who, &context, &result, now, emit) {
         participant.on_quarantined(&context, &reason);
         return;
@@ -953,6 +1088,14 @@ fn execute_step_wrapper_with_emit<P, F>(
             return;
         }
     };
+    // A plain result is made durable by the single strict forward-proof append; only
+    // a declared effect needs the raw result persisted before its dispatch.
+    if result.effect.is_none() {
+        if let Err(reason) = finish_step(participant, &who, &context, input, result, now, emit) {
+            participant.on_quarantined(&context, &reason);
+        }
+        return;
+    }
     if let Err(reason) = persist_result(participant, &who, &context, &result, now, emit) {
         participant.on_quarantined(&context, &reason);
         return;
@@ -1537,7 +1680,7 @@ where
 mod tests {
     use crate::{
         DeterministicContextBuilder, HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal,
-        ParticipantJournal, SagaContext, SagaParticipantSupport,
+        ParticipantJournal, SagaContext, SagaId, SagaParticipantSupport,
     };
 
     use super::*;
@@ -1668,17 +1811,10 @@ mod tests {
                 _,
                 _,
                 crate::JournalEntry {
-                    event: ParticipantEvent::StepExecutionCompleted {
-                        compensation_data,
-                        ..
-                    },
-                    ..
-                },
-                crate::JournalEntry {
                     event: ParticipantEvent::ParticipantForwardOutcomeRecorded { outcome },
                     ..
                 }
-            ] if compensation_data == &[9] && outcome.compensation_data == [9]
+            ] if outcome.compensation_data == [9] && outcome.effect.is_none()
         ));
     }
 

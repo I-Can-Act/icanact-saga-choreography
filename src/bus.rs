@@ -361,18 +361,86 @@ impl SyncActor for BusStateActor {
 struct ResolverGate {
     journal: Option<Arc<dyn TerminalResolverJournal>>,
     activated: AtomicBool,
-    /// Durable run index, built once from the journal at attach and kept
-    /// current from admitted/ingested events. Serializes start admission.
+    /// Bounded run index. Authoritative when the journal supports per-saga
+    /// lookup (misses reload; ordinarily resolved ids are evictable); otherwise
+    /// every fence stays resident and admission is refused at capacity.
+    /// Serializes start admission.
     admission: Mutex<AdmissionIndex>,
 }
 
+/// Bounds of the in-memory admission index.
+#[derive(Clone, Copy, Debug)]
+struct AdmissionLimits {
+    /// Saga ids and full-run fences resident at once (each bounded by this value).
+    max_ids: usize,
+    /// Effect fingerprints of unresolved or failed runs resident at once.
+    max_fingerprints: usize,
+}
+
+const DEFAULT_ADMISSION_CAPACITY: usize = 1 << 18;
+
+impl Default for AdmissionLimits {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_ADMISSION_CAPACITY)
+    }
+}
+
+impl AdmissionLimits {
+    fn with_capacity(max_ids: usize) -> Self {
+        Self {
+            max_ids,
+            max_fingerprints: max_ids.saturating_mul(4),
+        }
+    }
+
+    /// `SAGA_ADMISSION_CAPACITY` bounds resident saga ids and runs per resolver.
+    fn from_env() -> Self {
+        match std::env::var("SAGA_ADMISSION_CAPACITY") {
+            Ok(raw) => match raw.parse::<usize>() {
+                Ok(value) if value > 0 => Self::with_capacity(value),
+                Ok(_) => Self::default(),
+                Err(error) => {
+                    tracing::error!(
+                        target: "core::saga",
+                        event = "saga_admission_capacity_parse_failed",
+                        env = "SAGA_ADMISSION_CAPACITY",
+                        value = %raw,
+                        error = %error
+                    );
+                    Self::default()
+                }
+            },
+            Err(_) => Self::default(),
+        }
+    }
+}
+
 /// Lifecycle phase of one run as known from retained durable history.
-/// Ordered by strength: a phase never weakens.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// A successful and a failed terminal are different: a successful run keeps
+/// its business effects, so later sibling or trailing work is healthy, while
+/// new uncertainty after a failure needs reconciliation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RunPhase {
     Active,
-    Terminal,
+    Completed,
+    Failed,
     Quarantined,
+}
+
+impl RunPhase {
+    /// Quarantine dominates; the first ordinary terminal is never replaced.
+    fn merge(self, new: Self) -> Self {
+        match (self, new) {
+            (Self::Quarantined, _) | (_, Self::Quarantined) => Self::Quarantined,
+            (Self::Active, new) => new,
+            (current, _) => current,
+        }
+    }
+
+    fn is_ordinary_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed)
+    }
 }
 
 /// What the resolver does with a non-start event, given durable history.
@@ -380,12 +448,13 @@ enum RunPhase {
 enum Fence {
     /// Unknown or active run: the resolver handles it normally.
     Pass,
-    /// Ordinarily resolved run: stale replay, no journal, no output.
+    /// Ordinarily resolved run: stale replay or healthy trailing work after
+    /// success; no journal, no output.
     Drop,
     /// Quarantined run (or a quarantine of a resolved run): keep the evidence
     /// but never feed a resolver whose cache may have been evicted.
     RetainOnly,
-    /// New compensable effect after an ordinary terminal: retain it and escalate.
+    /// New compensable effect after a *failed* terminal: retain it and escalate.
     Escalate,
 }
 
@@ -398,92 +467,342 @@ struct Refusal {
     reject_id_waiter: bool,
 }
 
+type CompletedFingerprint = (Box<str>, u64);
+type AcceptedFingerprint = (Box<str>, crate::StepExecutionId);
+
+struct RunEntry {
+    started_at_millis: u64,
+    phase: RunPhase,
+    /// The start's admission intent is already journaled; the resolver must not
+    /// append it a second time when the fanned-out event reaches it.
+    prejournaled: bool,
+    /// Compensable effects known while the run was open. Dropped once the run
+    /// succeeded, because success never escalates later siblings.
+    completed: HashSet<CompletedFingerprint>,
+    accepted: HashSet<AcceptedFingerprint>,
+}
+
+#[derive(Default)]
+struct IdEntry {
+    runs: Vec<RunEntry>,
+    queued_for_eviction: bool,
+}
+
+impl IdEntry {
+    fn fingerprints(&self) -> usize {
+        self.runs
+            .iter()
+            .map(|run| run.completed.len() + run.accepted.len())
+            .sum()
+    }
+
+    fn evictable(&self) -> bool {
+        self.runs.iter().all(|run| run.phase.is_ordinary_terminal())
+    }
+}
+
 #[derive(Default)]
 struct AdmissionIndex {
-    runs: HashMap<SagaId, Vec<(u64, RunPhase)>>,
-    /// Starts whose admission intent is already journaled; the resolver must not
-    /// append them a second time when the fanned-out event reaches it.
-    prejournaled: HashSet<(SagaId, u64)>,
-    completed_forward: HashSet<(SagaId, u64, Box<str>, u64)>,
-    accepted_forward: HashSet<(SagaId, u64, Box<str>, crate::StepExecutionId)>,
+    ids: HashMap<SagaId, IdEntry>,
+    evictable: VecDeque<SagaId>,
+    runs: usize,
+    fingerprints: usize,
+    /// Unidentified excess evidence cannot be forgotten in an ephemeral index.
+    /// Refuse new ownership thereafter rather than manufacture missing fences.
+    overflowed: bool,
+    limits: AdmissionLimits,
+    /// The journal can reload an evicted id, so ordinarily resolved ids may be
+    /// dropped from memory. Without it nothing is ever forgotten.
+    can_evict: bool,
+    /// Rebuilding from history must be complete, so limits are not enforced.
+    loading: bool,
 }
 
 impl AdmissionIndex {
-    fn from_events<'a>(events: impl Iterator<Item = &'a SagaChoreographyEvent>) -> Self {
-        let mut index = Self::default();
-        for event in events {
-            index.observe(event);
+    fn new(limits: AdmissionLimits, can_evict: bool) -> Self {
+        Self {
+            limits,
+            can_evict,
+            ..Self::default()
         }
+    }
+
+    fn from_events<'a>(
+        limits: AdmissionLimits,
+        can_evict: bool,
+        events: impl Iterator<Item = &'a SagaChoreographyEvent>,
+    ) -> Self {
+        let mut index = Self::new(limits, can_evict);
+        index.loading = true;
+        for event in events {
+            let _ = index.observe(event);
+        }
+        index.loading = false;
+        index.make_room();
         index
     }
 
-    fn phase(&self, context: &SagaContext) -> Option<RunPhase> {
-        self.runs
+    fn resident_ids(&self) -> usize {
+        self.ids.len()
+    }
+
+    fn fingerprint_count(&self) -> usize {
+        self.fingerprints
+    }
+
+    fn contains(&self, saga_id: SagaId) -> bool {
+        self.ids.contains_key(&saga_id)
+    }
+
+    fn run(&self, context: &SagaContext) -> Option<&RunEntry> {
+        self.ids
             .get(&context.saga_id)?
+            .runs
             .iter()
-            .find(|(started, _)| *started == context.saga_started_at_millis)
-            .map(|(_, phase)| *phase)
+            .find(|run| run.started_at_millis == context.saga_started_at_millis)
     }
 
-    fn raise(&mut self, saga_id: SagaId, started: u64, phase: RunPhase) {
-        let runs = self.runs.entry(saga_id).or_default();
-        match runs.iter_mut().find(|(run, _)| *run == started) {
-            Some((_, current)) => *current = (*current).max(phase),
-            None => runs.push((started, phase)),
+    fn phase(&self, context: &SagaContext) -> Option<RunPhase> {
+        self.run(context).map(|run| run.phase)
+    }
+
+    fn exceeds_capacity(&self) -> bool {
+        self.ids.len() > self.limits.max_ids
+            || self.runs > self.limits.max_ids
+            || self.fingerprints > self.limits.max_fingerprints
+    }
+
+    fn remove_id(&mut self, saga_id: SagaId) {
+        if let Some(entry) = self.ids.remove(&saga_id) {
+            self.runs = self.runs.saturating_sub(entry.runs.len());
+            self.fingerprints = self.fingerprints.saturating_sub(entry.fingerprints());
+            if entry.queued_for_eviction {
+                // Explicit rejection of an oversized reload must not leave stale
+                // queue entries that accumulate on every subsequent cache miss.
+                self.evictable.retain(|candidate| *candidate != saga_id);
+            }
         }
     }
 
-    fn observe(&mut self, event: &SagaChoreographyEvent) {
+    fn make_room(&mut self) {
+        self.make_room_for(None);
+    }
+
+    /// Evict only reloadable ordinary ids, never the complete id currently used
+    /// by an admission/fence decision. Evicting that id and then reserving only
+    /// its new run would silently turn a complete resident history into a partial one.
+    fn make_room_for(&mut self, protected: Option<SagaId>) {
+        if !self.can_evict {
+            return;
+        }
+        let candidates = self.evictable.len();
+        for _ in 0..candidates {
+            if self.ids.len() < self.limits.max_ids
+                && self.runs < self.limits.max_ids
+                && self.fingerprints < self.limits.max_fingerprints
+            {
+                break;
+            }
+            let Some(candidate) = self.evictable.pop_front() else {
+                break;
+            };
+            if protected == Some(candidate) {
+                self.evictable.push_back(candidate);
+                continue;
+            }
+            let Some(entry) = self.ids.get_mut(&candidate) else {
+                continue;
+            };
+            entry.queued_for_eviction = false;
+            if entry.evictable() {
+                self.remove_id(candidate);
+            }
+        }
+    }
+
+    /// Bound both ids and full-run fences. Reusing one id must not bypass the
+    /// capacity of an ephemeral resolver by growing its run vector forever.
+    fn has_capacity_for(&mut self, context: &SagaContext) -> bool {
+        self.make_room_for(Some(context.saga_id));
+        if self.run(context).is_some() {
+            return true;
+        }
+        !self.overflowed
+            && (self.ids.contains_key(&context.saga_id) || self.ids.len() < self.limits.max_ids)
+            && self.runs < self.limits.max_ids
+            && self.fingerprints < self.limits.max_fingerprints
+    }
+
+    fn raise(&mut self, saga_id: SagaId, started: u64, phase: RunPhase) -> bool {
+        let known = self.ids.get(&saga_id).is_some_and(|entry| {
+            entry
+                .runs
+                .iter()
+                .any(|run| run.started_at_millis == started)
+        });
+        if !known && !self.loading {
+            self.make_room_for(Some(saga_id));
+            if self.runs >= self.limits.max_ids
+                || (!self.ids.contains_key(&saga_id) && self.ids.len() >= self.limits.max_ids)
+            {
+                self.overflowed = true;
+                return false;
+            }
+        }
+        let entry = self.ids.entry(saga_id).or_default();
+        let position = match entry
+            .runs
+            .iter()
+            .position(|run| run.started_at_millis == started)
+        {
+            Some(position) => position,
+            None => {
+                self.runs += 1;
+                entry.runs.push(RunEntry {
+                    started_at_millis: started,
+                    phase: RunPhase::Active,
+                    prejournaled: false,
+                    completed: HashSet::new(),
+                    accepted: HashSet::new(),
+                });
+                entry.runs.len() - 1
+            }
+        };
+        let run = &mut entry.runs[position];
+        run.phase = run.phase.merge(phase);
+        if matches!(run.phase, RunPhase::Completed | RunPhase::Quarantined)
+            && !(run.completed.is_empty() && run.accepted.is_empty())
+        {
+            self.fingerprints = self
+                .fingerprints
+                .saturating_sub(run.completed.len() + run.accepted.len());
+            run.completed.clear();
+            run.accepted.clear();
+        }
+        if self.can_evict && !entry.queued_for_eviction && entry.evictable() {
+            entry.queued_for_eviction = true;
+            self.evictable.push_back(saga_id);
+        }
+        true
+    }
+
+    /// False means excess evidence could not be represented safely; the caller
+    /// must visibly quarantine, not publish an ordinary outcome or silently grow.
+    fn observe(&mut self, event: &SagaChoreographyEvent) -> bool {
         let context = event.context();
-        match event {
-            SagaChoreographyEvent::StepCompleted { .. } => {
-                self.completed_forward.insert((
-                    context.saga_id,
-                    context.saga_started_at_millis,
-                    context.step_name.clone(),
-                    context.trace_id,
-                ));
-            }
-            SagaChoreographyEvent::StepAccepted { execution_id, .. } => {
-                self.accepted_forward.insert((
-                    context.saga_id,
-                    context.saga_started_at_millis,
-                    context.step_name.clone(),
-                    execution_id.clone(),
-                ));
-            }
-            _ => {}
-        }
         let phase = match event {
-            SagaChoreographyEvent::SagaCompleted { .. }
-            | SagaChoreographyEvent::SagaFailed { .. } => RunPhase::Terminal,
+            SagaChoreographyEvent::SagaCompleted { .. } => RunPhase::Completed,
+            SagaChoreographyEvent::SagaFailed { .. } => RunPhase::Failed,
             SagaChoreographyEvent::SagaQuarantined { .. } => RunPhase::Quarantined,
             _ => RunPhase::Active,
         };
-        self.raise(context.saga_id, context.saga_started_at_millis, phase);
+        // Phase first: a run that is not (yet) known is created Active.
+        if !self.raise(context.saga_id, context.saga_started_at_millis, phase) {
+            return false;
+        }
+        let Some(entry) = self.ids.get_mut(&context.saga_id) else {
+            return false;
+        };
+        let Some(run) = entry
+            .runs
+            .iter_mut()
+            .find(|run| run.started_at_millis == context.saga_started_at_millis)
+        else {
+            return false;
+        };
+        // Fingerprints matter only while the run can still fail: success never
+        // escalates later siblings, and quarantine already dominates.
+        if run.phase != RunPhase::Active {
+            return true;
+        }
+        let new_fingerprint = match event {
+            SagaChoreographyEvent::StepCompleted {
+                compensation_available: true,
+                ..
+            } => !run
+                .completed
+                .contains(&(context.step_name.clone(), context.trace_id)),
+            SagaChoreographyEvent::StepAccepted { execution_id, .. } => !run
+                .accepted
+                .contains(&(context.step_name.clone(), execution_id.clone())),
+            _ => false,
+        };
+        if new_fingerprint && !self.loading && self.fingerprints >= self.limits.max_fingerprints {
+            return false;
+        }
+        let inserted = match event {
+            SagaChoreographyEvent::StepCompleted {
+                compensation_available: true,
+                ..
+            } => run
+                .completed
+                .insert((context.step_name.clone(), context.trace_id)),
+            SagaChoreographyEvent::StepAccepted { execution_id, .. } => run
+                .accepted
+                .insert((context.step_name.clone(), execution_id.clone())),
+            _ => false,
+        };
+        if inserted {
+            self.fingerprints += 1;
+        }
+        true
+    }
+
+    fn mark_prejournaled(&mut self, context: &SagaContext) {
+        if let Some(entry) = self.ids.get_mut(&context.saga_id)
+            && let Some(run) = entry
+                .runs
+                .iter_mut()
+                .find(|run| run.started_at_millis == context.saga_started_at_millis)
+        {
+            run.prejournaled = true;
+        }
+    }
+
+    fn take_prejournaled(&mut self, context: &SagaContext) -> bool {
+        self.ids
+            .get_mut(&context.saga_id)
+            .and_then(|entry| {
+                entry
+                    .runs
+                    .iter_mut()
+                    .find(|run| run.started_at_millis == context.saga_started_at_millis)
+            })
+            .is_some_and(|run| std::mem::take(&mut run.prejournaled))
     }
 
     fn has_open_run(&self, saga_id: SagaId) -> bool {
-        self.runs.get(&saga_id).is_some_and(|runs| {
-            runs.iter()
-                .any(|(_, phase)| matches!(phase, RunPhase::Active | RunPhase::Quarantined))
+        self.ids.get(&saga_id).is_some_and(|entry| {
+            entry
+                .runs
+                .iter()
+                .any(|run| matches!(run.phase, RunPhase::Active | RunPhase::Quarantined))
+        })
+    }
+
+    /// Starts of the id's runs that are still open (not resolved, not quarantined).
+    fn active_starts(&self, saga_id: SagaId) -> impl Iterator<Item = u64> + '_ {
+        self.ids.get(&saga_id).into_iter().flat_map(|entry| {
+            entry
+                .runs
+                .iter()
+                .filter(|run| run.phase == RunPhase::Active)
+                .map(|run| run.started_at_millis)
         })
     }
 
     /// Replay, quarantine and active-ownership rules for a new start.
     fn start_refusal(&self, start: &SagaContext) -> Option<String> {
-        let runs = self.runs.get(&start.saga_id)?;
-        if runs
-            .iter()
-            .any(|(_, phase)| *phase == RunPhase::Quarantined)
-        {
+        let runs = &self.ids.get(&start.saga_id)?.runs;
+        if runs.iter().any(|run| run.phase == RunPhase::Quarantined) {
             return Some(format!(
                 "saga id is quarantined and unresolved; saga_id={}",
                 start.saga_id.get()
             ));
         }
-        if runs.iter().any(|(started, phase)| {
-            *phase == RunPhase::Terminal && *started >= start.saga_started_at_millis
+        if runs.iter().any(|run| {
+            run.phase.is_ordinary_terminal()
+                && run.started_at_millis >= start.saga_started_at_millis
         }) {
             return Some(format!(
                 "terminal saga run replay; saga_id={} run_started_at_millis={}",
@@ -491,8 +810,8 @@ impl AdmissionIndex {
                 start.saga_started_at_millis
             ));
         }
-        if runs.iter().any(|(started, phase)| {
-            *phase == RunPhase::Active && *started != start.saga_started_at_millis
+        if runs.iter().any(|run| {
+            run.phase == RunPhase::Active && run.started_at_millis != start.saga_started_at_millis
         }) {
             return Some(format!(
                 "saga id has an unresolved active run; saga_id={}",
@@ -510,39 +829,47 @@ impl AdmissionIndex {
     }
 
     fn has_successor(&self, context: &SagaContext) -> bool {
-        self.runs.get(&context.saga_id).is_some_and(|runs| {
-            runs.iter().any(|(started, phase)| {
-                *started != context.saga_started_at_millis && *phase != RunPhase::Quarantined
+        self.ids.get(&context.saga_id).is_some_and(|entry| {
+            entry.runs.iter().any(|run| {
+                run.started_at_millis != context.saga_started_at_millis
+                    && run.phase != RunPhase::Quarantined
             })
         })
     }
 
     fn fence(&self, event: &SagaChoreographyEvent) -> Fence {
         let context = event.context();
-        match self.phase(context) {
-            None | Some(RunPhase::Active) => Fence::Pass,
-            Some(RunPhase::Quarantined) => Fence::RetainOnly,
-            Some(RunPhase::Terminal) => match event {
-                SagaChoreographyEvent::SagaQuarantined { .. } => Fence::RetainOnly,
+        let Some(run) = self.run(context) else {
+            return if self.overflowed {
+                Fence::RetainOnly
+            } else {
+                Fence::Pass
+            };
+        };
+        match run.phase {
+            RunPhase::Active => Fence::Pass,
+            RunPhase::Quarantined => Fence::RetainOnly,
+            RunPhase::Completed | RunPhase::Failed
+                if matches!(event, SagaChoreographyEvent::SagaQuarantined { .. }) =>
+            {
+                Fence::RetainOnly
+            }
+            // Healthy trailing, sibling or replayed work of a successful run.
+            RunPhase::Completed => Fence::Drop,
+            RunPhase::Failed => match event {
                 SagaChoreographyEvent::StepCompleted {
                     compensation_available: true,
                     ..
-                } if !self.completed_forward.contains(&(
-                    context.saga_id,
-                    context.saga_started_at_millis,
-                    context.step_name.clone(),
-                    context.trace_id,
-                )) =>
+                } if !run
+                    .completed
+                    .contains(&(context.step_name.clone(), context.trace_id)) =>
                 {
                     Fence::Escalate
                 }
                 SagaChoreographyEvent::StepAccepted { execution_id, .. }
-                    if !self.accepted_forward.contains(&(
-                        context.saga_id,
-                        context.saga_started_at_millis,
-                        context.step_name.clone(),
-                        execution_id.clone(),
-                    )) =>
+                    if !run
+                        .accepted
+                        .contains(&(context.step_name.clone(), execution_id.clone())) =>
                 {
                     Fence::Escalate
                 }
@@ -554,15 +881,113 @@ impl AdmissionIndex {
 
 impl ResolverGate {
     fn index(&self) -> std::sync::MutexGuard<'_, AdmissionIndex> {
-        // The index only ever grows monotonically, so a poisoned guard is still
-        // a safe (conservative) view for the resolver actor.
+        // Entries only ever merge toward stronger phases, so a poisoned guard
+        // is still a safe (conservative) view for the resolver actor.
         self.admission
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    fn can_reload(&self) -> bool {
+        self.journal
+            .as_ref()
+            .is_some_and(|journal| journal.supports_saga_lookup())
+    }
+
+    /// Makes the id's complete durable history resident. A resident id is
+    /// always complete, so a miss means "not resident", never "unknown".
+    fn ensure_resident(&self, index: &mut AdmissionIndex, saga_id: SagaId) -> Result<(), Box<str>> {
+        if index.contains(saga_id) || !self.can_reload() {
+            return Ok(());
+        }
+        let Some(journal) = &self.journal else {
+            return Ok(());
+        };
+        let row_budget = index
+            .limits
+            .max_ids
+            .saturating_add(index.limits.max_fingerprints);
+        let entries = journal
+            .read_saga_bounded(saga_id, row_budget)
+            .map_err(|error| {
+                Box::<str>::from(format!(
+                    "terminal resolver journal lookup failed; saga_id={}: {error}",
+                    saga_id.get()
+                ))
+            })?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        index.make_room_for(Some(saga_id));
+        index.loading = true;
+        for entry in &entries {
+            let _ = index.observe(&entry.event);
+        }
+        index.loading = false;
+        index.make_room_for(Some(saga_id));
+        if index.exceeds_capacity() {
+            // The requested id alone may exceed the run/fingerprint budget. Do
+            // not keep a partial id or forget any fence: refuse the lookup visibly.
+            index.remove_id(saga_id);
+            return Err(format!(
+                "terminal resolver admission history exceeds capacity; saga_id={}",
+                saga_id.get()
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Fence for a non-start event. A storage failure never feeds a resolver
+    /// blindly: the evidence is retained and nothing is answered.
+    fn fence(&self, event: &SagaChoreographyEvent) -> Fence {
+        let saga_id = event.context().saga_id;
+        let mut index = self.index();
+        if let Err(reason) = self.ensure_resident(&mut index, saga_id) {
+            tracing::error!(target: "core::saga", event = "terminal_resolver_fence_lookup_failed", reason = %reason);
+            return Fence::RetainOnly;
+        }
+        index.fence(event)
+    }
+
+    fn observe(&self, event: &SagaChoreographyEvent) -> bool {
+        let saga_id = event.context().saga_id;
+        let mut index = self.index();
+        match self.ensure_resident(&mut index, saga_id) {
+            Ok(()) => index.observe(event),
+            // The event is already journaled (or the journal is down); a later
+            // admission reloads authoritative history from the journal.
+            Err(reason) => {
+                tracing::error!(target: "core::saga", event = "terminal_resolver_index_reload_failed", reason = %reason);
+                false
+            }
+        }
+    }
+
+    fn raise(&self, context: &SagaContext, phase: RunPhase) {
+        self.index()
+            .raise(context.saga_id, context.saga_started_at_millis, phase);
+    }
+
+    fn has_successor(&self, context: &SagaContext) -> bool {
+        self.index().has_successor(context)
+    }
+
+    fn take_prejournaled(&self, context: &SagaContext) -> bool {
+        self.index().take_prejournaled(context)
+    }
+
+    /// Active runs of the id (all open runs of this resolver's saga type).
+    fn active_starts(&self, saga_id: SagaId) -> Vec<u64> {
+        self.index().active_starts(saga_id).collect()
+    }
+
     /// Serialized start admission: check, journal the intent strictly, then
     /// reserve the run. Nothing is fanned out unless this returns `Ok`.
+    ///
+    /// The strict append (an fsync for durable journals) stays inside the
+    /// critical section: admission authority requires check-then-append to be
+    /// atomic per resolver, so durable starts of one saga type are serialized.
     fn admit_start(
         &self,
         event: &SagaChoreographyEvent,
@@ -587,11 +1012,32 @@ impl ResolverGate {
                 reject_id_waiter: false,
             });
         };
+        if let Err(reason) = self.ensure_resident(&mut index, context.saga_id) {
+            return Err(Refusal {
+                reason,
+                reject_run_waiter: true,
+                reject_id_waiter: false,
+            });
+        }
         if let Some(reason) = index.start_refusal(context) {
             return Err(Refusal {
                 reason: reason.into(),
                 reject_run_waiter: index.phase(context).is_none(),
                 reject_id_waiter: !index.has_open_run(context.saga_id),
+            });
+        }
+        if !index.has_capacity_for(context) {
+            return Err(Refusal {
+                reason: format!(
+                    "terminal resolver admission capacity reached; saga_type={} saga_id={} resident_ids={} fingerprints={}",
+                    context.saga_type,
+                    context.saga_id.get(),
+                    index.resident_ids(),
+                    index.fingerprint_count()
+                )
+                .into(),
+                reject_run_waiter: true,
+                reject_id_waiter: false,
             });
         }
         if let Some(journal) = &self.journal
@@ -613,9 +1059,7 @@ impl ResolverGate {
             RunPhase::Active,
         );
         if self.journal.is_some() {
-            index
-                .prejournaled
-                .insert((context.saga_id, context.saga_started_at_millis));
+            index.mark_prejournaled(context);
         }
         Ok(())
     }
@@ -773,7 +1217,7 @@ impl TerminalResolverActor {
         }
         // Storage failure cannot weaken the live fence; restart reconciliation
         // still requires a writable journal/application-owned durable evidence.
-        self.gate.index().observe(event);
+        self.gate.observe(event);
     }
 
     /// A compensable effect materialised after an ordinary terminal. The
@@ -782,11 +1226,7 @@ impl TerminalResolverActor {
     fn escalate_late_effect(&mut self, event: &SagaChoreographyEvent) {
         let context = event.context();
         self.retain_evidence(event);
-        self.gate.index().raise(
-            context.saga_id,
-            context.saga_started_at_millis,
-            RunPhase::Quarantined,
-        );
+        self.gate.raise(context, RunPhase::Quarantined);
         self.publish_terminal_events(vec![SagaChoreographyEvent::SagaQuarantined {
             context: context.next_step(TERMINAL_RESOLVER_STEP.into()),
             reason: "a compensable effect materialised after the saga resolved".into(),
@@ -809,7 +1249,7 @@ impl SyncActor for TerminalResolverActor {
         let terminal_events = match msg {
             TerminalResolverTell::Ingest(event) => {
                 {
-                    let fence = self.gate.index().fence(&event);
+                    let fence = self.gate.fence(&event);
                     match fence {
                         Fence::Pass => {}
                         Fence::Drop => {
@@ -827,7 +1267,7 @@ impl SyncActor for TerminalResolverActor {
                             // Do not bypass the resolver's cross-run quarantine rule.
                             let fence_successor =
                                 matches!(*event, SagaChoreographyEvent::SagaQuarantined { .. })
-                                    && self.gate.index().has_successor(event.context());
+                                    && self.gate.has_successor(event.context());
                             self.retain_evidence(&event);
                             if fence_successor {
                                 let terminal_events = self.resolver.ingest(&event);
@@ -843,10 +1283,7 @@ impl SyncActor for TerminalResolverActor {
                 }
                 let already_journaled = matches!(*event, SagaChoreographyEvent::SagaStarted { .. })
                     && self.gate.journal.is_some()
-                    && self.gate.index().prejournaled.remove(&(
-                        event.context().saga_id,
-                        event.context().saga_started_at_millis,
-                    ));
+                    && self.gate.take_prejournaled(event.context());
                 if !already_journaled
                     && let Some(journal) = &self.gate.journal
                     && let Err(error) = journal.append((*event).clone())
@@ -872,8 +1309,20 @@ impl SyncActor for TerminalResolverActor {
                     }
                     return;
                 }
-                if !already_journaled {
-                    self.gate.index().observe(&event);
+                if !already_journaled && !self.gate.observe(&event) {
+                    let context = event.context();
+                    let quarantine = SagaChoreographyEvent::SagaQuarantined {
+                        context: context.next_step(TERMINAL_RESOLVER_STEP.into()),
+                        reason: "terminal resolver admission evidence capacity unavailable; reconciliation required".into(),
+                        step: context.step_name.clone(),
+                        participant_id: "terminal_resolver".into(),
+                    };
+                    // Latch the resolver itself and retain the strong fence before
+                    // replying. A subsequent watchdog must not emit ordinary failure.
+                    let _ = self.resolver.ingest(&quarantine);
+                    self.retain_evidence(&quarantine);
+                    self.publish_terminal_events(vec![quarantine]);
+                    return;
                 }
                 self.resolver.ingest(&event)
             }
@@ -901,6 +1350,10 @@ pub struct SagaChoreographyBus {
     legacy_waiter_floors: Arc<Mutex<HashMap<SagaId, LegacyWaiter>>>,
     state_ref: local_sync::SyncActorRef<BusStateActor>,
     terminal_resolver_registry_ref: local_sync::SyncActorRef<TerminalResolverRegistryActor>,
+    /// Gates of attached resolvers, readable without an actor ask. Weak: the
+    /// registry owns each gate, and the resolver's own bus clone shares this map,
+    /// so a strong reference would keep the journal alive after shutdown.
+    gates: Arc<Mutex<HashMap<Box<str>, std::sync::Weak<ResolverGate>>>>,
     // Public clones own shutdown; internal resolver clones must not create a
     // lifecycle -> registry -> resolver -> lifecycle ownership cycle.
     _lifecycle: Option<Arc<BusActorLifecycle>>,
@@ -1024,6 +1477,7 @@ impl SagaChoreographyBus {
             legacy_waiter_floors: Arc::default(),
             state_ref,
             terminal_resolver_registry_ref,
+            gates: Arc::default(),
             _lifecycle: Some(lifecycle),
         }
     }
@@ -1381,8 +1835,11 @@ impl SagaChoreographyBus {
 
     /// Registers an id-scoped terminal waiter (compatibility API).
     ///
-    /// It is resolved only by a terminal of a run that started at or after the
-    /// registration; prefer [`Self::register_terminal_reply_for_run`].
+    /// It binds to the run admitted after it registered, or to the unique open
+    /// run (one saga type, id and start) already admitted when it registers;
+    /// with several open owners it waits for a run that starts afterwards. Stale
+    /// terminal history never resolves it. Prefer
+    /// [`Self::register_terminal_reply_for_run`].
     pub fn register_terminal_reply(
         &self,
         saga_id: SagaId,
@@ -1398,6 +1855,12 @@ impl SagaChoreographyBus {
                             bound_run: None,
                         },
                     );
+                }
+                // A run admitted before this registration cannot bind the waiter
+                // at admission; bind it to the unique active run of the id now.
+                // Several active owners (other saga types) or none stay unbound.
+                if let Some(run) = self.unique_active_run(saga_id) {
+                    self.bind_id_waiter_to(saga_id, run);
                 }
                 Ok(())
             }
@@ -1471,12 +1934,41 @@ impl SagaChoreographyBus {
 
     /// Binds a not-yet-bound id-scoped waiter to the run just admitted.
     fn bind_id_waiter(&self, context: &SagaContext) {
+        self.bind_id_waiter_to(context.saga_id, RunKey::of(context));
+    }
+
+    fn bind_id_waiter_to(&self, saga_id: SagaId, run: RunKey) {
         if let Ok(mut waiters) = self.legacy_waiter_floors.lock()
-            && let Some(waiter) = waiters.get_mut(&context.saga_id)
+            && let Some(waiter) = waiters.get_mut(&saga_id)
             && waiter.bound_run.is_none()
         {
-            waiter.bound_run = Some(RunKey::of(context));
+            waiter.bound_run = Some(run);
         }
+    }
+
+    /// The single open run (type, id, start) of `saga_id` across every attached
+    /// resolver, or `None` when there is none or ownership is ambiguous.
+    /// Reads the gates directly, never asking an actor, so it is safe to call
+    /// from inside a sync actor.
+    fn unique_active_run(&self, saga_id: SagaId) -> Option<RunKey> {
+        let gates = self.gates.lock().ok()?;
+        let mut found: Option<RunKey> = None;
+        for (saga_type, gate) in gates.iter() {
+            let Some(gate) = gate.upgrade() else {
+                continue;
+            };
+            for started_at_millis in gate.active_starts(saga_id) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(RunKey {
+                    saga_type: saga_type.clone(),
+                    saga_id,
+                    started_at_millis,
+                });
+            }
+        }
+        found
     }
 
     /// Resolves the id-scoped waiter. With `run_started_at`, only the run the
@@ -1512,7 +2004,7 @@ impl SagaChoreographyBus {
         policy: TerminalPolicy,
         responder: &'static str,
     ) -> Result<FirehoseSubscription, String> {
-        self.attach_terminal_resolver_inner(policy, responder, None)
+        self.attach_terminal_resolver_inner(policy, responder, None, AdmissionLimits::from_env())
     }
 
     pub fn attach_durable_terminal_resolver<J: TerminalResolverJournal>(
@@ -1521,7 +2013,12 @@ impl SagaChoreographyBus {
         responder: &'static str,
         journal: Arc<J>,
     ) -> Result<FirehoseSubscription, String> {
-        self.attach_terminal_resolver_inner(policy, responder, Some(journal))
+        self.attach_terminal_resolver_inner(
+            policy,
+            responder,
+            Some(journal),
+            AdmissionLimits::from_env(),
+        )
     }
 
     fn attach_terminal_resolver_inner(
@@ -1529,6 +2026,7 @@ impl SagaChoreographyBus {
         policy: TerminalPolicy,
         responder: &'static str,
         journal: Option<Arc<dyn TerminalResolverJournal>>,
+        limits: AdmissionLimits,
     ) -> Result<FirehoseSubscription, String> {
         let saga_type_topic = policy.saga_type.clone();
         let existing =
@@ -1593,8 +2091,16 @@ impl SagaChoreographyBus {
                     }
                     events.push(entry.event);
                 }
-                // The only full history read: later starts consult this index.
-                let admission = AdmissionIndex::from_events(events.iter());
+                // The only full history read. Later starts and cache misses use
+                // bounded per-saga lookups when the journal supports them.
+                let admission = AdmissionIndex::from_events(
+                    limits,
+                    journal.supports_saga_lookup(),
+                    events.iter(),
+                );
+                if admission.exceeds_capacity() {
+                    return Err("terminal resolver recovery exceeds admission capacity; increase SAGA_ADMISSION_CAPACITY or maintain resolved journal detail without deleting fences".into());
+                }
                 let (resolver, recovery_events) =
                     TerminalResolver::restore_from_events(policy.clone(), &events);
                 (resolver, recovery_events, admission)
@@ -1602,7 +2108,7 @@ impl SagaChoreographyBus {
             None => (
                 TerminalResolver::new(policy.clone()),
                 Vec::new(),
-                AdmissionIndex::default(),
+                AdmissionIndex::new(limits, false),
             ),
         };
         let durable = journal.is_some();
@@ -1669,6 +2175,14 @@ impl SagaChoreographyBus {
                     return Err(format!("terminal resolver registry unavailable: {err:?}"));
                 }
             };
+        // Mirror the winning gate so id-scoped lookups need no actor ask.
+        if let Ok(TerminalResolverRegistryReply::Gate(Some(gate))) = self
+            .terminal_resolver_registry_ref
+            .ask(TerminalResolverRegistryAsk::Gate(policy.saga_type.clone()))
+            && let Ok(mut gates) = self.gates.lock()
+        {
+            gates.insert(policy.saga_type.clone(), Arc::downgrade(&gate));
+        }
         Ok(registered)
     }
 
@@ -2029,6 +2543,7 @@ impl Clone for SagaChoreographyBus {
             legacy_waiter_floors: Arc::clone(&self.legacy_waiter_floors),
             state_ref: self.state_ref.clone(),
             terminal_resolver_registry_ref: self.terminal_resolver_registry_ref.clone(),
+            gates: Arc::clone(&self.gates),
             _lifecycle: self._lifecycle.clone(),
         }
     }
@@ -2161,10 +2676,63 @@ mod tests {
             lifecycle.upgrade().is_none(),
             "resolver must not keep its lifecycle owner alive forever"
         );
+        // The registry calls pooled shutdown from a scheduler callback; pinned
+        // core intentionally initiates stop without waiting there. Keep the
+        // immediate no-cycle assertion above, and require bounded actual release
+        // rather than assuming the resolver has already drained at reply time.
+        wait_until(Instant::now() + Duration::from_secs(3), || {
+            Arc::strong_count(&journal) == 1
+        });
         assert_eq!(
             Arc::strong_count(&journal),
             1,
             "resolver and gate must release LMDB ownership at shutdown"
+        );
+    }
+
+    #[test]
+    fn last_public_bus_dropped_in_a_sync_callback_also_releases_the_journal() {
+        enum DropMessage {
+            Bus(SagaChoreographyBus),
+        }
+        impl icanact_core::TellAskTell for DropMessage {}
+        let bus = SagaChoreographyBus::new();
+        let lifecycle = Arc::downgrade(bus._lifecycle.as_ref().unwrap());
+        let journal = Arc::new(InMemoryTerminalResolverJournal::default());
+        bus.attach_durable_terminal_resolver(
+            TerminalPolicy::order_lifecycle_default(),
+            "callback-drop",
+            Arc::clone(&journal),
+        )
+        .unwrap();
+        struct DropActor;
+        impl local_sync::SyncActor for DropActor {
+            type Contract = local_sync::contract::TellOnly;
+            type Tell = DropMessage;
+            type Ask = ();
+            type Reply = ();
+            type Channel = ();
+            type PubSub = ();
+            type Broadcast = ();
+            fn handle_tell(&mut self, message: DropMessage) {
+                let DropMessage::Bus(bus) = message;
+                drop(bus);
+            }
+        }
+        let (actor, handle) = local_sync::spawn(DropActor);
+        assert!(actor.tell(DropMessage::Bus(bus)));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline
+            && (lifecycle.upgrade().is_some() || Arc::strong_count(&journal) != 1)
+        {
+            thread::yield_now();
+        }
+        let released = lifecycle.upgrade().is_none() && Arc::strong_count(&journal) == 1;
+        handle.shutdown();
+        assert!(
+            released,
+            "scheduler callback shutdown must release the resolver journal, count={}",
+            Arc::strong_count(&journal)
         );
     }
 
@@ -3414,5 +3982,674 @@ mod tests {
             reason.as_ref().contains("stalled_timeout"),
             "expected stalled_timeout reason, got: {reason}"
         );
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    //! Bounded admission index, journal-authoritative reload and successful
+    //! versus failed terminal-phase fencing, all through a real bus.
+
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use crate::{
+        AcceptedStepTimeoutOutcome, FailureAuthority, InMemoryTerminalResolverJournal,
+        SagaChoreographyEvent, SagaContext, SagaId, SagaWorkflowContract, SagaWorkflowStepContract,
+        StepExecutionId, SuccessCriteria, TERMINAL_RESOLVER_STEP, TerminalPolicy,
+        TerminalResolverJournal, TerminalResolverJournalEntry, TerminalResolverJournalError,
+        WorkflowDependencySpec,
+    };
+
+    use super::{AdmissionLimits, SagaBusPublishError, SagaChoreographyBus};
+
+    struct Chain;
+    impl SagaWorkflowContract for Chain {
+        fn saga_type() -> &'static str {
+            "adm_chain"
+        }
+        fn first_step() -> &'static str {
+            "a"
+        }
+        fn steps() -> &'static [SagaWorkflowStepContract] {
+            &[
+                SagaWorkflowStepContract {
+                    step_name: "a",
+                    participant_id: "a",
+                    depends_on: WorkflowDependencySpec::OnSagaStart,
+                },
+                SagaWorkflowStepContract {
+                    step_name: "b",
+                    participant_id: "b",
+                    depends_on: WorkflowDependencySpec::After("a"),
+                },
+            ]
+        }
+        fn terminal_policy() -> TerminalPolicy {
+            let mut required: HashSet<Box<str>> = HashSet::new();
+            required.insert("b".into());
+            TerminalPolicy::new(
+                "adm_chain".into(),
+                "adm_chain/policy".into(),
+                FailureAuthority::AnyParticipant,
+                SuccessCriteria::AllOf(required),
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+                Self::steps(),
+            )
+        }
+    }
+
+    struct AnyOf;
+    impl SagaWorkflowContract for AnyOf {
+        fn saga_type() -> &'static str {
+            "adm_any"
+        }
+        fn first_step() -> &'static str {
+            "a"
+        }
+        fn steps() -> &'static [SagaWorkflowStepContract] {
+            &[
+                SagaWorkflowStepContract {
+                    step_name: "a",
+                    participant_id: "a",
+                    depends_on: WorkflowDependencySpec::OnSagaStart,
+                },
+                SagaWorkflowStepContract {
+                    step_name: "b",
+                    participant_id: "b",
+                    depends_on: WorkflowDependencySpec::OnSagaStart,
+                },
+            ]
+        }
+        fn terminal_policy() -> TerminalPolicy {
+            let mut any: HashSet<Box<str>> = HashSet::new();
+            any.insert("a".into());
+            any.insert("b".into());
+            TerminalPolicy::new(
+                "adm_any".into(),
+                "adm_any/policy".into(),
+                FailureAuthority::AnyParticipant,
+                SuccessCriteria::AnyOf(any),
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+                Self::steps(),
+            )
+        }
+    }
+
+    /// Journal with an honest per-saga lookup that counts and can fail it.
+    #[derive(Default)]
+    struct LookupJournal {
+        inner: InMemoryTerminalResolverJournal,
+        read_alls: AtomicUsize,
+        lookups: AtomicUsize,
+        fail_lookup: AtomicBool,
+        fail_append: AtomicBool,
+    }
+
+    impl TerminalResolverJournal for LookupJournal {
+        fn append(
+            &self,
+            event: SagaChoreographyEvent,
+        ) -> Result<u64, TerminalResolverJournalError> {
+            if self.fail_append.load(Ordering::SeqCst) {
+                return Err(TerminalResolverJournalError::Storage("append down".into()));
+            }
+            self.inner.append(event)
+        }
+        fn read_all(
+            &self,
+        ) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError> {
+            self.read_alls.fetch_add(1, Ordering::SeqCst);
+            self.inner.read_all()
+        }
+        fn supports_saga_lookup(&self) -> bool {
+            true
+        }
+        fn read_saga(
+            &self,
+            saga_id: SagaId,
+        ) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError> {
+            self.lookups.fetch_add(1, Ordering::SeqCst);
+            if self.fail_lookup.load(Ordering::SeqCst) {
+                return Err(TerminalResolverJournalError::Storage("lookup down".into()));
+            }
+            self.inner.read_saga(saga_id)
+        }
+        fn read_saga_bounded(
+            &self,
+            saga_id: SagaId,
+            max_entries: usize,
+        ) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError> {
+            self.lookups.fetch_add(1, Ordering::SeqCst);
+            if self.fail_lookup.load(Ordering::SeqCst) {
+                return Err(TerminalResolverJournalError::Storage("lookup down".into()));
+            }
+            self.inner.read_saga_bounded(saga_id, max_entries)
+        }
+    }
+
+    type Seen = Arc<Mutex<Vec<SagaChoreographyEvent>>>;
+
+    fn count(seen: &Seen, pred: impl Fn(&SagaChoreographyEvent) -> bool) -> usize {
+        seen.lock().unwrap().iter().filter(|e| pred(e)).count()
+    }
+
+    fn is_start(e: &SagaChoreographyEvent) -> bool {
+        matches!(e, SagaChoreographyEvent::SagaStarted { .. })
+    }
+    fn is_completed(e: &SagaChoreographyEvent) -> bool {
+        matches!(e, SagaChoreographyEvent::SagaCompleted { .. })
+    }
+    fn is_quarantined(e: &SagaChoreographyEvent) -> bool {
+        matches!(e, SagaChoreographyEvent::SagaQuarantined { .. })
+    }
+
+    fn ctx(saga_type: &str, id: u64, step: &str, started_at: u64) -> SagaContext {
+        SagaContext {
+            saga_id: SagaId::new(id),
+            saga_type: saga_type.into(),
+            step_name: step.into(),
+            correlation_id: id,
+            causation_id: 0,
+            trace_id: id,
+            step_index: 0,
+            attempt: 0,
+            initiator_peer_id: [0; 32],
+            saga_started_at_millis: started_at,
+            event_timestamp_millis: started_at,
+        }
+    }
+
+    fn started(c: &SagaContext) -> SagaChoreographyEvent {
+        SagaChoreographyEvent::SagaStarted {
+            context: c.clone(),
+            payload: vec![1],
+        }
+    }
+
+    fn completed(
+        c: &SagaContext,
+        step: &str,
+        trace: u64,
+        compensable: bool,
+    ) -> SagaChoreographyEvent {
+        let mut context = c.next_step(step.into());
+        context.trace_id = trace;
+        SagaChoreographyEvent::StepCompleted {
+            context,
+            output: vec![1],
+            saga_input: vec![1],
+            compensation_available: compensable,
+        }
+    }
+
+    fn accepted(c: &SagaContext, step: &str, execution: &str) -> SagaChoreographyEvent {
+        SagaChoreographyEvent::StepAccepted {
+            context: c.next_step(step.into()),
+            participant_id: step.into(),
+            execution_id: StepExecutionId::new(execution),
+            deadline_at_millis: u64::MAX / 2,
+            hard_deadline_at_millis: u64::MAX / 2,
+            timeouts_enabled: true,
+            timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
+                requires_compensation: true,
+            },
+            compensation_available: true,
+        }
+    }
+
+    fn saga_failed(c: &SagaContext) -> SagaChoreographyEvent {
+        SagaChoreographyEvent::SagaFailed {
+            context: c.next_step(TERMINAL_RESOLVER_STEP.into()),
+            reason: "ordinary".into(),
+            failure: None,
+        }
+    }
+
+    fn wait_until(limit: Duration, mut pred: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if pred() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        pred()
+    }
+
+    fn bus_with<C: SagaWorkflowContract>(
+        journal: Option<Arc<dyn TerminalResolverJournal>>,
+        limits: AdmissionLimits,
+    ) -> (SagaChoreographyBus, Seen) {
+        let bus = SagaChoreographyBus::new();
+        bus.register_workflow_contract_provider::<C>().unwrap();
+        for step in C::steps() {
+            bus.register_bound_workflow_step(C::saga_type(), step.step_name)
+                .unwrap();
+        }
+        let seen: Seen = Arc::default();
+        let sink = Arc::clone(&seen);
+        bus.subscribe_saga_type_fn(C::saga_type(), move |event| {
+            sink.lock().unwrap().push(event.clone());
+            true
+        });
+        for _ in 0..3 {
+            bus.subscribe_saga_type_fn(C::saga_type(), |_| true);
+        }
+        let durable = journal.is_some();
+        bus.attach_terminal_resolver_inner(C::terminal_policy(), "qa", journal, limits)
+            .unwrap();
+        if durable {
+            bus.activate_terminal_resolver_recovery(C::saga_type())
+                .unwrap();
+        }
+        (bus, seen)
+    }
+
+    fn limits(max_ids: usize, max_fingerprints: usize) -> AdmissionLimits {
+        AdmissionLimits {
+            max_ids,
+            max_fingerprints,
+        }
+    }
+
+    fn resident(bus: &SagaChoreographyBus, saga_type: &str) -> (usize, usize) {
+        let gate = bus
+            .gates
+            .lock()
+            .unwrap()
+            .get(saga_type)
+            .and_then(std::sync::Weak::upgrade)
+            .unwrap();
+        let index = gate.index();
+        (index.resident_ids(), index.fingerprint_count())
+    }
+
+    fn complete_chain(bus: &SagaChoreographyBus, c: &SagaContext, seen: &Seen, want: usize) {
+        bus.publish_strict(started(c)).unwrap();
+        bus.publish_strict(completed(c, "a", 1, true)).unwrap();
+        bus.publish_strict(completed(c, "b", 2, true)).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(5), || count(seen, is_completed) == want),
+            "run {} completes",
+            c.saga_id.get()
+        );
+    }
+
+    fn rejected_reason(
+        result: Result<icanact_core::local::PublishStats, SagaBusPublishError>,
+    ) -> String {
+        match result {
+            Err(SagaBusPublishError::AdmissionRejected { reason, .. }) => reason.to_string(),
+            other => panic!("expected admission rejection, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------ successful siblings
+
+    #[test]
+    fn accepted_and_compensable_siblings_after_anyof_success_never_quarantine() {
+        for durable in [false, true] {
+            let journal: Option<Arc<dyn TerminalResolverJournal>> =
+                durable.then(|| Arc::new(InMemoryTerminalResolverJournal::default()) as Arc<_>);
+            let (bus, seen) = bus_with::<AnyOf>(journal, AdmissionLimits::default());
+            let c = ctx("adm_any", 10, "a", SagaContext::now_millis());
+            bus.publish_strict(started(&c)).unwrap();
+            bus.publish_strict(completed(&c, "a", 1, true)).unwrap();
+            assert!(wait_until(Duration::from_secs(3), || count(
+                &seen,
+                is_completed
+            ) == 1));
+            bus.publish_strict(accepted(&c, "b", "late-exec")).unwrap();
+            bus.publish_strict(completed(&c, "b", 99, true)).unwrap();
+            thread::sleep(Duration::from_millis(200));
+            assert_eq!(count(&seen, is_quarantined), 0, "durable={durable}");
+        }
+    }
+
+    #[test]
+    fn new_accepted_effect_after_failure_still_escalates_once() {
+        let journal = Arc::new(LookupJournal::default());
+        let c = ctx("adm_chain", 11, "a", 1_000_000);
+        journal.inner.append(started(&c)).unwrap();
+        journal.inner.append(accepted(&c, "a", "known")).unwrap();
+        journal.inner.append(saga_failed(&c)).unwrap();
+        let (bus, seen) = bus_with::<Chain>(Some(journal), AdmissionLimits::default());
+        bus.publish_strict(accepted(&c, "a", "known")).unwrap();
+        thread::sleep(Duration::from_millis(150));
+        assert_eq!(count(&seen, is_quarantined), 0, "known replay is quiet");
+        bus.publish_strict(accepted(&c, "b", "new")).unwrap();
+        assert!(wait_until(Duration::from_secs(3), || count(
+            &seen,
+            is_quarantined
+        ) == 1));
+    }
+
+    // ------------------------------------------------------ bounded index
+
+    #[test]
+    fn ephemeral_admission_refuses_at_capacity_before_fanout_and_never_evicts() {
+        let (bus, seen) = bus_with::<Chain>(None, limits(2, 1_000));
+        let base = SagaContext::now_millis();
+        complete_chain(&bus, &ctx("adm_chain", 21, "a", base), &seen, 1);
+        complete_chain(&bus, &ctx("adm_chain", 22, "a", base), &seen, 2);
+        let starts_before = count(&seen, is_start);
+        let reason = rejected_reason(bus.publish_strict(started(&ctx("adm_chain", 23, "a", base))));
+        assert!(reason.contains("capacity"), "{reason}");
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            count(&seen, is_start),
+            starts_before,
+            "refused before fanout"
+        );
+        // Resolved fences were not forgotten to make room.
+        let replay = rejected_reason(bus.publish_strict(started(&ctx("adm_chain", 21, "a", base))));
+        assert!(replay.contains("replay"), "{replay}");
+        assert_eq!(resident(&bus, "adm_chain").0, 2);
+    }
+
+    #[test]
+    fn fingerprint_budget_refuses_admission_and_is_released_by_success() {
+        let (bus, seen) = bus_with::<Chain>(None, limits(100, 2));
+        let base = SagaContext::now_millis();
+        let first = ctx("adm_chain", 31, "a", base);
+        bus.publish_strict(started(&first)).unwrap();
+        bus.publish_strict(completed(&first, "a", 1, true)).unwrap();
+        bus.publish_strict(completed(&first, "x", 2, true)).unwrap();
+        assert!(wait_until(Duration::from_secs(3), || resident(
+            &bus,
+            "adm_chain"
+        )
+        .1 == 2));
+        let reason = rejected_reason(bus.publish_strict(started(&ctx("adm_chain", 32, "a", base))));
+        assert!(reason.contains("capacity"), "{reason}");
+        // Non-compensable success adds no fingerprint at the exact hard budget.
+        bus.publish_strict(completed(&first, "b", 3, false))
+            .unwrap();
+        assert!(wait_until(Duration::from_secs(3), || count(
+            &seen,
+            is_completed
+        ) == 1));
+        assert!(
+            wait_until(Duration::from_secs(3), || resident(&bus, "adm_chain").1
+                == 0),
+            "a successful run retains no effect fingerprints"
+        );
+        bus.publish_strict(started(&ctx("adm_chain", 32, "a", base)))
+            .expect("budget released");
+    }
+
+    #[test]
+    fn lookup_journal_bounds_cache_and_reloads_fences_without_global_reads() {
+        let journal = Arc::new(LookupJournal::default());
+        let (bus, seen) = bus_with::<Chain>(
+            Some(Arc::clone(&journal) as Arc<dyn TerminalResolverJournal>),
+            limits(3, 1_000),
+        );
+        let base = SagaContext::now_millis();
+        for id in 100..112u64 {
+            complete_chain(
+                &bus,
+                &ctx("adm_chain", id, "a", base),
+                &seen,
+                (id - 99) as usize,
+            );
+            thread::sleep(Duration::from_millis(30));
+        }
+        assert!(
+            resident(&bus, "adm_chain").0 <= 4,
+            "terminal fences are evicted, got {}",
+            resident(&bus, "adm_chain").0
+        );
+        // Evicted run: replayed start is refused from the durable fence.
+        let replay =
+            rejected_reason(bus.publish_strict(started(&ctx("adm_chain", 100, "a", base))));
+        assert!(replay.contains("replay"), "{replay}");
+        // Evicted run: stale non-start event is dropped, not journaled or answered.
+        let rows = journal.inner.read_all().unwrap().len();
+        let outputs = count(&seen, |_| true);
+        bus.publish_strict(SagaChoreographyEvent::StepFailed {
+            context: ctx("adm_chain", 101, "a", base).next_step("a".into()),
+            participant_id: "a".into(),
+            error: "late".into(),
+            error_code: None,
+            requires_compensation: false,
+        })
+        .unwrap();
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(journal.inner.read_all().unwrap().len(), rows);
+        assert_eq!(
+            count(&seen, |_| true),
+            outputs + 1,
+            "only the published step is seen"
+        );
+        assert_eq!(
+            journal.read_alls.load(Ordering::SeqCst),
+            1,
+            "history read once at attach"
+        );
+        assert!(journal.lookups.load(Ordering::SeqCst) > 0);
+    }
+
+    #[test]
+    fn evicted_success_replay_stays_successful_and_evicted_failure_still_escalates() {
+        let journal = Arc::new(LookupJournal::default());
+        let base = SagaContext::now_millis();
+        let ok = ctx("adm_any", 201, "a", base);
+        let (bus, seen) = bus_with::<AnyOf>(
+            Some(Arc::clone(&journal) as Arc<dyn TerminalResolverJournal>),
+            limits(2, 1_000),
+        );
+        bus.publish_strict(started(&ok)).unwrap();
+        bus.publish_strict(completed(&ok, "a", 1, true)).unwrap();
+        assert!(wait_until(Duration::from_secs(3), || count(
+            &seen,
+            is_completed
+        ) == 1));
+        for id in 202..208u64 {
+            let c = ctx("adm_any", id, "a", base);
+            bus.publish_strict(started(&c)).unwrap();
+            bus.publish_strict(completed(&c, "a", 1, true)).unwrap();
+            assert!(wait_until(Duration::from_secs(3), || {
+                count(&seen, is_completed) == (id - 200) as usize
+            }));
+            thread::sleep(Duration::from_millis(30));
+        }
+        bus.publish_strict(accepted(&ok, "b", "late")).unwrap();
+        bus.publish_strict(completed(&ok, "b", 77, true)).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(count(&seen, is_quarantined), 0);
+    }
+
+    #[test]
+    fn journal_lookup_failure_refuses_admission_visibly_then_recovers() {
+        let journal = Arc::new(LookupJournal::default());
+        let (bus, seen) = bus_with::<Chain>(
+            Some(Arc::clone(&journal) as Arc<dyn TerminalResolverJournal>),
+            AdmissionLimits::default(),
+        );
+        let c = ctx("adm_chain", 301, "a", SagaContext::now_millis());
+        journal.fail_lookup.store(true, Ordering::SeqCst);
+        let reason = rejected_reason(bus.publish_strict(started(&c)));
+        assert!(reason.contains("lookup"), "{reason}");
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            count(&seen, is_start),
+            0,
+            "no fanout without proven history"
+        );
+        journal.fail_lookup.store(false, Ordering::SeqCst);
+        bus.publish_strict(started(&c)).unwrap();
+        assert!(wait_until(Duration::from_secs(2), || count(
+            &seen, is_start
+        ) == 1));
+    }
+
+    #[test]
+    fn custom_journal_without_lookup_keeps_every_fence_and_refuses_at_capacity() {
+        struct NoLookup(InMemoryTerminalResolverJournal);
+        impl TerminalResolverJournal for NoLookup {
+            fn append(
+                &self,
+                e: SagaChoreographyEvent,
+            ) -> Result<u64, TerminalResolverJournalError> {
+                self.0.append(e)
+            }
+            fn read_all(
+                &self,
+            ) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError>
+            {
+                self.0.read_all()
+            }
+        }
+        let journal: Arc<dyn TerminalResolverJournal> =
+            Arc::new(NoLookup(InMemoryTerminalResolverJournal::default()));
+        let (bus, seen) = bus_with::<Chain>(Some(journal), limits(2, 1_000));
+        let base = SagaContext::now_millis();
+        complete_chain(&bus, &ctx("adm_chain", 401, "a", base), &seen, 1);
+        complete_chain(&bus, &ctx("adm_chain", 402, "a", base), &seen, 2);
+        let reason =
+            rejected_reason(bus.publish_strict(started(&ctx("adm_chain", 403, "a", base))));
+        assert!(reason.contains("capacity"), "{reason}");
+    }
+
+    #[test]
+    fn ephemeral_capacity_also_bounds_runs_reusing_one_saga_id() {
+        let (bus, seen) = bus_with::<Chain>(None, limits(2, 1_000));
+        let base = SagaContext::now_millis();
+        for offset in 0..2 {
+            complete_chain(
+                &bus,
+                &ctx("adm_chain", 450, "a", base + offset),
+                &seen,
+                offset as usize + 1,
+            );
+        }
+        let starts = count(&seen, is_start);
+        let reason =
+            rejected_reason(bus.publish_strict(started(&ctx("adm_chain", 450, "a", base + 2))));
+        assert!(reason.contains("capacity"), "{reason}");
+        assert_eq!(count(&seen, is_start), starts);
+        let replay =
+            rejected_reason(bus.publish_strict(started(&ctx("adm_chain", 450, "a", base))));
+        assert!(
+            replay.contains("replay"),
+            "old fences must stay authoritative: {replay}"
+        );
+    }
+
+    #[test]
+    fn active_effect_fingerprints_cannot_grow_past_the_budget() {
+        let (bus, seen) = bus_with::<Chain>(None, limits(10, 2));
+        let c = ctx("adm_chain", 451, "a", SagaContext::now_millis());
+        bus.publish_strict(started(&c)).unwrap();
+        for trace in 1..=3 {
+            bus.publish_strict(completed(&c, "a", trace, true)).unwrap();
+        }
+        assert!(
+            wait_until(Duration::from_secs(3), || count(&seen, is_quarantined) == 1),
+            "overflow of effect evidence must quarantine rather than silently grow"
+        );
+        assert!(resident(&bus, "adm_chain").1 <= 2);
+        let later = ctx("adm_chain", 451, "a", c.saga_started_at_millis + 1);
+        assert!(rejected_reason(bus.publish_strict(started(&later))).contains("quarantined"));
+    }
+
+    #[test]
+    fn reloadable_eviction_never_discards_the_current_ids_old_run_fences() {
+        let journal = Arc::new(LookupJournal::default());
+        let (bus, seen) = bus_with::<Chain>(Some(journal), limits(2, 1_000));
+        let base = SagaContext::now_millis();
+        let old = ctx("adm_chain", 455, "a", base);
+        complete_chain(&bus, &old, &seen, 1);
+        complete_chain(&bus, &ctx("adm_chain", 456, "a", base), &seen, 2);
+        let new = ctx("adm_chain", 455, "a", base + 1);
+        bus.publish_strict(started(&new)).unwrap();
+        let replay = rejected_reason(bus.publish_strict(started(&old)));
+        assert!(
+            replay.contains("replay"),
+            "current id must keep its complete history: {replay}"
+        );
+        bus.publish_strict(completed(&old, "a", 99, true)).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(count(&seen, is_quarantined), 0);
+        bus.publish_strict(completed(&new, "a", 1, true)).unwrap();
+        bus.publish_strict(completed(&new, "b", 2, true)).unwrap();
+        assert!(wait_until(Duration::from_secs(3), || count(
+            &seen,
+            is_completed
+        ) == 3));
+    }
+
+    #[test]
+    fn oversized_unresolved_restore_refuses_instead_of_exceeding_capacity() {
+        let journal = Arc::new(LookupJournal::default());
+        let base = SagaContext::now_millis();
+        for id in 460..463 {
+            journal
+                .append(started(&ctx("adm_chain", id, "a", base)))
+                .unwrap();
+        }
+        let bus = SagaChoreographyBus::new();
+        bus.register_workflow_contract_provider::<Chain>().unwrap();
+        for step in Chain::steps() {
+            bus.register_bound_workflow_step(Chain::saga_type(), step.step_name)
+                .unwrap();
+        }
+        let result = bus.attach_terminal_resolver_inner(
+            Chain::terminal_policy(),
+            "qa",
+            Some(journal),
+            limits(2, 2),
+        );
+        assert!(
+            matches!(result, Err(ref reason) if reason.contains("capacity")),
+            "cannot restore unresolved fences over the configured budget: {result:?}"
+        );
+    }
+
+    #[cfg(feature = "lmdb")]
+    #[test]
+    fn lmdb_bounded_cache_survives_eviction_compaction_and_reopen() {
+        use crate::LmdbTerminalResolverJournal;
+        let dir = tempfile::tempdir().unwrap();
+        let base = SagaContext::now_millis();
+        {
+            let journal = Arc::new(LmdbTerminalResolverJournal::open(dir.path()).unwrap());
+            let (bus, seen) = bus_with::<Chain>(
+                Some(Arc::clone(&journal) as Arc<dyn TerminalResolverJournal>),
+                limits(2, 1_000),
+            );
+            for id in 500..506u64 {
+                complete_chain(
+                    &bus,
+                    &ctx("adm_chain", id, "a", base),
+                    &seen,
+                    (id - 499) as usize,
+                );
+                thread::sleep(Duration::from_millis(30));
+            }
+            assert!(journal.compact_terminal_detail().unwrap() > 0);
+        }
+        let journal = Arc::new(LmdbTerminalResolverJournal::open(dir.path()).unwrap());
+        let (bus, seen) = bus_with::<Chain>(
+            Some(Arc::clone(&journal) as Arc<dyn TerminalResolverJournal>),
+            limits(2, 1_000),
+        );
+        for id in 500..506u64 {
+            let reason =
+                rejected_reason(bus.publish_strict(started(&ctx("adm_chain", id, "a", base))));
+            assert!(reason.contains("replay"), "id {id}: {reason}");
+        }
+        bus.publish_strict(started(&ctx("adm_chain", 900, "a", base)))
+            .expect("new ids are still admitted under a bounded cache");
+        assert!(wait_until(Duration::from_secs(2), || count(
+            &seen, is_start
+        ) == 1));
     }
 }

@@ -577,7 +577,8 @@ fn accepted_order_timeout_compensates_the_current_step_before_terminal_failure()
     assert!(
         matches!(
             timeout_events.as_slice(),
-            [SagaChoreographyEvent::CompensationRequested {
+            [SagaChoreographyEvent::StepFailed { requires_compensation: true, .. },
+             SagaChoreographyEvent::CompensationRequested {
                 failed_step,
                 steps_to_compensate,
                 ..
@@ -647,9 +648,25 @@ fn workflow_owned_order_and_release_wait_for_authoritative_completion() {
 
     std::thread::sleep(Duration::from_millis(3));
     let timeout_events = resolver.poll_timeouts();
-    let [compensation_requested] = timeout_events.as_slice() else {
+    // The resolver now publishes the authoritative timeout disposition before
+    // requesting undo. A compensating failure must still retain accepted ownership.
+    let [step_failed, compensation_requested] = timeout_events.as_slice() else {
         panic!("accepted order timeout must request its own compensation: {timeout_events:?}");
     };
+    assert!(matches!(
+        step_failed,
+        SagaChoreographyEvent::StepFailed {
+            requires_compensation: true,
+            ..
+        }
+    ));
+    apply_sync_workflow_participant_saga_ingress_with_hooks(
+        &mut actor,
+        step_failed.clone(),
+        |_actor, _event| {},
+        |_event| panic!("timeout disposition emitted an invalid transition"),
+        |actor, event| actor.emitted.push(event.clone()),
+    );
     assert!(matches!(
         compensation_requested,
         SagaChoreographyEvent::CompensationRequested {
@@ -1854,15 +1871,20 @@ fn accepted_step_completion_records_actual_completion_time() {
         .journal
         .read(ctx.saga_id)
         .expect("journal read should succeed");
+    // The single strict proof append carries the actual completion time; no raw
+    // result row precedes it for an authoritative accepted completion.
     assert!(entries.iter().any(|entry| {
         matches!(
             &entry.event,
-            ParticipantEvent::StepExecutionCompleted {
-                completed_at_millis: observed,
-                ..
-            } if *observed == completed_at_millis
+            ParticipantEvent::ParticipantForwardOutcomeRecorded { outcome }
+                if outcome.context.event_timestamp_millis == completed_at_millis
         )
     }));
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| matches!(entry.event, ParticipantEvent::StepExecutionCompleted { .. }))
+    );
 }
 
 #[test]

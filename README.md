@@ -82,6 +82,14 @@ fails closed by default; terminal retention needs capacity/compaction maintenanc
 use stable external idempotency keys and reconciliation. See
 [docs/operations.md](docs/operations.md).
 
+## Safety Policies (summary)
+
+- Success keeps business effects; late evidence after failure quarantines, and a `SagaFailed`
+  reply may be superseded by quarantine. Declared effects without undo are irreversible.
+- `FailStep(requires_compensation=false)` is a safe/no-undo remote contract, not cancellation.
+- Drain all in-flight sagas before upgrading from baseline; see
+  [docs/migration.md](docs/migration.md). No repair/safe-clear API exists.
+
 ## Timeout Semantics
 
 - `overall_timeout`: forward wall-clock budget; forward expiry with known effects starts

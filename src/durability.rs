@@ -458,24 +458,13 @@ where
         execution_id: execution_id.clone(),
         error: format!("{source:?}").into(),
     };
-    actor
-        .record_event_strict(
-            saga_id,
-            ParticipantEvent::StepExecutionCompleted {
-                output: completion.output.clone(),
-                compensation_data: completion.compensation_data.clone(),
-                completed_at_millis: completion.completed_at_millis,
-            },
-        )
-        .map_err(|source| {
-            retain_failed_accepted_result(actor, &accepted.context, &completion, &source);
-            durability(source)
-        })?;
     let mut context = accepted.context.clone();
     context.event_timestamp_millis = completion.completed_at_millis;
-    // Strict forward proof precedes success: the stored context is the exact one
-    // the returned completion carries, so recovery can resend it verbatim. An
-    // append failure fails closed; the raw result stays journaled as unconfirmed.
+    // One strict proof append carries the full result: the stored context is the
+    // exact one the returned completion carries, so recovery can resend it verbatim.
+    // An accepted completion declares no dispatch window, so a raw result row first
+    // would only manufacture uncertainty. An append failure retains the typed bytes
+    // as reconciliation evidence plus a durable quarantine and returns an error.
     let outcome = ParticipantForwardOutcome {
         context,
         output: completion.output.clone(),
@@ -487,7 +476,10 @@ where
     };
     actor
         .record_forward_outcome_strict(&outcome)
-        .map_err(durability)?;
+        .map_err(|source| {
+            retain_failed_accepted_result(actor, &accepted.context, &completion, &source);
+            durability(source)
+        })?;
     take_accepted_step(actor, saga_id, execution_id.clone())?;
     if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&saga_id) {
         let new_state = state.complete(
@@ -1222,6 +1214,27 @@ where
             // auto-resolved on restart; their evidence stays in the journal.
             continue;
         }
+        if let Some((run_type, run_started)) = run.identity
+            && run_type == saga_type
+        {
+            // Durable AllOf inputs of the current run only; never dependency_fired.
+            let seen: std::collections::HashSet<Box<str>> = all_entries
+                .iter()
+                .filter_map(|entry| match &entry.event {
+                    ParticipantEvent::ParticipantDependencyCompletedRecorded {
+                        context, ..
+                    } if context.saga_type.as_ref() == run_type
+                        && context.saga_started_at_millis == run_started =>
+                    {
+                        Some(context.step_name.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !seen.is_empty() {
+                support.dependency_completions.insert(saga_id, seen);
+            }
+        }
         let entries = run.entries;
         if entries.iter().any(|entry| {
             matches!(
@@ -1646,8 +1659,15 @@ fn recover_completed_step_effect_for_unstarted_compensation(
     let mut effect_at_request = None;
     for entry in entries {
         match &entry.event {
-            ParticipantEvent::ParticipantForwardOutcomeRecorded { .. }
-            | ParticipantEvent::ParticipantDependencyCompletedRecorded { .. } => {}
+            ParticipantEvent::ParticipantDependencyCompletedRecorded { .. } => {}
+            // A proof-only completion (no raw row) still names the materialised effect.
+            ParticipantEvent::ParticipantForwardOutcomeRecorded { outcome } => {
+                completed = Some((
+                    outcome.output.clone(),
+                    outcome.compensation_data.clone(),
+                    outcome.recorded_at_millis,
+                ));
+            }
             ParticipantEvent::StepExecutionStarted { .. } => completed = None,
             ParticipantEvent::StepExecutionCompleted {
                 output,
@@ -1682,14 +1702,76 @@ fn recover_completed_step_effect_for_unstarted_compensation(
     effect_at_request
 }
 
+/// The acknowledgement of an owned undo that is durably complete, if (and only
+/// if) the history is unambiguous: the retained request names this step and the
+/// run identity, the undo started and completed, and nothing after it reopened
+/// forward work, failed the undo, quarantined, or retained reconciliation
+/// evidence. The accepted-compensation protocol has its own recovery path.
+fn recover_proven_undo_acknowledgement(
+    entries: &[JournalEntry],
+    identity: Option<(&str, u64)>,
+    saga_type: &str,
+    step_name: &str,
+) -> Option<SagaChoreographyEvent> {
+    let (run_type, run_started) = identity?;
+    let mut request: Option<&SagaContext> = None;
+    let mut started = false;
+    let mut completed = false;
+    for entry in entries {
+        match &entry.event {
+            ParticipantEvent::CompensationRequestRecorded {
+                context,
+                steps_to_compensate,
+                ..
+            } => {
+                if steps_to_compensate
+                    .first()
+                    .is_some_and(|step| step.as_ref() == step_name)
+                {
+                    request = Some(context);
+                    started = false;
+                    completed = false;
+                }
+            }
+            ParticipantEvent::CompensationStarted { .. } if request.is_some() => {
+                started = true;
+                completed = false;
+            }
+            ParticipantEvent::CompensationCompleted { .. } if started => completed = true,
+            ParticipantEvent::AcceptedCompensationRecorded { .. }
+            | ParticipantEvent::CompensationFailed { .. }
+            | ParticipantEvent::Quarantined { .. }
+            | ParticipantEvent::ParticipantReconciliationEvidence { .. }
+            | ParticipantEvent::ParticipantTerminalRecorded { .. } => return None,
+            ParticipantEvent::StepExecutionStarted { .. }
+            | ParticipantEvent::StepExecutionCompleted { .. }
+            | ParticipantEvent::ParticipantForwardOutcomeRecorded { .. }
+                if completed =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+    }
+    let request = request?;
+    (completed
+        && request.saga_type.as_ref() == saga_type
+        && request.saga_type.as_ref() == run_type
+        && request.saga_started_at_millis == run_started)
+        .then(|| SagaChoreographyEvent::CompensationCompleted {
+            context: request.next_step(step_name.into()),
+        })
+}
+
 fn recover_accepted_workflow_step_from_entries(
     entries: &[JournalEntry],
 ) -> Option<AcceptedWorkflowStep> {
     let mut accepted = None;
     for entry in entries {
         match &entry.event {
-            ParticipantEvent::ParticipantForwardOutcomeRecorded { .. }
-            | ParticipantEvent::ParticipantDependencyCompletedRecorded { .. } => {}
+            // The strict proof is the sole record of an authoritative completion.
+            ParticipantEvent::ParticipantForwardOutcomeRecorded { .. } => accepted = None,
+            ParticipantEvent::ParticipantDependencyCompletedRecorded { .. } => {}
             ParticipantEvent::AcceptedStepRecorded {
                 context,
                 participant_id,
@@ -1753,8 +1835,8 @@ fn accepted_step_failure_requiring_compensation(
     let mut failure = None;
     for entry in entries {
         match &entry.event {
-            ParticipantEvent::ParticipantForwardOutcomeRecorded { .. }
-            | ParticipantEvent::ParticipantDependencyCompletedRecorded { .. } => {}
+            ParticipantEvent::ParticipantForwardOutcomeRecorded { .. } => failure = None,
+            ParticipantEvent::ParticipantDependencyCompletedRecorded { .. } => {}
             ParticipantEvent::AcceptedStepRecorded { .. } => {
                 failure = None;
             }
@@ -1967,9 +2049,17 @@ pub(crate) fn mark_accepted_step_resolved<A>(
         .insert((saga_id, execution_id));
 }
 
+/// A resolver-origin accepted-step timeout that carries no compensation durably
+/// resolves this participant's matching accepted work *before* the volatile
+/// metadata is dropped; otherwise a later ordinary failure would find unresolved
+/// accepted work and falsely quarantine a definitive rejection. Only the exact
+/// run (saga type, id and start time) that owns the metadata and is the journal's
+/// current unresolved run may be resolved, so an old context can never resolve a
+/// successor. A failed durable write keeps the metadata and the unresolved
+/// evidence visible.
 fn mark_matching_accepted_step_failed<A>(actor: &mut A, event: &SagaChoreographyEvent)
 where
-    A: HasSagaParticipantSupport,
+    A: SagaStateExt,
 {
     let SagaChoreographyEvent::StepFailed {
         context,
@@ -1991,24 +2081,73 @@ where
         return;
     }
     let saga_id = context.saga_id;
-    let Some(accepted) = actor
-        .saga_support_mut()
-        .accepted_workflow_steps
-        .remove(&saga_id)
-    else {
+    let Some(accepted) = actor.saga_support().accepted_workflow_steps.get(&saga_id) else {
         return;
     };
-    if accepted.context.step_name == context.step_name
-        && accepted.context.saga_type == context.saga_type
-        && accepted.context.saga_started_at_millis == context.saga_started_at_millis
+    if accepted.context.step_name != context.step_name
+        || accepted.context.saga_type != context.saga_type
+        || accepted.context.saga_started_at_millis != context.saga_started_at_millis
     {
-        mark_accepted_step_resolved(actor, saga_id, accepted.execution_id);
-    } else {
-        actor
-            .saga_support_mut()
-            .accepted_workflow_steps
-            .insert(saga_id, accepted);
+        return;
     }
+    let execution_id = accepted.execution_id.clone();
+    let accepted_context = accepted.context.clone();
+    match actor.saga_journal().read(saga_id) {
+        Ok(entries) => {
+            let run = current_run(&entries);
+            if run.terminal.is_none() {
+                let owns_run = run.identity
+                    == Some((
+                        accepted_context.saga_type.as_ref(),
+                        accepted_context.saga_started_at_millis,
+                    ));
+                if !owns_run {
+                    return;
+                }
+                if run_still_pending(actor, &accepted_context)
+                    && let Err(source) = actor.record_event_strict(
+                        saga_id,
+                        ParticipantEvent::StepExecutionFailed {
+                            error: error.clone(),
+                            requires_compensation: false,
+                            failed_at_millis: context.event_timestamp_millis,
+                        },
+                    )
+                {
+                    tracing::error!(
+                        target: "core::saga",
+                        event = "accepted_timeout_resolution_persistence_failed",
+                        saga_id = saga_id.get(),
+                        error = %source
+                    );
+                    return;
+                }
+            }
+        }
+        Err(source) => {
+            tracing::error!(
+                target: "core::saga",
+                event = "accepted_timeout_resolution_unreadable",
+                saga_id = saga_id.get(),
+                error = %source
+            );
+            return;
+        }
+    }
+    actor
+        .saga_support_mut()
+        .accepted_workflow_steps
+        .remove(&saga_id);
+    mark_accepted_step_resolved(actor, saga_id, execution_id);
+}
+
+/// True while the run still has unresolved accepted forward work in the journal.
+fn run_still_pending<A: SagaStateExt>(actor: &A, context: &SagaContext) -> bool {
+    actor
+        .participant_run_evidence_strict(context)
+        .map(|evidence| evidence.accepted_forward_pending)
+        // Unreadable evidence is not proof of resolution; attempt the write.
+        .unwrap_or(true)
 }
 
 pub fn apply_sync_participant_saga_ingress<P, FApplyTerminal, FOnInvalid>(
@@ -2069,6 +2208,11 @@ pub fn apply_sync_participant_saga_ingress_with_hooks<P, FApplyTerminal, FOnInva
 
         on_emitted_transition(participant, &next_event);
 
+        // The helper already published `StepStarted` strictly before business work;
+        // the buffered copy only feeds hooks and validation, never a second publish.
+        if matches!(next_event, SagaChoreographyEvent::StepStarted { .. }) {
+            continue;
+        }
         if let Some(bus) = &saga_bus
             && let Err(err) = bus.publish_strict(next_event)
         {
@@ -2215,9 +2359,24 @@ pub fn apply_sync_workflow_participant_saga_ingress_with_hooks<
     }
 
     let mut emitted = Vec::new();
-    handle_workflow_saga_event_with_emit(actor, workflow, event, |next_event| {
-        emitted.push(next_event)
-    });
+    // Managed `StepStarted` is published strictly, after durable intent and before
+    // business execution, so the resolver can see running work. Validation and the
+    // emitted-transition hook run at that moment (before the work, not after it).
+    let mut publish_start = |actor: &mut A, start: SagaChoreographyEvent| {
+        publish_workflow_step_started(
+            actor,
+            start,
+            &mut on_invalid_transition,
+            &mut on_emitted_transition,
+        )
+    };
+    handle_workflow_saga_event_with_emit(
+        actor,
+        workflow,
+        event,
+        |next_event| emitted.push(next_event),
+        &mut publish_start,
+    );
 
     let saga_bus = actor.saga_support().bus.clone();
     for next_event in emitted {
@@ -2243,14 +2402,43 @@ pub fn apply_sync_workflow_participant_saga_ingress_with_hooks<
     }
 }
 
-fn handle_workflow_saga_event_with_emit<A, F>(
+/// Validates, hooks and strictly publishes a managed step's `StepStarted` before
+/// its business work. `Err` means the start is not visible: the work must not run.
+fn publish_workflow_step_started<A>(
+    actor: &mut A,
+    start: SagaChoreographyEvent,
+    on_invalid_transition: &mut dyn FnMut(&SagaChoreographyEvent),
+    on_emitted_transition: &mut dyn FnMut(&mut A, &SagaChoreographyEvent),
+) -> Result<(), Box<str>>
+where
+    A: HasSagaParticipantSupport,
+{
+    if !is_valid_emitted_transition(
+        actor.saga_states_ref().get(&start.context().saga_id),
+        &start,
+    ) {
+        on_invalid_transition(&start);
+        return Err("step start is not a valid transition; effect not run".into());
+    }
+    on_emitted_transition(actor, &start);
+    let Some(bus) = actor.saga_support().bus.clone() else {
+        return Ok(());
+    };
+    bus.publish_strict(start)
+        .map(|_| ())
+        .map_err(|error| format!("step start publication failed; effect not run: {error:?}").into())
+}
+
+fn handle_workflow_saga_event_with_emit<A, F, S>(
     actor: &mut A,
     workflow: &'static dyn SagaWorkflowParticipant<A>,
     event: SagaChoreographyEvent,
     mut emit: F,
+    start: &mut S,
 ) where
     A: HasSagaParticipantSupport,
     F: FnMut(SagaChoreographyEvent),
+    S: FnMut(&mut A, SagaChoreographyEvent) -> Result<(), Box<str>>,
 {
     let context = event.context().clone();
     let now = actor.now_millis();
@@ -2327,6 +2515,17 @@ fn handle_workflow_saga_event_with_emit<A, F>(
         }
     }
 
+    // An AllOf input is durably observed before anything volatile (dedupe mark, seen
+    // set) can consume it, so a restart between inputs cannot lose it.
+    if let SagaChoreographyEvent::StepCompleted { .. } = &event
+        && let crate::DependencySpec::AllOf(steps) = workflow.depends_on()
+        && steps.contains(&context.step_name.as_ref())
+        && let Err(reason) = record_allof_dependency(actor, &context)
+    {
+        quarantine_closed(actor, &mut emit, reason);
+        return;
+    }
+
     // Idempotency is marked before workflow execution so replayed upstream
     // events do not duplicate business side effects. The marker is scoped to the
     // run identity. A crash between this mark and the durable StepExecutionStarted
@@ -2374,6 +2573,7 @@ fn handle_workflow_saga_event_with_emit<A, F>(
                 payload,
                 now,
                 &mut emit,
+                start,
             );
         }
         SagaChoreographyEvent::SagaStarted { .. } => {}
@@ -2384,6 +2584,13 @@ fn handle_workflow_saga_event_with_emit<A, F>(
             ..
         } => {
             let dependency_spec = workflow.depends_on();
+            if matches!(&dependency_spec, crate::DependencySpec::AllOf(steps)
+                if steps.contains(&step_ctx.step_name.as_ref()))
+                && let Err(reason) = hydrate_allof_dependencies(actor, &context)
+            {
+                quarantine_closed(actor, &mut emit, reason);
+                return;
+            }
             let should_fire = workflow_dependency_should_fire(
                 actor,
                 context.saga_id,
@@ -2404,6 +2611,7 @@ fn handle_workflow_saga_event_with_emit<A, F>(
                     input,
                     now,
                     &mut emit,
+                    start,
                 );
             }
         }
@@ -2513,6 +2721,44 @@ fn retain_workflow_terminal<A>(
     }
 }
 
+/// Durably records an incoming AllOf dependency completion for exactly this run
+/// (once). Failure is a visible-quarantine reason; it never authorizes execution.
+fn record_allof_dependency<A>(actor: &A, context: &SagaContext) -> Result<(), Box<str>>
+where
+    A: HasSagaParticipantSupport,
+{
+    let durable = actor
+        .completed_dependency_steps_strict(context)
+        .map_err(|error| Box::<str>::from(format!("dependency history unavailable: {error}")))?;
+    if durable.contains(&context.step_name) {
+        return Ok(());
+    }
+    actor
+        .record_dependency_completion_strict(context)
+        .map_err(|error| {
+            Box::<str>::from(format!(
+                "dependency observation persistence failed: {error}"
+            ))
+        })
+}
+
+/// Rebuilds this run's AllOf seen-set from the durable observations, so inputs seen
+/// before a restart or a cleared volatile cache still count.
+fn hydrate_allof_dependencies<A>(actor: &mut A, context: &SagaContext) -> Result<(), Box<str>>
+where
+    A: HasSagaParticipantSupport,
+{
+    let durable = actor
+        .completed_dependency_steps_strict(context)
+        .map_err(|error| Box::<str>::from(format!("dependency history unavailable: {error}")))?;
+    actor
+        .dependency_completions()
+        .entry(context.saga_id)
+        .or_default()
+        .extend(durable);
+    Ok(())
+}
+
 fn workflow_dependency_should_fire<A>(
     actor: &mut A,
     saga_id: SagaId,
@@ -2588,16 +2834,18 @@ fn confirmed_clean_forward(evidence: &crate::ParticipantRunEvidence) -> bool {
         && !evidence.needs_reconciliation
 }
 
-fn execute_workflow_step_with_emit<A, F>(
+fn execute_workflow_step_with_emit<A, F, S>(
     actor: &mut A,
     workflow: &'static dyn SagaWorkflowParticipant<A>,
     context: SagaContext,
     input: Vec<u8>,
     now: u64,
     emit: &mut F,
+    start: &mut S,
 ) where
     A: HasSagaParticipantSupport,
     F: FnMut(SagaChoreographyEvent),
+    S: FnMut(&mut A, SagaChoreographyEvent) -> Result<(), Box<str>>,
 {
     let saga_id = context.saga_id;
     let state = crate::SagaParticipantState::new(
@@ -2660,10 +2908,17 @@ fn execute_workflow_step_with_emit<A, F>(
         return;
     }
 
-    let accepted_context = context.next_step(workflow.step_name().into());
-    emit(SagaChoreographyEvent::StepStarted {
-        context: accepted_context.clone(),
-    });
+    // Strict start publication precedes the business effect. A start that cannot
+    // be made visible quarantines instead of running unseen work.
+    if let Err(reason) = start(
+        actor,
+        SagaChoreographyEvent::StepStarted {
+            context: context.next_step(workflow.step_name().into()),
+        },
+    ) {
+        quarantine_workflow_step_failure(actor, workflow, &context, reason, now, emit);
+        return;
+    }
     match workflow.execute_step(actor, &context, &input) {
         Ok(output) => complete_workflow_step(actor, workflow, &context, input, output, now, emit),
         Err(error) => fail_workflow_step(actor, workflow, &context, error, now, emit),
@@ -2723,16 +2978,21 @@ fn complete_workflow_step<A, F>(
         StepOutput::Accepted { .. } => unreachable!("accepted output returned above"),
     };
 
-    // Preserve compensation metadata before dispatch. A failed result write
-    // retains typed recovery evidence and quarantines; it never claims success.
-    if let Err(error) = actor.record_event_strict(
-        saga_id,
-        ParticipantEvent::StepExecutionCompleted {
-            output: out_data.clone(),
-            compensation_data: comp_data.clone(),
-            completed_at_millis: now,
-        },
-    ) {
+    // A declared effect preserves its result and compensation bytes before dispatch:
+    // that raw row is the only durable trace of work already handed off, so it is
+    // genuinely unconfirmed until the post-handoff proof. A plain completion has no
+    // dispatch window, so its single strict proof append (below) carries the full
+    // result; writing a raw row first would only create a false uncertainty window.
+    if effect.is_some()
+        && let Err(error) = actor.record_event_strict(
+            saga_id,
+            ParticipantEvent::StepExecutionCompleted {
+                output: out_data.clone(),
+                compensation_data: comp_data.clone(),
+                completed_at_millis: now,
+            },
+        )
+    {
         let reason: Box<str> = format!("step result persistence failed: {error}").into();
         if let Err(evidence_error) =
             actor.retain_reconciliation_evidence_strict(context, &out_data, &comp_data, &reason)
@@ -2743,6 +3003,7 @@ fn complete_workflow_step<A, F>(
         quarantine_workflow_step_failure(actor, workflow, context, reason, now, emit);
         return;
     }
+    let declared_effect = effect.is_some();
     let mut receipt_evidence: Option<Box<str>> = None;
     if let Some(effect) = effect.as_ref() {
         // The effect must be handed to the workflow's dispatch hook and acknowledged
@@ -2793,14 +3054,16 @@ fn complete_workflow_step<A, F>(
         recorded_at_millis: actor.now_millis(),
     };
     if let Err(error) = actor.record_forward_outcome_strict(&completion) {
-        quarantine_workflow_step_failure(
-            actor,
-            workflow,
-            context,
-            format!("forward outcome proof persistence failed: {error}").into(),
-            now,
-            emit,
-        );
+        let reason: Box<str> = format!("forward outcome proof persistence failed: {error}").into();
+        if !declared_effect
+            && let Err(evidence_error) =
+                actor.retain_reconciliation_evidence_strict(context, &out_data, &comp_data, &reason)
+        {
+            // No raw row exists for a plain completion; keep its typed bytes visible.
+            tracing::error!(target: "core::saga", event = "workflow_reconciliation_evidence_failed",
+                saga_id = saga_id.get(), error = %evidence_error);
+        }
+        quarantine_workflow_step_failure(actor, workflow, context, reason, now, emit);
         return;
     }
 
@@ -3341,6 +3604,11 @@ pub async fn apply_async_participant_saga_ingress_with_hooks<
 
         on_emitted_transition(participant, &next_event);
 
+        // The helper already published `StepStarted` strictly before business work;
+        // the buffered copy only feeds hooks and validation, never a second publish.
+        if matches!(next_event, SagaChoreographyEvent::StepStarted { .. }) {
+            continue;
+        }
         if let Some(bus) = &saga_bus
             && let Err(err) = bus.publish_strict(next_event)
         {
@@ -3839,6 +4107,15 @@ fn collect_startup_recovery_events_for_saga_type_inner<
             {
                 out.push(timeout_event);
             }
+            continue;
+        }
+        // Undo proven locally (request, intent and completion are all durable) but
+        // never acknowledged: resend only the original-run acknowledgement. No new
+        // request, no physical undo, no invented identity.
+        if let Some(ack) =
+            recover_proven_undo_acknowledgement(entries, run.identity, saga_type, step_name)
+        {
+            out.push(ack);
             continue;
         }
         if let Some(request) = recover_unstarted_compensation_request_from_entries(entries)
@@ -4949,19 +5226,13 @@ mod tests {
                     ..
                 },
                 _,
-                crate::JournalEntry {
-                    event: crate::ParticipantEvent::StepExecutionCompleted {
-                        compensation_data,
-                        ..
-                    },
-                    ..
-                },
-                // Forward success is proven durably before it is published.
+                // A plain completion is one strict proof append carrying the full
+                // result; no raw result row precedes it.
                 crate::JournalEntry {
                     event: crate::ParticipantEvent::ParticipantForwardOutcomeRecorded { outcome },
                     ..
                 }
-            ] if compensation_data == &[8] && outcome.compensation_data == [8]
+            ] if outcome.compensation_data == [8]
         ));
     }
 

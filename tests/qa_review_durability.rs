@@ -872,9 +872,14 @@ fn accepted_completion_fails_closed_when_forward_proof_cannot_be_recorded() {
         matches!(result, Err(AcceptedStepError::Durability { .. })),
         "{result:?}"
     );
-    // The raw result is retained, and recovery treats it as unconfirmed.
+    // A single proof append carries the result: there is no raw row to mistake for
+    // confirmation. The typed bytes survive as reconciliation evidence and the
+    // run is durably quarantined, so recovery can never resend success.
     let aged = actor.participant_run_evidence_strict(&c).unwrap();
-    assert!(aged.forward_result_recorded && aged.forward_outcome.is_none());
+    assert!(aged.forward_outcome.is_none());
+    assert!(aged.needs_reconciliation && aged.quarantined);
+    assert_eq!(aged.output, b"done");
+    assert_eq!(aged.compensation_data, b"release");
     assert!(aged.failure_requires_quarantine());
 }
 
@@ -1088,7 +1093,7 @@ fn workflow_local_quarantine_notification_still_reaches_the_callback() {
     // Local quarantine writes its tombstone before its own publication returns.
     journal.fail_once(
         JournalOp::Append,
-        FaultTrigger::EventKind("StepExecutionCompleted"),
+        FaultTrigger::EventKind("ParticipantForwardOutcomeRecorded"),
     );
     let out = deliver(&mut actor, started(&c));
     assert_eq!(out.quarantines(), 1);
@@ -1347,7 +1352,7 @@ fn failed_accepted_result_write_preserves_available_output_and_compensation() {
     accept(&mut actor, &c);
     journal.fail_once(
         JournalOp::Append,
-        FaultTrigger::EventKind("StepExecutionCompleted"),
+        FaultTrigger::EventKind("ParticipantForwardOutcomeRecorded"),
     );
     let result = complete_accepted_workflow_step(
         &mut actor,

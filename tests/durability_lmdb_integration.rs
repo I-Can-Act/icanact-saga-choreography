@@ -671,10 +671,11 @@ mod workflow_reopen {
             "restart must not auto-resolve quarantined work"
         );
         let entries = reopened.saga.journal.read(run.saga_id).expect("read");
+        // A plain completion's single proof append retains the compensation bytes.
         assert!(entries.iter().any(|e| matches!(
             &e.event,
-            ParticipantEvent::StepExecutionCompleted { compensation_data, .. }
-                if compensation_data == b"refund"
+            ParticipantEvent::ParticipantForwardOutcomeRecorded { outcome }
+                if outcome.compensation_data == b"refund"
         )));
         assert!(entries.iter().any(|e| matches!(
             &e.event,
@@ -705,6 +706,84 @@ mod workflow_reopen {
                     }
                 )),
             "retained original quarantine must continue fencing reuse"
+        );
+    }
+
+    #[test]
+    fn plain_completion_is_one_proof_append_that_survives_lmdb_reopen() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let run = ctx(100);
+        {
+            let mut actor = Actor::open(temp.path());
+            deliver(&mut actor, start(&run));
+        }
+        let reopened = Actor::open(temp.path());
+        let rows = reopened.saga.journal.read(run.saga_id).expect("read");
+        assert!(
+            !rows
+                .iter()
+                .any(|e| matches!(e.event, ParticipantEvent::StepExecutionCompleted { .. })),
+            "a plain completion has no raw result row: {rows:?}"
+        );
+        let proof = reopened
+            .participant_run_evidence_strict(&run)
+            .expect("evidence")
+            .forward_outcome
+            .expect("the proof alone confirms the completion");
+        assert_eq!(proof.output, b"paid");
+        assert_eq!(proof.compensation_data, b"refund");
+    }
+
+    #[test]
+    fn lost_undo_acknowledgement_is_resent_after_lmdb_reopen_without_a_new_undo() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let run = ctx(100);
+        {
+            let mut actor = Actor::open(temp.path());
+            deliver(&mut actor, start(&run));
+            deliver(&mut actor, undo_request(&run));
+            assert_eq!(actor.comp_calls, 1);
+            // The acknowledgement published by that undo is lost with the process.
+        }
+
+        let mut reopened = Actor::open(temp.path());
+        let resent = reopened.saga.take_startup_recovery_events();
+        assert!(
+            matches!(resent.as_slice(), [SagaChoreographyEvent::CompensationCompleted { context }]
+                if context.saga_id == run.saga_id
+                    && context.saga_type.as_ref() == "wf_pay"
+                    && context.saga_started_at_millis == 100
+                    && context.step_name.as_ref() == "pay"),
+            "{resent:?}"
+        );
+        assert_eq!(reopened.comp_calls, 0, "startup must not undo again");
+        let rows = reopened.saga.journal.read(run.saga_id).expect("read");
+        let count = |kind: &str| {
+            rows.iter()
+                .filter(|e| format!("{:?}", e.event).starts_with(kind))
+                .count()
+        };
+        assert_eq!(count("CompensationRequestRecorded"), 1);
+        assert_eq!(count("CompensationStarted"), 1);
+        assert_eq!(count("CompensationCompleted"), 1);
+
+        // Once the resolver's terminal failure lands, nothing is resent again.
+        deliver(
+            &mut reopened,
+            SagaChoreographyEvent::SagaFailed {
+                context: run.next_step("terminal_resolver".into()),
+                reason: "rolled back".into(),
+                failure: None,
+            },
+        );
+        drop(reopened);
+        let mut after_terminal = Actor::open(temp.path());
+        assert!(
+            after_terminal
+                .saga
+                .take_startup_recovery_events()
+                .is_empty(),
+            "terminally resolved history must not fabricate a rollback"
         );
     }
 
@@ -869,4 +948,167 @@ fn lmdb_journal_rejects_malformed_archive_rows_instead_of_decoding_them() {
         .read(saga)
         .expect_err("a malformed archive must fail validation");
     assert!(!err.to_string().is_empty());
+}
+
+// ---- AllOf liveness across a real LMDB close/reopen -------------------------------
+
+mod allof_reopen {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    use super::*;
+    use icanact_saga_choreography::durability::{
+        apply_sync_workflow_participant_saga_ingress_with_hooks,
+        recover_accepted_workflow_steps_for_saga_type,
+    };
+    use icanact_saga_choreography::{
+        CompensationError, CompensationOutput, DependencySpec, HasSagaWorkflowParticipants, PeerId,
+        SagaWorkflowParticipant, StepError, StepOutput,
+    };
+
+    struct Actor {
+        saga: SagaParticipantSupport<LmdbJournal, LmdbDedupe>,
+        joins: usize,
+    }
+
+    impl Actor {
+        fn open(base: &Path) -> Self {
+            Self {
+                saga: open_lmdb_participant_support_for_saga_type(base, "join", "wf_join")
+                    .expect("support should open"),
+                joins: 0,
+            }
+        }
+    }
+
+    impl HasSagaParticipantSupport for Actor {
+        type Journal = LmdbJournal;
+        type Dedupe = LmdbDedupe;
+        fn saga_support(&self) -> &SagaParticipantSupport<LmdbJournal, LmdbDedupe> {
+            &self.saga
+        }
+        fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<LmdbJournal, LmdbDedupe> {
+            &mut self.saga
+        }
+    }
+
+    struct Join;
+    static JOIN: Join = Join;
+    static WORKFLOWS: [&'static dyn SagaWorkflowParticipant<Actor>; 1] = [&JOIN];
+
+    impl HasSagaWorkflowParticipants for Actor {
+        fn saga_workflows() -> &'static [&'static dyn SagaWorkflowParticipant<Self>] {
+            &WORKFLOWS
+        }
+    }
+
+    impl SagaWorkflowParticipant<Actor> for Join {
+        fn step_name(&self) -> &'static str {
+            "join"
+        }
+        fn saga_types(&self) -> &[&'static str] {
+            &["wf_join"]
+        }
+        fn depends_on(&self) -> DependencySpec {
+            DependencySpec::AllOf(&["a", "b"])
+        }
+        fn execute_step(
+            &self,
+            actor: &mut Actor,
+            _context: &SagaContext,
+            _input: &[u8],
+        ) -> Result<StepOutput, StepError> {
+            actor.joins += 1;
+            Ok(StepOutput::Completed {
+                output: b"joined".to_vec(),
+                compensation_data: Vec::new(),
+            })
+        }
+        fn compensate_step(
+            &self,
+            _actor: &mut Actor,
+            _context: &SagaContext,
+            _data: &[u8],
+        ) -> Result<CompensationOutput, CompensationError> {
+            Ok(CompensationOutput::Completed)
+        }
+    }
+
+    fn ctx(started_at: u64) -> SagaContext {
+        SagaContext {
+            saga_id: SagaId::new(81),
+            saga_type: "wf_join".into(),
+            step_name: "join".into(),
+            correlation_id: 81,
+            causation_id: 81,
+            trace_id: 81,
+            step_index: 0,
+            attempt: 0,
+            initiator_peer_id: PeerId::default(),
+            saga_started_at_millis: started_at,
+            event_timestamp_millis: started_at,
+        }
+    }
+
+    fn deliver(actor: &mut Actor, event: SagaChoreographyEvent) -> Vec<SagaChoreographyEvent> {
+        let out = RefCell::new(Vec::new());
+        apply_sync_workflow_participant_saga_ingress_with_hooks(
+            actor,
+            event,
+            |_actor, _event| {},
+            |event| panic!("valid transition rejected: {event:?}"),
+            |_actor, event| out.borrow_mut().push(event.clone()),
+        );
+        out.into_inner()
+    }
+
+    fn dependency(run: &SagaContext, step: &str) -> SagaChoreographyEvent {
+        let mut context = run.clone();
+        context.step_name = step.into();
+        SagaChoreographyEvent::StepCompleted {
+            context,
+            output: b"in".to_vec(),
+            saga_input: b"input".to_vec(),
+            compensation_available: false,
+        }
+    }
+
+    #[test]
+    fn allof_input_seen_before_an_lmdb_reopen_still_fires_the_join() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let run = ctx(100);
+        {
+            let mut actor = Actor::open(temp.path());
+            deliver(
+                &mut actor,
+                SagaChoreographyEvent::SagaStarted {
+                    context: run.clone(),
+                    payload: b"input".to_vec(),
+                },
+            );
+            deliver(&mut actor, dependency(&run, "a"));
+            assert_eq!(actor.joins, 0);
+        }
+
+        // Real close/reopen between the two inputs; the replayed first input is a
+        // persistent-dedupe duplicate, so only the durable observation can carry it.
+        let mut reopened = Actor::open(temp.path());
+        recover_accepted_workflow_steps_for_saga_type(&mut reopened.saga, "join", "wf_join")
+            .expect("recovery hydrates");
+        assert!(reopened.saga.take_startup_recovery_events().is_empty());
+        deliver(&mut reopened, dependency(&run, "a"));
+        assert_eq!(reopened.joins, 0, "a duplicate cannot fire the join alone");
+        let out = deliver(&mut reopened, dependency(&run, "b"));
+        assert_eq!(reopened.joins, 1, "{out:?}");
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, SagaChoreographyEvent::StepCompleted { .. }))
+        );
+
+        // A second reopen after the join confirmed never re-executes it.
+        drop(reopened);
+        let mut again = Actor::open(temp.path());
+        deliver(&mut again, dependency(&run, "b"));
+        assert_eq!(again.joins, 0);
+    }
 }

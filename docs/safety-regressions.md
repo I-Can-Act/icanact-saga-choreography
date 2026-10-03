@@ -125,6 +125,53 @@ logs include `review-bus-parent-red.log`, `review-durability-parent-red.log`,
 `review-shared-state-red.log` and `review-foreign-owner-parent-red.log`. Historical worker
 and iteration logs are not substituted for final SHA-bound verification.
 
+## Re-challenge of `0f2a242`: remediation assertions
+
+The same reviewer's first re-challenge returned **BLOCK** (P1-A/P1-B, P2-a..g,
+and AllOf restart liveness). The following assertions address that report; they are
+not a replacement for the subsequent independent verdict or production validation.
+
+- **P1-A:** `tests/qa_rechallenge_bus.rs` and `bus::admission_tests` distinguish successful
+  AnyOf/Quorum/trailing siblings from new uncertainty after failed resolution. Real LMDB
+  compaction/reopen preserves success and known failed replay without erasing quarantine.
+- **P1-B:** `tests/qa_rechallenge_state.rs` closes definitive accepted failure, preserving
+  actual results, prior compensating failure and already-requested undo bytes. The
+  durability suite includes real-resolver rejection **with** potential compensation
+  bytes and a real accepted watchdog; `resolver::tests` covers a definitively rejected
+  sibling without saga-failure authority. The step disposition precedes terminal output.
+- **P2-a:** both helper modes and managed workflow ingress verify `StepStarted` is on a
+  real bus after durable intent and before slow business work. Failed publication prevents
+  execution; wrappers preserve hooks without duplicate start publication.
+- **P2-b:** startup resends only a proven `CompensationCompleted`, without a fresh request
+  or physical undo. Unknown/terminally resolved history is not acknowledged; real LMDB
+  close/reopen mirrors the lost-acknowledgement path.
+- **P2-c:** a compatibility waiter registered after admission binds only to the unique
+  active full run; ambiguous multi-type ownership and stale history remain unbound.
+- **P2-d:** admission tests cover ID **and run** limits, active fingerprint overflow,
+  oversized unresolved restore, protected current-ID eviction, failure-on-lookup, and
+  durable reload with one global history read at attach. Journal tests verify bounded
+  per-ID reads, schema-1 transactional backfill and row/index consistency on map exhaustion.
+- **P2-e:** plain and accepted completion use one full tag-15 proof append. Declared
+  dispatch keeps its pre-handoff raw result and post-handoff proof. Faults preserve typed
+  bytes and never infer proof from an old raw row; cold undo works from proof-only history.
+- **P2-f/g:** [operations.md](operations.md) and [migration.md](migration.md) document
+  irreversible effects, explicit safe/no-undo timeout contracts, baseline draining,
+  schema/API changes and application-owned reconciliation; no repair API is invented.
+- **AllOf:** both helpers and workflows journal relevant tag-16 input before dedupe/seen
+  updates and hydrate exact type/ID/start observations. Restart between branches, real
+  LMDB reopen, other-run input and append/read failures are covered.
+
+Parent inspection found and reproduced remaining integration gaps before fixing them.
+Behavioral RED evidence includes `review3-cache-parent-red.log` (three failures),
+`review3-accepted-resolver-parent-red2.log`, `review3-accepted-watchdog-parent-red.log`,
+`review3-accepted-authority-parent-red.log` and `review3-dependency-order-parent-red.log`.
+The earlier accepted-resolver compile error is **not** behavioral RED. Changed old row and
+output-sequence assertions retain the same compensation/quarantine requirements while
+checking the new single-proof path and per-step timeout disposition. The lifecycle test
+still asserts immediate disappearance of public ownership and bounded release of the
+journal: pinned pooled shutdown from a scheduler callback does not promise an immediate
+join. Native callback-drop coverage is characterization, not behavioral RED.
+
 ## Evidence and limits
 
 Behavior-bearing writers supplied pre-change RED/characterization logs. Parent inspection

@@ -589,6 +589,7 @@ impl TerminalResolver {
                 state.accepted_steps.remove(context.step_name.as_ref());
                 state.started_steps.insert(context.step_name.clone());
                 state.failed_steps.insert(context.step_name.clone());
+                close_definitive_accepted_potential(state, context, *requires_compensation);
                 if !self
                     .policy
                     .failure_authority
@@ -1180,11 +1181,23 @@ fn accepted_step_timeout_events(
             AcceptedStepTimeoutOutcome::FailStep {
                 requires_compensation,
             } => {
+                state.started_steps.insert(step_name.clone());
+                state.failed_steps.insert(step_name.clone());
+                close_definitive_accepted_potential(state, &context, requires_compensation);
+                // Publish the authoritative per-step disposition first. Participants
+                // must durably close matching accepted work before a later ordinary
+                // failure reaches their terminal handling; SagaFailed alone cannot
+                // prove a remote execution ended safely.
+                timeout_events.push(SagaChoreographyEvent::StepFailed {
+                    context: context.clone(),
+                    participant_id: accepted.participant_id.clone(),
+                    error_code: Some(timeout_kind.into()),
+                    error: reason.clone(),
+                    requires_compensation,
+                });
                 if !policy.failure_authority.is_authorized(step_name.as_ref()) {
                     continue;
                 }
-                state.started_steps.insert(step_name.clone());
-                state.failed_steps.insert(step_name);
                 apply_step_failure(
                     state,
                     &context,
@@ -1212,6 +1225,24 @@ fn accepted_step_timeout_events(
     Some(timeout_events)
 }
 
+/// A step's authoritative safe disposition is independent of whether that step
+/// is authorized to fail the entire saga. It closes only potential accepted work.
+fn close_definitive_accepted_potential(
+    state: &mut SagaResolutionState,
+    context: &SagaContext,
+    requires_compensation: bool,
+) {
+    if !requires_compensation
+        && state.accepted_participants.contains_key(&context.step_name)
+        && !state.completed_steps.contains(&context.step_name)
+        && !state.rollback_owns(&context.step_name)
+    {
+        state
+            .compensable_steps
+            .retain(|step| step != &context.step_name);
+    }
+}
+
 fn apply_step_failure(
     state: &mut SagaResolutionState,
     context: &SagaContext,
@@ -1228,6 +1259,12 @@ fn apply_step_failure(
         error_message: error.clone(),
         at_millis: context.event_timestamp_millis,
     };
+
+    // Acceptance advertises *potential* undo metadata, not proof of an effect.
+    // An authoritative safe/no-undo failure closes that potential obligation only
+    // when no result or already-owned rollback proves something remains owed.
+    // In particular it must not erase a completed effect or a prior undo request.
+    close_definitive_accepted_potential(state, context, requires_compensation);
 
     // A non-compensating failure still cannot hide effects the resolver knows
     // about, so any known effect starts the ordinary rollback.
@@ -1946,8 +1983,9 @@ mod tests {
         let timed_out = resolver.poll_timeouts_at(1_111);
         assert!(matches!(
             timed_out.as_slice(),
-            [SagaChoreographyEvent::SagaFailed { reason, failure: Some(failure), .. }]
-                if reason.contains("accepted step idle timeout")
+            [SagaChoreographyEvent::StepFailed { error_code: Some(code), requires_compensation: false, .. },
+             SagaChoreographyEvent::SagaFailed { reason, failure: Some(failure), .. }]
+                if code.as_ref() == "idle" && reason.contains("accepted step idle timeout")
                     && failure.step_name.as_ref() == "create_order"
                     && failure.participant_id.as_ref() == "order-manager"
         ));
@@ -2091,13 +2129,86 @@ mod tests {
         let timed_out = resolver.poll_timeouts_at(1_101);
         assert!(
             matches!(
-                timed_out.as_slice(),
-                [SagaChoreographyEvent::CompensationRequested { failed_step, steps_to_compensate, .. }]
+                timed_out.iter().find(|event| matches!(event, SagaChoreographyEvent::CompensationRequested { .. })),
+                Some(SagaChoreographyEvent::CompensationRequested { failed_step, steps_to_compensate, .. })
                     if failed_step.as_ref() == "create_order"
                         && steps_to_compensate.as_slice() == ["risk_check".into()]
             ),
             "unauthorized sibling timeout must not swallow compensation request: {timed_out:?}"
         );
+        assert_eq!(
+            timed_out
+                .iter()
+                .filter(|event| matches!(event, SagaChoreographyEvent::StepFailed { .. }))
+                .count(),
+            2,
+            "both step dispositions must reach their owners without granting sibling failure authority"
+        );
+    }
+
+    #[test]
+    fn rejected_accepted_sibling_has_no_undo_obligation_without_saga_failure_authority() {
+        for timeout in [false, true] {
+            let mut policy = open_position_policy(Duration::from_secs(5));
+            policy.failure_authority =
+                FailureAuthority::OnlySteps(HashSet::from(["create_order".into()]));
+            let mut resolver = TerminalResolver::new(policy);
+            let seed = ctx_at("create_order", 20, 1_000, 1_000);
+            resolver.ingest_at(
+                &SagaChoreographyEvent::SagaStarted {
+                    context: seed.clone(),
+                    payload: vec![],
+                },
+                1_000,
+            );
+            resolver.ingest_at(
+                &SagaChoreographyEvent::StepAccepted {
+                    context: ctx_at("risk_check", 20, 1_000, 1_010),
+                    participant_id: "risk".into(),
+                    execution_id: StepExecutionId::new("risk-potential"),
+                    deadline_at_millis: 1_100,
+                    hard_deadline_at_millis: 1_500,
+                    timeouts_enabled: true,
+                    timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
+                        requires_compensation: false,
+                    },
+                    compensation_available: true,
+                },
+                1_010,
+            );
+            if timeout {
+                let _ = resolver.poll_timeouts_at(1_101);
+            } else {
+                assert!(
+                    resolver
+                        .ingest_at(
+                            &SagaChoreographyEvent::StepFailed {
+                                context: ctx_at("risk_check", 20, 1_000, 1_100),
+                                participant_id: "risk".into(),
+                                error: "remote rejected".into(),
+                                error_code: None,
+                                requires_compensation: false,
+                            },
+                            1_100
+                        )
+                        .is_empty()
+                );
+            }
+            let out = resolver.ingest_at(
+                &SagaChoreographyEvent::StepFailed {
+                    context: ctx_at("create_order", 20, 1_000, 1_110),
+                    participant_id: "order".into(),
+                    error: "safe rejection".into(),
+                    error_code: None,
+                    requires_compensation: false,
+                },
+                1_110,
+            );
+            assert!(
+                matches!(out.as_slice(), [SagaChoreographyEvent::SagaFailed { .. }]),
+                "a definitively rejected sibling owns no effect, even when it cannot fail the saga (timeout={timeout}): {out:?}"
+            );
+        }
     }
 
     #[test]

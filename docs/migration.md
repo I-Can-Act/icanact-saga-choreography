@@ -9,6 +9,8 @@ Nothing in these notes authorizes publication or certifies production operation.
 
 1. **Exhaustive enums grew.** `ParticipantEvent` and `TerminalResolverJournalError` gained
    variants. Update exhaustive downstream matches; recovery evidence is not success.
+   `ParticipantRunEvidence` also gained fields including `undo_required`; update explicit
+   struct literals or construct with `Default` before setting the needed evidence.
 2. **Archive tags are appended.** Original tags 0–11 are not renumbered; appended tags
    12–14 retain run, terminal and reconciliation records. Tag 15 is
    `ParticipantForwardOutcomeRecorded { outcome: ParticipantForwardOutcome }`. The proof
@@ -17,7 +19,13 @@ Nothing in these notes authorizes publication or certifies production operation.
    publication; `participant_run_evidence_strict` distinguishes proof from a raw result.
    Recovery resends `completion_event()` without executing the effect. Missing proof is
    uncertainty. Tags are pinned by `tests/qa_remediation_state.rs` and
-   `tests/qa_review_state.rs`. Old readers cannot decode new tags. Upgrade every reader
+   `tests/qa_review_state.rs`. Tag 16 is
+   `ParticipantDependencyCompletedRecorded { context, recorded_at_millis }`: run-scoped
+   AllOf dependency observations written strictly before being marked seen and read back
+   by exact type/ID/start (`record_dependency_completion_strict`,
+   `completed_dependency_steps_strict`; covered in `tests/qa_rechallenge_state.rs`). Plain
+   `Completed`/accepted completion uses a single tag-15 append; declared effects keep
+   result-then-proof. Old readers cannot decode new tags. Upgrade every reader
    before enabling writers; do not roll an old binary onto new records.
 3. **Declared effects fail closed.** `CompletedWithEffect` invokes `dispatch_effect` on
    the participant/workflow trait. The default is `Unsupported` and quarantines. Return
@@ -48,6 +56,53 @@ Nothing in these notes authorizes publication or certifies production operation.
 8. **Pruning is destructive.** Permanent fences and unresolved evidence are not routine
    cleanup targets. Resolver compaction preserves fences and all quarantined/unresolved
    history. `prune_saga*` and backend pruning remove replay protection.
+
+9. **Resolver LMDB schema is now 2.** Opening schema 1 transactionally backfills
+   `resolver_saga_index` and commits the index/version together. Older schema-1
+   binaries refuse the migrated store; do not roll them back onto it. Budget backup,
+   map capacity and startup scan time before opening an existing store.
+10. **Admission lookups and capacity are explicit.** `TerminalResolverJournal` has
+    default `supports_saga_lookup`, `read_saga` and `read_saga_bounded` methods.
+    A custom journal advertising lookup must implement the bounded method; the
+    default returns `Unsupported`, not a global scan. Without lookup, fences remain
+    resident and new runs are refused at capacity. `SAGA_ADMISSION_CAPACITY` bounds
+    resident IDs **and runs**, including multiple runs reusing an ID; oversized
+    unresolved recovery or a per-ID miss fails visibly rather than forgetting fences.
+11. **Accepted timeout output includes the step disposition.** `FailStep` publishes
+    `StepFailed` before ordinary terminal failure or undo requests so the owner can
+    durably record its resolution. A step's safe disposition is independent of its
+    authority to fail the whole saga. `requires_compensation=true` still retains
+    owned undo; `false` never erases a real result or already-requested undo.
+12. **Managed start hook timing changed.** Workflow `on_emitted_transition` sees
+    `StepStarted` before business execution. With an attached bus, helper emit sinks
+    observe an already-published start; do not forward that event to the bus again.
+    Managed sync/async wrappers suppress the duplicate bus send, not the observer hook.
+
+## Drain before upgrading from baseline
+
+Baseline writers produced archives without run identity. Before replacing a baseline
+binary: stop new starts, **explicitly drain every in-flight saga**, and verify each reached
+ordinary completion or compensated failure in resolver/application records, with no
+unresolved participant execution/undo history. Baseline participants may already have
+pruned terminal detail, so an empty store alone is not proof of ordinary resolution.
+Only then upgrade. Stores that already contain unidentified execution or unconfirmed
+results remain blocked; keep them intact. Do not prune, forge identity or hand-edit them, and do not
+expect a built-in safe-clear.
+
+## Behavioral policies
+
+- A declared effect without compensation is irreversible: later failure needs
+  reconciliation/quarantine, not ordinary resolution.
+- `FailStep` with `requires_compensation=false` is an explicit safe/no-undo remote
+  contract, not physical cancellation; genuinely unknown work still quarantines.
+- Success keeps its effects: late compensable/accepted evidence after `SagaCompleted`
+  does not itself quarantine; after failure it does. A `SagaFailed` reply may be
+  superseded by quarantine on later evidence.
+- Managed attached-bus `StepStarted` is published strictly before business execution;
+  hooks stay application-idempotent.
+- ID-scoped compatibility waiters bind to the unique known active run after admission.
+- Ephemeral resolvers refuse new admission at capacity; durable caches are bounded with
+  lookups on miss, while permanent fences retain irreducible storage cost.
 
 ## Blocked legacy history and quarantine
 

@@ -321,37 +321,54 @@ fn failed_intent_write_runs_no_effect_and_publishes_no_success() {
     }
 }
 
+/// Plain results are durable through the ONE strict forward-proof append; a declared
+/// effect still persists its raw result before dispatch. Each variant's only durable
+/// write is faulted: no success, no dispatch, compensation bytes kept, no re-execution.
 #[test]
 fn failed_result_write_publishes_no_success_and_keeps_compensation_evidence() {
+    let variants = [
+        (false, "ParticipantForwardOutcomeRecorded"),
+        (true, "StepExecutionCompleted"),
+    ];
     for mode in MODES {
-        let world = World::new();
-        world.journal.fail_always(
-            JournalOp::Append,
-            FaultTrigger::EventKind("StepExecutionCompleted"),
-        );
-        let mut actor = world.actor();
-        let out = drive(mode, &mut actor, start(100));
-        assert_eq!(world.effects(), 1, "{mode:?}");
-        assert!(
-            !has_step_completed(&out),
-            "{mode:?}: success without evidence"
-        );
-        assert!(has_quarantine(&out), "{mode:?}: must surface quarantine");
-        let rows = world.rows();
-        assert!(
-            rows.iter().any(|e| matches!(e,
-                ParticipantEvent::ParticipantReconciliationEvidence { compensation_data, .. }
-                    if compensation_data.as_slice() == [42])),
-            "{mode:?}: compensation data must survive in durable evidence: {rows:?}"
-        );
-        // Restart must not repeat the effect.
-        let mut restarted = world.actor();
-        drive(mode, &mut restarted, start(100));
-        assert_eq!(
-            world.effects(),
-            1,
-            "{mode:?}: effect repeated after restart"
-        );
+        for (with_effect, faulted_kind) in variants {
+            let world = World::new();
+            world
+                .journal
+                .fail_always(JournalOp::Append, FaultTrigger::EventKind(faulted_kind));
+            let mut actor = world.actor();
+            actor.with_effect = with_effect;
+            actor.dispatch = Dispatch::Durable;
+            let out = drive(mode, &mut actor, start(100));
+            assert_eq!(world.effects(), 1, "{mode:?} {faulted_kind}");
+            assert!(
+                !has_step_completed(&out),
+                "{mode:?} {faulted_kind}: success without evidence"
+            );
+            assert!(
+                has_quarantine(&out),
+                "{mode:?} {faulted_kind}: must surface quarantine"
+            );
+            assert!(
+                world.shared.dispatched.lock().unwrap().is_empty(),
+                "{mode:?} {faulted_kind}: dispatched without a durable result"
+            );
+            let rows = world.rows();
+            assert!(
+                rows.iter().any(|e| matches!(e,
+                    ParticipantEvent::ParticipantReconciliationEvidence { compensation_data, .. }
+                        if compensation_data.as_slice() == [42])),
+                "{mode:?} {faulted_kind}: compensation data must survive in durable evidence: {rows:?}"
+            );
+            // Restart must not repeat the effect.
+            let mut restarted = world.actor();
+            drive(mode, &mut restarted, start(100));
+            assert_eq!(
+                world.effects(),
+                1,
+                "{mode:?} {faulted_kind}: effect repeated after restart"
+            );
+        }
     }
 }
 
