@@ -174,10 +174,11 @@ join. Native callback-drop coverage is characterization, not behavioral RED.
 
 ## Re-challenge of `d35b58e`: compaction, rollback and release assertions
 
-The latest completed same-reviewer report returned **BLOCK** (P1-C and P2-1..3; no
-P0). Report delivery and the five returned review4 writers were not safety acceptance.
-The shared rejection foundation is `ccd4f83`; the following integrated assertions and
-fresh parent gates address that report, pending the next committed-tree re-challenge.
+The re-challenge of `d35b58e` returned **BLOCK** (P1-C and P2-1..3; no P0).
+Report delivery and the five returned review4 writers were not safety acceptance.
+The shared rejection foundation is `ccd4f83`; these integrated assertions were subsequently
+reviewed at `8ffa003` as **OK with notes** (no P0/P1, six P2 notes). That verdict did not
+complete the all-findings plan; the remaining notes are mapped below.
 
 - **P1-C, closed reconstruction:** `tests/qa_review4_bus.rs` uses real LMDB failed
   parallel rollback, compact/close/reopen and a second restart. Activation invents no
@@ -216,6 +217,67 @@ release tests, passing parent guards and compiler-only fixture corrections are *
 acceptance RED. Corrected duplicate tests require no repeated work; cold resend uses a
 fresh ingress dedupe and durable proof. Failed logs/reports remain preserved; only fresh
 SHA-bound parent final gates establish implementation verification, not release readiness.
+
+## Re-challenge of `8ffa003`: six P2 notes
+
+The same reviewer's **OK with notes** was a local recommendation, not all-findings or
+production acceptance. Two isolated native writers supplied disjoint helper and coupled
+bus/resolver handoffs. The parent preserved their actual diffs, native receipts and logs,
+then integrated and strengthened them; the next independent verdict remains separate.
+
+- **N1, non-resolver quarantine waiters:** `tests/qa_review5_bus.rs` requires owned-run
+  participant and delivery-shortfall quarantines to resolve exact-run and correctly bound
+  legacy waiters, leaving foreign/other-run waiters untouched. Parent
+  `parent_review5_recovery_quarantine_resolves_held_waiters_at_activation_only` proves
+  ingestion before activation holds replies, then resolves them without republishing the
+  input or duplicating its durable row. Ordinary reply authority is unchanged.
+- **N2, managed cache/journal lag:** `tests/qa_review5_helpers.rs` starts real managed
+  sync/async accepted work, persists definitive rejection, then faults its cleanup read
+  while retaining the matching run marker/cache. Owned undo performs zero business work,
+  writes strict proof before ack and supports duplicate/cold resend. Proof-write failure
+  emits and retains exact-run quarantine. Parent
+  `managed_owned_request_post_append_read_error_never_uses_stale_cache` faults the strict
+  read **after owned-request persistence**, not admission, and requires quarantine/hook,
+  retained ownership and no undo/ack. True failure still owns real undo.
+- **N3, old uncertainty versus successor:** the parked-append barrier tests serialized
+  admission versus quarantine retention; the successor is refused or visibly/durably
+  quarantined. Both restart journal orders are tested, with a quiet second restart.
+  Parent LMDB compact/close/reopen tests additionally fence an ordinarily completed
+  successor whose resolver state/detail is gone, including a persisted-old-quarantine/
+  missing-propagation crash boundary with **no new ingress**. Propagation uses actual
+  quarantine rows and admitted newer-run markers, never gapped business detail; startup
+  output remains held until activation and ordinary closed history invents no success.
+- **N4, discarded cross-run outputs:**
+  `bus::admission_tests::capacity_failure_of_unknown_newer_run_publishes_and_persists_the_active_run_quarantine`
+  bounds the waiter assertion and verifies the original active owner is notified, visibly
+  quarantined, persisted and fenced against reuse despite newer-run capacity failure.
+- **N5, storage recovery without more evidence:** pending resident exact-run fences retry
+  on the active watchdog, independently of deadline expiry. The memory and real LMDB
+  close/reopen tests require durable quarantine after recovery without another event.
+  `bus::admission_tests::pending_fence_retry_is_activation_gated_bounded_and_stops_after_durability`
+  checks no pre-activation retry, one failure/no spin, eight-per-tick progress, deduplicated
+  bounded tracking and cessation after successful persistence.
+- **N6, redundant durable fences:** live, pending-then-recovered and validated restored
+  quarantine tests retain late evidence in order without a synthetic fence per event/tick.
+  Restarts do not add duplicate successor output/rows. Actual input evidence is still
+  retained; this is not destructive compaction or a safe-clear API.
+
+Genuine parent assertion REDs are `review5-helpers-parent-post-request-red.log`
+(physical undo despite unreadable post-request evidence),
+`review5-bus-parent-activation-successor-red.log` (lost activation reply and closed
+successor fencing), and `review5-bus-parent-closed-successor-recovery-red.log`
+(restored crash-boundary propagation). Worker RED logs establish the other defects;
+passing guards/characterization and compiler/style diagnostics are not RED. The originally
+hung bus regression was terminated only after process identity verification; forced
+termination is not RED. Its subsequent bounded assertion failure is preserved separately,
+along with native transcript/events and the disclosed overwritten attempt log.
+
+Pending retry does not certify a crash-safe fence before its append succeeds, nor flush
+on release. Unrepresented/sticky uncertainty remains conservative and may not fit retry
+tracking. Application-held evidence, audited reconciliation, external idempotency and
+irreducible retention/capacity costs remain explicit operational limits. Fresh SHA-bound
+parent gates and the same retained reviewer's committed-tree recommendation—not writer
+self-checks or this ledger—determine local remediation acceptance.
 
 ## Evidence and limits
 

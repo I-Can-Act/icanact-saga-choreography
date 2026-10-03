@@ -560,6 +560,10 @@ struct RunEntry {
     /// The start's admission intent is already journaled; the resolver must not
     /// append it a second time when the fanned-out event reaches it.
     prejournaled: bool,
+    /// A `SagaQuarantined` row of this exact run is known to be in the journal
+    /// (read back from it, or appended successfully). A quarantined run without
+    /// it is only a live fence whose durable copy is still pending.
+    quarantine_durable: bool,
     /// Compensable effects known while the run was open. Dropped once the run
     /// succeeded, because success never escalates later siblings.
     completed: HashSet<CompletedFingerprint>,
@@ -622,7 +626,7 @@ impl AdmissionIndex {
         let mut index = Self::new(limits, can_evict);
         index.loading = true;
         for event in events {
-            let _ = index.observe(event);
+            let _ = index.observe_row(event);
         }
         index.loading = false;
         index.make_room();
@@ -669,6 +673,25 @@ impl AdmissionIndex {
 
     fn phase(&self, context: &SagaContext) -> Option<RunPhase> {
         self.run(context).map(|run| run.phase)
+    }
+
+    fn run_mut(&mut self, context: &SagaContext) -> Option<&mut RunEntry> {
+        self.ids
+            .get_mut(&context.saga_id)?
+            .runs
+            .iter_mut()
+            .find(|run| run.started_at_millis == context.saga_started_at_millis)
+    }
+
+    /// Only a validated journal row or a successful append counts as durable.
+    fn mark_quarantine_durable(&mut self, context: &SagaContext) {
+        if let Some(run) = self.run_mut(context) {
+            run.quarantine_durable = true;
+        }
+    }
+
+    fn quarantine_durable(&self, context: &SagaContext) -> bool {
+        self.run(context).is_some_and(|run| run.quarantine_durable)
     }
 
     fn exceeds_capacity(&self) -> bool {
@@ -780,6 +803,7 @@ impl AdmissionIndex {
                     started_at_millis: started,
                     phase: RunPhase::Active,
                     prejournaled: false,
+                    quarantine_durable: false,
                     completed: HashSet::new(),
                     accepted: HashSet::new(),
                 });
@@ -807,6 +831,16 @@ impl AdmissionIndex {
     /// False means excess evidence could not be represented safely; the caller
     /// must visibly quarantine, not publish an ordinary outcome or silently grow.
     fn observe(&mut self, event: &SagaChoreographyEvent) -> bool {
+        self.observe_with(event, false)
+    }
+
+    /// Observes a row that was read back from the journal: a quarantine row
+    /// also proves that run's quarantine is durable.
+    fn observe_row(&mut self, event: &SagaChoreographyEvent) -> bool {
+        self.observe_with(event, true)
+    }
+
+    fn observe_with(&mut self, event: &SagaChoreographyEvent, journal_row: bool) -> bool {
         let context = event.context();
         let phase = match event {
             SagaChoreographyEvent::SagaCompleted { .. } => RunPhase::Completed,
@@ -817,6 +851,9 @@ impl AdmissionIndex {
         // Phase first: a run that is not (yet) known is created Active.
         if !self.raise(context.saga_id, context.saga_started_at_millis, phase) {
             return false;
+        }
+        if journal_row && phase == RunPhase::Quarantined {
+            self.mark_quarantine_durable(context);
         }
         let Some(entry) = self.ids.get_mut(&context.saga_id) else {
             return false;
@@ -962,10 +999,28 @@ impl AdmissionIndex {
     fn has_successor(&self, context: &SagaContext) -> bool {
         self.ids.get(&context.saga_id).is_some_and(|entry| {
             entry.runs.iter().any(|run| {
-                run.started_at_millis != context.saga_started_at_millis
+                run.started_at_millis > context.saga_started_at_millis
                     && run.phase != RunPhase::Quarantined
             })
         })
+    }
+
+    /// Older uncertainty also supersedes a successor's ordinary terminal, even
+    /// when the resolver's volatile state/detail for that successor is gone.
+    fn successor_starts(&self, context: &SagaContext) -> Vec<u64> {
+        self.ids
+            .get(&context.saga_id)
+            .map_or_else(Vec::new, |entry| {
+                entry
+                    .runs
+                    .iter()
+                    .filter_map(|run| {
+                        (run.started_at_millis > context.saga_started_at_millis
+                            && run.phase != RunPhase::Quarantined)
+                            .then_some(run.started_at_millis)
+                    })
+                    .collect()
+            })
     }
 
     fn fence(&self, event: &SagaChoreographyEvent) -> Fence {
@@ -1059,7 +1114,7 @@ impl ResolverGate {
         index.make_room_for(Some(saga_id));
         index.loading = true;
         for entry in &entries {
-            let _ = index.observe(&entry.event);
+            let _ = index.observe_row(&entry.event);
         }
         index.loading = false;
         index.make_room_for(Some(saga_id));
@@ -1097,7 +1152,7 @@ impl ResolverGate {
                 ))
             })?;
         for entry in &entries {
-            if !index.observe(&entry.event) {
+            if !index.observe_row(&entry.event) {
                 return Err(format!(
                     "terminal resolver admission history exceeds capacity; saga_id={}",
                     saga_id.get()
@@ -1139,6 +1194,20 @@ impl ResolverGate {
         self.index().mark_unpersisted(context);
     }
 
+    fn mark_quarantine_durable(&self, context: &SagaContext) {
+        self.index().mark_quarantine_durable(context);
+    }
+
+    /// Resident quarantined run whose durable quarantine row is not yet proven.
+    fn quarantine_pending(&self, context: &SagaContext) -> bool {
+        let index = self.index();
+        index.phase(context) == Some(RunPhase::Quarantined) && !index.quarantine_durable(context)
+    }
+
+    fn phase(&self, context: &SagaContext) -> Option<RunPhase> {
+        self.index().phase(context)
+    }
+
     fn raise(&self, context: &SagaContext, phase: RunPhase) {
         self.index()
             .raise(context.saga_id, context.saga_started_at_millis, phase);
@@ -1146,6 +1215,10 @@ impl ResolverGate {
 
     fn has_successor(&self, context: &SagaContext) -> bool {
         self.index().has_successor(context)
+    }
+
+    fn successor_starts(&self, context: &SagaContext) -> Vec<u64> {
+        self.index().successor_starts(context)
     }
 
     fn take_prejournaled(&self, context: &SagaContext) -> bool {
@@ -1354,14 +1427,26 @@ struct TerminalResolverActor {
     /// Resolver output computed before recovery activation; delivered once at
     /// activation so watchdog and ingress recovery cannot precede binding.
     held_events: Vec<SagaChoreographyEvent>,
+    /// Incoming known-run quarantine replies held until activation. One per
+    /// represented quarantined run: bounded by admission capacity, no replay of
+    /// the input event or duplicate journal append merely to notify a waiter.
+    held_quarantine_replies: HashMap<(SagaId, u64), SagaChoreographyEvent>,
     activated: bool,
     gate: Arc<ResolverGate>,
     bus: SagaChoreographyBus,
     responder: Arc<str>,
     saga_type: Box<str>,
+    /// Quarantined runs fenced live whose durable quarantine row is not yet
+    /// proven. Bounded: only runs resident in the (bounded) admission index are
+    /// tracked, each at most once. Retried from the watchdog tick.
+    pending_fences: VecDeque<SagaContext>,
+    pending_fence_keys: HashSet<(SagaId, u64)>,
     // Last, including the internal bus's subscriber resources, not just its gate.
     _release: ReleaseGuard,
 }
+
+/// Pending quarantine fences retried per watchdog tick (bounded, no spinning).
+const PENDING_FENCE_RETRIES_PER_TICK: usize = 8;
 
 impl TerminalResolverActor {
     fn publish_terminal_events(&mut self, terminal_events: Vec<SagaChoreographyEvent>) {
@@ -1386,30 +1471,187 @@ impl TerminalResolverActor {
 }
 
 impl TerminalResolverActor {
+    fn fence_event(&self, context: &SagaContext) -> SagaChoreographyEvent {
+        SagaChoreographyEvent::SagaQuarantined {
+            context: context.next_step(TERMINAL_RESOLVER_STEP.into()),
+            reason: "terminal resolver retained quarantined ownership; reconciliation required"
+                .into(),
+            step: context.step_name.clone(),
+            participant_id: self.responder.as_ref().into(),
+        }
+    }
+
+    /// Strictly appends the quarantine fence of a run; only success proves it durable.
+    fn append_fence(&mut self, context: &SagaContext) -> bool {
+        let Some(journal) = &self.gate.journal else {
+            return true;
+        };
+        let fence = self.fence_event(context);
+        if let Err(error) = journal.append(fence) {
+            tracing::error!(target: "core::saga", event = "terminal_resolver_quarantine_fence_append_failed",
+                saga_type = self.saga_type.as_ref(), saga_id = %context.saga_id, error = ?error);
+            self.track_pending_fence(context);
+            return false;
+        }
+        self.gate.mark_quarantine_durable(context);
+        self.pending_fence_keys
+            .remove(&(context.saga_id, context.saga_started_at_millis));
+        true
+    }
+
+    /// Remembers a live quarantine whose durable row is not yet proven. Runs the
+    /// index cannot represent are not tracked (they stay conservatively fenced).
+    fn track_pending_fence(&mut self, context: &SagaContext) {
+        if self.gate.journal.is_none() || !self.gate.quarantine_pending(context) {
+            return;
+        }
+        if self
+            .pending_fence_keys
+            .insert((context.saga_id, context.saga_started_at_millis))
+        {
+            self.pending_fences.push_back(context.clone());
+        }
+    }
+
+    /// Fences a run live (admission and resolver view) and tracks its durable copy.
+    fn fence_live(&mut self, context: &SagaContext) {
+        self.gate.raise(context, RunPhase::Quarantined);
+        self.track_pending_fence(context);
+    }
+
+    /// Raises and keeps resolver outputs; a quarantine for a run that is already
+    /// fenced is a duplicate and is dropped.
+    fn fence_outputs(&mut self, outputs: Vec<SagaChoreographyEvent>) -> Vec<SagaChoreographyEvent> {
+        let mut kept = Vec::with_capacity(outputs.len());
+        for output in outputs {
+            if matches!(output, SagaChoreographyEvent::SagaQuarantined { .. }) {
+                if self.gate.phase(output.context()) == Some(RunPhase::Quarantined) {
+                    continue;
+                }
+                self.fence_live(output.context());
+            }
+            kept.push(output);
+        }
+        kept
+    }
+
+    /// Bounded retry of pending quarantine fences from the watchdog tick, so a
+    /// recovered journal receives them without any later evidence event.
+    fn retry_pending_fences(&mut self) {
+        if !self.activated {
+            return;
+        }
+        for _ in 0..PENDING_FENCE_RETRIES_PER_TICK.min(self.pending_fences.len()) {
+            let Some(context) = self.pending_fences.pop_front() else {
+                break;
+            };
+            let key = (context.saga_id, context.saga_started_at_millis);
+            if !self.gate.quarantine_pending(&context) && self.gate.phase(&context).is_some() {
+                // Became durable through an ordinary quarantine row meanwhile.
+                self.pending_fence_keys.remove(&key);
+                continue;
+            }
+            if !self.append_fence(&context) {
+                // Storage still down: keep it queued behind others and stop.
+                self.pending_fences.push_back(context);
+                break;
+            }
+        }
+    }
+
+    /// Reconstruct successor fences from actual retained quarantine rows, never
+    /// from gapped ordinary detail. The earliest quarantine per ID subsumes the
+    /// others, so history is scanned once rather than once per duplicate row.
+    /// Outputs remain held until activation; already-derived recovery outputs
+    /// are latched first so they are not synthesized twice.
+    fn recover_successor_fences(&mut self, history: &[SagaChoreographyEvent]) {
+        let derived: Vec<_> = self
+            .recovery_events
+            .iter()
+            .filter(|event| matches!(event, SagaChoreographyEvent::SagaQuarantined { .. }))
+            .map(|event| event.context().clone())
+            .collect();
+        for context in derived {
+            self.fence_live(&context);
+        }
+        let mut oldest: HashMap<SagaId, &SagaChoreographyEvent> = HashMap::new();
+        for event in history {
+            if !matches!(event, SagaChoreographyEvent::SagaQuarantined { .. })
+                || self.gate.phase(event.context()) != Some(RunPhase::Quarantined)
+            {
+                continue;
+            }
+            oldest
+                .entry(event.context().saga_id)
+                .and_modify(|prior| {
+                    if event.context().saga_started_at_millis
+                        < prior.context().saga_started_at_millis
+                    {
+                        *prior = event;
+                    }
+                })
+                .or_insert(event);
+        }
+        for event in oldest.into_values() {
+            self.fence_successors(event);
+        }
+    }
+
+    /// A quarantine row for the run was retained: older-run uncertainty also
+    /// fences every admitted successor. Evaluated AFTER the retained quarantine
+    /// raised the older run, so admission (which serializes on the index) either
+    /// refused the successor or is seen here.
+    fn fence_successors(&mut self, event: &SagaChoreographyEvent) {
+        let SagaChoreographyEvent::SagaQuarantined {
+            context,
+            reason,
+            step,
+            participant_id,
+        } = event
+        else {
+            return;
+        };
+        if !self.gate.has_successor(context) {
+            return;
+        }
+        let outputs = self.resolver.ingest(event);
+        let mut out = self.fence_outputs(outputs);
+        for start in self.gate.successor_starts(context) {
+            let mut successor = context.next_step(TERMINAL_RESOLVER_STEP.into());
+            successor.saga_started_at_millis = start;
+            let quarantine = SagaChoreographyEvent::SagaQuarantined {
+                context: successor,
+                reason: format!(
+                    "unresolved quarantine in run {}: {reason}",
+                    context.saga_started_at_millis
+                )
+                .into(),
+                step: step.clone(),
+                participant_id: participant_id.clone(),
+            };
+            self.fence_live(quarantine.context());
+            // Latch the resolver's own view; its cross-run echo is a duplicate.
+            let _ = self.resolver.ingest(&quarantine);
+            out.push(quarantine);
+        }
+        self.publish_terminal_events(out);
+    }
+
     /// Journals evidence for a fenced run without involving the resolver.
     fn retain_evidence(&mut self, event: &SagaChoreographyEvent) {
         // A quarantine may have been latched while the journal was unwritable.
-        // Once storage returns, its fence must precede new retained evidence;
-        // otherwise a restart could reconstruct an ordinary success from that
-        // evidence and forget the already-published quarantine.
-        let quarantined = self.gate.index().phase(event.context()) == Some(RunPhase::Quarantined);
-        if quarantined
-            && !matches!(event, SagaChoreographyEvent::SagaQuarantined { .. })
-            && let Some(journal) = &self.gate.journal
+        // Until its durable row is proven, the fence must precede new retained
+        // evidence; otherwise a restart could reconstruct an ordinary success
+        // from that evidence and forget the already-published quarantine. Once
+        // durable it is never re-appended per late event.
+        let context = event.context();
+        let incoming_quarantine = matches!(event, SagaChoreographyEvent::SagaQuarantined { .. });
+        if !incoming_quarantine
+            && self.gate.journal.is_some()
+            && self.gate.quarantine_pending(context)
+            && !self.append_fence(context)
         {
-            let context = event.context();
-            let fence = SagaChoreographyEvent::SagaQuarantined {
-                context: context.next_step(TERMINAL_RESOLVER_STEP.into()),
-                reason: "terminal resolver retained quarantined ownership; reconciliation required"
-                    .into(),
-                step: context.step_name.clone(),
-                participant_id: self.responder.as_ref().into(),
-            };
-            if let Err(error) = journal.append(fence) {
-                tracing::error!(target: "core::saga", event = "terminal_resolver_quarantine_fence_append_failed",
-                    saga_type = self.saga_type.as_ref(), saga_id = %context.saga_id, error = ?error);
-                return;
-            }
+            return;
         }
         let mut persisted = true;
         if let Some(journal) = &self.gate.journal
@@ -1425,6 +1667,15 @@ impl TerminalResolverActor {
             // Neither resident nor persisted: never recoverable from the journal.
             self.gate.mark_unpersisted(event.context());
         }
+        if incoming_quarantine && self.gate.journal.is_some() {
+            if persisted {
+                self.gate.mark_quarantine_durable(context);
+                self.pending_fence_keys
+                    .remove(&(context.saga_id, context.saga_started_at_millis));
+            } else {
+                self.track_pending_fence(context);
+            }
+        }
     }
 
     /// A compensable effect materialised after an ordinary terminal. The
@@ -1433,7 +1684,7 @@ impl TerminalResolverActor {
     fn escalate_late_effect(&mut self, event: &SagaChoreographyEvent) {
         let context = event.context();
         self.retain_evidence(event);
-        self.gate.raise(context, RunPhase::Quarantined);
+        self.fence_live(context);
         self.publish_terminal_events(vec![SagaChoreographyEvent::SagaQuarantined {
             context: context.next_step(TERMINAL_RESOLVER_STEP.into()),
             reason: "a compensable effect materialised after the saga resolved".into(),
@@ -1455,109 +1706,148 @@ impl SyncActor for TerminalResolverActor {
     fn handle_tell(&mut self, msg: Self::Tell) {
         let terminal_events = match msg {
             TerminalResolverTell::Ingest(event) => {
-                {
-                    let fence = self.gate.fence(&event);
-                    match fence {
-                        Fence::Pass => {}
-                        Fence::Drop => {
-                            tracing::warn!(
-                                target: "core::saga",
-                                event = "terminal_resolver_fenced_stale_event",
-                                saga_type = self.saga_type.as_ref(),
-                                saga_id = %event.context().saga_id,
-                                event_type = event.event_type()
-                            );
-                            return;
-                        }
-                        Fence::RetainOnly => {
-                            // Older-run uncertainty also fences an active successor.
-                            // Do not bypass the resolver's cross-run quarantine rule.
-                            let fence_successor =
-                                matches!(*event, SagaChoreographyEvent::SagaQuarantined { .. })
-                                    && self.gate.has_successor(event.context());
-                            self.retain_evidence(&event);
-                            if fence_successor {
-                                let terminal_events = self.resolver.ingest(&event);
-                                self.publish_terminal_events(terminal_events);
-                            }
-                            return;
-                        }
-                        Fence::Escalate => {
-                            self.escalate_late_effect(&event);
-                            return;
-                        }
-                    }
-                }
-                let already_journaled = matches!(*event, SagaChoreographyEvent::SagaStarted { .. })
-                    && self.gate.journal.is_some()
-                    && self.gate.take_prejournaled(event.context());
-                if !already_journaled
-                    && let Some(journal) = &self.gate.journal
-                    && let Err(error) = journal.append((*event).clone())
-                {
-                    tracing::error!(
-                        target: "core::saga",
-                        event = "terminal_resolver_journal_append_failed",
-                        saga_type = self.saga_type.as_ref(),
-                        saga_id = %event.context().saga_id,
-                        error = ?error
-                    );
-                    self.gate.mark_unpersisted(event.context());
-                    let incoming_quarantine =
-                        matches!(*event, SagaChoreographyEvent::SagaQuarantined { .. });
-                    let quarantine = if incoming_quarantine {
-                        (*event).clone()
+                // A quarantine of a run this resolver already owns resolves its
+                // waiters whoever raised it (participant, delivery shortfall, ...).
+                let known_quarantine =
+                    matches!(*event, SagaChoreographyEvent::SagaQuarantined { .. })
+                        && self.gate.phase(event.context()).is_some();
+                self.ingest_event(&event);
+                if known_quarantine {
+                    if self.activated {
+                        let _ = self
+                            .bus
+                            .complete_quarantine_reply_from_event(&event, self.responder.as_ref());
                     } else {
-                        SagaChoreographyEvent::SagaQuarantined {
-                            context: event.context().next_step(TERMINAL_RESOLVER_STEP.into()),
-                            reason: format!("terminal resolver durability failed: {error}").into(),
-                            step: TERMINAL_RESOLVER_STEP.into(),
-                            participant_id: self.responder.as_ref().into(),
-                        }
-                    };
-                    // Publication/loopback is not the live authority, especially
-                    // when its own append also fails. Fence both admission and
-                    // resolver state before any later queued completion/watchdog.
-                    self.gate.raise(quarantine.context(), RunPhase::Quarantined);
-                    let mut outputs = self.resolver.ingest(&quarantine);
-                    for output in &outputs {
-                        if matches!(output, SagaChoreographyEvent::SagaQuarantined { .. }) {
-                            self.gate.raise(output.context(), RunPhase::Quarantined);
-                        }
+                        let context = event.context();
+                        self.held_quarantine_replies
+                            .entry((context.saga_id, context.saga_started_at_millis))
+                            .or_insert_with(|| (*event).clone());
                     }
-                    if !incoming_quarantine {
-                        outputs.insert(0, quarantine);
-                    }
-                    self.publish_terminal_events(outputs);
-                    return;
                 }
-                if !already_journaled && !self.gate.observe(&event) {
-                    let context = event.context();
-                    let quarantine = SagaChoreographyEvent::SagaQuarantined {
-                        context: context.next_step(TERMINAL_RESOLVER_STEP.into()),
-                        reason: "terminal resolver admission evidence capacity unavailable; reconciliation required".into(),
-                        step: context.step_name.clone(),
-                        participant_id: "terminal_resolver".into(),
-                    };
-                    // Latch the resolver itself and retain the strong fence before
-                    // replying. A subsequent watchdog must not emit ordinary failure.
-                    let _ = self.resolver.ingest(&quarantine);
-                    self.retain_evidence(&quarantine);
-                    self.publish_terminal_events(vec![quarantine]);
-                    return;
-                }
-                self.resolver.ingest(&event)
+                return;
             }
             TerminalResolverTell::ActivateRecovery => {
                 self.activated = true;
                 let mut pending = std::mem::take(&mut self.recovery_events);
                 pending.append(&mut self.held_events);
                 self.publish_terminal_events(pending);
+                for event in std::mem::take(&mut self.held_quarantine_replies).into_values() {
+                    let _ = self
+                        .bus
+                        .complete_quarantine_reply_from_event(&event, self.responder.as_ref());
+                }
                 return;
             }
-            TerminalResolverTell::PollTimeouts => self.resolver.poll_timeouts(),
+            TerminalResolverTell::PollTimeouts => {
+                self.retry_pending_fences();
+                self.resolver.poll_timeouts()
+            }
         };
         self.publish_terminal_events(terminal_events);
+    }
+}
+
+impl TerminalResolverActor {
+    fn ingest_event(&mut self, event: &SagaChoreographyEvent) {
+        match self.gate.fence(event) {
+            Fence::Pass => {}
+            Fence::Drop => {
+                tracing::warn!(
+                    target: "core::saga",
+                    event = "terminal_resolver_fenced_stale_event",
+                    saga_type = self.saga_type.as_ref(),
+                    saga_id = %event.context().saga_id,
+                    event_type = event.event_type()
+                );
+                return;
+            }
+            Fence::RetainOnly => {
+                // Retain (and raise the index) first; only then is the successor
+                // check ordered against concurrent start admission.
+                self.retain_evidence(event);
+                self.fence_successors(event);
+                return;
+            }
+            Fence::Escalate => {
+                self.escalate_late_effect(event);
+                return;
+            }
+        }
+        let already_journaled = matches!(event, SagaChoreographyEvent::SagaStarted { .. })
+            && self.gate.journal.is_some()
+            && self.gate.take_prejournaled(event.context());
+        if !already_journaled
+            && let Some(journal) = &self.gate.journal
+            && let Err(error) = journal.append(event.clone())
+        {
+            tracing::error!(
+                target: "core::saga",
+                event = "terminal_resolver_journal_append_failed",
+                saga_type = self.saga_type.as_ref(),
+                saga_id = %event.context().saga_id,
+                error = ?error
+            );
+            self.gate.mark_unpersisted(event.context());
+            let incoming_quarantine =
+                matches!(event, SagaChoreographyEvent::SagaQuarantined { .. });
+            let quarantine = if incoming_quarantine {
+                event.clone()
+            } else {
+                SagaChoreographyEvent::SagaQuarantined {
+                    context: event.context().next_step(TERMINAL_RESOLVER_STEP.into()),
+                    reason: format!("terminal resolver durability failed: {error}").into(),
+                    step: TERMINAL_RESOLVER_STEP.into(),
+                    participant_id: self.responder.as_ref().into(),
+                }
+            };
+            // Publication/loopback is not the live authority, especially
+            // when its own append also fails. Fence both admission and
+            // resolver state before any later queued completion/watchdog.
+            self.fence_live(quarantine.context());
+            let mut outputs = self.resolver.ingest(&quarantine);
+            for output in &outputs {
+                if matches!(output, SagaChoreographyEvent::SagaQuarantined { .. }) {
+                    self.fence_live(output.context());
+                }
+            }
+            if !incoming_quarantine {
+                outputs.insert(0, quarantine);
+            }
+            self.publish_terminal_events(outputs);
+            return;
+        }
+        if !already_journaled && !self.gate.observe(event) {
+            let context = event.context();
+            let quarantine = SagaChoreographyEvent::SagaQuarantined {
+                context: context.next_step(TERMINAL_RESOLVER_STEP.into()),
+                reason: "terminal resolver admission evidence capacity unavailable; reconciliation required".into(),
+                step: context.step_name.clone(),
+                participant_id: "terminal_resolver".into(),
+            };
+            // Latch the resolver itself and retain the strong fence before
+            // replying. Cross-run outputs (an active older run fenced by this
+            // unrepresentable newer run) are raised, retained and published too,
+            // so a later watchdog cannot emit an ordinary outcome.
+            let cross_run = self.resolver.ingest(&quarantine);
+            let mut outputs = vec![quarantine.clone()];
+            outputs.extend(self.fence_outputs(cross_run));
+            self.retain_evidence(&quarantine);
+            self.publish_terminal_events(outputs);
+            return;
+        }
+        if !already_journaled
+            && matches!(event, SagaChoreographyEvent::SagaQuarantined { .. })
+            && self.gate.journal.is_some()
+        {
+            // Appended successfully above: this exact run's quarantine is durable.
+            self.gate.mark_quarantine_durable(event.context());
+            self.pending_fence_keys.remove(&(
+                event.context().saga_id,
+                event.context().saga_started_at_millis,
+            ));
+        }
+        let outputs = self.resolver.ingest(event);
+        self.publish_terminal_events(outputs);
     }
 }
 
@@ -2315,7 +2605,7 @@ impl SagaChoreographyBus {
         bus._lifecycle = None;
         let responder: Arc<str> = Arc::from(responder);
         let shutdown = Arc::new(AtomicBool::new(false));
-        let (resolver, recovery_events, admission) = match &journal {
+        let (resolver, recovery_events, admission, recovery_history) = match &journal {
             Some(journal) => {
                 let entries = journal.read_all().map_err(|error| {
                     format!(
@@ -2363,12 +2653,13 @@ impl SagaChoreographyBus {
                 });
                 let (resolver, recovery_events) =
                     TerminalResolver::restore_from_events(policy.clone(), &events);
-                (resolver, recovery_events, admission)
+                (resolver, recovery_events, admission, events)
             }
             None => (
                 TerminalResolver::new(policy.clone()),
                 Vec::new(),
                 AdmissionIndex::new(limits, false),
+                Vec::new(),
             ),
         };
         let durable = journal.is_some();
@@ -2378,17 +2669,22 @@ impl SagaChoreographyBus {
             activated: AtomicBool::new(!durable),
             admission: Mutex::new(admission),
         });
-        let (resolver_ref, resolver_handle) = local_sync::spawn(TerminalResolverActor {
+        let mut resolver_actor = TerminalResolverActor {
             resolver,
             _release: self.release.guard(),
             recovery_events,
             held_events: Vec::new(),
+            held_quarantine_replies: HashMap::new(),
             activated: !durable,
             gate: Arc::clone(&gate),
             bus: bus.clone(),
             responder: Arc::clone(&responder),
             saga_type: saga_type_topic.clone(),
-        });
+            pending_fences: VecDeque::new(),
+            pending_fence_keys: HashSet::new(),
+        };
+        resolver_actor.recover_successor_fences(&recovery_history);
+        let (resolver_ref, resolver_handle) = local_sync::spawn(resolver_actor);
         spawn_terminal_watchdog_if_needed(&policy, resolver_ref.clone(), Arc::clone(&shutdown))?;
         let subscription_saga_type = policy.saga_type.clone();
         let subscription_resolver_ref = resolver_ref.clone();
@@ -2542,6 +2838,29 @@ impl SagaChoreographyBus {
         if !is_resolver_terminal {
             return false;
         }
+        self.resolve_terminal_reply(event, responder)
+    }
+
+    /// Quarantine of a run the resolver already owns, raised by anyone (a
+    /// participant, the delivery-shortfall path, ...). Only quarantine is
+    /// accepted here: an ordinary terminal still needs resolver authority.
+    /// Quarantine dominates, and waiters resolve by exact run binding.
+    fn complete_quarantine_reply_from_event(
+        &self,
+        event: &SagaChoreographyEvent,
+        responder: impl Into<Box<str>>,
+    ) -> bool {
+        if !matches!(event, SagaChoreographyEvent::SagaQuarantined { .. }) {
+            return false;
+        }
+        self.resolve_terminal_reply(event, responder)
+    }
+
+    fn resolve_terminal_reply(
+        &self,
+        event: &SagaChoreographyEvent,
+        responder: impl Into<Box<str>>,
+    ) -> bool {
         let Some(outcome) = event.terminal_outcome() else {
             return false;
         };
@@ -4281,16 +4600,37 @@ mod admission_tests {
 
     use crate::{
         AcceptedStepTimeoutOutcome, FailureAuthority, InMemoryTerminalResolverJournal,
-        SagaChoreographyEvent, SagaContext, SagaId, SagaWorkflowContract, SagaWorkflowStepContract,
-        StepExecutionId, SuccessCriteria, TERMINAL_RESOLVER_STEP, TerminalPolicy,
-        TerminalResolverJournal, TerminalResolverJournalEntry, TerminalResolverJournalError,
-        WorkflowDependencySpec,
+        SagaChoreographyEvent, SagaContext, SagaId, SagaTerminalOutcome, SagaWorkflowContract,
+        SagaWorkflowStepContract, StepExecutionId, SuccessCriteria, TERMINAL_RESOLVER_STEP,
+        TerminalPolicy, TerminalResolverJournal, TerminalResolverJournalEntry,
+        TerminalResolverJournalError, WorkflowDependencySpec,
     };
 
     use super::{
         AdmissionIndex, AdmissionLimits, ResolverGate, RunPhase, SagaBusPublishError,
-        SagaChoreographyBus,
+        SagaChoreographyBus, SagaReplyToHandle, SagaReplyToResult,
     };
+    use icanact_core::local_sync;
+
+    /// Registers an id-scoped waiter from an off-actor probe.
+    fn register_pending_reply(
+        bus: SagaChoreographyBus,
+        saga_id: SagaId,
+    ) -> (
+        local_sync::PendingAsk<SagaReplyToResult>,
+        local_sync::mpsc::ActorHandle,
+    ) {
+        let (probe_addr, probe_handle) = local_sync::mpsc::spawn(
+            8,
+            |(bus, saga_id, reply): (SagaChoreographyBus, SagaId, SagaReplyToHandle)| {
+                let _ = bus.register_terminal_reply(saga_id, reply);
+            },
+        );
+        let pending = probe_addr
+            .ask_delegated(|reply| (bus, saga_id, reply))
+            .expect("pending reply should be registered");
+        (pending, probe_handle)
+    }
 
     struct Chain;
     impl SagaWorkflowContract for Chain {
@@ -5043,6 +5383,152 @@ mod admission_tests {
         ) == 1));
         bus.publish_strict(started(&ctx("adm_chain", 704, "a", base)))
             .expect("durable overflow must not wedge admission once capacity returns");
+    }
+
+    #[test]
+    fn pending_fence_retry_is_activation_gated_bounded_and_stops_after_durability() {
+        let journal = Arc::new(LookupJournal::default());
+        let bus = SagaChoreographyBus::new();
+        let gate = Arc::new(ResolverGate {
+            journal: Some(journal.clone()),
+            _release: bus.release.guard(),
+            activated: AtomicBool::new(false),
+            admission: Mutex::new(AdmissionIndex::new(limits(32, 128), true)),
+        });
+        let mut actor = super::TerminalResolverActor {
+            resolver: crate::TerminalResolver::new(Chain::terminal_policy()),
+            recovery_events: Vec::new(),
+            held_events: Vec::new(),
+            held_quarantine_replies: Default::default(),
+            activated: false,
+            gate: Arc::clone(&gate),
+            bus: bus.clone(),
+            responder: Arc::from("qa"),
+            saga_type: "adm_chain".into(),
+            pending_fences: Default::default(),
+            pending_fence_keys: Default::default(),
+            _release: bus.release.guard(),
+        };
+        let base = SagaContext::now_millis();
+        for id in 0..20 {
+            let context = ctx("adm_chain", 800 + id, "a", base);
+            actor.ingest_event(&started(&context));
+            actor.fence_live(&context);
+            let quarantine = actor.fence_event(&context);
+            actor.resolver.ingest(&quarantine);
+            actor.track_pending_fence(&context);
+        }
+        assert_eq!(
+            actor.pending_fence_keys.len(),
+            20,
+            "one key per resident run"
+        );
+        assert_eq!(
+            actor.pending_fences.len(),
+            20,
+            "duplicate tracking is bounded"
+        );
+        let quarantine_count = || {
+            journal
+                .inner
+                .read_all()
+                .unwrap()
+                .iter()
+                .filter(|row| is_quarantined(&row.event))
+                .count()
+        };
+        actor.retry_pending_fences();
+        assert_eq!(quarantine_count(), 0, "no retry before recovery activation");
+        actor.activated = true;
+        journal.fail_append.store(true, Ordering::SeqCst);
+        actor.retry_pending_fences();
+        assert_eq!(
+            journal.append_failures.load(Ordering::SeqCst),
+            1,
+            "failed tick does not spin"
+        );
+        assert_eq!(actor.pending_fences.len(), 20);
+        journal.fail_append.store(false, Ordering::SeqCst);
+        for (durable, pending) in [(8, 12), (16, 4), (20, 0)] {
+            actor.retry_pending_fences();
+            assert_eq!(quarantine_count(), durable, "at most eight fences per tick");
+            assert_eq!(actor.pending_fences.len(), pending);
+            assert_eq!(actor.pending_fence_keys.len(), pending);
+        }
+        actor.retry_pending_fences();
+        for id in 0..20 {
+            let context = ctx("adm_chain", 800 + id, "a", base);
+            actor.track_pending_fence(&context);
+            assert!(!gate.quarantine_pending(&context));
+        }
+        assert_eq!(actor.pending_fences.len(), 0);
+        assert_eq!(quarantine_count(), 20, "durable rows are never retried");
+        assert!(!gate.index().exceeds_capacity());
+    }
+
+    #[test]
+    fn capacity_failure_of_unknown_newer_run_publishes_and_persists_the_active_run_quarantine() {
+        let journal = Arc::new(LookupJournal::default());
+        let (bus, seen) = bus_with::<Chain>(
+            Some(Arc::clone(&journal) as Arc<dyn TerminalResolverJournal>),
+            limits(1, 100),
+        );
+        let base = SagaContext::now_millis();
+        let active = ctx("adm_chain", 741, "a", base);
+        let unknown_newer = ctx("adm_chain", 741, "a", base + 1);
+        bus.publish_strict(started(&active)).unwrap();
+        let (pending, probe) = register_pending_reply(bus.clone(), active.saga_id);
+        thread::sleep(Duration::from_millis(50));
+
+        // The newer run cannot be represented (capacity 1 run), so its evidence
+        // is quarantined; the resolver's cross-run rule fences the active run.
+        bus.publish_strict(completed(&unknown_newer, "a", 1, true))
+            .unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(pending.wait());
+        });
+        let reply = rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("the active run's waiter must resolve")
+            .expect("waiter reply")
+            .expect("quarantine is a terminal saga reply");
+        assert!(matches!(
+            reply.outcome,
+            SagaTerminalOutcome::Quarantined { .. }
+        ));
+        probe.shutdown();
+        let active_quarantined = |event: &SagaChoreographyEvent| {
+            is_quarantined(event)
+                && event.context().saga_started_at_millis == active.saga_started_at_millis
+        };
+        assert!(wait_until(Duration::from_secs(3), || count(
+            &seen,
+            active_quarantined
+        ) >= 1));
+        assert!(
+            wait_until(Duration::from_secs(3), || journal
+                .inner
+                .read_saga(active.saga_id)
+                .unwrap()
+                .iter()
+                .any(|entry| active_quarantined(&entry.event))),
+            "the active run's quarantine is persisted"
+        );
+        let gate = bus
+            .gates
+            .lock()
+            .unwrap()
+            .get("adm_chain")
+            .and_then(std::sync::Weak::upgrade)
+            .unwrap();
+        assert_eq!(gate.index().phase(&active), Some(RunPhase::Quarantined));
+        assert!(
+            bus.publish_strict(started(&ctx("adm_chain", 741, "a", base + 2)))
+                .is_err(),
+            "the id stays refused behind the quarantined active run"
+        );
     }
 
     #[test]

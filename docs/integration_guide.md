@@ -219,10 +219,15 @@ For runtime publishing paths, prefer `publish_strict(...)` so partial delivery i
   unrequested potential queue obligation is removed. An already-owned request for exact-run
   proven rejection is completed durably before acknowledgement without calling business
   undo; real results, prior compensation-requiring failure or unresolved undo remain owed.
-  Completion hooks include this logical no-op. Never hand-build a no-effect completion
-  from absent rows; persistence errors quarantine and send no acknowledgement.
-- `SagaFailed` waiter replies can be superseded by quarantine on later evidence. Managed
-  ingress publishes `StepStarted` before running your step; keep hooks idempotent.
+  Completion hooks include this logical no-op. Strict evidence wins over stale
+  accepted/local caches; evidence-read failure after request persistence also quarantines
+  without undo or acknowledgement. Never hand-build a no-effect completion from absent
+  rows; persistence errors quarantine and send no acknowledgement.
+- `SagaFailed` waiter replies can be superseded by quarantine on later evidence. Owned-run
+  participant/delivery quarantine resolves exact-run and correctly bound legacy waiters;
+  pre-activation replies wait for activation. Old uncertainty also fences an already-closed
+  successor after compaction/reopen. Managed ingress publishes `StepStarted` before running
+  your step; keep hooks idempotent.
 - Upgrading from baseline: drain all in-flight sagas first ([migration.md](migration.md)).
 
 ## Async Accepted-Step Model
@@ -345,7 +350,9 @@ stopping application-owned actors and dropping every public clone, call
 off-callback** context. True means actual bus-owned actor/gate/subscriber resources and
 backend references have been destroyed, not merely shutdown requested. False is not
 permission to reopen a store. The waiter owns only completion coordination; it does not
-shut down work, resolve a saga or cancel external execution. Drop every application-owned
+shut down work, resolve a saga, cancel external execution or flush pending live-only
+quarantine fences. The active watchdog retries pending resident fences within a bounded
+per-tick budget, but storage recovery alone is not a durable receipt. Drop every application-owned
 journal clone before store close/reopen. See [operations.md](operations.md).
 
 ## Timeout Model

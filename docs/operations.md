@@ -20,7 +20,9 @@ load, Linux/Windows or external-service certification.
    opening stores is not permission to replay unresolved business effects.
 3. Bind every required participant through the strict binding helpers. Deliver the
    collected startup events through normal ingress. Resolver output produced by
-   ingestion **and** the watchdog stays held until activation.
+   ingestion **and** the watchdog stays held until activation. Known-run quarantine
+   replies raised by participants are held too, then resolved at activation without
+   republishing the ingress event or appending it again just to notify a waiter.
 4. Call `activate_terminal_resolver_recovery_for_contract` only after binding is live.
    Activation queues retained output; it is not an acknowledgement that remote work
    has finished. Only then admit new `SagaStarted` events.
@@ -50,7 +52,10 @@ bus-owned resource release with the completion waiter described below before clo
   compensable or accepted effect keeps the successful business effect and does **not**
   by itself manufacture quarantine, even from compacted/reopened success history. After
   rollback or `SagaFailed`, a late effect escalates to quarantine, and unresolved
-  older-run uncertainty still fences a successor.
+  older-run uncertainty still fences a successor, including one already ordinarily
+  resolved whose volatile resolver state or compacted detail is gone. Recovery uses
+  actual retained quarantine rows to propagate this fence, not gapped business detail;
+  propagation output remains held until activation.
 - Managed intent is durable before execution/undo. A changed delivery trace cannot
   reopen a durably started step, even with cleared volatile caches; uncertain replay
   quarantines for reconciliation. Keep the entire original context on redelivery.
@@ -101,7 +106,11 @@ resend only a proved completion, never repeat physical undo. Completion hooks de
 logical obligation completion, including this proved no-op, not necessarily physical work.
 Real results/proofs, any compensation-requiring failure, open/real undo, new forward
 intent/acceptance, reconciliation or quarantine invalidate rejection. An owned request
-alone does not: it remains owed until completion. Any `StepExecutionFailed(true)` retains
+alone does not: it remains owed until completion. A stale local `Completed` or accepted
+`Executing` cache cannot authorize undo over exact-run durable rejection. The managed
+helper reads strict evidence after recording the owned request, before using that cache;
+an evidence-read error quarantines with no business undo or acknowledgement.
+Any `StepExecutionFailed(true)` retains
 undo and invalidates earlier undo completion even without pending accepted metadata. An unrelated
 `SagaFailed` never closes unresolved accepted work, and a genuinely late result after an
 authoritative failure becomes original-run reconciliation evidence (quarantine). Genuinely
@@ -170,7 +179,8 @@ have been destroyed and bus-held backend references released—not merely that s
 was requested. Drop guards notify after their owning fields are destroyed. The waiter
 retains only completion coordination, not public lifecycle, actors or journals. Timeout
 is not permission to reopen. It neither shuts down work nor resolves a saga or physically
-cancels external execution. Waiting inside a runtime callback can deadlock the drain;
+cancels external execution or flushes pending live-only quarantine fences. Waiting
+inside a runtime callback can deadlock the drain;
 application-owned actors, journal clones, callback jobs and remote work remain the
 application's responsibility.
 
@@ -186,7 +196,7 @@ application's responsibility.
   still-retained evidence, even with contradictory ordinary terminals. Detail may already
   have been compacted before a failed run later quarantines. Restoration first computes
   final full-run phase: ordinary closed detail never drives live work/success; closed
-  quarantine retains actual quarantine rows for fencing and active-successor propagation,
+  quarantine retains actual quarantine rows for fencing and admitted-successor propagation,
   not fresh outputs from gapped detail. Failed runs keep known compensable-completion/
   acceptance fingerprints, distinguishing harmless replay from new uncertainty after
   compaction/reopen. Corruption aborts maintenance. Unsupported journals return
@@ -220,10 +230,18 @@ application's responsibility.
   and retained failed fingerprints all have irreducible costs; no hard limit guarantees
   every workload fits. Cache recovery is not a safe-clear API.
 - A resolver write failure latches live quarantine before publication/loopback; restored
-  storage cannot downgrade it to success. Before retaining later evidence for a known
-  quarantined run, its quarantine fence is persisted first. An unwritable store cannot
-  durably retain that fence/evidence: preserve application/external records and reconcile
-  before restart/admission. An emitted quarantine or log is not itself a durable receipt.
+  storage cannot downgrade it to success. Exact-run fences are tracked as pending versus
+  proven durable (successful append or validated journal row). After activation, each
+  watchdog tick retries up to eight resident pending fences, stopping at an append error,
+  independently of ordinary/accepted deadline expiry and without another evidence event.
+  The queue deduplicates full runs and stays within resident admission capacity;
+  unrepresented/sticky uncertainty is not invented into a retryable owner. Before later
+  evidence, a pending fence is persisted first. A proven durable fence, including one
+  restored from history, is not synthetically re-appended per late event or tick.
+  Retry is not an instantaneous durability guarantee or shutdown flush: until append
+  actually succeeds, crash/release/reopen may lose live-only uncertainty. Confirm retained
+  journal evidence and preserve application/external records; reconcile before restart/
+  admission when persistence is unproved. An emitted quarantine or log is not a receipt.
 - `prune_saga`/`prune_saga_strict` and backend `prune` are destructive administrative
   primitives: they remove replay protection and are **not** routine terminal cleanup.
   Do not use them to unblock a saga or replace safe resolver compaction.
@@ -256,8 +274,11 @@ its original run without contaminating a successor. Result-write errors retain e
 and quarantine where storage permits; they do not authorize another external execution.
 Use `register_terminal_reply_for_run` and `take_terminal_outcome_for_run` with the full
 context. Saga-ID-only compatibility waiters registered after admission bind to the unique known
-active run; ambiguous multi-type ownership is not guessed. They are not an unambiguous
-way to wait for concurrent saga types sharing an ID.
+active run; ambiguous multi-type ownership is not guessed. Participant-originated and
+required-delivery-shortfall quarantine of an owned run resolve its exact-run and correctly
+bound legacy waiters, while ordinary terminals still require resolver authority. Unknown,
+foreign and different-run waiters are not inferred from the quarantine. They are not an
+unambiguous way to wait for concurrent saga types sharing an ID.
 
 ## Upgrading from the baseline
 

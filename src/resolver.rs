@@ -407,6 +407,23 @@ impl TerminalResolver {
                         event_type = event.event_type(),
                         "ignoring newer-run event while the earlier run is unresolved"
                     );
+                    if existing.terminal_outcome == Some("saga_quarantined")
+                        && matches!(event, SagaChoreographyEvent::SagaStarted { .. })
+                    {
+                        // The older quarantined owner stays unresolved; its newer,
+                        // already-admitted successor is quarantined visibly rather
+                        // than silently ignored (restart or admission race).
+                        return vec![SagaChoreographyEvent::SagaQuarantined {
+                            context: terminal_context(event.context()),
+                            reason: format!(
+                                "a newer run started behind unresolved quarantined run {}; reconciliation required",
+                                existing.run_started_at_millis
+                            )
+                            .into(),
+                            step: event.context().step_name.clone(),
+                            participant_id: "terminal_resolver".into(),
+                        }];
+                    }
                     return Vec::new();
                 }
                 self.states.remove(&saga_id);
