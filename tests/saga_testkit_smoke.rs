@@ -72,7 +72,17 @@ impl SyncParticipant {
             .map(|saga_id| {
                 self.saga
                     .dedupe
-                    .contains(saga_id, "1:1700000000000:saga_started:start")
+                    .contains(
+                        saga_id,
+                        &self.run_dedupe_key(
+                            &DeterministicContextBuilder::default()
+                                .with_saga_id(saga_id.get())
+                                .with_saga_type("order_lifecycle")
+                                .with_step_name("start")
+                                .build(),
+                            "1:1700000000000:saga_started:start",
+                        ),
+                    )
                     .expect("dedupe contains should succeed")
             })
             .unwrap_or(false);
@@ -802,14 +812,17 @@ fn sync_world_runs_real_saga_workflow_and_exposes_actor_state() {
     let a_state = wait_for_sync_snapshot(
         &step_a.actor_ref(),
         |snapshot: &SyncSnapshot| {
-            snapshot.journal_entry_count == 0 && !snapshot.start_dedupe_present
+            snapshot.journal_entry_count >= 4 && snapshot.start_dedupe_present
         },
         Duration::from_secs(1),
     );
-    assert_eq!(a_state.journal_entry_count, 0);
     assert!(
-        !a_state.start_dedupe_present,
-        "terminal processing should prune participant dedupe keys"
+        a_state.journal_entry_count >= 4,
+        "durable terminal evidence remains"
+    );
+    assert!(
+        a_state.start_dedupe_present,
+        "terminal processing must retain replay fences"
     );
 
     step_a.shutdown();

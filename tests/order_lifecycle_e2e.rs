@@ -596,11 +596,11 @@ fn all_succeed_saga_completed() {
 }
 
 // ===========================================================================
-// Test 2: Position fails Terminal
+// Test 2: Position fails Terminal after a known Balance effect; undo is required
 // ===========================================================================
 
 #[test]
-fn position_fails_terminal_no_compensation() {
+fn position_terminal_failure_undoes_the_known_balance_effect() {
     let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
@@ -612,7 +612,9 @@ fn position_fails_terminal_no_compensation() {
     let (p_ref, p_h) = spawn_and_subscribe(
         &world,
         &bus,
-        ConfigurableParticipant::new(STEP_POSITION, DependencySpec::OnSagaStart)
+        // Establish the earlier effect deterministically; concurrent-unknown
+        // failure/quarantine is covered by qa_review_resolver and qa_review_bus.
+        ConfigurableParticipant::new(STEP_POSITION, DependencySpec::After(STEP_BALANCE))
             .with_execute_result(Err(terminal_error("position unavailable"))),
     );
     let (b_ref, b_h) = spawn_and_subscribe(
@@ -656,9 +658,9 @@ fn position_fails_terminal_no_compensation() {
         query_state(&b_ref),
         ParticipantState {
             executed_count: 1,
-            compensated_count: 0
+            compensated_count: 1
         }
-    ); // OnSagaStart, still executes
+    ); // Known effect must be undone before ordinary failure
     assert_eq!(
         query_state(&o_ref),
         ParticipantState {
@@ -694,7 +696,7 @@ fn balance_fails_terminal_after_position_succeeds() {
     let (b_ref, b_h) = spawn_and_subscribe(
         &world,
         &bus,
-        ConfigurableParticipant::new(STEP_BALANCE, DependencySpec::OnSagaStart)
+        ConfigurableParticipant::new(STEP_BALANCE, DependencySpec::After(STEP_POSITION))
             .with_execute_result(Err(terminal_error("insufficient balance"))),
     );
     let (o_ref, o_h) = spawn_and_subscribe(
@@ -718,7 +720,7 @@ fn balance_fails_terminal_after_position_succeeds() {
         query_state(&p_ref),
         ParticipantState {
             executed_count: 1,
-            compensated_count: 0
+            compensated_count: 1
         }
     );
     assert_eq!(
@@ -787,14 +789,14 @@ fn order_fails_terminal_after_both_succeed() {
         query_state(&p_ref),
         ParticipantState {
             executed_count: 1,
-            compensated_count: 0
+            compensated_count: 1
         }
     );
     assert_eq!(
         query_state(&b_ref),
         ParticipantState {
             executed_count: 1,
-            compensated_count: 0
+            compensated_count: 1
         }
     );
     assert_eq!(
@@ -876,7 +878,7 @@ fn order_fails_require_compensation_triggers_full_compensation() {
 // ===========================================================================
 
 #[test]
-fn position_compensation_fails_terminal_causes_saga_failed() {
+fn position_compensation_fails_terminal_causes_quarantine() {
     let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
@@ -911,7 +913,9 @@ fn position_compensation_fails_terminal_causes_saga_failed() {
         requires_compensation: true,
     });
 
-    wait_until(TIMEOUT, || query_terminal_counts(&terminal_ref).failed >= 1);
+    wait_until(TIMEOUT, || {
+        query_terminal_counts(&terminal_ref).quarantined >= 1
+    });
 
     wait_until(TIMEOUT, || query_state(&p_ref).compensated_count >= 1);
 
@@ -919,8 +923,8 @@ fn position_compensation_fails_terminal_causes_saga_failed() {
         query_terminal_counts(&terminal_ref),
         TerminalCounts {
             completed: 0,
-            failed: 1,
-            quarantined: 0,
+            failed: 0,
+            quarantined: 1,
         }
     );
     assert_eq!(
@@ -985,11 +989,11 @@ fn balance_compensation_fails_ambiguous_causes_quarantine() {
 }
 
 // ===========================================================================
-// Test 8: Balance compensation fails SafeToRetry -> SagaFailed
+// Test 8: Balance compensation fails SafeToRetry -> retained quarantine
 // ===========================================================================
 
 #[test]
-fn balance_compensation_fails_safe_to_retry_causes_failed() {
+fn balance_compensation_fails_safe_to_retry_causes_quarantine() {
     let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
@@ -1027,13 +1031,15 @@ fn balance_compensation_fails_safe_to_retry_causes_failed() {
         payload: vec![42],
     });
 
-    wait_until(TIMEOUT, || query_terminal_counts(&terminal_ref).failed >= 1);
+    wait_until(TIMEOUT, || {
+        query_terminal_counts(&terminal_ref).quarantined >= 1
+    });
     assert_eq!(
         query_terminal_counts(&terminal_ref),
         TerminalCounts {
             completed: 0,
-            failed: 1,
-            quarantined: 0,
+            failed: 0,
+            quarantined: 1,
         }
     );
     p_h.shutdown();

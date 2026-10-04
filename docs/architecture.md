@@ -23,7 +23,7 @@ At saga start, framework enforcement is fail-fast:
 - Missing workflow contract for the saga type: immediate `SagaFailed`.
 - `SagaStarted.context.step_name` does not match contract `first_step`: immediate `SagaFailed`.
 - Any declared contract step is not bound to a participant: immediate `SagaFailed` with `missing_steps=...`.
-- Live start-event fanout below contract minimum (`declared_steps + terminal_resolver`): immediate `SagaFailed` (prevents latent stalls from stale/unwired subscribers).
+- Live start-event fanout below contract minimum (`declared_steps + terminal_resolver`): `SagaQuarantined`, because an effect owner may already have received the start. A pre-fanout ownership refusal does not fabricate a foreign failure/quarantine.
 - Invalid workflow contracts are rejected at registration (duplicate steps, undeclared dependencies, cycles, required terminal steps missing).
 
 This prevents runtime “partial wiring” where a saga starts and then stalls waiting for steps that can never run.
@@ -141,16 +141,25 @@ sequenceDiagram
 - In this repository, in-memory implementations are available for tests/examples.
 - For production, use a durable backend by implementing the storage traits (for example LMDB/Heed).
 - Accepted-step metadata, original saga input, and compensation data are journaled before `StepAccepted` is published so restart recovery can rehydrate pending external executions.
-- The durable terminal resolver journals the saga-wide event history and rebuilds the complete compensation stack before participant recovery failures are replayed. Participant-local journals cannot infer effects owned by other actors.
-- A currently accepted step with compensation data is part of the resolver's compensation stack; timeout cannot skip release of that step's possible external effect.
+- The durable terminal resolver journals saga-wide history and classifies final full-run phases before replay. It rebuilds open compensation ownership, not fresh outputs from gapped closed detail; actual quarantine rows retain fencing and propagation to admitted successors, including ordinary closed successors after resolver cache/detail loss. Admission still uses full retained history. Participant-local journals cannot infer effects owned by other actors.
+- An accepted step with potential compensation data contributes an obligation until authoritative disposition. Definitive no-effect rejection can remove only an unrequested queue entry. An owned request instead needs strict exact-run completion proof without physical undo; stale accepted/local caches cannot override durable rejection, and evidence-read errors quarantine before cache-based undo. Actual effects/open undo/reconciliation must not be guessed safe.
 - Accepted compensation is journaled independently and must reach authoritative completion before terminal failure. Its timeout quarantines the saga.
 
 ## Recovery, Cleanup, and Operations
 
 - Recovery enumerates known saga IDs from the journal and rebuilds coarse state from event history.
 - Non-terminal sagas are returned for resume/reconciliation.
-- On terminal saga events (`SagaCompleted` or `SagaFailed`), participants prune local in-memory state and dedupe keys.
-- Quarantined sagas are intentionally preserved for manual investigation.
+- Ordinary terminal events clear only volatile run tracking; durable terminal tombstones, journal history and dedupe markers remain. Quarantine also retains in-memory state and accepted metadata.
+- Quarantined sagas are intentionally preserved for manual investigation and are never pruned automatically; operators resolve them administratively.
+- Terminal and quarantine outcomes are durably fenced and rehydrated at startup so replayed events are rejected at managed ingress and stale or replayed terminal side-effect hooks are fenced; arbitrary application hooks must still be idempotent. Startup order: attach -> bind/hydrate -> activate -> new starts.
+- Success and failure are distinct phases: late compensable evidence after `SagaCompleted` keeps the successful effect; after failure it quarantines. A `SagaFailed` reply can be superseded by `SagaQuarantined` on genuinely later evidence. Declared effects with no undo are irreversible and need reconciliation after later failure; `FailStep(requires_compensation=false)` is an explicit safe/no-undo remote contract, not cancellation.
+- Managed attached-bus ingress publishes `StepStarted` strictly after durable intent and before business execution. AllOf dependency completions are journaled (tag 16) before being marked seen, so restart restores them.
+- Reverse compensation is serialized with a single owner; terminal failure is published only after all owed compensation completes, otherwise the saga is quarantined.
+- Effect dispatch is explicit and fails closed by default. Retained terminal records need capacity/compaction maintenance. Durable cache reclamation can release reloadable failed fingerprints without forgetting full-run authority; complete per-ID reloads preserve protected history. Active/quarantined and ephemeral/non-indexed ownership remain irreducible costs.
+- Last-public-bus drop initiates pooled shutdown, which may drain asynchronously. `release_waiter().wait_timeout(Duration)` observes actual bus-owned resource destruction; wait only off-actor/off-callback. It holds no journal/lifecycle ownership and does not resolve sagas, cancel external work or close application-owned journal clones.
+- Resolver write failure fences live resolver/admission state before quarantine loopback. After activation, a capacity-bounded exact-run queue retries at most eight pending fences per watchdog tick, without further evidence or deadline expiry. A pending fence precedes later retained evidence; successfully appended/validated restored fences need no redundant synthetic row. Until append succeeds, retry is not crash durability or a shutdown flush; failed/unrepresented storage still requires application-owned evidence/reconciliation.
+- Known-run participant/delivery quarantine resolves full-run and correctly bound legacy waiters. Pre-activation replies are held then resolved without replaying ingress; ordinary terminal replies still require resolver authority.
+- Bus delivery may be lost or duplicated; handle strict publication errors. There is no exactly-once external-effect guarantee. Use stable idempotency keys and reconciliation; see [operations.md](operations.md).
 - Terminal policies support two timeout dimensions:
 - `overall_timeout` (overall wall clock)
 - `stalled_timeout` (watchdog reset by each progress event)

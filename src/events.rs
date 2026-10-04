@@ -324,6 +324,31 @@ pub enum AckStatus {
     AlreadyProcessing,
 }
 
+/// Durable confirmation that forward business execution and any declared effect
+/// dispatch succeeded. Recorded strictly before publishing the original completion.
+/// Its stored context is reused verbatim on recovery, not re-traced.
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct ParticipantForwardOutcome {
+    pub context: SagaContext,
+    pub output: Vec<u8>,
+    pub saga_input: Vec<u8>,
+    pub compensation_data: Vec<u8>,
+    pub effect: Option<Box<str>>,
+    pub receipt: Option<Box<str>>,
+    pub recorded_at_millis: u64,
+}
+
+impl ParticipantForwardOutcome {
+    pub fn completion_event(&self) -> SagaChoreographyEvent {
+        SagaChoreographyEvent::StepCompleted {
+            context: self.context.clone(),
+            output: self.output.clone(),
+            saga_input: self.saga_input.clone(),
+            compensation_available: !self.compensation_data.is_empty(),
+        }
+    }
+}
+
 /// Events stored in participant's local journal for durability and recovery.
 #[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum ParticipantEvent {
@@ -445,4 +470,52 @@ pub enum ParticipantEvent {
         deadline_at_millis: u64,
         hard_deadline_at_millis: u64,
     },
+    /// Durable identity of a participant run (appended; never reorders earlier variants).
+    ///
+    /// A run is identified by saga id (journal key), `saga_type` and
+    /// `saga_started_at_millis`.
+    ParticipantRunRecorded {
+        saga_type: Box<str>,
+        saga_started_at_millis: u64,
+        recorded_at_millis: u64,
+    },
+    /// Durable terminal tombstone for one participant run. Retained so replay of the
+    /// same run stays fenced after restart and after in-memory cache eviction.
+    ParticipantTerminalRecorded {
+        saga_type: Box<str>,
+        saga_started_at_millis: u64,
+        outcome: ParticipantTerminalKind,
+        reason: Box<str>,
+        recorded_at_millis: u64,
+    },
+    /// Typed recovery evidence when the ordinary result write failed after an
+    /// effect. This is not a successful result and never authorizes replay.
+    /// Compensation bytes stay out of public quarantine reasons and logs.
+    ParticipantReconciliationEvidence {
+        context: SagaContext,
+        output: Vec<u8>,
+        compensation_data: Vec<u8>,
+        reason: Box<str>,
+        recorded_at_millis: u64,
+    },
+    /// Confirmed forward outcome, including the original input/context for safe
+    /// retransmission. Appended tag 15; unconfirmed result rows are not this proof.
+    ParticipantForwardOutcomeRecorded { outcome: ParticipantForwardOutcome },
+    /// Durable observation that an incoming dependency step completed for this
+    /// run. The context names the dependency step (`context.step_name`) and the
+    /// exact run identity. Appended tag 16. This is receipt metadata, not
+    /// execution evidence: a history of only these rows is idle.
+    ParticipantDependencyCompletedRecorded {
+        context: SagaContext,
+        recorded_at_millis: u64,
+    },
+}
+
+/// Terminal classification stored in a participant terminal tombstone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum ParticipantTerminalKind {
+    Completed,
+    Failed,
+    /// Needs explicit operator resolution; blocks reuse of the saga id.
+    Quarantined,
 }

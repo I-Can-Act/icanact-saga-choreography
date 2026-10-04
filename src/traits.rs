@@ -3,7 +3,10 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::{CompensationError, CompensationOutput, SagaContext, StepError, StepOutput};
+use crate::{
+    CompensationError, CompensationOutput, EffectDispatchError, EffectDispatchOutcome,
+    EffectDispatchRequest, SagaContext, StepError, StepOutput,
+};
 
 use icanact_core::{ActorId, ActorIdError};
 
@@ -87,6 +90,20 @@ pub trait SagaParticipant {
         compensation_data: &[u8],
     ) -> Result<CompensationOutput, CompensationError>;
 
+    /// Dispatch the effect of `StepOutput::CompletedWithEffect`.
+    ///
+    /// The default fails closed with [`EffectDispatchError::Unsupported`]; a
+    /// participant must override it and return durable evidence before the step
+    /// may be reported complete.
+    fn dispatch_effect(
+        &mut self,
+        request: &EffectDispatchRequest<'_>,
+    ) -> Result<EffectDispatchOutcome, EffectDispatchError> {
+        Err(EffectDispatchError::Unsupported {
+            effect: request.effect.into(),
+        })
+    }
+
     // === Optional Hooks ===
 
     /// Called after saga completes successfully
@@ -153,6 +170,19 @@ pub trait SagaWorkflowParticipant<A>: Send + Sync + 'static {
         context: &SagaContext,
         compensation_data: &[u8],
     ) -> Result<CompensationOutput, CompensationError>;
+
+    /// Dispatch the effect of `StepOutput::CompletedWithEffect` for this workflow.
+    ///
+    /// The default fails closed with [`EffectDispatchError::Unsupported`].
+    fn dispatch_effect(
+        &self,
+        _actor: &mut A,
+        request: &EffectDispatchRequest<'_>,
+    ) -> Result<EffectDispatchOutcome, EffectDispatchError> {
+        Err(EffectDispatchError::Unsupported {
+            effect: request.effect.into(),
+        })
+    }
 
     /// Called after saga completes successfully.
     fn on_saga_completed(&self, _actor: &mut A, _context: &SagaContext) {}
@@ -226,6 +256,20 @@ pub trait AsyncSagaParticipant {
         context: &'a SagaContext,
         compensation_data: &'a [u8],
     ) -> SagaBoxFuture<'a, Result<CompensationOutput, CompensationError>>;
+
+    /// Async dispatch of the effect of `StepOutput::CompletedWithEffect`.
+    ///
+    /// The default fails closed with [`EffectDispatchError::Unsupported`].
+    fn dispatch_effect<'a>(
+        &'a mut self,
+        request: &'a EffectDispatchRequest<'a>,
+    ) -> SagaBoxFuture<'a, Result<EffectDispatchOutcome, EffectDispatchError>> {
+        Box::pin(async move {
+            Err(EffectDispatchError::Unsupported {
+                effect: request.effect.into(),
+            })
+        })
+    }
 
     fn on_saga_completed(&mut self, _context: &SagaContext) {}
 

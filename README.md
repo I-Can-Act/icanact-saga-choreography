@@ -20,7 +20,9 @@ Before publishing `SagaStarted`, register all of the following on the saga bus:
 4. resolver recovery activation (`activate_terminal_resolver_recovery_for_contract`)
 
 Registering a workflow contract alone is not enough; `attach_terminal_resolver*` must succeed.
-If startup wiring is incomplete, saga start is failed immediately with a terminal event instead of stalling.
+Incomplete startup wiring rejects starts before business fanout; contract diagnostics
+must not overwrite an existing owner's durable terminal/quarantine fence. A live delivery
+shortfall quarantines because some owners may already have received the start.
 
 ## Minimal Startup Example
 
@@ -73,10 +75,39 @@ reconstruct compensation ownership across all participants.
 Activation is deliberately separate from attachment: call it only after every participant
 binding is live, so recovered compensation requests cannot be lost during startup.
 
+Startup order is: attach resolver -> bind/hydrate participants -> activate recovery -> accept
+new starts. Terminal and quarantine state is durably fenced so restarts do not repeat
+managed terminal ingress side effects (managed ingress fences stale or replayed
+terminal side-effect hooks; arbitrary application hooks must still be idempotent); rollback is serialized in reverse order; effect dispatch is explicit and
+fails closed by default; terminal retention needs capacity/compaction maintenance
+(quarantines are never auto-pruned). The library does not promise exactly-once effects:
+use stable external idempotency keys and reconciliation. See
+[docs/operations.md](docs/operations.md).
+
+## Safety Policies (summary)
+
+- Success keeps business effects; late evidence after failure quarantines, and a `SagaFailed`
+  reply may be superseded by quarantine. Older-run uncertainty can also supersede an admitted
+  successor's `SagaCompleted`, even after its ordinary detail/cache is gone. Declared effects
+  without undo are irreversible.
+- `FailStep(requires_compensation=false)` is a safe/no-undo remote contract, not cancellation.
+  Definitive rejection during rollback removes only unrequested potential work; an owned
+  request needs durable no-effect completion before acknowledgement, without business undo.
+- Closed/compacted ordinary history cannot invent fresh terminal or undo output on restart;
+  actual quarantine still fences admitted newer successors, including ordinarily resolved ones. Durable capacity recovery never forgets
+  current-ID authority, and active/quarantined/ephemeral retention has irreducible cost.
+- Obtain `bus.release_waiter()` before dropping public bus owners. Its
+  `wait_timeout(Duration)` observes actual bus-owned resource destruction; wait only
+  off-actor/off-callback. It neither cancels work nor closes application-owned journal clones.
+- Drain all in-flight sagas before upgrading from baseline; see
+  [docs/migration.md](docs/migration.md). No repair/safe-clear API exists.
+
 ## Timeout Semantics
 
-- `overall_timeout`: hard wall-clock budget from saga start.
+- `overall_timeout`: forward wall-clock budget; forward expiry with known effects starts
+  rollback with renewed budgets instead of bypassing undo.
 - `stalled_timeout`: resettable watchdog budget; resets on participant progress events.
+- Expiry or failed undo while rollback is unresolved quarantines and retains evidence.
 
 ## Testing
 
@@ -87,3 +118,5 @@ binding is live, so recovered compensation requests cannot be lost during startu
 
 - [docs/integration_guide.md](docs/integration_guide.md)
 - [docs/architecture.md](docs/architecture.md)
+- [docs/operations.md](docs/operations.md)
+- [docs/migration.md](docs/migration.md) (breaking changes and release prerequisites)
