@@ -4,8 +4,8 @@ use std::sync::{
 };
 
 use icanact_saga_choreography::{
-    DedupeError, JournalEntry, JournalError, ParticipantDedupeStore, ParticipantEvent,
-    ParticipantJournal, SagaId,
+    JournalEntry, JournalError, ParticipantEvent, ParticipantStore, SagaContext, SagaId,
+    StoreAdmission,
 };
 
 /// Named crash/fault points in the participant pipeline.
@@ -51,9 +51,16 @@ impl Cuts {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JournalOp {
     Append,
+    AppendBatch,
+    AdmitAndRecordIntent,
     Read,
     ListSagas,
+    UnresolvedSagas,
+    CheckAndMark,
+    RemoveProcessed,
     Prune,
+    CompactTerminalDetail,
+    PruneResolvedBefore,
 }
 
 /// When an armed fault fires.
@@ -61,7 +68,7 @@ pub enum JournalOp {
 pub enum FaultTrigger {
     /// The Nth (1-based) call of the op on this wrapper.
     NthCall(usize),
-    /// Appends whose event variant name equals this (e.g. `"StepExecutionCompleted"`).
+    /// Single appends or batches containing this variant (e.g. `"StepExecutionCompleted"`).
     EventKind(&'static str),
     /// Any call of the op while the cursor sits at this cut point.
     AtCut(Cuts, CutPoint),
@@ -75,30 +82,45 @@ struct Rule {
 }
 
 #[derive(Default)]
-struct Calls {
-    append: AtomicUsize,
-    read: AtomicUsize,
-    list: AtomicUsize,
-    prune: AtomicUsize,
+struct Calls([AtomicUsize; 11]);
+
+fn event_kind(event: &ParticipantEvent) -> &'static str {
+    match event {
+        ParticipantEvent::AcceptedDeadlineRenewed { .. } => "AcceptedDeadlineRenewed",
+        ParticipantEvent::StepTriggered { .. } => "StepTriggered",
+        ParticipantEvent::StepExecutionStarted { .. } => "StepExecutionStarted",
+        ParticipantEvent::StepExecutionCompleted { .. } => "StepExecutionCompleted",
+        ParticipantEvent::StepExecutionFailed { .. } => "StepExecutionFailed",
+        ParticipantEvent::CompensationStarted { .. } => "CompensationStarted",
+        ParticipantEvent::CompensationCompleted { .. } => "CompensationCompleted",
+        ParticipantEvent::CompensationFailed { .. } => "CompensationFailed",
+        ParticipantEvent::CompensationRequestRecorded { .. } => "CompensationRequestRecorded",
+        ParticipantEvent::Quarantined { .. } => "Quarantined",
+        ParticipantEvent::AcceptedStepRecorded { .. } => "AcceptedStepRecorded",
+        ParticipantEvent::AcceptedCompensationRecorded { .. } => "AcceptedCompensationRecorded",
+        ParticipantEvent::ParticipantRunRecorded { .. } => "ParticipantRunRecorded",
+        ParticipantEvent::ParticipantTerminalRecorded { .. } => "ParticipantTerminalRecorded",
+        ParticipantEvent::ParticipantReconciliationEvidence { .. } => {
+            "ParticipantReconciliationEvidence"
+        }
+        ParticipantEvent::ParticipantForwardOutcomeRecorded { .. } => {
+            "ParticipantForwardOutcomeRecorded"
+        }
+        ParticipantEvent::ParticipantDependencyCompletedRecorded { .. } => {
+            "ParticipantDependencyCompletedRecorded"
+        }
+    }
 }
 
-fn event_kind(event: &ParticipantEvent) -> String {
-    let dbg = format!("{event:?}");
-    dbg.split(|c: char| !c.is_alphanumeric())
-        .next()
-        .unwrap_or_default()
-        .to_owned()
-}
-
-/// Journal wrapper injecting failures. Cloning shares the inner store, rules
+/// Unified participant-store wrapper injecting failures. Cloning shares the inner store, rules
 /// and counters, so a "reopened" actor can be given a clone.
-pub struct FaultJournal<J: ParticipantJournal> {
-    inner: Arc<J>,
+pub struct FaultStore<S: ParticipantStore> {
+    inner: Arc<S>,
     rules: Arc<Mutex<Vec<Rule>>>,
     calls: Arc<Calls>,
 }
 
-impl<J: ParticipantJournal> Clone for FaultJournal<J> {
+impl<S: ParticipantStore> Clone for FaultStore<S> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -108,13 +130,13 @@ impl<J: ParticipantJournal> Clone for FaultJournal<J> {
     }
 }
 
-impl<J: ParticipantJournal> FaultJournal<J> {
-    pub fn new(inner: J) -> Self {
+impl<S: ParticipantStore> FaultStore<S> {
+    pub fn new(inner: S) -> Self {
         Self::shared(Arc::new(inner))
     }
 
     /// New wrapper (fresh rules and counters) over an existing shared store.
-    pub fn shared(inner: Arc<J>) -> Self {
+    pub fn shared(inner: Arc<S>) -> Self {
         Self {
             inner,
             rules: Arc::default(),
@@ -122,7 +144,7 @@ impl<J: ParticipantJournal> FaultJournal<J> {
         }
     }
 
-    pub fn inner(&self) -> &Arc<J> {
+    pub fn inner(&self) -> &Arc<S> {
         &self.inner
     }
 
@@ -154,15 +176,10 @@ impl<J: ParticipantJournal> FaultJournal<J> {
     }
 
     fn counter(&self, op: JournalOp) -> &AtomicUsize {
-        match op {
-            JournalOp::Append => &self.calls.append,
-            JournalOp::Read => &self.calls.read,
-            JournalOp::ListSagas => &self.calls.list,
-            JournalOp::Prune => &self.calls.prune,
-        }
+        &self.calls.0[op as usize]
     }
 
-    fn check(&self, op: JournalOp, kind: Option<&str>) -> Result<(), JournalError> {
+    fn check(&self, op: JournalOp, kinds: &[&str]) -> Result<(), JournalError> {
         let n = self.counter(op).fetch_add(1, Ordering::SeqCst) + 1;
         let mut rules = self.rules.lock().expect("rules lock");
         for rule in rules
@@ -171,7 +188,7 @@ impl<J: ParticipantJournal> FaultJournal<J> {
         {
             let hit = match &rule.trigger {
                 FaultTrigger::NthCall(target) => *target == n,
-                FaultTrigger::EventKind(want) => kind == Some(*want),
+                FaultTrigger::EventKind(want) => kinds.iter().any(|kind| kind == want),
                 FaultTrigger::AtCut(cuts, point) => cuts.current() == Some(*point),
             };
             if hit {
@@ -185,128 +202,68 @@ impl<J: ParticipantJournal> FaultJournal<J> {
     }
 }
 
-impl<J: ParticipantJournal> ParticipantJournal for FaultJournal<J> {
+impl<S: ParticipantStore> ParticipantStore for FaultStore<S> {
     fn append(&self, saga_id: SagaId, event: ParticipantEvent) -> Result<u64, JournalError> {
-        self.check(JournalOp::Append, Some(&event_kind(&event)))?;
+        self.check(JournalOp::Append, &[event_kind(&event)])?;
         self.inner.append(saga_id, event)
     }
 
     fn read(&self, saga_id: SagaId) -> Result<Vec<JournalEntry>, JournalError> {
-        self.check(JournalOp::Read, None)?;
+        self.check(JournalOp::Read, &[])?;
         self.inner.read(saga_id)
     }
 
     fn list_sagas(&self) -> Result<Vec<SagaId>, JournalError> {
-        self.check(JournalOp::ListSagas, None)?;
+        self.check(JournalOp::ListSagas, &[])?;
         self.inner.list_sagas()
     }
 
     fn prune(&self, saga_id: SagaId) -> Result<(), JournalError> {
-        self.check(JournalOp::Prune, None)?;
+        self.check(JournalOp::Prune, &[])?;
         self.inner.prune(saga_id)
     }
-}
-
-/// Dedupe wrapper failing `check_and_mark` / `prune` on the Nth call or at a cut.
-/// Cloning shares the inner store, triggers and counters.
-pub struct FaultDedupe<D: ParticipantDedupeStore> {
-    inner: Arc<D>,
-    mark_trigger: Arc<Mutex<Option<FaultTrigger>>>,
-    prune_trigger: Arc<Mutex<Option<FaultTrigger>>>,
-    marks: Arc<AtomicUsize>,
-    prunes: Arc<AtomicUsize>,
-}
-
-impl<D: ParticipantDedupeStore> Clone for FaultDedupe<D> {
-    fn clone(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-            mark_trigger: Arc::clone(&self.mark_trigger),
-            prune_trigger: Arc::clone(&self.prune_trigger),
-            marks: Arc::clone(&self.marks),
-            prunes: Arc::clone(&self.prunes),
-        }
+    fn append_batch(
+        &self,
+        saga_id: SagaId,
+        events: Vec<ParticipantEvent>,
+    ) -> Result<Vec<u64>, JournalError> {
+        let kinds: Vec<_> = events.iter().map(event_kind).collect();
+        self.check(JournalOp::AppendBatch, &kinds)?;
+        self.inner.append_batch(saga_id, events)
     }
-}
-
-impl<D: ParticipantDedupeStore> FaultDedupe<D> {
-    pub fn new(inner: D) -> Self {
-        Self::shared(Arc::new(inner))
+    fn admit_and_record_intent(
+        &self,
+        context: &SagaContext,
+        dedupe_key: &str,
+        triggering_event: &str,
+    ) -> Result<StoreAdmission, JournalError> {
+        self.check(JournalOp::AdmitAndRecordIntent, &[])?;
+        self.inner
+            .admit_and_record_intent(context, dedupe_key, triggering_event)
     }
-
-    pub fn shared(inner: Arc<D>) -> Self {
-        Self {
-            inner,
-            mark_trigger: Arc::default(),
-            prune_trigger: Arc::default(),
-            marks: Arc::default(),
-            prunes: Arc::default(),
-        }
-    }
-
-    pub fn inner(&self) -> &Arc<D> {
-        &self.inner
-    }
-
-    pub fn fail_check_and_mark(&self, trigger: FaultTrigger) {
-        *self.mark_trigger.lock().expect("trigger lock") = Some(trigger);
-    }
-
-    pub fn fail_prune(&self, trigger: FaultTrigger) {
-        *self.prune_trigger.lock().expect("trigger lock") = Some(trigger);
-    }
-
-    pub fn disarm(&self) {
-        *self.mark_trigger.lock().expect("trigger lock") = None;
-        *self.prune_trigger.lock().expect("trigger lock") = None;
-    }
-
-    pub fn mark_calls(&self) -> usize {
-        self.marks.load(Ordering::SeqCst)
-    }
-
-    pub fn prune_calls(&self) -> usize {
-        self.prunes.load(Ordering::SeqCst)
-    }
-
-    fn fires(trigger: &Mutex<Option<FaultTrigger>>, counter: &AtomicUsize) -> bool {
-        let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
-        match trigger.lock().expect("trigger lock").as_ref() {
-            Some(FaultTrigger::NthCall(target)) => *target == n,
-            Some(FaultTrigger::AtCut(cuts, point)) => cuts.current() == Some(*point),
-            // Event kinds are meaningless for dedupe.
-            Some(FaultTrigger::EventKind(_)) | None => false,
-        }
-    }
-}
-
-impl<D: ParticipantDedupeStore> ParticipantDedupeStore for FaultDedupe<D> {
-    fn check_and_mark(&self, saga_id: SagaId, key: &str) -> Result<bool, DedupeError> {
-        if Self::fires(&self.mark_trigger, &self.marks) {
-            return Err(DedupeError::Storage(
-                "injected check_and_mark failure".into(),
-            ));
-        }
+    fn check_and_mark(&self, saga_id: SagaId, key: &str) -> Result<bool, JournalError> {
+        self.check(JournalOp::CheckAndMark, &[])?;
         self.inner.check_and_mark(saga_id, key)
     }
-
-    fn contains(&self, saga_id: SagaId, key: &str) -> Result<bool, DedupeError> {
-        self.inner.contains(saga_id, key)
-    }
-
-    fn mark_processed(&self, saga_id: SagaId, key: &str) -> Result<(), DedupeError> {
-        self.inner.mark_processed(saga_id, key)
-    }
-
-    fn remove_processed(&self, saga_id: SagaId, key: &str) -> Result<(), DedupeError> {
+    fn remove_processed(&self, saga_id: SagaId, key: &str) -> Result<(), JournalError> {
+        self.check(JournalOp::RemoveProcessed, &[])?;
         self.inner.remove_processed(saga_id, key)
     }
-
-    fn prune(&self, saga_id: SagaId) -> Result<(), DedupeError> {
-        if Self::fires(&self.prune_trigger, &self.prunes) {
-            return Err(DedupeError::Storage("injected prune failure".into()));
-        }
-        self.inner.prune(saga_id)
+    fn unresolved_saga_ids(&self) -> Result<Vec<SagaId>, JournalError> {
+        self.check(JournalOp::UnresolvedSagas, &[])?;
+        self.inner.unresolved_saga_ids()
+    }
+    fn compact_terminal_detail(&self, batch_limit: usize) -> Result<usize, JournalError> {
+        self.check(JournalOp::CompactTerminalDetail, &[])?;
+        self.inner.compact_terminal_detail(batch_limit)
+    }
+    fn prune_resolved_before(
+        &self,
+        cutoff_millis: u64,
+        batch_limit: usize,
+    ) -> Result<usize, JournalError> {
+        self.check(JournalOp::PruneResolvedBefore, &[])?;
+        self.inner.prune_resolved_before(cutoff_millis, batch_limit)
     }
 }
 

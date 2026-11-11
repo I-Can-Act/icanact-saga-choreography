@@ -21,15 +21,14 @@ use icanact_saga_choreography::{
     AcceptedStepCompletion, AcceptedStepFailure, AcceptedStepPolicy, AcceptedStepTimeoutOutcome,
     CompensationError, CompensationOutput, DependencySpec, EffectDispatchError,
     EffectDispatchOutcome, EffectDispatchRequest, HasSagaParticipantSupport,
-    HasSagaWorkflowParticipants, InMemoryDedupe, InMemoryJournal, JournalEntry, ParticipantEvent,
-    ParticipantJournal, ParticipantTerminalKind, PeerId, SagaChoreographyBus,
-    SagaChoreographyEvent, SagaContext, SagaId, SagaParticipantSupport, SagaStateExt,
-    SagaWorkflowParticipant, StepError, StepExecutionId, StepOutput, fail_accepted_workflow_step,
+    HasSagaWorkflowParticipants, InMemoryParticipantStore, JournalEntry, ParticipantEvent,
+    ParticipantStore, ParticipantTerminalKind, PeerId, SagaChoreographyBus, SagaChoreographyEvent,
+    SagaContext, SagaId, SagaParticipantSupport, SagaStateExt, SagaWorkflowParticipant, StepError,
+    StepExecutionId, StepOutput, fail_accepted_workflow_step,
 };
-use support::{FaultDedupe, FaultJournal, FaultTrigger, JournalOp};
+use support::{FaultStore, FaultTrigger, JournalOp};
 
-type Journal = FaultJournal<InMemoryJournal>;
-type Dedupe = FaultDedupe<InMemoryDedupe>;
+type Journal = FaultStore<InMemoryParticipantStore>;
 
 const SAGA: u64 = 77;
 
@@ -60,7 +59,7 @@ icanact_saga_choreography::define_saga_workflow_contract! {
 }
 
 struct Actor {
-    saga: SagaParticipantSupport<Journal, Dedupe>,
+    saga: SagaParticipantSupport<Journal>,
     calls: usize,
     comp_calls: usize,
     dispatched: usize,
@@ -76,9 +75,9 @@ struct Actor {
 }
 
 impl Actor {
-    fn new(journal: &Journal, dedupe: &Dedupe) -> Self {
+    fn new(journal: &Journal) -> Self {
         Self {
-            saga: SagaParticipantSupport::new(journal.clone(), dedupe.clone()),
+            saga: SagaParticipantSupport::new(journal.clone()),
             calls: 0,
             comp_calls: 0,
             dispatched: 0,
@@ -94,12 +93,11 @@ impl Actor {
 }
 
 impl HasSagaParticipantSupport for Actor {
-    type Journal = Journal;
-    type Dedupe = Dedupe;
-    fn saga_support(&self) -> &SagaParticipantSupport<Journal, Dedupe> {
+    type Store = Journal;
+    fn saga_support(&self) -> &SagaParticipantSupport<Journal> {
         &self.saga
     }
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal, Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal> {
         &mut self.saga
     }
 }
@@ -234,7 +232,7 @@ impl SagaWorkflowParticipant<Actor> for Effect {
         request: &EffectDispatchRequest<'_>,
     ) -> Result<EffectDispatchOutcome, EffectDispatchError> {
         actor.dispatched += 1;
-        actor.rows_at_dispatch = actor.saga.journal.read(request.context.saga_id).ok();
+        actor.rows_at_dispatch = actor.saga.store.read(request.context.saga_id).ok();
         Ok(EffectDispatchOutcome::Durable {
             receipt: "outbox-1".into(),
         })
@@ -350,11 +348,8 @@ impl SagaWorkflowParticipant<Actor> for Join {
     hooks!();
 }
 
-fn stores() -> (Journal, Dedupe) {
-    (
-        FaultJournal::new(InMemoryJournal::new()),
-        FaultDedupe::new(InMemoryDedupe::new()),
-    )
+fn stores() -> Journal {
+    FaultStore::new(InMemoryParticipantStore::new())
 }
 
 fn ctx_for(saga: u64, saga_type: &str, step: &str, started_at: u64) -> SagaContext {
@@ -447,13 +442,8 @@ fn deliver(actor: &mut Actor, event: SagaChoreographyEvent) -> Delivery {
     }
 }
 
-fn recover(
-    journal: &Journal,
-    dedupe: &Dedupe,
-    step: &'static str,
-    ty: &'static str,
-) -> Vec<SagaChoreographyEvent> {
-    collect_startup_recovery_events_for_saga_type(journal, dedupe, step, ty)
+fn recover(journal: &Journal, step: &'static str, ty: &'static str) -> Vec<SagaChoreographyEvent> {
+    collect_startup_recovery_events_for_saga_type(journal, step, ty)
         .expect("startup recovery should collect")
 }
 
@@ -470,6 +460,14 @@ fn count_rows(journal: &Journal, kind: &str) -> usize {
 
 fn recording_bus(saga_type: &str, refuse_started: bool) -> (SagaChoreographyBus, Seen) {
     let bus = SagaChoreographyBus::new();
+    if refuse_started {
+        bus.register_workflow_contract_provider::<SlowContract>()
+            .unwrap();
+        bus.subscribe_workflow_step_fn(saga_type, "slow", |event| {
+            !matches!(event, SagaChoreographyEvent::StepStarted { .. })
+        })
+        .unwrap();
+    }
     let seen: Seen = Arc::default();
     let sink = Arc::clone(&seen);
     // The subscription lives as long as the process-wide bus clone does.
@@ -486,9 +484,9 @@ fn recording_bus(saga_type: &str, refuse_started: bool) -> (SagaChoreographyBus,
 
 #[test]
 fn managed_start_is_visible_on_the_bus_while_business_work_runs() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let (bus, seen) = recording_bus("wf_slow", false);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     actor.saga.attach_bus(bus);
     actor.probe = Some(Arc::clone(&seen));
     let c = ctx("wf_slow", "slow", 100);
@@ -518,9 +516,9 @@ fn managed_start_is_visible_on_the_bus_while_business_work_runs() {
 
 #[test]
 fn failed_start_publication_prevents_the_effect_and_quarantines() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let (bus, _seen) = recording_bus("wf_slow", true);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     actor.saga.attach_bus(bus);
     let c = ctx("wf_slow", "slow", 100);
 
@@ -540,18 +538,19 @@ fn failed_start_publication_prevents_the_effect_and_quarantines() {
 
 #[test]
 fn managed_work_longer_than_the_stall_window_never_escapes_as_an_ordinary_failure() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let (bus, seen) = recording_bus("wf_slow", false);
     bus.register_workflow_contract_provider::<SlowContract>()
         .expect("contract");
-    bus.register_bound_workflow_step("wf_slow", "slow").unwrap();
+    bus.subscribe_workflow_step_fn("wf_slow", "slow", |_| true)
+        .unwrap();
     let _resolver = bus
         .attach_terminal_resolver_for_contract::<SlowContract>("rechallenge-resolver")
         .expect("resolver");
     let c = ctx("wf_slow", "slow", SagaContext::now_millis());
     bus.publish_strict(started(&c)).expect("start admitted");
 
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     actor.saga.attach_bus(bus.clone());
     actor.work_millis = 1_200;
     let worker = std::thread::spawn(move || {
@@ -589,9 +588,9 @@ fn managed_work_longer_than_the_stall_window_never_escapes_as_an_ordinary_failur
 
 #[test]
 fn plain_completion_is_a_single_proof_append_with_no_raw_result() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_plain", "plain", 100);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     let out = deliver(&mut actor, started(&c));
 
     assert_eq!(count_rows(&journal, "StepExecutionCompleted"), 0);
@@ -613,7 +612,7 @@ fn plain_completion_is_a_single_proof_append_with_no_raw_result() {
         format!("{:?}", proof.completion_event())
     );
     // Restart resends the proven completion; nothing re-runs.
-    let events = recover(&journal, &dedupe, "plain", "wf_plain");
+    let events = recover(&journal, "plain", "wf_plain");
     assert_eq!(events.len(), 1, "{events:?}");
     assert_eq!(format!("{:?}", events[0]), format!("{emitted:?}"));
     assert_eq!(actor.calls, 1);
@@ -621,13 +620,13 @@ fn plain_completion_is_a_single_proof_append_with_no_raw_result() {
 
 #[test]
 fn plain_proof_append_failure_keeps_typed_bytes_and_never_reports_success() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     journal.fail_once(
         JournalOp::Append,
         FaultTrigger::EventKind("ParticipantForwardOutcomeRecorded"),
     );
     let c = ctx("wf_plain", "plain", 100);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     let out = deliver(&mut actor, started(&c));
 
     assert_eq!(out.count("step_completed"), 0, "{:?}", out.valid);
@@ -651,7 +650,7 @@ fn plain_proof_append_failure_keeps_typed_bytes_and_never_reports_success() {
     );
     assert!(run.failure_requires_quarantine());
     // Restart never resends success or re-executes.
-    let events = recover(&journal, &dedupe, "plain", "wf_plain");
+    let events = recover(&journal, "plain", "wf_plain");
     assert!(
         events
             .iter()
@@ -663,9 +662,9 @@ fn plain_proof_append_failure_keeps_typed_bytes_and_never_reports_success() {
 
 #[test]
 fn declared_effect_keeps_pre_dispatch_result_and_post_handoff_proof() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_fx", "fx", 100);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     deliver(&mut actor, started(&c));
     assert_eq!(actor.dispatched, 1);
     let at_dispatch = actor.rows_at_dispatch.as_ref().expect("dispatch observed");
@@ -696,8 +695,8 @@ fn declared_effect_keeps_pre_dispatch_result_and_post_handoff_proof() {
     assert_eq!(proof.receipt.as_deref(), Some("outbox-1"));
 }
 
-fn accepted_actor(journal: &Journal, dedupe: &Dedupe, c: &SagaContext) -> Actor {
-    let mut actor = Actor::new(journal, dedupe);
+fn accepted_actor(journal: &Journal, c: &SagaContext) -> Actor {
+    let mut actor = Actor::new(journal);
     let out = deliver(&mut actor, started(c));
     assert_eq!(out.count("step_accepted"), 1, "{:?}", out.valid);
     actor
@@ -713,9 +712,9 @@ fn completion() -> AcceptedStepCompletion {
 
 #[test]
 fn authoritative_accepted_completion_is_a_single_proof_append() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_accf", "accf", 100);
-    let mut actor = accepted_actor(&journal, &dedupe, &c);
+    let mut actor = accepted_actor(&journal, &c);
     let event = complete_accepted_workflow_step(
         &mut actor,
         c.saga_id,
@@ -735,7 +734,7 @@ fn authoritative_accepted_completion_is_a_single_proof_append() {
         format!("{event:?}")
     );
     // A restart must see a completed step, not an accepted one still pending.
-    let events = recover(&journal, &dedupe, "accf", "wf_accf");
+    let events = recover(&journal, "accf", "wf_accf");
     assert!(
         events
             .iter()
@@ -746,9 +745,9 @@ fn authoritative_accepted_completion_is_a_single_proof_append() {
 
 #[test]
 fn accepted_completion_append_failure_keeps_typed_bytes_and_quarantines() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_accf", "accf", 100);
-    let mut actor = accepted_actor(&journal, &dedupe, &c);
+    let mut actor = accepted_actor(&journal, &c);
     journal.fail_once(
         JournalOp::Append,
         FaultTrigger::EventKind("ParticipantForwardOutcomeRecorded"),
@@ -802,11 +801,11 @@ fn assert_rejected_accepted_step_fails_ordinarily<
     step: &'static str,
     execution: &str,
 ) {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let (bus, seen) = recording_bus(C::saga_type(), false);
     bus.register_workflow_contract_provider::<C>()
         .expect("contract");
-    bus.register_bound_workflow_step(C::saga_type(), step)
+    bus.subscribe_workflow_step_fn(C::saga_type(), step, |_| true)
         .unwrap();
     let _resolver = bus
         .attach_terminal_resolver_for_contract::<C>("rechallenge-resolver")
@@ -814,7 +813,7 @@ fn assert_rejected_accepted_step_fails_ordinarily<
     let c = ctx(C::saga_type(), step, SagaContext::now_millis());
     bus.publish_strict(started(&c)).expect("start admitted");
 
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     actor.saga.attach_bus(bus.clone());
     deliver(&mut actor, started(&c));
     let rejection = fail_accepted_workflow_step(
@@ -872,16 +871,17 @@ fn rejected_accepted_step_with_potential_undo_bytes_fails_ordinarily_through_a_r
 
 #[test]
 fn real_accepted_watchdog_resolves_potential_undo_metadata_before_terminal_failure() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let (bus, seen) = recording_bus("wf_accf", false);
     bus.register_workflow_contract_provider::<AcceptContract>()
         .unwrap();
-    bus.register_bound_workflow_step("wf_accf", "accf").unwrap();
+    bus.subscribe_workflow_step_fn("wf_accf", "accf", |_| true)
+        .unwrap();
     bus.attach_terminal_resolver_for_contract::<AcceptContract>("real-timeout")
         .unwrap();
     let c = ctx("wf_accf", "accf", SagaContext::now_millis());
     bus.publish_strict(started(&c)).unwrap();
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     actor.accepted_idle_timeout = Duration::from_millis(100);
     actor.saga.attach_bus(bus.clone());
     deliver(&mut actor, started(&c));
@@ -940,9 +940,9 @@ fn resolver_timeout(c: &SagaContext) -> SagaChoreographyEvent {
 
 #[test]
 fn resolver_origin_accepted_timeout_is_durably_resolved_before_the_failure_arrives() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_accf", "accf", 100);
-    let mut actor = accepted_actor(&journal, &dedupe, &c);
+    let mut actor = accepted_actor(&journal, &c);
 
     deliver(&mut actor, resolver_timeout(&c));
     assert_eq!(
@@ -960,9 +960,9 @@ fn resolver_origin_accepted_timeout_is_durably_resolved_before_the_failure_arriv
 
 #[test]
 fn resolver_timeout_with_unwritable_failure_keeps_pending_work_visible() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_accf", "accf", 100);
-    let mut actor = accepted_actor(&journal, &dedupe, &c);
+    let mut actor = accepted_actor(&journal, &c);
     journal.fail_always(
         JournalOp::Append,
         FaultTrigger::EventKind("StepExecutionFailed"),
@@ -986,9 +986,9 @@ fn resolver_timeout_with_unwritable_failure_keeps_pending_work_visible() {
 
 #[test]
 fn old_run_timeout_cannot_resolve_the_successor_run() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let old = ctx("wf_accf", "accf", 100);
-    let mut actor = accepted_actor(&journal, &dedupe, &old);
+    let mut actor = accepted_actor(&journal, &old);
     deliver(&mut actor, resolver_timeout(&old));
     deliver(&mut actor, saga_failed(&old, "timed out"));
 
@@ -1021,9 +1021,9 @@ fn old_run_timeout_cannot_resolve_the_successor_run() {
 
 #[test]
 fn startup_resends_the_proven_undo_acknowledgement_without_a_new_request_or_undo() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_plain", "plain", 100);
-    let mut first = Actor::new(&journal, &dedupe);
+    let mut first = Actor::new(&journal);
     deliver(&mut first, started(&c));
     let undone = deliver(&mut first, undo_request(&c, "plain"));
     assert_eq!(first.comp_calls, 1);
@@ -1035,7 +1035,7 @@ fn startup_resends_the_proven_undo_acknowledgement_without_a_new_request_or_undo
         .clone();
     // The acknowledgement was lost: nothing reached the resolver.
 
-    let events = recover(&journal, &dedupe, "plain", "wf_plain");
+    let events = recover(&journal, "plain", "wf_plain");
     assert_eq!(events.len(), 1, "{events:?}");
     let SagaChoreographyEvent::CompensationCompleted { context } = &events[0] else {
         panic!("expected a resent acknowledgement: {events:?}");
@@ -1048,7 +1048,7 @@ fn startup_resends_the_proven_undo_acknowledgement_without_a_new_request_or_undo
         context.step_name.as_ref(),
         original_ack.context().step_name.as_ref()
     );
-    let mut restarted = Actor::new(&journal, &dedupe);
+    let mut restarted = Actor::new(&journal);
     recover_accepted_workflow_steps_for_saga_type(&mut restarted.saga, "plain", "wf_plain")
         .unwrap();
     assert_eq!(restarted.comp_calls, 0, "no physical undo at startup");
@@ -1058,27 +1058,27 @@ fn startup_resends_the_proven_undo_acknowledgement_without_a_new_request_or_undo
 
 #[test]
 fn startup_does_not_resend_an_undo_acknowledgement_after_terminal_resolution() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_plain", "plain", 100);
-    let mut first = Actor::new(&journal, &dedupe);
+    let mut first = Actor::new(&journal);
     deliver(&mut first, started(&c));
     deliver(&mut first, undo_request(&c, "plain"));
     deliver(&mut first, saga_failed(&c, "rolled back"));
-    assert!(recover(&journal, &dedupe, "plain", "wf_plain").is_empty());
+    assert!(recover(&journal, "plain", "wf_plain").is_empty());
 }
 
 #[test]
 fn startup_does_not_resend_for_an_undo_with_unknown_outcome() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_plain", "plain", 100);
-    let mut first = Actor::new(&journal, &dedupe);
+    let mut first = Actor::new(&journal);
     deliver(&mut first, started(&c));
     journal.fail_once(
         JournalOp::Append,
         FaultTrigger::EventKind("CompensationCompleted"),
     );
     deliver(&mut first, undo_request(&c, "plain"));
-    let events = recover(&journal, &dedupe, "plain", "wf_plain");
+    let events = recover(&journal, "plain", "wf_plain");
     assert!(
         !events
             .iter()
@@ -1093,9 +1093,9 @@ fn startup_does_not_resend_for_an_undo_with_unknown_outcome() {
 
 #[test]
 fn allof_dependency_observed_before_a_restart_still_completes_the_join() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_all", "join", 100);
-    let mut first = Actor::new(&journal, &dedupe);
+    let mut first = Actor::new(&journal);
     deliver(&mut first, started(&c));
     let out = deliver(&mut first, dependency_done(&c, "a"));
     assert_eq!(first.calls, 0);
@@ -1106,7 +1106,7 @@ fn allof_dependency_observed_before_a_restart_still_completes_the_join() {
     );
 
     // Restart between the two dependencies.
-    let mut restarted = Actor::new(&journal, &dedupe);
+    let mut restarted = Actor::new(&journal);
     recover_accepted_workflow_steps_for_saga_type(&mut restarted.saga, "join", "wf_all").unwrap();
     let out = deliver(&mut restarted, dependency_done(&c, "b"));
     assert_eq!(
@@ -1118,27 +1118,27 @@ fn allof_dependency_observed_before_a_restart_still_completes_the_join() {
 
 #[test]
 fn allof_hydrates_durably_even_without_the_startup_hook() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_all", "join", 100);
-    let mut first = Actor::new(&journal, &dedupe);
+    let mut first = Actor::new(&journal);
     deliver(&mut first, started(&c));
     deliver(&mut first, dependency_done(&c, "a"));
-    let mut restarted = Actor::new(&journal, &dedupe);
+    let mut restarted = Actor::new(&journal);
     deliver(&mut restarted, dependency_done(&c, "b"));
     assert_eq!(restarted.calls, 1);
 }
 
 #[test]
 fn allof_observations_from_another_run_do_not_count() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let old = ctx("wf_all", "join", 100);
-    let mut first = Actor::new(&journal, &dedupe);
+    let mut first = Actor::new(&journal);
     deliver(&mut first, started(&old));
     deliver(&mut first, dependency_done(&old, "a"));
     deliver(&mut first, saga_failed(&old, "abandoned"));
 
     let fresh = ctx("wf_all", "join", 200);
-    let mut next = Actor::new(&journal, &dedupe);
+    let mut next = Actor::new(&journal);
     deliver(&mut next, started(&fresh));
     deliver(&mut next, dependency_done(&fresh, "b"));
     assert_eq!(
@@ -1151,9 +1151,9 @@ fn allof_observations_from_another_run_do_not_count() {
 
 #[test]
 fn allof_observation_write_failure_is_visible_and_never_executes() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_all", "join", 100);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     deliver(&mut actor, started(&c));
     journal.fail_once(
         JournalOp::Append,
@@ -1167,12 +1167,12 @@ fn allof_observation_write_failure_is_visible_and_never_executes() {
 
 #[test]
 fn dependency_only_history_is_idle_not_an_ambiguity() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_all", "join", 100);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     deliver(&mut actor, started(&c));
     deliver(&mut actor, dependency_done(&c, "a"));
-    assert!(recover(&journal, &dedupe, "join", "wf_all").is_empty());
+    assert!(recover(&journal, "join", "wf_all").is_empty());
     assert_eq!(
         actor.terminal_run_outcome_strict(&c).unwrap(),
         None,

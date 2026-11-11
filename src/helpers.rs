@@ -295,8 +295,7 @@ where
                     participant,
                     &who,
                     &context,
-                    saga_input,
-                    result,
+                    (saga_input, result),
                     dispatched,
                     now,
                     &mut emit,
@@ -315,8 +314,7 @@ where
                 participant,
                 &who,
                 &context,
-                saga_input,
-                data,
+                (saga_input, data),
                 result,
                 now,
                 &mut emit,
@@ -402,8 +400,7 @@ where
                     participant,
                     &who,
                     &context,
-                    saga_input,
-                    result,
+                    (saga_input, result),
                     dispatched,
                     now,
                     &mut emit,
@@ -422,8 +419,7 @@ where
                 participant,
                 &who,
                 &context,
-                saga_input,
-                data,
+                (saga_input, data),
                 result,
                 now,
                 &mut emit,
@@ -513,7 +509,13 @@ where
                 };
                 let dispatched = workflow.dispatch_effect(actor, &request);
                 notification = commit_dispatch_result(
-                    actor, &who, &context, saga_input, result, dispatched, now, &mut emit,
+                    actor,
+                    &who,
+                    &context,
+                    (saga_input, result),
+                    dispatched,
+                    now,
+                    &mut emit,
                 );
             }
             (context, notification, false)
@@ -526,7 +528,13 @@ where
             let now = actor.now_millis();
             let result = workflow.compensate_step(actor, &context, &data);
             let notification = commit_compensation_result(
-                actor, &who, &context, saga_input, data, result, now, &mut emit,
+                actor,
+                &who,
+                &context,
+                (saga_input, data),
+                result,
+                now,
+                &mut emit,
             );
             (context, notification, false)
         }
@@ -1290,12 +1298,12 @@ fn commit_dispatch_result<A: SagaStateExt, F: FnMut(SagaChoreographyEvent)>(
     actor: &mut A,
     who: &Who,
     context: &SagaContext,
-    saga_input: Vec<u8>,
-    mut result: StepResult,
+    completion: (Vec<u8>, StepResult),
     dispatched: Result<EffectDispatchOutcome, crate::EffectDispatchError>,
     now: u64,
     emit: &mut F,
 ) -> Notification {
+    let (saga_input, mut result) = completion;
     match dispatched {
         Ok(outcome) => {
             result.receipt = Some(log_dispatch_receipt(
@@ -1320,12 +1328,12 @@ fn commit_compensation_result<A: SagaStateExt, F: FnMut(SagaChoreographyEvent)>(
     actor: &mut A,
     who: &Who,
     context: &SagaContext,
-    saga_input: Vec<u8>,
-    data: Vec<u8>,
+    payload: (Vec<u8>, Vec<u8>),
     result: Result<CompensationOutput, CompensationError>,
     now: u64,
     emit: &mut F,
 ) -> Notification {
+    let (saga_input, data) = payload;
     match result {
         Ok(CompensationOutput::Completed) => {
             match complete_compensation(actor, who, context, now, emit) {

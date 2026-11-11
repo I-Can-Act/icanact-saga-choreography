@@ -488,12 +488,12 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
                 reason: reason.into(),
             });
         }
-        if !runs.contains(context) {
-            if let Some(active) = runs.runs.iter().find(|run| run.terminal.is_none()) {
-                return Ok(ParticipantAdmission::ActiveRunReuse {
-                    active_started_at_millis: active.started_at,
-                });
-            }
+        if !runs.contains(context)
+            && let Some(active) = runs.runs.iter().find(|run| run.terminal.is_none())
+        {
+            return Ok(ParticipantAdmission::ActiveRunReuse {
+                active_started_at_millis: active.started_at,
+            });
         }
         Ok(ParticipantAdmission::Admitted)
     }

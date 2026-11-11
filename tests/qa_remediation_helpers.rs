@@ -15,16 +15,15 @@ use std::task::{Context, Poll, Waker};
 
 use icanact_saga_choreography::{
     AsyncSagaParticipant, CompensationError, CompensationOutput, EffectDispatchError,
-    EffectDispatchOutcome, EffectDispatchRequest, HasSagaParticipantSupport, InMemoryDedupe,
-    InMemoryJournal, ParticipantEvent, ParticipantJournal, PeerId, SagaBoxFuture,
+    EffectDispatchOutcome, EffectDispatchRequest, HasSagaParticipantSupport,
+    InMemoryParticipantStore, ParticipantEvent, ParticipantStore, PeerId, SagaBoxFuture,
     SagaChoreographyEvent, SagaContext, SagaFailureDetails, SagaId, SagaParticipant,
     SagaParticipantSupport, StepError, StepOutput, handle_async_saga_event_with_emit,
     handle_saga_event_with_emit,
 };
-use support::{FaultDedupe, FaultJournal, FaultTrigger, JournalOp};
+use support::{FaultStore, FaultTrigger, JournalOp};
 
-type Journal = FaultJournal<InMemoryJournal>;
-type Dedupe = FaultDedupe<InMemoryDedupe>;
+type Journal = FaultStore<InMemoryParticipantStore>;
 
 #[derive(Clone, Copy, Debug)]
 enum Mode {
@@ -51,7 +50,7 @@ struct Counters {
 }
 
 struct Actor {
-    saga: SagaParticipantSupport<Journal, Dedupe>,
+    saga: SagaParticipantSupport<Journal>,
     shared: Arc<Counters>,
     step: &'static str,
     with_effect: bool,
@@ -59,9 +58,9 @@ struct Actor {
 }
 
 impl Actor {
-    fn new(journal: &Journal, dedupe: &Dedupe, shared: &Arc<Counters>) -> Self {
+    fn new(journal: &Journal, shared: &Arc<Counters>) -> Self {
         Self {
-            saga: SagaParticipantSupport::new(journal.clone(), dedupe.clone()),
+            saga: SagaParticipantSupport::new(journal.clone()),
             shared: shared.clone(),
             step: "a",
             with_effect: false,
@@ -117,18 +116,16 @@ impl Actor {
 }
 
 impl HasSagaParticipantSupport for Actor {
-    type Journal = Journal;
-    type Dedupe = Dedupe;
-    fn saga_support(&self) -> &SagaParticipantSupport<Journal, Dedupe> {
+    type Store = Journal;
+    fn saga_support(&self) -> &SagaParticipantSupport<Journal> {
         &self.saga
     }
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal, Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal> {
         &mut self.saga
     }
 }
 
 impl SagaParticipant for Actor {
-    type Error = String;
     fn step_name(&self) -> &str {
         self.step
     }
@@ -154,7 +151,6 @@ impl SagaParticipant for Actor {
 }
 
 impl AsyncSagaParticipant for Actor {
-    type Error = String;
     fn step_name(&self) -> &str {
         self.step
     }
@@ -185,21 +181,19 @@ impl AsyncSagaParticipant for Actor {
 
 struct World {
     journal: Journal,
-    dedupe: Dedupe,
     shared: Arc<Counters>,
 }
 
 impl World {
     fn new() -> Self {
         Self {
-            journal: FaultJournal::new(InMemoryJournal::new()),
-            dedupe: FaultDedupe::new(InMemoryDedupe::new()),
+            journal: FaultStore::new(InMemoryParticipantStore::new()),
             shared: Arc::default(),
         }
     }
     /// A fresh actor over the same durable stores (simulated restart).
     fn actor(&self) -> Actor {
-        Actor::new(&self.journal, &self.dedupe, &self.shared)
+        Actor::new(&self.journal, &self.shared)
     }
     fn effects(&self) -> usize {
         self.shared.effects.load(Ordering::SeqCst)
@@ -310,10 +304,9 @@ fn has_quarantine(events: &[SagaChoreographyEvent]) -> bool {
 fn failed_intent_write_runs_no_effect_and_publishes_no_success() {
     for mode in MODES {
         let world = World::new();
-        world.journal.fail_always(
-            JournalOp::Append,
-            FaultTrigger::EventKind("StepExecutionStarted"),
-        );
+        world
+            .journal
+            .fail_always(JournalOp::AdmitAndRecordIntent, FaultTrigger::NthCall(1));
         let mut actor = world.actor();
         let out = drive(mode, &mut actor, start(100));
         assert_eq!(world.effects(), 0, "{mode:?}: effect ran without intent");
@@ -376,7 +369,9 @@ fn failed_result_write_publishes_no_success_and_keeps_compensation_evidence() {
 fn dedupe_outage_is_a_visible_quarantine_not_a_silent_duplicate() {
     for mode in MODES {
         let world = World::new();
-        world.dedupe.fail_check_and_mark(FaultTrigger::NthCall(1));
+        world
+            .journal
+            .fail_once(JournalOp::AdmitAndRecordIntent, FaultTrigger::NthCall(1));
         let mut actor = world.actor();
         let out = drive(mode, &mut actor, start(100));
         assert_eq!(world.effects(), 0, "{mode:?}: fail closed on outage");
@@ -385,7 +380,7 @@ fn dedupe_outage_is_a_visible_quarantine_not_a_silent_duplicate() {
             has_quarantine(&out),
             "{mode:?}: callers must observe storage failure"
         );
-        world.dedupe.disarm();
+        world.journal.disarm();
         drive(mode, &mut actor, start(100));
         assert_eq!(
             world.effects(),
@@ -412,10 +407,11 @@ fn changed_delivery_trace_cannot_reopen_a_durably_started_step() {
             1,
             "{mode:?}: a new trace reopened durable execution"
         );
-        assert!(
-            has_quarantine(&out),
-            "uncertain replay requires reconciliation"
-        );
+        assert!(!has_quarantine(&out), "confirmed replay is safe to ignore");
+        assert!(world.rows().iter().any(|event| matches!(
+            event,
+            ParticipantEvent::ParticipantForwardOutcomeRecorded { .. }
+        )));
     }
 }
 
@@ -472,7 +468,6 @@ fn quarantine_retains_journal_and_dedupe_and_blocks_restart_reexecution() {
         drive(mode, &mut actor, quarantined(100));
         assert!(world.rows().len() > before, "{mode:?}: evidence kept");
         assert_eq!(world.journal.call_count(JournalOp::Prune), 0, "{mode:?}");
-        assert_eq!(world.dedupe.prune_calls(), 0, "{mode:?}");
         let mut restarted = world.actor();
         drive(mode, &mut restarted, start(100));
         assert_eq!(world.effects(), 1, "{mode:?}");
@@ -539,20 +534,9 @@ fn legacy_history_without_run_identity_requires_reconciliation() {
 }
 
 #[test]
-fn registration_only_history_is_admitted() {
+fn empty_history_is_admitted() {
     for mode in MODES {
         let world = World::new();
-        world
-            .journal
-            .append(
-                SagaId::new(7),
-                ParticipantEvent::SagaRegistered {
-                    saga_type: "order".into(),
-                    step_name: "a".into(),
-                    registered_at_millis: 1,
-                },
-            )
-            .unwrap();
         let mut actor = world.actor();
         drive(mode, &mut actor, start(100));
         assert_eq!(world.effects(), 1, "{mode:?}");
