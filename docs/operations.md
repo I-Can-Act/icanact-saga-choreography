@@ -11,7 +11,8 @@ load, Linux/Windows or external-service certification.
    `SagaChoreographyBus::attach_durable_terminal_resolver_for_contract` and a persistent
    `TerminalResolverJournal`, one journal per saga type. Attachment holds recovery output.
 2. Open participant stores and restore projections before binding ingress.
-   `durability::lmdb::open_lmdb_participant_support_for_saga_type` (or `_for_saga_types`)
+   `durability::lmdb::open_lmdb_participant_support_for_saga_type` (or `_for_saga_types`;
+   LMDB store helpers require the crate's `lmdb` Cargo feature)
    collects startup recovery events and invokes
    `durability::recover_accepted_workflow_steps_for_saga_type` to restore accepted
    work, confirmed completed projections, recorded unstarted undo requests and current-run fences. For custom stores,
@@ -36,6 +37,17 @@ and participant-support publication errors; do not treat best-effort publish sta
 as a delivery guarantee. Shut down application actor handles before releasing stores.
 Dropping the last public bus initiates shutdown of its resolver runtimes. Observe actual
 bus-owned resource release with the completion waiter described below before closing stores.
+
+## Detaching a resolver
+
+`SagaChoreographyBus::detach_terminal_resolver(saga_type)` is the supported removal
+path for an attached resolver: it unsubscribes the resolver and stops its actor and
+watchdog, returning `false` when none was attached. Merely releasing the
+`FirehoseSubscription` returned by attachment is not a full detach. In-flight sagas of
+that type lose terminal resolution and their waiters are not resolved by the detach.
+A later attach for the same type starts fresh. New saga starts for the type fail
+closed while detached, until a replacement resolver is attached and, for durable
+resolvers, recovery is activated.
 
 ## Run identity and retained evidence
 
@@ -160,9 +172,13 @@ quarantine does not establish whether an external effect happened.
 
 ## Observing bus-owned resource release
 
-Pooled shutdown initiated inside a scheduler callback may drain asynchronously. Obtain
-`SagaBusReleaseWaiter` with `SagaChoreographyBus::release_waiter()` before dropping the
-last public owner; call `wait_timeout(Duration) -> bool` **off-actor and off-callback**:
+Last-owner drop moves bus lifecycle shutdown off scheduler workers onto a dedicated
+`saga-bus-cleanup` thread (falling back to inline cleanup when the thread cannot be
+spawned): resolver subscriptions are unsubscribed, resolver/state actors are shut
+down, and pending terminal waiters are answered with an error. That drain is
+asynchronous, so obtain `SagaBusReleaseWaiter` with
+`SagaChoreographyBus::release_waiter()` before dropping the last public owner; call
+`wait_timeout(Duration) -> bool` **off-actor and off-callback**:
 
 ```rust,ignore
 let released = bus.release_waiter();
@@ -190,6 +206,17 @@ application's responsibility.
   Resolver LMDB uses `LmdbTerminalResolverJournal::open_with_map_size(path, bytes)`;
   `open` defaults to 256 MiB. Choose capacity at startup, monitor retained usage, and
   follow backend/backup procedures for resizing; there is no implied live-resize API.
+- LMDB environments are path-keyed within the process. Crate-owned participant
+  journal/dedupe and resolver-journal handles for the same path share one environment
+  registration: the environment is prepared for closing only when the **last**
+  same-path crate handle drops, and dropping one of several openers preserves the
+  others. Before reopening a path, drop every same-path handle (and observe bus-owned
+  release as above). heed handles opened outside this crate on the same path are not
+  counted by the crate's registry.
+- Each attached terminal resolver ingests through a mailbox bounded at 1,024 events.
+  An event the saturated resolver cannot accept is reported as **not delivered**, so
+  required-path shortfall handling and `publish_strict` errors surface it instead of
+  counting phantom delivery.
 - `TerminalResolverJournal::compact_terminal_detail()` returns removed-row count.
   LMDB removes obsolete detail of ordinarily resolved runs but keeps their terminal
   fences and monotonic sequence. Every unresolved **or quarantined** run keeps all
@@ -289,9 +316,12 @@ Never prune or fabricate identity to unblock an old store; preserve it (see belo
 
 ## Release and migration
 
-This work contains breaking changes (exhaustive enums, appended archive tags, fail-closed
-default effect hook, legacy-identity reconciliation). See [migration.md](migration.md).
-No version bump is included; a bump and release work are prerequisites before publication.
+The production-safety change set contains breaking changes (exhaustive enums, appended
+archive tags, fail-closed default effect hook, legacy-identity reconciliation). It is
+merged on `main` (`394a5e2`, PR #54, with the resource-lifecycle follow-up `5af675f`,
+PR #55), but the crate version in `Cargo.toml` is still `0.1.0`; a semver-appropriate
+version bump and release validation remain prerequisites before publication. See
+[migration.md](migration.md).
 
 ## Administrative reconciliation
 

@@ -23,7 +23,7 @@ At saga start, framework enforcement is fail-fast:
 - Missing workflow contract for the saga type: immediate `SagaFailed`.
 - `SagaStarted.context.step_name` does not match contract `first_step`: immediate `SagaFailed`.
 - Any declared contract step is not bound to a participant: immediate `SagaFailed` with `missing_steps=...`.
-- Live start-event fanout below contract minimum (`declared_steps + terminal_resolver`): `SagaQuarantined`, because an effect owner may already have received the start. A pre-fanout ownership refusal does not fabricate a foreign failure/quarantine.
+- Live start-event fanout below contract minimum (`required_path_steps + terminal_resolver`, where required-path steps are the success-criteria steps plus their transitive dependencies): `SagaQuarantined`, because an effect owner may already have received the start. A pre-fanout ownership refusal does not fabricate a foreign failure/quarantine; `publish_strict` instead returns `Err(SagaBusPublishError::AdmissionRejected)` and `publish` returns empty stats.
 - Invalid workflow contracts are rejected at registration (duplicate steps, undeclared dependencies, cycles, required terminal steps missing).
 
 This prevents runtime “partial wiring” where a saga starts and then stalls waiting for steps that can never run.
@@ -61,7 +61,7 @@ flowchart LR
 | Workflow contract | `SagaWorkflowContract`, `validate_workflow_contract`, `define_saga_workflow_contract!` | Declare stable saga graph (`first_step`, step dependencies, terminal criteria) |
 | Start gating | Saga bus enforces registered contract + terminal policy + bound steps before accepting `SagaStarted` | Ensure startup registers all required contracts/bindings |
 | State access contract | `HasSagaParticipantSupport` + blanket `SagaStateExt` | Expose the embedded `saga` field |
-| Persistence contract | `ParticipantJournal` and `ParticipantDedupeStore` traits | Provide concrete backend (in-memory, LMDB/Heed, etc.) |
+| Persistence contract | `ParticipantJournal` and `ParticipantDedupeStore` traits, plus provided in-memory and LMDB/Heed implementations (`durability::lmdb`, feature `lmdb`) | Choose a provided backend or implement the traits for a custom store |
 | Runtime helpers | `apply_sync_participant_saga_ingress`, `apply_async_participant_saga_ingress`, strict workflow binding helpers (`bind_*_workflow_participant_*_strict`) | Wire ingress helpers into actor message handling and bind workflow participants strictly |
 | Observability | `ParticipantStats`, `SagaObserver` | Export metrics and connect observer implementation |
 | E2E test harness | `SagaTestWorld`, transcript capture, terminal waits | Spawn real actors and assert through actor refs, transcript, and shared stores |
@@ -75,9 +75,13 @@ stateDiagram-v2
     Triggered --> Executing: execute step
     Executing --> Completed: step success
     Executing --> Failed: step failure
+    Executing --> Compensating: compensation requested
+    Executing --> Quarantined: ambiguous outcome
     Completed --> Compensating: compensation requested
     Compensating --> Compensated: compensation success
+    Compensating --> Failed: compensation failure
     Compensating --> Quarantined: ambiguous/terminal compensation failure
+    Failed --> [*]
     Compensated --> [*]
     Quarantined --> [*]
 ```
@@ -136,10 +140,15 @@ sequenceDiagram
 
 - Journal records participant-local events in append order (`ParticipantEvent`).
 - Dedupe store prevents duplicate processing for the same saga event.
-- The framework uses a dedupe key of `trace_id:saga_started_at_millis:event_type:step_name`
-  when handling incoming events, with `failed_step` appended for compensation requests.
+- For incoming events the framework builds an event key of
+  `trace_id:saga_started_at_millis:event_type:step_name`, with `failed_step` appended
+  for compensation requests, and stores it run-scoped as
+  `run\u{1f}<saga_started_at_millis>\u{1f}<saga_type>\u{1f}<event key>` (see
+  `SagaStateExt::check_run_dedupe_strict`), so a later run of the same saga ID never
+  collides with an earlier run's markers.
 - In this repository, in-memory implementations are available for tests/examples.
-- For production, use a durable backend by implementing the storage traits (for example LMDB/Heed).
+- For production, use the provided LMDB/Heed backend (`durability::lmdb`, feature
+  `lmdb`) or implement the storage traits for another durable store.
 - Accepted-step metadata, original saga input, and compensation data are journaled before `StepAccepted` is published so restart recovery can rehydrate pending external executions.
 - The durable terminal resolver journals saga-wide history and classifies final full-run phases before replay. It rebuilds open compensation ownership, not fresh outputs from gapped closed detail; actual quarantine rows retain fencing and propagation to admitted successors, including ordinary closed successors after resolver cache/detail loss. Admission still uses full retained history. Participant-local journals cannot infer effects owned by other actors.
 - An accepted step with potential compensation data contributes an obligation until authoritative disposition. Definitive no-effect rejection can remove only an unrequested queue entry. An owned request instead needs strict exact-run completion proof without physical undo; stale accepted/local caches cannot override durable rejection, and evidence-read errors quarantine before cache-based undo. Actual effects/open undo/reconciliation must not be guessed safe.
@@ -156,18 +165,25 @@ sequenceDiagram
 - Managed attached-bus ingress publishes `StepStarted` strictly after durable intent and before business execution. AllOf dependency completions are journaled (tag 16) before being marked seen, so restart restores them.
 - Reverse compensation is serialized with a single owner; terminal failure is published only after all owed compensation completes, otherwise the saga is quarantined.
 - Effect dispatch is explicit and fails closed by default. Retained terminal records need capacity/compaction maintenance. Durable cache reclamation can release reloadable failed fingerprints without forgetting full-run authority; complete per-ID reloads preserve protected history. Active/quarantined and ephemeral/non-indexed ownership remain irreducible costs.
-- Last-public-bus drop initiates pooled shutdown, which may drain asynchronously. `release_waiter().wait_timeout(Duration)` observes actual bus-owned resource destruction; wait only off-actor/off-callback. It holds no journal/lifecycle ownership and does not resolve sagas, cancel external work or close application-owned journal clones.
+- Last-public-bus drop moves lifecycle shutdown onto a dedicated cleanup thread (falling back to inline cleanup if the thread cannot be spawned), which unsubscribes resolver subscriptions, shuts down resolver/state actors and answers pending terminal waiters with an error. `release_waiter().wait_timeout(Duration)` observes actual bus-owned resource destruction; wait only off-actor/off-callback. It holds no journal/lifecycle ownership and does not resolve sagas, cancel external work or close application-owned journal clones.
+- `detach_terminal_resolver(saga_type)` is the supported resolver removal path: it unsubscribes the resolver and stops its actor and watchdog (returning `false` if none was attached), does not resolve in-flight waiters, and new starts for the type fail closed until a replacement resolver is attached and, for durable resolvers, recovery is activated.
 - Resolver write failure fences live resolver/admission state before quarantine loopback. After activation, a capacity-bounded exact-run queue retries at most eight pending fences per watchdog tick, without further evidence or deadline expiry. A pending fence precedes later retained evidence; successfully appended/validated restored fences need no redundant synthetic row. Until append succeeds, retry is not crash durability or a shutdown flush; failed/unrepresented storage still requires application-owned evidence/reconciliation.
 - Known-run participant/delivery quarantine resolves full-run and correctly bound legacy waiters. Pre-activation replies are held then resolved without replaying ingress; ordinary terminal replies still require resolver authority.
 - Bus delivery may be lost or duplicated; handle strict publication errors. There is no exactly-once external-effect guarantee. Use stable idempotency keys and reconciliation; see [operations.md](operations.md).
 - Terminal policies support two timeout dimensions:
-- `overall_timeout` (overall wall clock)
-- `stalled_timeout` (watchdog reset by each progress event)
+  - `overall_timeout` (overall wall clock)
+  - `stalled_timeout` (watchdog reset by each progress event)
 - Accepted steps add participant-declared `idle_timeout`, `hard_timeout`, and `timeout_outcome`; the terminal resolver watchdog enforces these from `StepAccepted`, and startup recovery emits expired accepted-step outcomes from journaled metadata. Accepted compensation uses its own per-execution deadlines and fails closed to quarantine.
 
 ## Observability
 
-- `ParticipantStats` tracks key counters:
-  events received/relevant/duplicate, steps started/completed/failed, compensations started/completed, and quarantined sagas.
-- `SagaObserver` allows external hooks for lifecycle and failure telemetry.
-- `TracingObserver` provides structured tracing integration out of the box.
+- Lifecycle telemetry is emitted through `tracing` events from the bus, helpers and
+  durability layers, and through the participant/terminal hooks on the participant
+  traits (`on_saga_completed`, `on_quarantined`, emitted-transition hooks).
+- `ParticipantStats` is an embedded counter struct (events received/relevant/duplicate,
+  steps started/completed/failed, compensations started/completed, quarantined sagas)
+  with public atomic fields. The framework does not currently increment these counters:
+  they stay at zero unless application code updates them itself.
+- `SagaObserver`, `NoOpObserver` and `TracingObserver` are public types, but no
+  framework path currently invokes an observer. Treat them as an application-side
+  callback vocabulary to call from your own hooks, not as wired-in telemetry.
