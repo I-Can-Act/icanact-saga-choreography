@@ -1945,6 +1945,7 @@ pub struct SagaChoreographyBus {
 
 struct BusActorLifecycle {
     bus: FirehosePubSub<SagaChoreographyEvent>,
+    release: Arc<ReleaseLatch>,
     pending_replies: CorrelationRegistry<SagaId, SagaReplyToResult>,
     pending_run_replies: CorrelationRegistry<RunKey, SagaReplyToResult>,
     state_handle: Option<local_sync::ActorHandle>,
@@ -1962,12 +1963,17 @@ impl Drop for BusActorLifecycle {
         let pending_replies = self.pending_replies.clone();
         let pending_run_replies = self.pending_run_replies.clone();
         let bus = self.bus.clone();
+        let cleanup_release = self.release.guard();
         let cleanup = move || {
+            // Locals drop in reverse order, including on unwind: subscriber
+            // destruction must finish before cleanup can signal release.
+            let _release = cleanup_release;
+            let cleanup_bus = bus;
             if let Ok(TerminalResolverRegistryReply::ShutdownComplete(subscriptions)) =
                 terminal_resolver_registry_ref.ask(TerminalResolverRegistryAsk::ShutdownAll)
             {
                 for subscription in subscriptions {
-                    bus.unsubscribe(subscription);
+                    cleanup_bus.unsubscribe(subscription);
                 }
             }
             if let Some(handle) = terminal_resolver_registry_handle {
@@ -2095,6 +2101,7 @@ impl SagaChoreographyBus {
         let bus = FirehosePubSub::new();
         let lifecycle = Arc::new(BusActorLifecycle {
             bus: bus.clone(),
+            release: Arc::clone(&release),
             _release: release.guard(),
             pending_replies: pending_replies.clone(),
             pending_run_replies: pending_run_replies.clone(),
