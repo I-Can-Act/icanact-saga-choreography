@@ -7,4 +7,4 @@ pub mod effects;
 pub mod faults;
 
 pub use effects::{EffectError, EffectLedger};
-pub use faults::{CutPoint, Cuts, FaultDedupe, FaultJournal, FaultTrigger, JournalOp, ManualClock};
+pub use faults::{CutPoint, Cuts, FaultStore, FaultTrigger, JournalOp, ManualClock};

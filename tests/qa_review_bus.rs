@@ -92,15 +92,15 @@ fn prepared_bus() -> (SagaChoreographyBus, Seen) {
     let bus = SagaChoreographyBus::new();
     bus.register_workflow_contract_provider::<ReviewContract>()
         .unwrap();
-    bus.register_bound_workflow_step(TYPE, "a").unwrap();
-    bus.register_bound_workflow_step(TYPE, "b").unwrap();
+    bus.subscribe_workflow_step_fn(TYPE, "a", |_| true).unwrap();
+    bus.subscribe_workflow_step_fn(TYPE, "b", |_| true).unwrap();
     let seen: Seen = Arc::default();
     let sink = Arc::clone(&seen);
     bus.subscribe_saga_type_fn(TYPE, move |event| {
         sink.lock().unwrap().push(event.clone());
         true
     });
-    // Required-path delivery needs more subscribers than the capture sink.
+    // Additional untagged observers supply diagnostics, not role coverage.
     for _ in 0..2 {
         bus.subscribe_saga_type_fn(TYPE, |_| true);
     }
@@ -125,6 +125,10 @@ struct ProbeJournal {
 }
 
 impl TerminalResolverJournal for ProbeJournal {
+    fn max_run_start_millis(&self) -> Result<u64, TerminalResolverJournalError> {
+        self.inner.max_run_start_millis()
+    }
+
     fn append(&self, event: SagaChoreographyEvent) -> Result<u64, TerminalResolverJournalError> {
         if self.fail_appends.load(Ordering::SeqCst) {
             return Err(TerminalResolverJournalError::Storage("append down".into()));
@@ -162,6 +166,7 @@ enum ProbeMsg {
         context: Option<SagaContext>,
         saga_id: SagaId,
         reply: SagaReplyToHandle,
+        registered: mpsc::Sender<()>,
     },
 }
 
@@ -180,19 +185,23 @@ fn waiter(
             context,
             saga_id,
             reply,
+            registered,
         } => {
             let _ = match context {
                 Some(context) => bus.register_terminal_reply_for_run(&context, reply),
                 None => bus.register_terminal_reply(saga_id, reply),
             };
+            registered.send(()).unwrap();
         }
     });
+    let (registered, ready) = mpsc::channel();
     let pending = probe
         .ask_delegated(|reply| ProbeMsg::Register {
             bus: bus.clone(),
             context: context.cloned(),
             saga_id,
             reply,
+            registered,
         })
         .expect("waiter registered");
     let (tx, rx) = mpsc::channel();
@@ -200,8 +209,9 @@ fn waiter(
         let _keep = _handle;
         let _ = tx.send(pending.wait().map_err(|e| format!("{e:?}")));
     });
-    // Let the probe actor register before the caller proceeds.
-    std::thread::sleep(Duration::from_millis(50));
+    ready
+        .recv_timeout(Duration::from_secs(2))
+        .expect("registration acknowledged");
     rx
 }
 
@@ -751,4 +761,426 @@ fn ephemeral_resolver_also_serializes_concurrent_live_admission() {
         .count();
     assert_eq!(admitted, 1);
     assert_eq!(count(&seen, is_start), 1);
+}
+
+#[test]
+fn invalid_start_settles_both_preregistered_waiters_without_diagnostic_delivery() {
+    for invalid in [
+        "no resolver",
+        "no contract",
+        "wrong first step",
+        "missing role",
+    ] {
+        let bus = SagaChoreographyBus::new();
+        if invalid != "no contract" {
+            bus.register_workflow_contract_provider::<ReviewContract>()
+                .unwrap();
+        }
+        if invalid != "no resolver" {
+            bus.attach_terminal_resolver_for_contract::<ReviewContract>("qa")
+                .unwrap();
+        }
+        if invalid != "missing role" {
+            for step in ["a", "b"] {
+                bus.subscribe_workflow_step_fn(TYPE, step, |_| true)
+                    .unwrap();
+            }
+        }
+        // No diagnostic subscriber is capable of delivering a reply.
+        bus.subscribe_saga_type_fn(TYPE, |_| false);
+        let ctx = context_at(
+            9_100,
+            if invalid == "wrong first step" {
+                "b"
+            } else {
+                "a"
+            },
+            SagaContext::now_millis(),
+        );
+        let run = waiter(&bus, ctx.saga_id, Some(&ctx));
+        let legacy = waiter(&bus, ctx.saga_id, None);
+        assert!(bus.publish_strict(started(&ctx)).is_err(), "{invalid}");
+        for receiver in [&run, &legacy] {
+            assert!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap()
+                    .is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(
+            !bus.cancel_terminal_reply_for_run(&ctx),
+            "settled run waiter removed"
+        );
+        assert!(
+            !bus.cancel_terminal_reply(ctx.saga_id),
+            "settled id waiter removed"
+        );
+    }
+}
+
+#[test]
+fn waiter_ttl_expires_and_cancel_releases_both_registration_kinds() {
+    let bus = SagaChoreographyBus::with_waiter_ttl(Duration::from_millis(100));
+    let ctx = context_at(9_101, "a", SagaContext::now_millis());
+    let run = waiter(&bus, ctx.saga_id, Some(&ctx));
+    let legacy = waiter(&bus, ctx.saga_id, None);
+    // Expiry drops the delegated handle; it does not fabricate a saga failure.
+    assert!(run.recv_timeout(Duration::from_secs(2)).unwrap().is_err());
+    assert!(
+        legacy
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .is_err()
+    );
+    assert!(!bus.cancel_terminal_reply_for_run(&ctx));
+    assert!(!bus.cancel_terminal_reply(ctx.saga_id));
+    assert!(bus.take_terminal_outcome_for_run(&ctx).is_none());
+
+    // Expired registrations leave neither duplicate handles nor legacy floors.
+    let run = waiter(&bus, ctx.saga_id, Some(&ctx));
+    let legacy = waiter(&bus, ctx.saga_id, None);
+    assert!(bus.cancel_terminal_reply_for_run(&ctx));
+    assert!(bus.cancel_terminal_reply(ctx.saga_id));
+    assert!(run.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
+    assert!(
+        legacy
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .is_err()
+    );
+    assert!(!bus.cancel_terminal_reply_for_run(&ctx));
+    assert!(!bus.cancel_terminal_reply(ctx.saga_id));
+}
+
+#[test]
+fn ephemeral_bus_fifo_evicts_ordinary_runs_but_pins_active_and_quarantined() {
+    const CHILD: &str = "W3A_FIFO_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Environment-based admission limits are isolated from parallel tests.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ephemeral_bus_fifo_evicts_ordinary_runs_but_pins_active_and_quarantined",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("SAGA_ADMISSION_CAPACITY", "4")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let (bus, seen) = prepared_bus();
+    bus.attach_terminal_resolver_for_contract::<ReviewContract>("qa")
+        .unwrap();
+    let base = SagaContext::now_millis();
+    let contexts: Vec<_> = (0..5).map(|id| context_at(9_200 + id, "a", base)).collect();
+    let [active, quarantined, completed, failed, fresh] = contexts.as_slice() else {
+        unreachable!()
+    };
+    for ctx in [active, quarantined, completed, failed] {
+        bus.publish_strict(started(ctx)).unwrap();
+    }
+    bus.publish_strict(SagaChoreographyEvent::SagaQuarantined {
+        context: quarantined.clone(),
+        reason: "pinned".into(),
+        step: "a".into(),
+        participant_id: "a".into(),
+    })
+    .unwrap();
+    bus.publish_strict(SagaChoreographyEvent::SagaCompleted {
+        context: completed.clone(),
+    })
+    .unwrap();
+    bus.publish_strict(SagaChoreographyEvent::SagaFailed {
+        context: failed.clone(),
+        reason: "ordinary".into(),
+        failure: None,
+    })
+    .unwrap();
+    assert!(wait_until(Duration::from_secs(2), || bus
+        .publish_strict(started(fresh))
+        .is_ok()));
+    // The newer ordinary failure remains; only the oldest completion was evicted.
+    assert!(bus.publish_strict(started(failed)).is_err());
+    assert!(bus.publish_strict(started(completed)).is_ok());
+    // Re-admitting that evicted run consumes the slot of the ordinary failure.
+    assert!(
+        bus.publish_strict(started(failed)).is_err(),
+        "all slots are now protected"
+    );
+    for ctx in [active, quarantined] {
+        assert!(bus.publish_strict(started(ctx)).is_err());
+        let mut successor = ctx.clone();
+        successor.saga_started_at_millis += 1;
+        assert!(bus.publish_strict(started(&successor)).is_err());
+    }
+    assert_eq!(
+        count(&seen, |event| is_start(event)
+            && event.context().saga_id == completed.saga_id),
+        2
+    );
+    assert_eq!(
+        count(&seen, |event| is_start(event)
+            && event.context().saga_id == failed.saga_id),
+        1
+    );
+}
+
+/// Compatibility journal deliberately implementing only append/read_all.
+#[derive(Default)]
+struct LegacyJournal(InMemoryTerminalResolverJournal);
+impl TerminalResolverJournal for LegacyJournal {
+    fn append(&self, event: SagaChoreographyEvent) -> Result<u64, TerminalResolverJournalError> {
+        self.0.append(event)
+    }
+    fn read_all(&self) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError> {
+        self.0.read_all()
+    }
+}
+
+fn record_closed_journal(journal: &impl TerminalResolverJournal, ctx: &SagaContext) {
+    journal.append(started(ctx)).unwrap();
+    journal
+        .append(SagaChoreographyEvent::SagaCompleted {
+            context: ctx.clone(),
+        })
+        .unwrap();
+}
+
+fn record_closed_store(store: &impl ParticipantStore, ctx: &SagaContext) {
+    assert_eq!(
+        store
+            .admit_and_record_intent(ctx, "start", "SagaStarted")
+            .unwrap(),
+        StoreAdmission::Admitted
+    );
+    store
+        .append(
+            ctx.saga_id,
+            ParticipantEvent::ParticipantTerminalRecorded {
+                saga_type: ctx.saga_type.clone(),
+                saga_started_at_millis: ctx.saga_started_at_millis,
+                outcome: ParticipantTerminalKind::Completed,
+                reason: "done".into(),
+                recorded_at_millis: SagaContext::now_millis(),
+            },
+        )
+        .unwrap();
+}
+
+fn assert_fresh_journal_run(journal: impl TerminalResolverJournal, old: u64) {
+    let (bus, _) = durable_bus(Arc::new(journal));
+    let token = SagaContext::next_run_start_millis();
+    assert!(
+        token > old,
+        "new token {token} must exceed retained token {old}"
+    );
+    bus.publish_strict(started(&context_at(77, "a", token)))
+        .unwrap();
+}
+
+fn assert_fresh_store_run(store: impl ParticipantStore, old: u64) {
+    let support = SagaParticipantSupport::new(store);
+    let token = SagaContext::next_run_start_millis();
+    assert!(
+        token > old,
+        "new token {token} must exceed retained token {old}"
+    );
+    assert_eq!(
+        support
+            .store
+            .admit_and_record_intent(&context_at(77, "a", token), "start", "SagaStarted")
+            .unwrap(),
+        StoreAdmission::Admitted
+    );
+}
+
+#[test]
+fn closed_memory_and_legacy_history_seed_run_allocator() {
+    const CHILD: &str = "PR57_MEMORY_HIGH_WATER";
+    if let Ok(kind) = std::env::var(CHILD) {
+        // Simulate retained logical tokens ahead of this process's allocator.
+        let old = SagaContext::now_millis() + 60_000;
+        let ctx = context_at(77, "a", old);
+        match kind.as_str() {
+            "memory" => {
+                let journal = InMemoryTerminalResolverJournal::default();
+                record_closed_journal(&journal, &ctx);
+                assert_fresh_journal_run(journal, old);
+            }
+            "legacy" => {
+                let journal = LegacyJournal::default();
+                record_closed_journal(&journal, &ctx);
+                assert_fresh_journal_run(journal, old);
+            }
+            "participant" => {
+                let store = InMemoryParticipantStore::new();
+                record_closed_store(&store, &ctx);
+                assert_fresh_store_run(store, old);
+            }
+            "memory-evicted" => {
+                let journal = InMemoryTerminalResolverJournal::with_capacity(0, 2);
+                record_closed_journal(&journal, &ctx);
+                assert!(journal.read_all().unwrap().is_empty());
+                assert_fresh_journal_run(journal, old);
+            }
+            "participant-evicted" => {
+                let store = InMemoryParticipantStore::with_capacity(0, 2);
+                record_closed_store(&store, &ctx);
+                assert!(store.read(ctx.saga_id).unwrap().is_empty());
+                assert_fresh_store_run(store, old);
+            }
+            "participant-deleted" => {
+                let store = InMemoryParticipantStore::new();
+                record_closed_store(&store, &ctx);
+                store.prune(ctx.saga_id).unwrap();
+                assert_fresh_store_run(store, old);
+            }
+            "memory-pruned" => {
+                let journal = InMemoryTerminalResolverJournal::default();
+                record_closed_journal(&journal, &ctx);
+                journal.compact_terminal_detail().unwrap();
+                journal.prune_resolved_before(u64::MAX, 256).unwrap();
+                assert!(journal.read_all().unwrap().is_empty());
+                assert_fresh_journal_run(journal, old);
+            }
+            "participant-pruned" => {
+                let store = InMemoryParticipantStore::new();
+                record_closed_store(&store, &ctx);
+                store.compact_terminal_detail(256).unwrap();
+                store.prune_resolved_before(u64::MAX, 256).unwrap();
+                assert!(store.read(ctx.saga_id).unwrap().is_empty());
+                assert_fresh_store_run(store, old);
+            }
+            _ => unreachable!(),
+        }
+        return;
+    }
+    let mut failures = Vec::new();
+    for kind in [
+        "memory",
+        "legacy",
+        "participant",
+        "memory-pruned",
+        "participant-pruned",
+        "memory-evicted",
+        "participant-evicted",
+        "participant-deleted",
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "closed_memory_and_legacy_history_seed_run_allocator",
+                "--nocapture",
+            ])
+            .env(CHILD, kind)
+            .output()
+            .unwrap();
+        if !output.status.success() {
+            failures.push(format!(
+                "{kind}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[cfg(feature = "lmdb")]
+#[test]
+fn lmdb_restart_seeds_allocator_from_closed_and_pruned_history() {
+    const CHILD: &str = "PR57_LMDB_HIGH_WATER";
+    if let Ok(phase) = std::env::var(CHILD) {
+        let root = std::path::PathBuf::from(std::env::var_os("PR57_LMDB_DIR").unwrap());
+        let kind = std::env::var("PR57_LMDB_KIND").unwrap();
+        let participant = kind.starts_with("participant");
+        let compact = kind.ends_with("compact");
+        let prune = kind.ends_with("prune");
+        if phase == "write" {
+            for _ in 0..5_000 {
+                SagaContext::next_run_start_millis();
+            }
+            let old = SagaContext::next_run_start_millis();
+            assert!(SagaContext::now_millis() < old);
+            let ctx = context_at(77, "a", old);
+            if participant {
+                let store = LmdbParticipantStore::open(&root, "a").unwrap();
+                record_closed_store(&store, &ctx);
+                if compact || prune {
+                    store.compact_terminal_detail(256).unwrap();
+                }
+                if prune {
+                    store.prune_resolved_before(u64::MAX, 256).unwrap();
+                }
+            } else {
+                let journal = LmdbTerminalResolverJournal::open(&root).unwrap();
+                record_closed_journal(&journal, &ctx);
+                if compact || prune {
+                    journal.compact_terminal_detail().unwrap();
+                }
+                if prune {
+                    journal.prune_resolved_before(u64::MAX, 256).unwrap();
+                }
+            }
+            std::fs::write(root.join("token"), old.to_string()).unwrap();
+        } else {
+            let old = std::fs::read_to_string(root.join("token"))
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+            assert!(
+                SagaContext::now_millis() < old,
+                "restart must precede wall-clock catchup"
+            );
+            if participant {
+                assert_fresh_store_run(LmdbParticipantStore::open(&root, "a").unwrap(), old);
+            } else {
+                assert_fresh_journal_run(LmdbTerminalResolverJournal::open(&root).unwrap(), old);
+            }
+        }
+        return;
+    }
+    let mut failures = Vec::new();
+    for kind in [
+        "resolver",
+        "resolver-compact",
+        "resolver-prune",
+        "participant",
+        "participant-compact",
+        "participant-prune",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        for phase in ["write", "read"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "lmdb_restart_seeds_allocator_from_closed_and_pruned_history",
+                    "--nocapture",
+                ])
+                .env(CHILD, phase)
+                .env("PR57_LMDB_DIR", dir.path())
+                .env("PR57_LMDB_KIND", kind)
+                .output()
+                .unwrap();
+            if !output.status.success() {
+                failures.push(format!(
+                    "{kind}/{phase}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+                break;
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

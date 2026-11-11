@@ -20,11 +20,11 @@ use icanact_saga_choreography::durability::{
     run_participant_phase_with_panic_quarantine,
 };
 use icanact_saga_choreography::{
-    CompensationError, DependencySpec, FailureAuthority, HasSagaParticipantSupport, InMemoryDedupe,
-    InMemoryJournal, SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId,
+    CompensationError, DependencySpec, FailureAuthority, HasSagaParticipantSupport,
+    InMemoryParticipantStore, SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId,
     SagaParticipant, SagaParticipantChannel, SagaParticipantSupport, SagaWorkflowContract,
     SagaWorkflowStepContract, StepError, StepOutput, SuccessCriteria, TerminalPolicy,
-    WorkflowDependencySpec, bind_sync_participant_channel, handle_saga_event_with_emit,
+    WorkflowDependencySpec, handle_saga_event_with_emit,
 };
 
 const SAGA_TYPE: &str = "order_lifecycle";
@@ -144,7 +144,7 @@ struct ConfigurableParticipant {
     execute_result: Option<Result<StepOutput, StepError>>,
     compensate_result: Result<icanact_saga_choreography::CompensationOutput, CompensationError>,
     should_panic: bool,
-    saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
+    saga: SagaParticipantSupport<InMemoryParticipantStore>,
     active_saga_execution: Option<ActiveSagaExecution>,
     bus: Option<SagaChoreographyBus>,
     executed_count: usize,
@@ -162,7 +162,7 @@ impl ConfigurableParticipant {
             })),
             compensate_result: Ok(icanact_saga_choreography::CompensationOutput::Completed),
             should_panic: false,
-            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+            saga: SagaParticipantSupport::new(InMemoryParticipantStore::new()),
             active_saga_execution: None,
             bus: None,
             executed_count: 0,
@@ -255,14 +255,13 @@ impl local_sync::SyncActor for TerminalProbe {
 }
 
 impl HasSagaParticipantSupport for ConfigurableParticipant {
-    type Journal = InMemoryJournal;
-    type Dedupe = InMemoryDedupe;
+    type Store = InMemoryParticipantStore;
 
-    fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support(&self) -> &SagaParticipantSupport<Self::Store> {
         &self.saga
     }
 
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Store> {
         &mut self.saga
     }
 }
@@ -274,8 +273,6 @@ impl HasActiveSagaExecution for ConfigurableParticipant {
 }
 
 impl SagaParticipant for ConfigurableParticipant {
-    type Error = String;
-
     fn step_name(&self) -> &str {
         self.step_name
     }
@@ -293,6 +290,13 @@ impl SagaParticipant for ConfigurableParticipant {
         _context: &SagaContext,
         _input: &[u8],
     ) -> Result<StepOutput, StepError> {
+        if matches!(self.dependency_spec, DependencySpec::AllOf(_)) {
+            assert_eq!(
+                _input,
+                &[42],
+                "AllOf receives original saga input, not predecessor output"
+            );
+        }
         self.executed_count += 1;
         if self.should_panic {
             panic!("deliberate panic from {}", self.step_name);
@@ -332,7 +336,7 @@ fn context_for(saga_id: u64) -> SagaContext {
         step_index: 0,
         attempt: 0,
         initiator_peer_id: [0; 32],
-        saga_started_at_millis: now,
+        saga_started_at_millis: SagaContext::next_run_start_millis(),
         event_timestamp_millis: now,
     }
 }
@@ -386,12 +390,12 @@ impl SagaWorkflowContract for OrderLifecycleE2eContract {
             SagaWorkflowStepContract {
                 step_name: STEP_POSITION,
                 participant_id: "position",
-                depends_on: WorkflowDependencySpec::After(STEP_START),
+                depends_on: WorkflowDependencySpec::OnSagaStart,
             },
             SagaWorkflowStepContract {
                 step_name: STEP_BALANCE,
                 participant_id: "balance",
-                depends_on: WorkflowDependencySpec::After(STEP_START),
+                depends_on: WorkflowDependencySpec::OnSagaStart,
             },
             SagaWorkflowStepContract {
                 step_name: STEP_ORDER,
@@ -406,14 +410,27 @@ impl SagaWorkflowContract for OrderLifecycleE2eContract {
     }
 }
 
+/// Queue ingress for a test-controlled participant rather than claiming an
+/// observer is a workflow step. The test drives business results explicitly.
+fn manual_step_inbox(
+    bus: &SagaChoreographyBus,
+    step: &str,
+) -> std::sync::Arc<std::sync::Mutex<Vec<SagaChoreographyEvent>>> {
+    let inbox = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = inbox.clone();
+    bus.subscribe_workflow_step_fn(SAGA_TYPE, step, move |event| {
+        sink.lock().unwrap().push(event.clone());
+        true
+    })
+    .expect("manual participant ingress should bind");
+    inbox
+}
+
 fn new_e2e_bus() -> SagaChoreographyBus {
     let bus = SagaChoreographyBus::new();
     bus.register_workflow_contract_provider::<OrderLifecycleE2eContract>()
         .expect("order lifecycle test workflow contract registration should succeed");
-    for step in [STEP_START, STEP_POSITION, STEP_BALANCE, STEP_ORDER] {
-        bus.register_bound_workflow_step(SAGA_TYPE, step)
-            .expect("order lifecycle test step binding should succeed");
-    }
+
     bus
 }
 
@@ -431,6 +448,7 @@ fn spawn_and_subscribe(
     local_sync::SyncActorRef<ConfigurableParticipant>,
     SpawnedParticipant,
 ) {
+    let step_name = participant.step_name;
     participant.attach_bus(bus.clone());
     let opts = local_sync::SpawnOpts {
         mailbox_capacity: MAILBOX_CAPACITY,
@@ -438,14 +456,22 @@ fn spawn_and_subscribe(
     };
     let (actor_ref, handle) = world.spawn_sync_with_opts(participant, opts);
     handle.wait_for_startup();
-    let subscriptions = bind_sync_participant_channel::<ConfigurableParticipant, ()>(
-        bus,
-        &actor_ref,
-        &[SAGA_TYPE],
-        "saga",
-        MAILBOX_CAPACITY,
-    )
-    .expect("participant saga channel should bind");
+    let sender = actor_ref
+        .add_channel("saga", MAILBOX_CAPACITY)
+        .expect("participant saga channel should bind");
+    let sender = std::sync::Mutex::new(sender);
+    let subscriptions = vec![
+        bus.subscribe_workflow_step_fn(SAGA_TYPE, step_name, move |event| {
+            sender
+                .lock()
+                .unwrap()
+                .try_send(
+                    icanact_saga_choreography::SagaParticipantChannel::<()>::Saga(event.clone()),
+                )
+                .is_ok()
+        })
+        .expect("participant workflow route should bind"),
+    ];
     (
         actor_ref,
         SpawnedParticipant {
@@ -882,12 +908,12 @@ fn position_compensation_fails_terminal_causes_quarantine() {
     let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
+    let _manual_step_balance = manual_step_inbox(&bus, STEP_BALANCE);
+    let _manual_step_order = manual_step_inbox(&bus, STEP_ORDER);
     let _resolver = bus
         .attach_terminal_resolver(test_policy(), "e2e-resolver")
         .expect("terminal resolver should attach");
     let (terminal_ref, terminal_h) = spawn_terminal_probe(&world, &bus);
-    let _pad_sub_a = bus.subscribe_saga_type_fn(SAGA_TYPE, |_event| true);
-    let _pad_sub_b = bus.subscribe_saga_type_fn(SAGA_TYPE, |_event| true);
 
     let (p_ref, p_h) = spawn_and_subscribe(
         &world,
@@ -989,11 +1015,11 @@ fn balance_compensation_fails_ambiguous_causes_quarantine() {
 }
 
 // ===========================================================================
-// Test 8: Balance compensation fails SafeToRetry -> retained quarantine
+// Test 8: Balance compensation fails Terminal -> retained quarantine
 // ===========================================================================
 
 #[test]
-fn balance_compensation_fails_safe_to_retry_causes_quarantine() {
+fn balance_compensation_fails_terminal_causes_quarantine() {
     let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
@@ -1011,7 +1037,7 @@ fn balance_compensation_fails_safe_to_retry_causes_quarantine() {
         &world,
         &bus,
         ConfigurableParticipant::new(STEP_BALANCE, DependencySpec::OnSagaStart)
-            .with_compensate_result(Err(CompensationError::SafeToRetry {
+            .with_compensate_result(Err(CompensationError::Terminal {
                 reason: "transient".into(),
             })),
     );
@@ -1112,6 +1138,7 @@ fn balance_panics_after_position_succeeds() {
     let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
+    let _manual_step_balance = manual_step_inbox(&bus, STEP_BALANCE);
     let _resolver = bus
         .attach_terminal_resolver(test_policy(), "e2e-resolver")
         .expect("terminal resolver should attach");
@@ -1174,6 +1201,7 @@ fn order_panics_after_both_succeed() {
     let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
+    let _manual_step_order = manual_step_inbox(&bus, STEP_ORDER);
     let _resolver = bus
         .attach_terminal_resolver(test_policy(), "e2e-resolver")
         .expect("terminal resolver should attach");
@@ -1210,7 +1238,7 @@ fn order_panics_after_both_succeed() {
     assert_eq!(query_state(&p_ref).executed_count, 1);
     assert_eq!(query_state(&b_ref).executed_count, 1);
 
-    let order_ctx = context_for(11).next_step(STEP_ORDER.into());
+    let order_ctx = ctx.next_step(STEP_ORDER.into());
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_participant_phase_with_panic_quarantine(
             &mut order,
@@ -1303,6 +1331,8 @@ fn order_does_not_fire_on_partial_dependency() {
     let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
+    let _manual_step_position = manual_step_inbox(&bus, STEP_POSITION);
+    let _manual_step_balance = manual_step_inbox(&bus, STEP_BALANCE);
 
     let (o_ref, o_h) = spawn_and_subscribe(
         &world,
@@ -1484,12 +1514,11 @@ fn duplicate_compensation_request_is_deduped() {
     let _serial = serial_test_guard();
     let world = TestWorld::new();
     let bus = new_e2e_bus();
+    let _manual_step_balance = manual_step_inbox(&bus, STEP_BALANCE);
+    let _manual_step_order = manual_step_inbox(&bus, STEP_ORDER);
     let _resolver = bus
         .attach_terminal_resolver(test_policy(), "e2e-resolver")
         .expect("terminal resolver should attach");
-    let _pad_sub_a = bus.subscribe_saga_type_fn(SAGA_TYPE, |_event| true);
-    let _pad_sub_b = bus.subscribe_saga_type_fn(SAGA_TYPE, |_event| true);
-    let _pad_sub_c = bus.subscribe_saga_type_fn(SAGA_TYPE, |_event| true);
 
     let (p_ref, p_h) = spawn_and_subscribe(
         &world,

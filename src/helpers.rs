@@ -14,91 +14,134 @@
 use crate::{
     AsyncSagaParticipant, CompensationError, CompensationOutput, DependencySpec,
     EffectDispatchOutcome, EffectDispatchRequest, ParticipantAdmission, ParticipantEvent,
-    ParticipantForwardOutcome, ParticipantTerminalKind, RunDedupe, SagaChoreographyEvent,
+    ParticipantForwardOutcome, ParticipantStore, ParticipantTerminalKind, SagaChoreographyEvent,
     SagaContext, SagaFailureDetails, SagaParticipant, SagaParticipantState, SagaStateEntry,
-    SagaStateExt, StepError, StepOutput,
+    SagaStateExt, StepError, StepOutput, StoreAdmission,
 };
 
-/// Saga event handler with an explicit emit sink for produced choreography events.
-pub fn handle_saga_event_with_emit<P, F>(
-    participant: &mut P,
+/// Owned work prepared by the synchronous protocol; no actor borrow crosses business IO.
+enum Prepared {
+    Step {
+        context: SagaContext,
+        input: Vec<u8>,
+        saga_input: Vec<u8>,
+    },
+    Compensation {
+        context: SagaContext,
+        saga_input: Vec<u8>,
+        data: Vec<u8>,
+    },
+    Notify {
+        context: SagaContext,
+        notification: Notification,
+        terminal: bool,
+    },
+    Ignore,
+}
+
+enum Notification {
+    Completed,
+    Failed(Box<str>),
+    Quarantined(Box<str>),
+    Compensated,
+    None,
+}
+
+fn prepare_event<A, F, S>(
+    actor: &mut A,
     event: SagaChoreographyEvent,
-    mut emit: F,
-) where
-    P: SagaParticipant + SagaStateExt,
+    who: &Who,
+    dependencies: &DependencySpec,
+    matches_type: bool,
+    emit: &mut F,
+    start: &mut S,
+) -> Prepared
+where
+    A: SagaStateExt,
     F: FnMut(SagaChoreographyEvent),
+    S: FnMut(&mut A, SagaChoreographyEvent) -> Result<(), Box<str>>,
 {
-    if !participant
-        .saga_types()
-        .iter()
-        .any(|t| *t == event.context().saga_type.as_ref())
-    {
-        return;
+    if !matches_type {
+        return Prepared::Ignore;
     }
-    // Ownership is decided before admission/dedupe so a request addressed to another
-    // step never consumes this step's dedupe marker for its later singleton request.
     if let SagaChoreographyEvent::CompensationRequested {
         steps_to_compensate,
         ..
     } = &event
-        && !owns_compensation(participant.step_name(), steps_to_compensate)
+        && !owns_compensation(&who.step, steps_to_compensate)
     {
-        return;
+        return Prepared::Ignore;
     }
-    let who = Who::sync(participant);
-    let dependencies = participant.depends_on();
-    if !admit_event(participant, &event, &who, &dependencies, &mut emit) {
-        return;
+    if matches!(event, SagaChoreographyEvent::StepFailed { .. })
+        && actor
+            .inspect_participant_event_strict(event.context())
+            .is_ok_and(|admission| admission.is_admitted())
+    {
+        crate::durability::mark_matching_accepted_step_failed(actor, &event);
+    }
+    // Irrelevant events must not allocate run metadata or consume admission markers.
+    let relevant = match &event {
+        SagaChoreographyEvent::SagaStarted { .. } => dependencies.is_on_saga_start(),
+        SagaChoreographyEvent::StepCompleted { context, .. } => match dependencies {
+            DependencySpec::OnSagaStart => false,
+            DependencySpec::After(step) => context.step_name.as_ref() == *step,
+            DependencySpec::AnyOf(steps) | DependencySpec::AllOf(steps) => {
+                steps.contains(&context.step_name.as_ref())
+            }
+        },
+        SagaChoreographyEvent::CompensationRequested { .. } => true,
+        _ => is_terminal_event(&event),
+    };
+    if !relevant || !admit_event(actor, &event, who, dependencies, emit) {
+        return Prepared::Ignore;
     }
     let context = event.context().clone();
-    let now = participant.now_millis();
-
+    let now = actor.now_millis();
+    if is_terminal_event(&event) {
+        let (notification, terminal) = commit_terminal(actor, &event, who, now, emit);
+        return Prepared::Notify {
+            context,
+            notification,
+            terminal,
+        };
+    }
     match event {
-        SagaChoreographyEvent::SagaCompleted { .. } => {
-            if retain_terminal(participant, &event) {
-                participant.on_saga_completed(&context);
+        SagaChoreographyEvent::SagaStarted { payload, .. } => {
+            if begin_step(actor, who, &context, "saga_started", now, emit, start) {
+                Prepared::Step {
+                    context,
+                    input: payload.clone(),
+                    saga_input: payload,
+                }
+            } else {
+                Prepared::Ignore
             }
-        }
-        SagaChoreographyEvent::SagaFailed { ref reason, .. } => {
-            match resolve_failed(participant, &event, &who, now, &mut emit) {
-                FailedResolution::Ordinary => participant.on_saga_failed(&context, reason),
-                FailedResolution::Escalated(why) => participant.on_quarantined(&context, &why),
-                FailedResolution::NotRetained => {}
-            }
-        }
-        SagaChoreographyEvent::SagaQuarantined { ref reason, .. } => {
-            if retain_terminal(participant, &event) {
-                participant.on_quarantined(&context, reason);
-            }
-        }
-        SagaChoreographyEvent::SagaStarted { payload, .. }
-            if participant.depends_on().is_on_saga_start() =>
-        {
-            execute_step_wrapper_with_emit(participant, context, payload, now, &mut emit);
         }
         SagaChoreographyEvent::StepCompleted {
-            context: step_ctx,
+            context,
             output,
             saga_input,
             ..
         } => {
-            let dependency_spec = participant.depends_on();
-            if dependency_ready(
-                participant,
-                &who,
-                &step_ctx,
-                &dependency_spec,
-                now,
-                &mut emit,
-            ) && !forward_already_confirmed(participant, &context)
+            if !dependency_ready(actor, who, &context, dependencies, now, emit)
+                || forward_already_confirmed(actor, &context)
             {
-                let next_context = context.next_step(participant.step_name().into());
-                let input = if dependency_spec.prefers_original_saga_input() {
-                    saga_input
-                } else {
-                    output
-                };
-                execute_step_wrapper_with_emit(participant, next_context, input, now, &mut emit);
+                return Prepared::Ignore;
+            }
+            let input = if dependencies.prefers_original_saga_input() {
+                saga_input.clone()
+            } else {
+                output
+            };
+            let context = context.next_step(who.step.clone());
+            if begin_step(actor, who, &context, "step_completed", now, emit, start) {
+                Prepared::Step {
+                    context,
+                    input,
+                    saga_input,
+                }
+            } else {
+                Prepared::Ignore
             }
         }
         SagaChoreographyEvent::CompensationRequested {
@@ -108,8 +151,9 @@ pub fn handle_saga_event_with_emit<P, F>(
             steps_to_compensate,
             ..
         } => {
-            compensate_wrapper_with_emit(
-                participant,
+            let notification = match start_compensation(
+                actor,
+                who,
                 &context,
                 CompensationRequest {
                     failed_step,
@@ -118,125 +162,397 @@ pub fn handle_saga_event_with_emit<P, F>(
                     steps_to_compensate,
                 },
                 now,
+                emit,
+            ) {
+                CompensationStart::Run {
+                    saga_input,
+                    compensation_data,
+                } => {
+                    return Prepared::Compensation {
+                        context,
+                        saga_input,
+                        data: compensation_data,
+                    };
+                }
+                CompensationStart::Skip => return Prepared::Ignore,
+                CompensationStart::Acknowledge => {
+                    resend_compensation_ack(who, &context, emit);
+                    Notification::None
+                }
+                CompensationStart::NoEffect => {
+                    match complete_no_effect_compensation(actor, who, &context, now, emit) {
+                        Ok(()) => Notification::Compensated,
+                        Err(reason) => Notification::Quarantined(reason),
+                    }
+                }
+                CompensationStart::Quarantined(reason) => Notification::Quarantined(reason),
+            };
+            Prepared::Notify {
+                context,
+                notification,
+                terminal: false,
+            }
+        }
+        _ => Prepared::Ignore,
+    }
+}
+
+fn commit_terminal<A: SagaStateExt, F: FnMut(SagaChoreographyEvent)>(
+    actor: &mut A,
+    event: &SagaChoreographyEvent,
+    who: &Who,
+    now: u64,
+    emit: &mut F,
+) -> (Notification, bool) {
+    match event {
+        SagaChoreographyEvent::SagaCompleted { .. } if retain_terminal(actor, event) => {
+            (Notification::Completed, true)
+        }
+        SagaChoreographyEvent::SagaFailed { reason, .. } => {
+            match resolve_failed(actor, event, who, now, emit) {
+                FailedResolution::Ordinary => (Notification::Failed(reason.clone()), true),
+                FailedResolution::Escalated(reason) => (Notification::Quarantined(reason), false),
+                FailedResolution::NotRetained => (Notification::None, false),
+            }
+        }
+        SagaChoreographyEvent::SagaQuarantined { reason, .. } if retain_terminal(actor, event) => {
+            (Notification::Quarantined(reason.clone()), true)
+        }
+        _ => (Notification::None, false),
+    }
+}
+
+/// Validate and strictly publish the start before invoking business code.
+pub(crate) fn publish_start<A: SagaStateExt>(
+    actor: &mut A,
+    event: SagaChoreographyEvent,
+) -> Result<(), Box<str>> {
+    if !crate::is_valid_emitted_transition(
+        actor.saga_states_ref().get(&event.context().saga_id),
+        &event,
+    ) {
+        return Err("invalid step start; effect not run".into());
+    }
+    if let Some(bus) = &actor.saga_support().bus {
+        bus.publish_strict(event).map_err(|error| -> Box<str> {
+            format!("step start publication failed; effect not run: {error:?}").into()
+        })?;
+    }
+    Ok(())
+}
+
+pub(crate) fn handle_saga_event_core<P, F, S>(
+    participant: &mut P,
+    event: SagaChoreographyEvent,
+    mut emit: F,
+    mut start: S,
+) -> bool
+where
+    P: SagaParticipant + SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
+    S: FnMut(&mut P, SagaChoreographyEvent) -> Result<(), Box<str>>,
+{
+    let who = Who::sync(participant);
+    let dependencies = participant.depends_on();
+    let matches_type = participant
+        .saga_types()
+        .contains(&event.context().saga_type.as_ref());
+    let prepared = prepare_event(
+        participant,
+        event,
+        &who,
+        &dependencies,
+        matches_type,
+        &mut emit,
+        &mut start,
+    );
+    let (context, notification, terminal) = match prepared {
+        Prepared::Step {
+            context,
+            input,
+            saga_input,
+        } => {
+            let now = participant.now_millis();
+            let output = participant.execute_step(&context, &input);
+            let (dispatch, mut notification) = commit_step_result(
+                participant,
+                &who,
+                &context,
+                saga_input.clone(),
+                output,
+                now,
                 &mut emit,
             );
+            if let Some(result) = dispatch {
+                let request = EffectDispatchRequest {
+                    context: &context,
+                    effect: result.effect.as_deref().unwrap(),
+                    output: &result.output,
+                    compensation_data: &result.compensation_data,
+                };
+                let dispatched = participant.dispatch_effect(&request);
+                notification = commit_dispatch_result(
+                    participant,
+                    &who,
+                    &context,
+                    (saga_input, result),
+                    dispatched,
+                    now,
+                    &mut emit,
+                );
+            }
+            (context, notification, false)
         }
-        _ => {}
+        Prepared::Compensation {
+            context,
+            saga_input,
+            data,
+        } => {
+            let now = participant.now_millis();
+            let result = participant.compensate_step(&context, &data);
+            let notification = commit_compensation_result(
+                participant,
+                &who,
+                &context,
+                (saga_input, data),
+                result,
+                now,
+                &mut emit,
+            );
+            (context, notification, false)
+        }
+        Prepared::Notify {
+            context,
+            notification,
+            terminal,
+        } => (context, notification, terminal),
+        Prepared::Ignore => return false,
+    };
+    match notification {
+        Notification::Completed => participant.on_saga_completed(&context),
+        Notification::Failed(reason) => participant.on_saga_failed(&context, &reason),
+        Notification::Quarantined(reason) => participant.on_quarantined(&context, &reason),
+        Notification::Compensated => participant.on_compensation_completed(&context),
+        Notification::None => {}
     }
+    terminal
+}
+
+pub fn handle_saga_event_with_emit<P, F>(participant: &mut P, event: SagaChoreographyEvent, emit: F)
+where
+    P: SagaParticipant + SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
+{
+    handle_saga_event_core(participant, event, emit, publish_start);
+}
+
+pub(crate) async fn handle_async_saga_event_core<P, F, S>(
+    participant: &mut P,
+    event: SagaChoreographyEvent,
+    mut emit: F,
+    mut start: S,
+) -> bool
+where
+    P: AsyncSagaParticipant + SagaStateExt,
+    F: FnMut(SagaChoreographyEvent),
+    S: FnMut(&mut P, SagaChoreographyEvent) -> Result<(), Box<str>>,
+{
+    let who = Who::asynchronous(participant);
+    let dependencies = participant.depends_on();
+    let matches_type = participant
+        .saga_types()
+        .contains(&event.context().saga_type.as_ref());
+    let prepared = prepare_event(
+        participant,
+        event,
+        &who,
+        &dependencies,
+        matches_type,
+        &mut emit,
+        &mut start,
+    );
+    let (context, notification, terminal) = match prepared {
+        Prepared::Step {
+            context,
+            input,
+            saga_input,
+        } => {
+            let now = participant.now_millis();
+            let output = participant.execute_step(&context, &input).await;
+            let (dispatch, mut notification) = commit_step_result(
+                participant,
+                &who,
+                &context,
+                saga_input.clone(),
+                output,
+                now,
+                &mut emit,
+            );
+            if let Some(result) = dispatch {
+                let request = EffectDispatchRequest {
+                    context: &context,
+                    effect: result.effect.as_deref().unwrap(),
+                    output: &result.output,
+                    compensation_data: &result.compensation_data,
+                };
+                let dispatched = participant.dispatch_effect(&request).await;
+                notification = commit_dispatch_result(
+                    participant,
+                    &who,
+                    &context,
+                    (saga_input, result),
+                    dispatched,
+                    now,
+                    &mut emit,
+                );
+            }
+            (context, notification, false)
+        }
+        Prepared::Compensation {
+            context,
+            saga_input,
+            data,
+        } => {
+            let now = participant.now_millis();
+            let result = participant.compensate_step(&context, &data).await;
+            let notification = commit_compensation_result(
+                participant,
+                &who,
+                &context,
+                (saga_input, data),
+                result,
+                now,
+                &mut emit,
+            );
+            (context, notification, false)
+        }
+        Prepared::Notify {
+            context,
+            notification,
+            terminal,
+        } => (context, notification, terminal),
+        Prepared::Ignore => return false,
+    };
+    match notification {
+        Notification::Completed => participant.on_saga_completed(&context),
+        Notification::Failed(reason) => participant.on_saga_failed(&context, &reason),
+        Notification::Quarantined(reason) => participant.on_quarantined(&context, &reason),
+        Notification::Compensated => participant.on_compensation_completed(&context),
+        Notification::None => {}
+    }
+    terminal
 }
 
 pub async fn handle_async_saga_event_with_emit<P, F>(
     participant: &mut P,
     event: SagaChoreographyEvent,
-    mut emit: F,
+    emit: F,
 ) where
     P: AsyncSagaParticipant + SagaStateExt,
     F: FnMut(SagaChoreographyEvent),
 {
-    if !participant
-        .saga_types()
-        .iter()
-        .any(|t| *t == event.context().saga_type.as_ref())
-    {
-        return;
-    }
-    // Ownership is decided before admission/dedupe so a request addressed to another
-    // step never consumes this step's dedupe marker for its later singleton request.
-    if let SagaChoreographyEvent::CompensationRequested {
-        steps_to_compensate,
-        ..
-    } = &event
-        && !owns_compensation(participant.step_name(), steps_to_compensate)
-    {
-        return;
-    }
-    let who = Who::asynchronous(participant);
-    let dependencies = participant.depends_on();
-    if !admit_event(participant, &event, &who, &dependencies, &mut emit) {
-        return;
-    }
-    let context = event.context().clone();
-    let now = participant.now_millis();
+    handle_async_saga_event_core(participant, event, emit, publish_start).await;
+}
 
-    match event {
-        SagaChoreographyEvent::SagaCompleted { .. } => {
-            if retain_terminal(participant, &event) {
-                participant.on_saga_completed(&context);
-            }
-        }
-        SagaChoreographyEvent::SagaFailed { ref reason, .. } => {
-            match resolve_failed(participant, &event, &who, now, &mut emit) {
-                FailedResolution::Ordinary => participant.on_saga_failed(&context, reason),
-                FailedResolution::Escalated(why) => participant.on_quarantined(&context, &why),
-                FailedResolution::NotRetained => {}
-            }
-        }
-        SagaChoreographyEvent::SagaQuarantined { ref reason, .. } => {
-            if retain_terminal(participant, &event) {
-                participant.on_quarantined(&context, reason);
-            }
-        }
-        SagaChoreographyEvent::SagaStarted { payload, .. }
-            if participant.depends_on().is_on_saga_start() =>
-        {
-            execute_step_wrapper_with_emit_async(participant, context, payload, now, &mut emit)
-                .await;
-        }
-        SagaChoreographyEvent::StepCompleted {
-            context: step_ctx,
-            output,
+pub(crate) fn handle_workflow_saga_event_with_emit<A, F, S>(
+    actor: &mut A,
+    workflow: &'static dyn crate::SagaWorkflowParticipant<A>,
+    event: SagaChoreographyEvent,
+    mut emit: F,
+    mut start: S,
+) -> bool
+where
+    A: SagaStateExt + crate::HasSagaWorkflowParticipants,
+    F: FnMut(SagaChoreographyEvent),
+    S: FnMut(&mut A, SagaChoreographyEvent) -> Result<(), Box<str>>,
+{
+    let who = Who {
+        step: workflow.step_name().into(),
+        participant_id: workflow.participant_id_owned(),
+    };
+    let dependencies = workflow.depends_on();
+    let matches_type = workflow
+        .saga_types()
+        .contains(&event.context().saga_type.as_ref());
+    let prepared = prepare_event(
+        actor,
+        event,
+        &who,
+        &dependencies,
+        matches_type,
+        &mut emit,
+        &mut start,
+    );
+    let (context, notification, terminal) = match prepared {
+        Prepared::Step {
+            context,
+            input,
             saga_input,
-            ..
         } => {
-            let dependency_spec = participant.depends_on();
-            if dependency_ready(
-                participant,
+            let now = actor.now_millis();
+            let output = workflow.execute_step(actor, &context, &input);
+            let (dispatch, mut notification) = commit_step_result(
+                actor,
                 &who,
-                &step_ctx,
-                &dependency_spec,
+                &context,
+                saga_input.clone(),
+                output,
                 now,
                 &mut emit,
-            ) && !forward_already_confirmed(participant, &context)
-            {
-                let next_context = context.next_step(participant.step_name().into());
-                let input = if dependency_spec.prefers_original_saga_input() {
-                    saga_input
-                } else {
-                    output
+            );
+            if let Some(result) = dispatch {
+                let request = EffectDispatchRequest {
+                    context: &context,
+                    effect: result.effect.as_deref().unwrap(),
+                    output: &result.output,
+                    compensation_data: &result.compensation_data,
                 };
-                execute_step_wrapper_with_emit_async(
-                    participant,
-                    next_context,
-                    input,
+                let dispatched = workflow.dispatch_effect(actor, &request);
+                notification = commit_dispatch_result(
+                    actor,
+                    &who,
+                    &context,
+                    (saga_input, result),
+                    dispatched,
                     now,
                     &mut emit,
-                )
-                .await;
+                );
             }
+            (context, notification, false)
         }
-        SagaChoreographyEvent::CompensationRequested {
-            failed_step,
-            reason,
-            failure,
-            steps_to_compensate,
-            ..
+        Prepared::Compensation {
+            context,
+            saga_input,
+            data,
         } => {
-            compensate_wrapper_with_emit_async(
-                participant,
+            let now = actor.now_millis();
+            let result = workflow.compensate_step(actor, &context, &data);
+            let notification = commit_compensation_result(
+                actor,
+                &who,
                 &context,
-                CompensationRequest {
-                    failed_step,
-                    reason,
-                    failure,
-                    steps_to_compensate,
-                },
+                (saga_input, data),
+                result,
                 now,
                 &mut emit,
-            )
-            .await;
+            );
+            (context, notification, false)
         }
-        _ => {}
+        Prepared::Notify {
+            context,
+            notification,
+            terminal,
+        } => (context, notification, terminal),
+        Prepared::Ignore => return false,
+    };
+    match notification {
+        Notification::Completed => workflow.on_saga_completed(actor, &context),
+        Notification::Failed(reason) => workflow.on_saga_failed(actor, &context, &reason),
+        Notification::Quarantined(reason) => workflow.on_quarantined(actor, &context, &reason),
+        Notification::Compensated => workflow.on_compensation_completed(actor, &context),
+        Notification::None => {}
     }
+    terminal
 }
 
 /// Step identity captured once per handled event.
@@ -302,11 +618,10 @@ where
     F: FnMut(SagaChoreographyEvent),
 {
     let context = event.context();
-    match actor.admit_participant_event_strict(context) {
+    match actor.inspect_participant_event_strict(context) {
         Ok(ParticipantAdmission::Admitted) => {}
-        Ok(ParticipantAdmission::TerminalReplay { outcome })
-            if matches!(event, SagaChoreographyEvent::SagaQuarantined { .. })
-                && outcome != ParticipantTerminalKind::Quarantined =>
+        Ok(ParticipantAdmission::TerminalReplay { .. })
+            if matches!(event, SagaChoreographyEvent::SagaQuarantined { .. }) =>
         {
             return true;
         }
@@ -371,7 +686,8 @@ where
             if steps.contains(&context.step_name.as_ref()))
     {
         let observed = actor
-            .completed_dependency_steps_strict(context)
+            .admit_participant_event_strict(context)
+            .and_then(|_| actor.completed_dependency_steps_strict(context))
             .and_then(|seen| {
                 if seen.contains(&context.step_name) {
                     Ok(())
@@ -391,35 +707,13 @@ where
             return false;
         }
     }
-    match actor.check_run_dedupe_strict(context, &dedupe_key_for_event(event)) {
-        Ok(RunDedupe::First) => {}
-        Ok(RunDedupe::Duplicate) => return false,
-        Err(error) => {
-            tracing::error!(
-                target: "core::saga",
-                event = "saga_participant_dedupe_unavailable",
-                saga_id = context.saga_id.get(),
-                event_type = event.event_type(),
-                error = %error
-            );
-            quarantine_run(
-                actor,
-                who,
-                context,
-                format!("participant dedupe unavailable: {error}").into(),
-                actor.now_millis(),
-                emit,
-            );
-            return false;
-        }
-    }
     reset_in_memory_run_if_changed(actor, context);
     true
 }
 
 /// Per-run in-memory dependency/state tracking must never leak across runs that
 /// reuse a saga id.
-fn reset_in_memory_run_if_changed<A>(actor: &mut A, context: &SagaContext)
+pub(crate) fn reset_in_memory_run_if_changed<A>(actor: &mut A, context: &SagaContext)
 where
     A: SagaStateExt,
 {
@@ -589,27 +883,6 @@ where
     }
 }
 
-fn dedupe_key_for_event(event: &SagaChoreographyEvent) -> String {
-    let context = event.context();
-    match event {
-        SagaChoreographyEvent::CompensationRequested { failed_step, .. } => format!(
-            "{}:{}:{}:{}:{}",
-            context.trace_id,
-            context.saga_started_at_millis,
-            event.event_type(),
-            context.step_name,
-            failed_step
-        ),
-        _ => format!(
-            "{}:{}:{}:{}",
-            context.trace_id,
-            context.saga_started_at_millis,
-            event.event_type(),
-            context.step_name
-        ),
-    }
-}
-
 /// Output of a step that completed (not accepted) and its optional declared effect.
 struct StepResult {
     output: Vec<u8>,
@@ -621,12 +894,28 @@ struct StepResult {
 
 /// Persists forward execution intent, then publishes `StepStarted`. When intent
 /// cannot be made durable the effect is not run and the step fails (nothing to undo).
-fn begin_step<A, F>(actor: &mut A, who: &Who, context: &SagaContext, now: u64, emit: &mut F) -> bool
+fn begin_step<A, F, S>(
+    actor: &mut A,
+    who: &Who,
+    context: &SagaContext,
+    trigger: &str,
+    now: u64,
+    emit: &mut F,
+    start: &mut S,
+) -> bool
 where
     A: SagaStateExt,
     F: FnMut(SagaChoreographyEvent),
+    S: FnMut(&mut A, SagaChoreographyEvent) -> Result<(), Box<str>>,
 {
     let saga_id = context.saga_id;
+    if forward_already_confirmed(actor, context)
+        || actor
+            .participant_run_evidence_strict(context)
+            .is_ok_and(|e| e.accepted_forward_pending)
+    {
+        return false;
+    }
     let refusal = match actor.forward_execution_recorded_strict(context) {
         Ok(false) => None,
         Ok(true) => Some(
@@ -638,28 +927,23 @@ where
         quarantine_run(actor, who, context, reason, now, emit);
         return false;
     }
-    if let Err(error) = actor.record_event_strict(
-        saga_id,
-        ParticipantEvent::StepExecutionStarted {
-            attempt: 1,
-            started_at_millis: now,
-        },
-    ) {
-        tracing::error!(
-            target: "core::saga",
-            event = "saga_step_intent_persistence_failed",
-            saga_id = saga_id.get(),
-            error = %error
-        );
-        quarantine_run(
-            actor,
-            who,
-            context,
-            format!("step intent persistence failed; effect not run: {error}").into(),
-            now,
-            emit,
-        );
-        return false;
+    match actor
+        .saga_store()
+        .admit_and_record_intent(context, "forward", trigger)
+    {
+        Ok(StoreAdmission::Admitted) => {}
+        Ok(StoreAdmission::Duplicate | StoreAdmission::Rejected(_)) => return false,
+        Err(error) => {
+            quarantine_run(
+                actor,
+                who,
+                context,
+                format!("step intent persistence failed; effect not run: {error}").into(),
+                now,
+                emit,
+            );
+            return false;
+        }
     }
 
     let state = SagaParticipantState::new(
@@ -679,28 +963,8 @@ where
     let started = SagaChoreographyEvent::StepStarted {
         context: context.next_step(who.step.clone()),
     };
-    // With an attached bus the start must be visible to the resolver *before* the
-    // business callback can outlive its deadlines. A failed publication means the
-    // run's liveness cannot be proven, so the effect is not run (intent stays as
-    // evidence). The sink still receives the event for observers; ingress wrappers
-    // must not publish it a second time.
-    if let Some(bus) = actor.saga_support().bus.clone()
-        && let Err(error) = bus.publish_strict(started.clone())
-    {
-        tracing::error!(
-            target: "core::saga",
-            event = "saga_step_start_publication_failed",
-            saga_id = saga_id.get(),
-            error = ?error
-        );
-        quarantine_run(
-            actor,
-            who,
-            context,
-            format!("step start publication failed; effect not run: {error:?}").into(),
-            now,
-            emit,
-        );
+    if let Err(reason) = start(actor, started.clone()) {
+        quarantine_run(actor, who, context, reason, now, emit);
         return false;
     }
     emit(started);
@@ -994,135 +1258,122 @@ fn quarantine_run<A, F>(
     });
 }
 
-async fn execute_step_wrapper_with_emit_async<P, F>(
-    participant: &mut P,
-    context: SagaContext,
-    input: Vec<u8>,
+fn commit_step_result<A: SagaStateExt, F: FnMut(SagaChoreographyEvent)>(
+    actor: &mut A,
+    who: &Who,
+    context: &SagaContext,
+    saga_input: Vec<u8>,
+    output: Result<StepOutput, StepError>,
     now: u64,
     emit: &mut F,
-) where
-    P: AsyncSagaParticipant + SagaStateExt,
-    F: FnMut(SagaChoreographyEvent),
-{
-    let who = Who::asynchronous(participant);
-    if !begin_step(participant, &who, &context, now, emit) {
-        return;
-    }
-    let output = match participant.execute_step(&context, &input).await {
+) -> (Option<StepResult>, Notification) {
+    let output = match output {
         Ok(output) => output,
         Err(error) => {
-            fail_step(participant, &who, &context, error, now, emit);
-            return;
+            fail_step(actor, who, context, error, now, emit);
+            return (None, Notification::None);
         }
     };
-    let mut result = match split_output(output) {
+    let result = match split_output(output) {
         Ok(result) => result,
         Err(accepted) => {
-            accept_step(participant, &who, &context, input, accepted, now, emit);
-            return;
+            accept_step(actor, who, context, saga_input, accepted, now, emit);
+            return (None, Notification::None);
         }
     };
-    // A plain result is made durable by the single strict forward-proof append; only
-    // a declared effect needs the raw result persisted before its dispatch.
     if result.effect.is_none() {
-        if let Err(reason) = finish_step(participant, &who, &context, input, result, now, emit) {
-            participant.on_quarantined(&context, &reason);
-        }
-        return;
+        let notification = match finish_step(actor, who, context, saga_input, result, now, emit) {
+            Ok(()) => Notification::None,
+            Err(reason) => Notification::Quarantined(reason),
+        };
+        return (None, notification);
     }
-    if let Err(reason) = persist_result(participant, &who, &context, &result, now, emit) {
-        participant.on_quarantined(&context, &reason);
-        return;
-    }
-    let receipt = match result.effect.as_deref() {
-        Some(effect) => {
-            let request = EffectDispatchRequest {
-                context: &context,
-                effect,
-                output: &result.output,
-                compensation_data: &result.compensation_data,
-            };
-            match participant.dispatch_effect(&request).await {
-                Ok(outcome) => Some(log_dispatch_receipt(&context, effect, outcome)),
-                Err(error) => {
-                    let reason = dispatch_failure_reason(&error);
-                    quarantine_run(participant, &who, &context, reason.clone(), now, emit);
-                    participant.on_quarantined(&context, &reason);
-                    return;
-                }
-            }
-        }
-        None => None,
-    };
-    result.receipt = receipt;
-    if let Err(reason) = finish_step(participant, &who, &context, input, result, now, emit) {
-        participant.on_quarantined(&context, &reason);
+    match persist_result(actor, who, context, &result, now, emit) {
+        Ok(()) => (Some(result), Notification::None),
+        Err(reason) => (None, Notification::Quarantined(reason)),
     }
 }
 
-fn execute_step_wrapper_with_emit<P, F>(
-    participant: &mut P,
-    context: SagaContext,
-    input: Vec<u8>,
+fn commit_dispatch_result<A: SagaStateExt, F: FnMut(SagaChoreographyEvent)>(
+    actor: &mut A,
+    who: &Who,
+    context: &SagaContext,
+    completion: (Vec<u8>, StepResult),
+    dispatched: Result<EffectDispatchOutcome, crate::EffectDispatchError>,
     now: u64,
     emit: &mut F,
-) where
-    P: SagaParticipant + SagaStateExt,
-    F: FnMut(SagaChoreographyEvent),
-{
-    let who = Who::sync(participant);
-    if !begin_step(participant, &who, &context, now, emit) {
-        return;
-    }
-    let output = match participant.execute_step(&context, &input) {
-        Ok(output) => output,
+) -> Notification {
+    let (saga_input, mut result) = completion;
+    match dispatched {
+        Ok(outcome) => {
+            result.receipt = Some(log_dispatch_receipt(
+                context,
+                result.effect.as_deref().unwrap(),
+                outcome,
+            ))
+        }
         Err(error) => {
-            fail_step(participant, &who, &context, error, now, emit);
-            return;
+            let reason = dispatch_failure_reason(&error);
+            quarantine_run(actor, who, context, reason.clone(), now, emit);
+            return Notification::Quarantined(reason);
         }
-    };
-    let mut result = match split_output(output) {
-        Ok(result) => result,
-        Err(accepted) => {
-            accept_step(participant, &who, &context, input, accepted, now, emit);
-            return;
-        }
-    };
-    // A plain result is made durable by the single strict forward-proof append; only
-    // a declared effect needs the raw result persisted before its dispatch.
-    if result.effect.is_none() {
-        if let Err(reason) = finish_step(participant, &who, &context, input, result, now, emit) {
-            participant.on_quarantined(&context, &reason);
-        }
-        return;
     }
-    if let Err(reason) = persist_result(participant, &who, &context, &result, now, emit) {
-        participant.on_quarantined(&context, &reason);
-        return;
+    match finish_step(actor, who, context, saga_input, result, now, emit) {
+        Ok(()) => Notification::None,
+        Err(reason) => Notification::Quarantined(reason),
     }
-    let receipt = match result.effect.as_deref() {
-        Some(effect) => {
-            let request = EffectDispatchRequest {
-                context: &context,
-                effect,
-                output: &result.output,
-                compensation_data: &result.compensation_data,
-            };
-            match participant.dispatch_effect(&request) {
-                Ok(outcome) => Some(log_dispatch_receipt(&context, effect, outcome)),
-                Err(error) => {
-                    let reason = dispatch_failure_reason(&error);
-                    quarantine_run(participant, &who, &context, reason.clone(), now, emit);
-                    participant.on_quarantined(&context, &reason);
-                    return;
-                }
+}
+
+fn commit_compensation_result<A: SagaStateExt, F: FnMut(SagaChoreographyEvent)>(
+    actor: &mut A,
+    who: &Who,
+    context: &SagaContext,
+    payload: (Vec<u8>, Vec<u8>),
+    result: Result<CompensationOutput, CompensationError>,
+    now: u64,
+    emit: &mut F,
+) -> Notification {
+    let (saga_input, data) = payload;
+    match result {
+        Ok(CompensationOutput::Completed) => {
+            match complete_compensation(actor, who, context, now, emit) {
+                Ok(()) => Notification::Compensated,
+                Err(reason) => Notification::Quarantined(reason),
             }
         }
-        None => None,
-    };
-    result.receipt = receipt;
-    if let Err(reason) = finish_step(participant, &who, &context, input, result, now, emit) {
-        participant.on_quarantined(&context, &reason);
+        Ok(CompensationOutput::Accepted {
+            execution_id,
+            policy,
+        }) => {
+            match crate::accept_started_workflow_compensation(
+                actor,
+                context.next_step(who.step.clone()),
+                who.participant_id.clone(),
+                execution_id,
+                policy,
+                saga_input,
+                data,
+            ) {
+                Ok(event) => {
+                    emit(event);
+                    Notification::None
+                }
+                Err(error) => Notification::Quarantined(fail_compensation(
+                    actor,
+                    who,
+                    context,
+                    CompensationError::Ambiguous {
+                        reason: format!("accepted compensation persistence failed: {error:?}")
+                            .into(),
+                    },
+                    now,
+                    emit,
+                )),
+            }
+        }
+        Err(error) => {
+            Notification::Quarantined(fail_compensation(actor, who, context, error, now, emit))
+        }
     }
 }
 
@@ -1432,169 +1683,14 @@ where
     {
         crate::durability::mark_accepted_step_resolved(actor, saga_id, accepted.execution_id);
     }
+    let saga_input = actor
+        .participant_run_evidence_strict(context)
+        .ok()
+        .and_then(|e| e.forward_outcome.map(|outcome| outcome.saga_input))
+        .unwrap_or(saga_input);
     CompensationStart::Run {
         saga_input,
         compensation_data,
-    }
-}
-
-async fn compensate_wrapper_with_emit_async<P, F>(
-    participant: &mut P,
-    context: &SagaContext,
-    request: CompensationRequest,
-    now: u64,
-    emit: &mut F,
-) where
-    P: AsyncSagaParticipant + SagaStateExt,
-    F: FnMut(SagaChoreographyEvent),
-{
-    let who = Who::asynchronous(participant);
-    let (saga_input, comp_data) =
-        match start_compensation(participant, &who, context, request, now, emit) {
-            CompensationStart::Run {
-                saga_input,
-                compensation_data,
-            } => (saga_input, compensation_data),
-            CompensationStart::Skip => return,
-            CompensationStart::Acknowledge => {
-                resend_compensation_ack(&who, context, emit);
-                return;
-            }
-            CompensationStart::NoEffect => {
-                match complete_no_effect_compensation(participant, &who, context, now, emit) {
-                    Ok(()) => participant.on_compensation_completed(context),
-                    Err(reason) => participant.on_quarantined(context, &reason),
-                }
-                return;
-            }
-            CompensationStart::Quarantined(reason) => {
-                participant.on_quarantined(context, &reason);
-                return;
-            }
-        };
-
-    match participant.compensate_step(context, &comp_data).await {
-        Ok(CompensationOutput::Completed) => {
-            match complete_compensation(participant, &who, context, now, emit) {
-                Ok(()) => participant.on_compensation_completed(context),
-                Err(reason) => participant.on_quarantined(context, &reason),
-            }
-        }
-        Ok(CompensationOutput::Accepted {
-            execution_id,
-            policy,
-        }) => {
-            match crate::durability::accept_started_workflow_compensation(
-                participant,
-                context.next_step(who.step.clone()),
-                who.participant_id.clone(),
-                execution_id,
-                policy,
-                saga_input,
-                comp_data,
-            ) {
-                Ok(event) => emit(event),
-                Err(error) => {
-                    let reason = fail_compensation(
-                        participant,
-                        &who,
-                        context,
-                        CompensationError::Ambiguous {
-                            reason: format!(
-                                "accepted async compensation persistence failed: {error:?}"
-                            )
-                            .into(),
-                        },
-                        now,
-                        emit,
-                    );
-                    participant.on_quarantined(context, &reason);
-                }
-            }
-        }
-        Err(error) => {
-            let reason = fail_compensation(participant, &who, context, error, now, emit);
-            participant.on_quarantined(context, &reason);
-        }
-    }
-}
-
-fn compensate_wrapper_with_emit<P, F>(
-    participant: &mut P,
-    context: &SagaContext,
-    request: CompensationRequest,
-    now: u64,
-    emit: &mut F,
-) where
-    P: SagaParticipant + SagaStateExt,
-    F: FnMut(SagaChoreographyEvent),
-{
-    let who = Who::sync(participant);
-    let (saga_input, comp_data) =
-        match start_compensation(participant, &who, context, request, now, emit) {
-            CompensationStart::Run {
-                saga_input,
-                compensation_data,
-            } => (saga_input, compensation_data),
-            CompensationStart::Skip => return,
-            CompensationStart::Acknowledge => {
-                resend_compensation_ack(&who, context, emit);
-                return;
-            }
-            CompensationStart::NoEffect => {
-                match complete_no_effect_compensation(participant, &who, context, now, emit) {
-                    Ok(()) => participant.on_compensation_completed(context),
-                    Err(reason) => participant.on_quarantined(context, &reason),
-                }
-                return;
-            }
-            CompensationStart::Quarantined(reason) => {
-                participant.on_quarantined(context, &reason);
-                return;
-            }
-        };
-
-    match participant.compensate_step(context, &comp_data) {
-        Ok(CompensationOutput::Completed) => {
-            match complete_compensation(participant, &who, context, now, emit) {
-                Ok(()) => participant.on_compensation_completed(context),
-                Err(reason) => participant.on_quarantined(context, &reason),
-            }
-        }
-        Ok(CompensationOutput::Accepted {
-            execution_id,
-            policy,
-        }) => {
-            match crate::durability::accept_started_workflow_compensation(
-                participant,
-                context.next_step(who.step.clone()),
-                who.participant_id.clone(),
-                execution_id,
-                policy,
-                saga_input,
-                comp_data,
-            ) {
-                Ok(event) => emit(event),
-                Err(error) => {
-                    let reason = fail_compensation(
-                        participant,
-                        &who,
-                        context,
-                        CompensationError::Ambiguous {
-                            reason: format!("accepted compensation persistence failed: {error:?}")
-                                .into(),
-                        },
-                        now,
-                        emit,
-                    );
-                    participant.on_quarantined(context, &reason);
-                }
-            }
-        }
-        Err(error) => {
-            let reason = fail_compensation(participant, &who, context, error, now, emit);
-            participant.on_quarantined(context, &reason);
-        }
     }
 }
 
@@ -1703,7 +1799,6 @@ where
 {
     let saga_id = context.saga_id;
     let (reason, is_ambiguous) = match error {
-        CompensationError::SafeToRetry { reason } => (reason, false),
         CompensationError::Ambiguous { reason } => (reason, true),
         CompensationError::Terminal { reason } => (reason, false),
     };
@@ -1782,8 +1877,8 @@ where
 #[cfg(test)]
 mod tests {
     use crate::{
-        DeterministicContextBuilder, HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal,
-        ParticipantJournal, SagaContext, SagaId, SagaParticipantSupport,
+        DeterministicContextBuilder, HasSagaParticipantSupport, InMemoryParticipantStore,
+        ParticipantStore, SagaContext, SagaId, SagaParticipantSupport,
     };
 
     use super::*;
@@ -1795,7 +1890,7 @@ mod tests {
     }
 
     struct TestParticipant {
-        saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
+        saga: SagaParticipantSupport<InMemoryParticipantStore>,
         execute_mode: ExecuteMode,
         compensation_error: Option<CompensationError>,
         executed: usize,
@@ -1806,7 +1901,7 @@ mod tests {
     impl Default for TestParticipant {
         fn default() -> Self {
             Self {
-                saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+                saga: SagaParticipantSupport::new(InMemoryParticipantStore::new()),
                 execute_mode: ExecuteMode::Completed,
                 compensation_error: None,
                 executed: 0,
@@ -1817,21 +1912,18 @@ mod tests {
     }
 
     impl HasSagaParticipantSupport for TestParticipant {
-        type Journal = InMemoryJournal;
-        type Dedupe = InMemoryDedupe;
+        type Store = InMemoryParticipantStore;
 
-        fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+        fn saga_support(&self) -> &SagaParticipantSupport<Self::Store> {
             &self.saga
         }
 
-        fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+        fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Store> {
             &mut self.saga
         }
     }
 
     impl SagaParticipant for TestParticipant {
-        type Error = String;
-
         fn step_name(&self) -> &str {
             "risk_check"
         }
@@ -1882,6 +1974,30 @@ mod tests {
     }
 
     #[test]
+    fn after_receives_output_but_preserves_original_saga_input() {
+        let mut participant = TestParticipant {
+            dependency_spec: DependencySpec::After("upstream"),
+            ..TestParticipant::default()
+        };
+        let mut context = started_event().context().clone();
+        context.step_name = "upstream".into();
+        let mut emitted = Vec::new();
+        handle_saga_event_with_emit(
+            &mut participant,
+            SagaChoreographyEvent::StepCompleted {
+                context,
+                output: vec![42],
+                saga_input: vec![7],
+                compensation_available: false,
+            },
+            |event| emitted.push(event),
+        );
+        assert_eq!(participant.observed_inputs, vec![vec![42]]);
+        assert!(emitted.iter().any(|event| matches!(event,
+            SagaChoreographyEvent::StepCompleted { saga_input, .. } if saga_input == &[7])));
+    }
+
+    #[test]
     fn handle_saga_event_with_emit_emits_step_completed() {
         let mut participant = TestParticipant::default();
         let mut emitted = Vec::new();
@@ -1905,12 +2021,13 @@ mod tests {
         ));
         let entries = participant
             .saga
-            .journal
+            .store
             .read(SagaId::new(1))
             .expect("journal read should succeed");
         assert!(matches!(
             entries.as_slice(),
             [
+                _,
                 _,
                 _,
                 crate::JournalEntry {
@@ -2153,7 +2270,7 @@ mod tests {
         ));
         let entries = participant
             .saga
-            .journal
+            .store
             .read(SagaId::new(1))
             .expect("journal read should succeed");
         assert!(matches!(
@@ -2214,7 +2331,7 @@ mod tests {
         ));
         let entries = participant
             .saga
-            .journal
+            .store
             .read(SagaId::new(1))
             .expect("journal read should succeed");
         assert!(entries.iter().any(|entry| matches!(

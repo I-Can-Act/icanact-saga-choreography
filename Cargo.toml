@@ -8,9 +8,7 @@ authors = ["Greg"]
 
 [features]
 default = []
-diagnostics = []
-test-harness = ["icanact-core/test-support", "dep:tracing-subscriber"]
-test-support = ["test-harness"]
+test-harness = ["icanact-core/test-support", "dep:tracing-subscriber", "dep:tokio"]
 lmdb = ["dep:heed"]
 # Opt-in exhaustive concurrency model checking of a reference dedupe
 # check-and-mark model (the algorithm the in-memory store also uses; shipped
@@ -39,7 +37,7 @@ required-features = ["test-harness"]
 icanact-core = { git = "ssh://git@github.com/moofone/actor-framework-core.git", rev = "b151e071d3693f4065f928f81cc1c7464b83aed8", features = ["async-actors"] }
 rkyv = { version = "0.8", features = ["std", "bytecheck"] }
 thiserror = "1.0"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros", "sync"], optional = true }
 tracing = "0.1"
 heed = { version = "0.20", optional = true }
 

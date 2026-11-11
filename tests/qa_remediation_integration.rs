@@ -41,7 +41,7 @@ fn durable_bus(journal: Arc<InMemoryTerminalResolverJournal>, bind: bool) -> Sag
         .unwrap();
     if bind {
         for step in ["a", "finish"] {
-            bus.register_bound_workflow_step("integration-qa", step)
+            bus.subscribe_workflow_step_fn("integration-qa", step, |_| true)
                 .unwrap();
             bus.subscribe_saga_type_fn("integration-qa", |_| true);
         }
@@ -81,14 +81,13 @@ fn failure(c: &SagaContext) -> SagaChoreographyEvent {
     }
 }
 
-struct Support(SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>);
+struct Support(SagaParticipantSupport<InMemoryParticipantStore>);
 impl HasSagaParticipantSupport for Support {
-    type Journal = InMemoryJournal;
-    type Dedupe = InMemoryDedupe;
-    fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    type Store = InMemoryParticipantStore;
+    fn saga_support(&self) -> &SagaParticipantSupport<Self::Store> {
         &self.0
     }
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Store> {
         &mut self.0
     }
 }
@@ -97,10 +96,7 @@ impl HasSagaParticipantSupport for Support {
 fn completion_after_accepted_effect_was_undone_escalates_terminal_failure_to_quarantine() {
     let mut r = TerminalResolver::new(policy());
     let c = ctx(5001, "a", SagaContext::now_millis());
-    let mut actor = Support(SagaParticipantSupport::new(
-        InMemoryJournal::new(),
-        InMemoryDedupe::new(),
-    ));
+    let mut actor = Support(SagaParticipantSupport::new(InMemoryParticipantStore::new()));
     let accepted = accept_workflow_step(
         &mut actor,
         c.clone(),
@@ -207,10 +203,7 @@ fn late_quarantine_of_an_old_run_fences_an_already_active_successor() {
 
 #[test]
 fn late_quarantine_durably_overrides_an_ordinary_terminal_tombstone() {
-    let mut actor = Support(SagaParticipantSupport::new(
-        InMemoryJournal::new(),
-        InMemoryDedupe::new(),
-    ));
+    let mut actor = Support(SagaParticipantSupport::new(InMemoryParticipantStore::new()));
     let c = ctx(5010, "a", SagaContext::now_millis());
     actor.admit_participant_event_strict(&c).unwrap();
     actor

@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use icanact_saga_choreography::durability::{
     ActiveSagaExecution, ActiveSagaExecutionPhase, DEFAULT_RECOVERY_SAGA_TYPE,
-    HasActiveSagaExecution, PANIC_QUARANTINE_PUBLISH_KEY, RecoveryDecision, RecoveryPolicy,
+    HasActiveSagaExecution, PANIC_QUARANTINE_PUBLISH_KEY, RecoveryDecision,
     apply_sync_participant_saga_ingress, apply_sync_participant_saga_ingress_with_hooks,
     classify_recovery, collect_startup_recovery_events,
     collect_startup_recovery_events_for_saga_type, default_runtime_dir, is_panic_quarantine_reason,
@@ -17,11 +17,10 @@ use icanact_saga_choreography::{
     complete_accepted_workflow_step,
 };
 use icanact_saga_choreography::{
-    CompensationError, DependencySpec, HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal,
-    JournalEntry, ParticipantDedupeStore, ParticipantEvent, ParticipantJournal,
-    SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant,
-    SagaParticipantState, SagaParticipantSupport, SagaStateEntry, SagaStateExt, StepError,
-    StepExecutionId, StepOutput,
+    CompensationError, DependencySpec, HasSagaParticipantSupport, InMemoryParticipantStore,
+    JournalEntry, ParticipantEvent, ParticipantStore, SagaChoreographyBus, SagaChoreographyEvent,
+    SagaContext, SagaId, SagaParticipant, SagaParticipantState, SagaParticipantSupport,
+    SagaStateEntry, SagaStateExt, StepError, StepExecutionId, StepOutput,
 };
 
 const ORDER_LIFECYCLE: &str = "order_lifecycle";
@@ -33,10 +32,10 @@ enum ExecuteMode {
     DropStateBeforeReturn,
 }
 
-struct TestParticipant {
+struct TestParticipant<S: ParticipantStore = InMemoryParticipantStore> {
     step_name: &'static str,
     mode: ExecuteMode,
-    saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
+    saga: SagaParticipantSupport<S>,
     active_saga_execution: Option<ActiveSagaExecution>,
 }
 
@@ -45,56 +44,49 @@ impl TestParticipant {
         Self {
             step_name,
             mode,
-            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+            saga: SagaParticipantSupport::new(InMemoryParticipantStore::new()),
             active_saga_execution: None,
         }
     }
 }
 
-impl HasSagaParticipantSupport for TestParticipant {
-    type Journal = InMemoryJournal;
-    type Dedupe = InMemoryDedupe;
+impl<S: ParticipantStore> HasSagaParticipantSupport for TestParticipant<S> {
+    type Store = S;
 
-    fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support(&self) -> &SagaParticipantSupport<Self::Store> {
         &self.saga
     }
 
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Store> {
         &mut self.saga
     }
 }
 
 #[cfg(feature = "lmdb")]
 struct LmdbAcceptedStepActor {
-    saga: SagaParticipantSupport<
-        icanact_saga_choreography::durability::lmdb::LmdbJournal,
-        icanact_saga_choreography::durability::lmdb::LmdbDedupe,
-    >,
+    saga: SagaParticipantSupport<icanact_saga_choreography::LmdbParticipantStore>,
 }
 
 #[cfg(feature = "lmdb")]
 impl HasSagaParticipantSupport for LmdbAcceptedStepActor {
-    type Journal = icanact_saga_choreography::durability::lmdb::LmdbJournal;
-    type Dedupe = icanact_saga_choreography::durability::lmdb::LmdbDedupe;
+    type Store = icanact_saga_choreography::LmdbParticipantStore;
 
-    fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support(&self) -> &SagaParticipantSupport<Self::Store> {
         &self.saga
     }
 
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Store> {
         &mut self.saga
     }
 }
 
-impl HasActiveSagaExecution for TestParticipant {
+impl<S: ParticipantStore> HasActiveSagaExecution for TestParticipant<S> {
     fn active_saga_execution_slot(&mut self) -> &mut Option<ActiveSagaExecution> {
         &mut self.active_saga_execution
     }
 }
 
-impl SagaParticipant for TestParticipant {
-    type Error = String;
-
+impl<S: ParticipantStore> SagaParticipant for TestParticipant<S> {
     fn step_name(&self) -> &str {
         self.step_name
     }
@@ -155,20 +147,16 @@ fn lmdb_open_recovers_accepted_step_metadata_for_restart_completion() {
     let ctx = context(90, ORDER_LIFECYCLE, TEST_STEP);
     let execution_id = StepExecutionId::new("external-90");
     let policy = AcceptedStepPolicy {
-        idle_timeout: std::time::Duration::from_millis(100),
-        hard_timeout: std::time::Duration::from_millis(250),
+        idle_timeout: std::time::Duration::from_secs(60),
+        hard_timeout: std::time::Duration::from_secs(60),
         timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
             requires_compensation: false,
         },
     };
 
     let support =
-        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_type(
-            temp.path(),
-            TEST_STEP,
-            ORDER_LIFECYCLE,
-        )
-        .expect("support should open before restart");
+        open_lmdb_participant_support_for_saga_type(temp.path(), TEST_STEP, ORDER_LIFECYCLE)
+            .expect("support should open before restart");
     let mut actor = LmdbAcceptedStepActor { saga: support };
     accept_workflow_step(
         &mut actor,
@@ -183,12 +171,8 @@ fn lmdb_open_recovers_accepted_step_metadata_for_restart_completion() {
     drop(actor);
 
     let support =
-        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_type(
-            temp.path(),
-            TEST_STEP,
-            ORDER_LIFECYCLE,
-        )
-        .expect("support should reopen after restart");
+        open_lmdb_participant_support_for_saga_type(temp.path(), TEST_STEP, ORDER_LIFECYCLE)
+            .expect("support should reopen after restart");
     let mut reopened = LmdbAcceptedStepActor { saga: support };
     let completed = complete_accepted_workflow_step(
         &mut reopened,
@@ -230,13 +214,12 @@ fn lmdb_open_recovers_accepted_steps_for_each_declared_saga_type() {
             requires_compensation: true,
         },
     };
-    let support =
-        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_types(
-            temp.path(),
-            TEST_STEP,
-            &[OPEN_POSITION, CLOSE_POSITION],
-        )
-        .expect("multi-workflow support should open before restart");
+    let support = open_lmdb_participant_support_for_saga_types(
+        temp.path(),
+        TEST_STEP,
+        &[OPEN_POSITION, CLOSE_POSITION],
+    )
+    .expect("multi-workflow support should open before restart");
     let mut actor = LmdbAcceptedStepActor { saga: support };
     accept_workflow_step(
         &mut actor,
@@ -260,13 +243,12 @@ fn lmdb_open_recovers_accepted_steps_for_each_declared_saga_type() {
     .expect("close workflow step should be accepted");
     drop(actor);
 
-    let support =
-        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_types(
-            temp.path(),
-            TEST_STEP,
-            &[OPEN_POSITION, CLOSE_POSITION],
-        )
-        .expect("multi-workflow support should reopen after restart");
+    let support = open_lmdb_participant_support_for_saga_types(
+        temp.path(),
+        TEST_STEP,
+        &[OPEN_POSITION, CLOSE_POSITION],
+    )
+    .expect("multi-workflow support should reopen after restart");
     assert!(
         support
             .accepted_workflow_steps
@@ -286,15 +268,14 @@ fn lmdb_multi_saga_open_only_replays_stale_journal_with_exact_type_evidence() {
     const CLOSE_POSITION: &str = "close_position";
 
     let temp = tempfile::tempdir().expect("tempdir should open");
-    let support =
-        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_types(
-            temp.path(),
-            TEST_STEP,
-            &[OPEN_POSITION, CLOSE_POSITION],
-        )
-        .expect("multi-workflow support should open");
+    let support = open_lmdb_participant_support_for_saga_types(
+        temp.path(),
+        TEST_STEP,
+        &[OPEN_POSITION, CLOSE_POSITION],
+    )
+    .expect("multi-workflow support should open");
     support
-        .journal
+        .store
         .append(
             SagaId::new(192),
             ParticipantEvent::Quarantined {
@@ -307,18 +288,7 @@ fn lmdb_multi_saga_open_only_replays_stale_journal_with_exact_type_evidence() {
         )
         .expect("untyped legacy event should persist");
     support
-        .journal
-        .append(
-            SagaId::new(193),
-            ParticipantEvent::SagaRegistered {
-                saga_type: OPEN_POSITION.into(),
-                step_name: TEST_STEP.into(),
-                registered_at_millis: 0,
-            },
-        )
-        .expect("typed registration should persist");
-    support
-        .journal
+        .store
         .append(
             SagaId::new(193),
             ParticipantEvent::ParticipantRunRecorded {
@@ -329,7 +299,7 @@ fn lmdb_multi_saga_open_only_replays_stale_journal_with_exact_type_evidence() {
         )
         .expect("typed run identity should persist");
     support
-        .journal
+        .store
         .append(
             SagaId::new(193),
             ParticipantEvent::Quarantined {
@@ -343,13 +313,27 @@ fn lmdb_multi_saga_open_only_replays_stale_journal_with_exact_type_evidence() {
         .expect("typed stale execution should persist");
     drop(support);
 
-    let support =
-        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_types(
-            temp.path(),
-            TEST_STEP,
-            &[OPEN_POSITION, CLOSE_POSITION],
-        )
-        .expect("multi-workflow support should reopen");
+    let err = match open_lmdb_participant_support_for_saga_types(
+        temp.path(),
+        TEST_STEP,
+        &[OPEN_POSITION, CLOSE_POSITION],
+    ) {
+        Err(err) => err,
+        Ok(_) => panic!("untyped recovery evidence must fail closed"),
+    };
+    assert!(err.contains("operator reconciliation required"));
+    let store =
+        icanact_saga_choreography::LmdbParticipantStore::open(temp.path(), TEST_STEP).unwrap();
+    store
+        .prune(SagaId::new(192))
+        .expect("explicit operator reconciliation removes unidentified history");
+    drop(store);
+    let support = open_lmdb_participant_support_for_saga_types(
+        temp.path(),
+        TEST_STEP,
+        &[OPEN_POSITION, CLOSE_POSITION],
+    )
+    .expect("multi-workflow support should reopen");
     assert!(matches!(
         support.startup_recovery_events.as_slice(),
         [SagaChoreographyEvent::SagaQuarantined { context, .. }]
@@ -366,14 +350,10 @@ fn lmdb_open_does_not_rehydrate_expired_accepted_step() {
     let ctx = context(91, ORDER_LIFECYCLE, TEST_STEP);
     let execution_id = StepExecutionId::new("external-91");
     let support =
-        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_type(
-            temp.path(),
-            TEST_STEP,
-            ORDER_LIFECYCLE,
-        )
-        .expect("support should open before restart");
+        open_lmdb_participant_support_for_saga_type(temp.path(), TEST_STEP, ORDER_LIFECYCLE)
+            .expect("support should open before restart");
     support
-        .journal
+        .store
         .append(
             ctx.saga_id,
             ParticipantEvent::AcceptedStepRecorded {
@@ -396,12 +376,8 @@ fn lmdb_open_does_not_rehydrate_expired_accepted_step() {
     drop(support);
 
     let support =
-        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_type(
-            temp.path(),
-            TEST_STEP,
-            ORDER_LIFECYCLE,
-        )
-        .expect("support should reopen after restart");
+        open_lmdb_participant_support_for_saga_type(temp.path(), TEST_STEP, ORDER_LIFECYCLE)
+            .expect("support should reopen after restart");
     assert_eq!(support.accepted_workflow_step_count(), 0);
     assert!(
         support.startup_recovery_events.iter().any(|event| matches!(
@@ -429,14 +405,10 @@ fn lmdb_open_rehydrates_expired_compensable_step_with_forward_tombstone() {
     let ctx = context(92, ORDER_LIFECYCLE, TEST_STEP);
     let execution_id = StepExecutionId::new("external-92");
     let support =
-        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_type(
-            temp.path(),
-            TEST_STEP,
-            ORDER_LIFECYCLE,
-        )
-        .expect("support should open before restart");
+        open_lmdb_participant_support_for_saga_type(temp.path(), TEST_STEP, ORDER_LIFECYCLE)
+            .expect("support should open before restart");
     support
-        .journal
+        .store
         .append(
             ctx.saga_id,
             ParticipantEvent::AcceptedStepRecorded {
@@ -459,12 +431,8 @@ fn lmdb_open_rehydrates_expired_compensable_step_with_forward_tombstone() {
     drop(support);
 
     let support =
-        icanact_saga_choreography::durability::lmdb::open_lmdb_participant_support_for_saga_type(
-            temp.path(),
-            TEST_STEP,
-            ORDER_LIFECYCLE,
-        )
-        .expect("support should reopen after restart");
+        open_lmdb_participant_support_for_saga_type(temp.path(), TEST_STEP, ORDER_LIFECYCLE)
+            .expect("support should reopen after restart");
     assert_eq!(support.accepted_workflow_step_count(), 1);
     assert_eq!(support.resolved_workflow_step_count(), 1);
     assert_eq!(
@@ -538,7 +506,7 @@ fn ingress_applies_side_effects_and_publishes_valid_emitted_events() {
         },
     );
 
-    assert_eq!(terminal_side_effect_calls, 1);
+    assert_eq!(terminal_side_effect_calls, 0);
     assert_eq!(invalid_transition_calls, 0);
     assert_eq!(emitted_transition_calls, 2);
     assert_eq!(DELIVERED_STEP_COMPLETED.load(Ordering::Relaxed), 1);
@@ -631,7 +599,7 @@ fn panic_quarantine_records_journal_marks_dedupe_and_publishes() {
 
     let entries = participant
         .saga
-        .journal
+        .store
         .read(saga_context.saga_id)
         .expect("journal read should succeed");
     let panic_reason = panic_quarantine_reason_from_entries(&entries)
@@ -641,16 +609,16 @@ fn panic_quarantine_records_journal_marks_dedupe_and_publishes() {
     assert!(
         participant
             .saga
-            .dedupe
-            .contains(saga_context.saga_id, PANIC_QUARANTINE_PUBLISH_KEY,)
+            .store
+            .check_and_mark(saga_context.saga_id, PANIC_QUARANTINE_PUBLISH_KEY,)
+            .map(|fresh| !fresh)
             .expect("dedupe contains should succeed")
     );
 }
 
 #[test]
 fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
-    let journal = InMemoryJournal::new();
-    let dedupe = InMemoryDedupe::new();
+    let journal = InMemoryParticipantStore::new();
 
     let saga_id = SagaId::new(13);
     let reason = panic_quarantine_reason(ActiveSagaExecutionPhase::CompensationExecution, "boom");
@@ -675,13 +643,9 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
         )
         .expect("append should succeed");
 
-    let first = collect_startup_recovery_events_for_saga_type(
-        &journal,
-        &dedupe,
-        "risk_gate",
-        "mature_pool_refresh",
-    )
-    .expect("startup recovery should collect");
+    let first =
+        collect_startup_recovery_events_for_saga_type(&journal, "risk_gate", "mature_pool_refresh")
+            .expect("startup recovery should collect");
     assert_eq!(first.len(), 1);
     assert!(matches!(
         &first[0],
@@ -690,13 +654,9 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
                 && context.saga_started_at_millis == 4_242
     ));
 
-    let second = collect_startup_recovery_events_for_saga_type(
-        &journal,
-        &dedupe,
-        "risk_gate",
-        "mature_pool_refresh",
-    )
-    .expect("startup recovery should collect");
+    let second =
+        collect_startup_recovery_events_for_saga_type(&journal, "risk_gate", "mature_pool_refresh")
+            .expect("startup recovery should collect");
     assert!(
         second.is_empty(),
         "dedupe should prevent duplicate replay events"
@@ -711,13 +671,7 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
         },
     }];
     assert_eq!(
-        classify_recovery(
-            &stale_entries,
-            10_000,
-            RecoveryPolicy {
-                stale_after_ms: 500
-            }
-        ),
+        classify_recovery(&stale_entries, 10_000),
         RecoveryDecision::QuarantineStale
     );
 
@@ -741,18 +695,11 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
         },
     }];
     assert_eq!(
-        classify_recovery(
-            &accepted_entries,
-            10_000,
-            RecoveryPolicy {
-                stale_after_ms: 500
-            }
-        ),
+        classify_recovery(&accepted_entries, 10_000),
         RecoveryDecision::Continue
     );
 
-    let expired_journal = InMemoryJournal::new();
-    let expired_dedupe = InMemoryDedupe::new();
+    let expired_journal = InMemoryParticipantStore::new();
     expired_journal
         .append(
             SagaId::new(15),
@@ -775,13 +722,9 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
             },
         )
         .expect("append should succeed");
-    let expired = collect_startup_recovery_events_for_saga_type(
-        &expired_journal,
-        &expired_dedupe,
-        TEST_STEP,
-        ORDER_LIFECYCLE,
-    )
-    .expect("startup recovery should collect expired accepted step");
+    let expired =
+        collect_startup_recovery_events_for_saga_type(&expired_journal, TEST_STEP, ORDER_LIFECYCLE)
+            .expect("startup recovery should collect expired accepted step");
     assert!(matches!(
         expired.as_slice(),
         [SagaChoreographyEvent::StepAccepted {
@@ -794,8 +737,7 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
         }] if error.contains("accepted step hard timeout after restart")
     ));
 
-    let failed_journal = InMemoryJournal::new();
-    let failed_dedupe = InMemoryDedupe::new();
+    let failed_journal = InMemoryParticipantStore::new();
     failed_journal
         .append(
             SagaId::new(16),
@@ -825,13 +767,9 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
             },
         )
         .expect("accepted-step failure should be durable");
-    let failed = collect_startup_recovery_events_for_saga_type(
-        &failed_journal,
-        &failed_dedupe,
-        TEST_STEP,
-        ORDER_LIFECYCLE,
-    )
-    .expect("startup recovery should replay the durable accepted-step failure");
+    let failed =
+        collect_startup_recovery_events_for_saga_type(&failed_journal, TEST_STEP, ORDER_LIFECYCLE)
+            .expect("startup recovery should replay the durable accepted-step failure");
     assert!(matches!(
         failed.as_slice(),
         [SagaChoreographyEvent::StepAccepted {
@@ -857,13 +795,7 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
         },
     }];
     assert_eq!(
-        classify_recovery(
-            &terminal_entries,
-            10_000,
-            RecoveryPolicy {
-                stale_after_ms: 500
-            }
-        ),
+        classify_recovery(&terminal_entries, 10_000),
         RecoveryDecision::TerminalNoAction
     );
 
@@ -876,13 +808,7 @@ fn recovery_collection_replays_panic_quarantine_once_and_classifies_states() {
         },
     }];
     assert_eq!(
-        classify_recovery(
-            &replay_entries,
-            10_000,
-            RecoveryPolicy {
-                stale_after_ms: 500
-            }
-        ),
+        classify_recovery(&replay_entries, 10_000),
         RecoveryDecision::ReplayPanicQuarantine
     );
 }
@@ -992,21 +918,81 @@ impl icanact_saga_choreography::durability::SagaLmdbBackedActor for FailingLmdbB
 
 #[derive(Clone)]
 struct StaticJournal {
+    failed_appends: std::sync::Arc<AtomicUsize>,
+    inner: std::sync::Arc<InMemoryParticipantStore>,
     rows: Vec<(SagaId, Vec<JournalEntry>)>,
 }
 
 impl StaticJournal {
     fn new(rows: Vec<(SagaId, Vec<JournalEntry>)>) -> Self {
-        Self { rows }
+        Self {
+            rows,
+            failed_appends: std::sync::Arc::new(AtomicUsize::new(0)),
+            inner: std::sync::Arc::new(InMemoryParticipantStore::new()),
+        }
     }
 }
 
-impl ParticipantJournal for StaticJournal {
+impl ParticipantStore for StaticJournal {
+    fn check_and_mark(
+        &self,
+        id: SagaId,
+        key: &str,
+    ) -> Result<bool, icanact_saga_choreography::JournalError> {
+        self.inner.check_and_mark(id, key)
+    }
+    fn remove_processed(
+        &self,
+        id: SagaId,
+        key: &str,
+    ) -> Result<(), icanact_saga_choreography::JournalError> {
+        self.inner.remove_processed(id, key)
+    }
+    fn append_batch(
+        &self,
+        id: SagaId,
+        events: Vec<ParticipantEvent>,
+    ) -> Result<Vec<u64>, icanact_saga_choreography::JournalError> {
+        let _ = (id, events);
+        Err(icanact_saga_choreography::JournalError::Storage(
+            "static store is read-only".into(),
+        ))
+    }
+    fn admit_and_record_intent(
+        &self,
+        context: &SagaContext,
+        key: &str,
+        trigger: &str,
+    ) -> Result<icanact_saga_choreography::StoreAdmission, icanact_saga_choreography::JournalError>
+    {
+        let _ = (context, key, trigger);
+        Err(icanact_saga_choreography::JournalError::Storage(
+            "static store is read-only".into(),
+        ))
+    }
+    fn unresolved_saga_ids(&self) -> Result<Vec<SagaId>, icanact_saga_choreography::JournalError> {
+        self.list_sagas()
+    }
+    fn compact_terminal_detail(
+        &self,
+        limit: usize,
+    ) -> Result<usize, icanact_saga_choreography::JournalError> {
+        self.inner.compact_terminal_detail(limit)
+    }
+    fn prune_resolved_before(
+        &self,
+        cutoff: u64,
+        limit: usize,
+    ) -> Result<usize, icanact_saga_choreography::JournalError> {
+        self.inner.prune_resolved_before(cutoff, limit)
+    }
+
     fn append(
         &self,
         _saga_id: SagaId,
         _event: ParticipantEvent,
     ) -> Result<u64, icanact_saga_choreography::JournalError> {
+        self.failed_appends.fetch_add(1, Ordering::SeqCst);
         Err(icanact_saga_choreography::JournalError::Storage(
             "append not supported in StaticJournal".into(),
         ))
@@ -1076,13 +1062,7 @@ fn helper_and_wrapper_apis_cover_default_branches() {
     assert!(panic_quarantine_reason_from_entries(&non_panic_quarantine_entries).is_none());
 
     assert_eq!(
-        classify_recovery(
-            &[],
-            10_000,
-            RecoveryPolicy {
-                stale_after_ms: 500
-            }
-        ),
+        classify_recovery(&[], 10_000),
         RecoveryDecision::TerminalNoAction
     );
 
@@ -1096,13 +1076,7 @@ fn helper_and_wrapper_apis_cover_default_branches() {
     }];
     // An open forward intent has an unknown outcome and is unsafe at any age.
     assert_eq!(
-        classify_recovery(
-            &recent_entries,
-            10_000,
-            RecoveryPolicy {
-                stale_after_ms: 500
-            }
-        ),
+        classify_recovery(&recent_entries, 10_000),
         RecoveryDecision::QuarantineStale
     );
     // An idle run record is healthy in-flight state however old it is.
@@ -1116,13 +1090,7 @@ fn helper_and_wrapper_apis_cover_default_branches() {
         },
     }];
     assert_eq!(
-        classify_recovery(
-            &idle_entries,
-            10_000,
-            RecoveryPolicy {
-                stale_after_ms: 500
-            }
-        ),
+        classify_recovery(&idle_entries, 10_000),
         RecoveryDecision::Continue
     );
 
@@ -1232,7 +1200,6 @@ fn startup_recovery_collectors_cover_default_and_stale_paths() {
     )]);
     let error = collect_startup_recovery_events_for_saga_type(
         &stale_journal,
-        &InMemoryDedupe::new(),
         "risk_gate",
         "mature_pool_refresh",
     )
@@ -1240,7 +1207,7 @@ fn startup_recovery_collectors_cover_default_and_stale_paths() {
     assert!(format!("{error:?}").contains("reconciliation required"));
 
     let default_saga = SagaId::new(89);
-    let default_journal = InMemoryJournal::new();
+    let default_journal = InMemoryParticipantStore::new();
     default_journal
         .append(
             default_saga,
@@ -1260,9 +1227,8 @@ fn startup_recovery_collectors_cover_default_and_stale_paths() {
             },
         )
         .expect("append should succeed");
-    let default_events =
-        collect_startup_recovery_events(&default_journal, &InMemoryDedupe::new(), "risk_gate")
-            .expect("startup recovery should collect");
+    let default_events = collect_startup_recovery_events(&default_journal, "risk_gate")
+        .expect("startup recovery should collect");
     assert_eq!(default_events.len(), 1);
     assert!(matches!(
         &default_events[0],
@@ -1302,7 +1268,6 @@ fn startup_recovery_collectors_cover_default_and_stale_paths() {
     ]);
     let mixed_events = collect_startup_recovery_events_for_saga_type(
         &mixed_journal,
-        &InMemoryDedupe::new(),
         "risk_gate",
         "mature_pool_refresh",
     )
@@ -1319,8 +1284,7 @@ fn helper_propagates_open_errors_and_honors_env_runtime_dir() {
         .expect_err("open helper should propagate actor open errors");
     assert_eq!(err, "forced-open-error".to_string());
 
-    let mut support_without_bus =
-        SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new());
+    let mut support_without_bus = SagaParticipantSupport::new(InMemoryParticipantStore::new());
     let no_bus_context = context(93, ORDER_LIFECYCLE, TEST_STEP);
     publish_active_saga_panic_quarantine(
         &mut support_without_bus,
@@ -1332,9 +1296,93 @@ fn helper_propagates_open_errors_and_honors_env_runtime_dir() {
     );
     assert!(
         !support_without_bus
-            .dedupe
-            .contains(no_bus_context.saga_id, PANIC_QUARANTINE_PUBLISH_KEY)
+            .store
+            .check_and_mark(no_bus_context.saga_id, PANIC_QUARANTINE_PUBLISH_KEY)
+            .map(|fresh| !fresh)
             .expect("dedupe contains should succeed"),
         "without bus delivery we should not mark panic quarantine dedupe key"
     );
+}
+
+#[cfg(feature = "lmdb")]
+fn open_lmdb_participant_support_for_saga_types(
+    base: &std::path::Path,
+    participant_key: &str,
+    saga_types: &[&str],
+) -> Result<SagaParticipantSupport<icanact_saga_choreography::LmdbParticipantStore>, String> {
+    let store = icanact_saga_choreography::LmdbParticipantStore::open(base, participant_key)
+        .map_err(|err| err.to_string())?;
+    let mut support = SagaParticipantSupport::new(store);
+    let registrations: Vec<_> = saga_types
+        .iter()
+        .map(|kind| (participant_key, *kind))
+        .collect();
+    support.startup_recovery_events =
+        icanact_saga_choreography::durability::collect_startup_recovery_events_for_participants(
+            &mut support,
+            &registrations,
+        )
+        .map_err(|err| format!("{err:?}"))?;
+    Ok(support)
+}
+
+#[cfg(feature = "lmdb")]
+fn open_lmdb_participant_support_for_saga_type(
+    base: &std::path::Path,
+    participant_key: &str,
+    saga_type: &str,
+) -> Result<SagaParticipantSupport<icanact_saga_choreography::LmdbParticipantStore>, String> {
+    open_lmdb_participant_support_for_saga_types(base, participant_key, &[saga_type])
+}
+
+#[test]
+fn failed_terminal_tombstone_persistence_suppresses_terminal_side_effects() {
+    let mut original = TestParticipant::new(TEST_STEP, ExecuteMode::Normal);
+    let ctx = context(501, ORDER_LIFECYCLE, "start");
+    apply_sync_participant_saga_ingress(
+        &mut original,
+        SagaChoreographyEvent::SagaStarted {
+            context: ctx.clone(),
+            payload: b"original".to_vec(),
+        },
+        |_, _| panic!("nonterminal must not invoke terminal side effects"),
+        |_| {},
+    );
+    let rows = original.saga.store.read(ctx.saga_id).unwrap();
+    let mut participant = TestParticipant {
+        step_name: TEST_STEP,
+        mode: ExecuteMode::Normal,
+        saga: SagaParticipantSupport::new(StaticJournal::new(vec![(ctx.saga_id, rows.clone())])),
+        active_saga_execution: None,
+    };
+    participant.saga.saga_states = original.saga.saga_states;
+    participant.saga.saga_run_started_at = original.saga.saga_run_started_at;
+    for terminal in [
+        SagaChoreographyEvent::SagaCompleted {
+            context: ctx.clone(),
+        },
+        SagaChoreographyEvent::SagaFailed {
+            context: ctx.clone(),
+            reason: "clean failure".into(),
+            failure: None,
+        },
+    ] {
+        let before_attempts = participant.saga.store.failed_appends.load(Ordering::SeqCst);
+        let mut calls = 0;
+        apply_sync_participant_saga_ingress(&mut participant, terminal, |_, _| calls += 1, |_| {});
+        assert_eq!(
+            calls, 0,
+            "failed terminal retention never authorizes business cleanup"
+        );
+        assert!(
+            participant.saga.store.failed_appends.load(Ordering::SeqCst) > before_attempts,
+            "test must actually inject terminal persistence failure"
+        );
+        assert!(participant.saga.saga_states.contains_key(&ctx.saga_id));
+        assert!(!participant.saga.terminal_sagas.contains(&ctx.saga_id));
+        assert_eq!(
+            participant.saga.store.read(ctx.saga_id).unwrap().len(),
+            rows.len()
+        );
+    }
 }

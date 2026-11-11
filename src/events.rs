@@ -3,6 +3,9 @@
 use super::{AcceptedStepTimeoutOutcome, SagaContext, StepExecutionId};
 use icanact_core::ActorId;
 
+pub type SagaReplyToResult = Result<SagaReplyTo, String>;
+pub type SagaReplyToHandle = icanact_core::local_sync::ReplyTo<SagaReplyToResult>;
+
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct SagaFailureDetails {
     pub step_name: Box<str>,
@@ -143,16 +146,6 @@ pub enum SagaChoreographyEvent {
         /// The participant that caused quarantine.
         participant_id: Box<str>,
     },
-
-    /// Emitted as an acknowledgment from a participant for a step.
-    StepAck {
-        /// The saga context containing identifiers and metadata.
-        context: SagaContext,
-        /// The identifier of the participant sending the acknowledgment.
-        participant_id: Box<str>,
-        /// The status of the acknowledgment.
-        status: AckStatus,
-    },
 }
 
 #[derive(Clone, Debug)]
@@ -253,7 +246,6 @@ impl SagaChoreographyEvent {
             Self::CompensationCompleted { context } => context,
             Self::CompensationFailed { context, .. } => context,
             Self::SagaQuarantined { context, .. } => context,
-            Self::StepAck { context, .. } => context,
         }
     }
 
@@ -275,7 +267,6 @@ impl SagaChoreographyEvent {
             Self::CompensationCompleted { .. } => "compensation_completed",
             Self::CompensationFailed { .. } => "compensation_failed",
             Self::SagaQuarantined { .. } => "saga_quarantined",
-            Self::StepAck { .. } => "step_ack",
         }
     }
 
@@ -309,21 +300,6 @@ impl SagaChoreographyEvent {
     }
 }
 
-/// Acknowledgment status for step processing responses.
-#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub enum AckStatus {
-    /// The step has been accepted and queued for processing.
-    Accepted,
-    /// The step has completed successfully.
-    Completed,
-    /// The step has failed during processing.
-    Failed,
-    /// The step is not applicable to this participant.
-    NotApplicable,
-    /// The step is already being processed by this participant.
-    AlreadyProcessing,
-}
-
 /// Durable confirmation that forward business execution and any declared effect
 /// dispatch succeeded. Recorded strictly before publishing the original completion.
 /// Its stored context is reused verbatim on recovery, not re-traced.
@@ -352,14 +328,13 @@ impl ParticipantForwardOutcome {
 /// Events stored in participant's local journal for durability and recovery.
 #[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum ParticipantEvent {
-    /// Emitted when a participant registers to handle a step in a saga type.
-    SagaRegistered {
-        /// The type of saga this participant is registered for.
-        saga_type: Box<str>,
-        /// The name of the step this participant will handle.
-        step_name: Box<str>,
-        /// The timestamp (in milliseconds since epoch) when registration occurred.
-        registered_at_millis: u64,
+    /// Compact progress evidence; never repeats business or compensation payloads.
+    AcceptedDeadlineRenewed {
+        context: SagaContext,
+        execution_id: crate::StepExecutionId,
+        is_compensation: bool,
+        deadline_at_millis: u64,
+        renewed_at_millis: u64,
     },
     /// Emitted when a step is triggered by an incoming choreography event.
     StepTriggered {

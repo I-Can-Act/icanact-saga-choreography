@@ -12,18 +12,17 @@
 //! ```rust,ignore
 //! // 1. Add one embedded saga support field to your actor
 //! pub struct MyActor {
-//!     saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
+//!     saga: SagaParticipantSupport<InMemoryParticipantStore>,
 //! }
 //!
 //! // 2. Expose the embedded support
 //! impl HasSagaParticipantSupport for MyActor {
-//!     type Journal = InMemoryJournal;
-//!     type Dedupe = InMemoryDedupe;
+//!     type Store = InMemoryParticipantStore;
 //!
-//!     fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+//!     fn saga_support(&self) -> &SagaParticipantSupport<Self::Store> {
 //!         &self.saga
 //!     }
-//!     fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+//!     fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Store> {
 //!         &mut self.saga
 //!     }
 //! }
@@ -59,18 +58,12 @@ mod state_ext;
 mod traits;
 
 // === Storage ===
-mod dedupe;
 mod journal;
 #[cfg(feature = "lmdb")]
 mod lmdb_owner;
 
-// === Observability ===
-mod observer;
-mod stats;
-
 // === Helpers ===
 mod helpers;
-mod reply_registry;
 mod resolver;
 mod resolver_journal;
 #[cfg(any(test, feature = "test-harness"))]
@@ -82,12 +75,9 @@ mod workflow_contract;
 // Types
 pub use binding::{
     SagaParticipantChannel, bind_async_participant_channel, bind_async_participant_channel_lazy,
-    bind_async_participant_tell, bind_async_workflow_participant_channel,
-    bind_async_workflow_participant_channel_lazy,
-    bind_async_workflow_participant_channel_lazy_strict,
-    bind_async_workflow_participant_channel_strict, bind_sync_participant_channel,
-    bind_sync_participant_channel_lazy, bind_sync_participant_tell,
-    bind_sync_workflow_participant_channel, bind_sync_workflow_participant_channel_lazy,
+    bind_async_participant_tell, bind_sync_participant_channel, bind_sync_participant_channel_lazy,
+    bind_sync_participant_tell, bind_sync_workflow_participant_channel,
+    bind_sync_workflow_participant_channel_lazy,
     bind_sync_workflow_participant_channel_lazy_strict,
     bind_sync_workflow_participant_channel_strict, bind_sync_workflow_participant_tell,
     bind_sync_workflow_participant_tell_strict, checked_workflow_saga_types, workflow_saga_types,
@@ -95,7 +85,7 @@ pub use binding::{
 pub use bus::{
     SagaBusPublishError, SagaBusReleaseWaiter, SagaChoreographyBus, global_saga_choreography_bus,
 };
-pub use context::{PeerId, SagaContext, SagaId, StepId};
+pub use context::{PeerId, SagaContext, SagaId};
 pub use durability::*;
 
 // State (typestate)
@@ -110,8 +100,8 @@ pub use support::{
 
 // Events
 pub use events::{
-    AckStatus, ParticipantEvent, ParticipantForwardOutcome, ParticipantTerminalKind,
-    SagaChoreographyEvent, SagaFailureDetails, SagaReplyTo, SagaTerminalOutcome,
+    ParticipantEvent, ParticipantForwardOutcome, ParticipantTerminalKind, SagaChoreographyEvent,
+    SagaFailureDetails, SagaReplyTo, SagaReplyToHandle, SagaReplyToResult, SagaTerminalOutcome,
 };
 
 // Errors
@@ -132,16 +122,14 @@ pub use traits::{
 };
 
 // Storage
-pub use dedupe::{DedupeError, InMemoryDedupe, ParticipantDedupeStore};
-pub use journal::{InMemoryJournal, JournalEntry, JournalError, ParticipantJournal};
-
-// Observability
-pub use observer::{NoOpObserver, SagaObserver, TracingObserver};
-pub use stats::{ParticipantStats, ParticipantStatsSnapshot};
+#[cfg(feature = "lmdb")]
+pub use journal::lmdb::LmdbParticipantStore;
+pub use journal::{
+    InMemoryParticipantStore, JournalEntry, JournalError, ParticipantStore, StoreAdmission,
+};
 
 // Helpers
 pub use helpers::{handle_async_saga_event_with_emit, handle_saga_event_with_emit};
-pub use reply_registry::{SagaReplyToHandle, SagaReplyToResult};
 pub use resolver::{
     FailureAuthority, SuccessCriteria, TERMINAL_RESOLVER_STEP, TerminalPolicy, TerminalResolver,
 };

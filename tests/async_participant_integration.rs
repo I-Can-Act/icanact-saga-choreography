@@ -4,13 +4,13 @@ use icanact_saga_choreography::durability::apply_async_participant_saga_ingress_
 use icanact_saga_choreography::{
     AcceptedStepCompletion, AcceptedStepPolicy, AcceptedStepTimeoutOutcome, AsyncSagaParticipant,
     CompensationError, CompensationOutput, DependencySpec, HasSagaParticipantSupport,
-    InMemoryDedupe, InMemoryJournal, ParticipantEvent, ParticipantJournal, PeerId,
-    SagaChoreographyEvent, SagaContext, SagaId, SagaParticipantSupport, SagaStateEntry,
-    SagaStateExt, StepError, StepExecutionId, StepOutput, complete_accepted_workflow_step,
+    InMemoryParticipantStore, ParticipantEvent, ParticipantStore, PeerId, SagaChoreographyEvent,
+    SagaContext, SagaId, SagaParticipantSupport, SagaStateEntry, SagaStateExt, StepError,
+    StepExecutionId, StepOutput, complete_accepted_workflow_step,
 };
 
 struct AsyncTestParticipant {
-    saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
+    saga: SagaParticipantSupport<InMemoryParticipantStore>,
     dependency_spec: DependencySpec,
     execute_output: Result<StepOutput, StepError>,
     compensation_result: Result<CompensationOutput, CompensationError>,
@@ -21,7 +21,7 @@ struct AsyncTestParticipant {
 impl Default for AsyncTestParticipant {
     fn default() -> Self {
         Self {
-            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+            saga: SagaParticipantSupport::new(InMemoryParticipantStore::new()),
             dependency_spec: DependencySpec::OnSagaStart,
             execute_output: Ok(StepOutput::Completed {
                 output: b"ok".to_vec(),
@@ -35,21 +35,18 @@ impl Default for AsyncTestParticipant {
 }
 
 impl HasSagaParticipantSupport for AsyncTestParticipant {
-    type Journal = InMemoryJournal;
-    type Dedupe = InMemoryDedupe;
+    type Store = InMemoryParticipantStore;
 
-    fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support(&self) -> &SagaParticipantSupport<Self::Store> {
         &self.saga
     }
 
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Store> {
         &mut self.saga
     }
 }
 
 impl AsyncSagaParticipant for AsyncTestParticipant {
-    type Error = String;
-
     fn step_name(&self) -> &str {
         "async_step"
     }
@@ -240,7 +237,7 @@ async fn async_ingress_non_ambiguous_compensation_failure_keeps_local_failed_sta
     ));
     let entries = participant
         .saga
-        .journal
+        .store
         .read(SagaId::new(1))
         .expect("journal read should succeed");
     assert!(matches!(

@@ -4,30 +4,23 @@
 mod support;
 
 use icanact_saga_choreography::*;
-use support::{FaultJournal, FaultTrigger, JournalOp};
+use support::{FaultStore, FaultTrigger, JournalOp};
 
-type Journal = FaultJournal<InMemoryJournal>;
+type Journal = FaultStore<InMemoryParticipantStore>;
 
-struct Actor(SagaParticipantSupport<Journal, InMemoryDedupe>);
+struct Actor(SagaParticipantSupport<Journal>);
 impl HasSagaParticipantSupport for Actor {
-    type Journal = Journal;
-    type Dedupe = InMemoryDedupe;
-    fn saga_support(&self) -> &SagaParticipantSupport<Journal, InMemoryDedupe> {
+    type Store = Journal;
+    fn saga_support(&self) -> &SagaParticipantSupport<Journal> {
         &self.0
     }
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal, InMemoryDedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal> {
         &mut self.0
     }
 }
 fn actor() -> (Actor, Journal) {
-    let journal = FaultJournal::new(InMemoryJournal::new());
-    (
-        Actor(SagaParticipantSupport::new(
-            journal.clone(),
-            InMemoryDedupe::new(),
-        )),
-        journal,
-    )
+    let journal = FaultStore::new(InMemoryParticipantStore::new());
+    (Actor(SagaParticipantSupport::new(journal.clone())), journal)
 }
 fn ctx(start: u64) -> SagaContext {
     SagaContext {
@@ -207,7 +200,7 @@ fn definite_failure_classification_is_run_scoped_and_survives_cold_reconstructio
     let old = ctx(100);
     accept(&a, &old, vec![42]);
     fail(&a, &old, false);
-    let restarted = Actor(SagaParticipantSupport::new(journal, InMemoryDedupe::new()));
+    let restarted = Actor(SagaParticipantSupport::new(journal));
     assert!(
         !restarted
             .participant_run_evidence_strict(&old)
@@ -344,10 +337,12 @@ fn existing_archive_tags_zero_to_fifteen_keep_their_layout() {
         recorded_at_millis: 1,
     };
     let events = [
-        ParticipantEvent::SagaRegistered {
-            saga_type: "s".into(),
-            step_name: "t".into(),
-            registered_at_millis: 1,
+        ParticipantEvent::AcceptedDeadlineRenewed {
+            context: ctx(1),
+            execution_id: icanact_saga_choreography::StepExecutionId::new("exec-1"),
+            is_compensation: false,
+            deadline_at_millis: 10,
+            renewed_at_millis: 1,
         },
         ParticipantEvent::StepTriggered {
             triggering_event: "e".into(),
@@ -444,7 +439,7 @@ fn dependency_completions_are_exact_run_scoped_and_survive_cold_reconstruction()
     let mut other_type = dep(100, "foreign");
     other_type.saga_type = "other".into();
     a.record_dependency_completion_strict(&other_type).unwrap();
-    let cold = Actor(SagaParticipantSupport::new(journal, InMemoryDedupe::new()));
+    let cold = Actor(SagaParticipantSupport::new(journal));
     let got = cold.completed_dependency_steps_strict(&c).unwrap();
     assert_eq!(got.len(), 2);
     assert!(got.contains("reserve") && got.contains("pay"));

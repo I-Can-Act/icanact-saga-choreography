@@ -104,8 +104,8 @@ fn prepared_bus(extra_subscribers: usize) -> (SagaChoreographyBus, Seen) {
     let bus = SagaChoreographyBus::new();
     bus.register_workflow_contract_provider::<Review5Contract>()
         .unwrap();
-    bus.register_bound_workflow_step(TYPE, "a").unwrap();
-    bus.register_bound_workflow_step(TYPE, "b").unwrap();
+    bus.subscribe_workflow_step_fn(TYPE, "a", |_| true).unwrap();
+    bus.subscribe_workflow_step_fn(TYPE, "b", |_| true).unwrap();
     let seen: Seen = Arc::default();
     let sink = Arc::clone(&seen);
     bus.subscribe_saga_type_fn(TYPE, move |event| {
@@ -187,6 +187,10 @@ impl FaultJournal {
 }
 
 impl TerminalResolverJournal for FaultJournal {
+    fn max_run_start_millis(&self) -> Result<u64, TerminalResolverJournalError> {
+        self.inner.max_run_start_millis()
+    }
+
     fn append(&self, event: SagaChoreographyEvent) -> Result<u64, TerminalResolverJournalError> {
         let parked = match &event {
             SagaChoreographyEvent::SagaQuarantined { reason, .. } => {
@@ -237,7 +241,7 @@ impl TerminalResolverJournal for FaultJournal {
     ) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError> {
         self.inner.read_saga_bounded(saga_id, max_entries)
     }
-    fn compact_terminal_detail(&self) -> Result<u64, TerminalResolverJournalError> {
+    fn compact_terminal_detail(&self) -> Result<usize, TerminalResolverJournalError> {
         self.inner.compact_terminal_detail()
     }
 }
@@ -350,7 +354,13 @@ fn participant_quarantine_resolves_bound_run_and_id_waiters_only() {
 
 #[test]
 fn delivery_shortfall_quarantine_resolves_the_run_waiter() {
-    let (bus, _seen) = prepared_bus(0);
+    let bus = SagaChoreographyBus::new();
+    bus.register_workflow_contract_provider::<Review5Contract>()
+        .unwrap();
+    bus.subscribe_workflow_step_fn(TYPE, "a", |_| true).unwrap();
+    // The required b role was live at admission but fails its delivery receipt.
+    bus.subscribe_workflow_step_fn(TYPE, "b", |_| false)
+        .unwrap();
     bus.attach_durable_terminal_resolver_for_contract::<Review5Contract, _>(
         "qa",
         FaultJournal::memory(),
@@ -360,7 +370,7 @@ fn delivery_shortfall_quarantine_resolves_the_run_waiter() {
         .unwrap();
     let ctx = context_at(5_010, "a", SagaContext::now_millis());
     let run_rx = waiter(&bus, ctx.saga_id, Some(&ctx));
-    // Too few subscribers for the required path: start fanout is quarantined.
+    // A failed required-role receipt quarantines the admitted start.
     let _ = bus.publish(started(&ctx));
     expect_quarantine_reply(&run_rx, "delivery shortfall");
     assert!(matches!(
@@ -504,7 +514,8 @@ fn restart_order_case(quarantine_first: bool) {
     assert_eq!(
         journal.rows_matching(quarantined_run(new.saga_started_at_millis)),
         1,
-        "exactly one successor quarantine row"
+        "exactly one successor quarantine row: {:?}",
+        journal.rows()
     );
 }
 
@@ -526,6 +537,12 @@ fn outage_quarantine(
 ) -> (SagaChoreographyBus, Seen) {
     let (bus, seen) = durable_bus(Arc::clone(journal));
     bus.publish_strict(started(ctx)).unwrap();
+    assert!(wait_until(Duration::from_secs(3), || journal
+        .rows_matching(|event| {
+            matches!(event, SagaChoreographyEvent::SagaStarted { .. })
+                && event.context().saga_id == ctx.saga_id
+        })
+        == 1));
     journal.fail_append.store(true, Ordering::SeqCst);
     bus.publish_strict(step_completed(ctx, "a", 1)).unwrap();
     assert!(
@@ -828,4 +845,76 @@ fn lmdb_pending_fence_survives_close_and_reopen_after_tick_recovery() {
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(count(&seen, is_completed), 0);
     assert!(bus.publish_strict(started(&ctx)).is_err());
+}
+
+#[test]
+fn activation_handoff_requeues_a_failed_exact_quarantine_append_without_new_ingress() {
+    let journal = FaultJournal::memory();
+    let base = SagaContext::now_millis();
+    let old = context_at(9_401, "a", base);
+    let new = context_at(9_401, "a", base + 1);
+    journal.inner.append(started(&old)).unwrap();
+    journal
+        .inner
+        .append(participant_quarantine(&old, "old unresolved effect"))
+        .unwrap();
+    journal.inner.append(started(&new)).unwrap();
+    let (bus, seen) = prepared_bus(0);
+    bus.attach_durable_terminal_resolver_for_contract::<Review5Contract, _>(
+        "qa",
+        Arc::clone(&journal),
+    )
+    .unwrap();
+    let reply = waiter(&bus, new.saga_id, Some(&new));
+    journal.fail_append.store(true, Ordering::SeqCst);
+    bus.activate_terminal_resolver_recovery_for_contract::<Review5Contract>()
+        .unwrap();
+    expect_quarantine_reply(&reply, "live quarantine despite failed activation append");
+    assert!(wait_until(Duration::from_secs(2), || journal
+        .append_failures
+        .load(Ordering::SeqCst)
+        > 0));
+    assert_eq!(
+        journal.rows_matching(quarantined_run(new.saga_started_at_millis)),
+        0
+    );
+    journal.fail_append.store(false, Ordering::SeqCst);
+    assert!(wait_until(Duration::from_secs(3), || journal
+        .rows_matching(quarantined_run(new.saga_started_at_millis))
+        == 1));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        journal.rows_matching(quarantined_run(new.saga_started_at_millis)),
+        1
+    );
+    assert_eq!(count(&seen, is_completed), 0);
+    assert!(
+        bus.publish_strict(started(&context_at(new.saga_id.get(), "a", base + 2)))
+            .is_err()
+    );
+}
+
+#[test]
+fn watchdog_keeps_retrying_when_the_last_fence_is_in_flight() {
+    let journal = FaultJournal::memory();
+    let ctx = context_at(9_402, "a", SagaContext::now_millis());
+    let (_bus, _seen) = outage_quarantine(&journal, &ctx);
+    journal.park_next("terminal resolver retained quarantined ownership; reconciliation required");
+    assert!(journal.wait_parked(), "watchdog retry entered the journal");
+    // The actor popped the sole queue entry and is blocked in append. Give
+    // the watchdog several ticks to observe that window with no active runs.
+    std::thread::sleep(Duration::from_millis(350));
+    let failures = journal.append_failures.load(Ordering::SeqCst);
+    journal.release();
+    assert!(wait_until(Duration::from_secs(2), || journal
+        .append_failures
+        .load(Ordering::SeqCst)
+        > failures));
+    journal.fail_append.store(false, Ordering::SeqCst);
+    assert!(
+        wait_until(Duration::from_secs(3), || journal
+            .rows_matching(quarantined_run(ctx.saga_started_at_millis))
+            >= 1),
+        "an in-flight failed append must not put the watchdog to sleep forever"
+    );
 }

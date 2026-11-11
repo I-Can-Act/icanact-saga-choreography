@@ -5,9 +5,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use icanact_core::local::PublishStats;
 
 use crate::{
-    AcceptedStepPolicy, ParticipantDedupeStore, ParticipantJournal, ParticipantStats,
-    SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId, SagaStateEntry,
-    StepExecutionId,
+    AcceptedStepPolicy, ParticipantStore, SagaChoreographyBus, SagaChoreographyEvent, SagaContext,
+    SagaId, SagaStateEntry, StepExecutionId,
 };
 
 #[derive(Clone, Debug)]
@@ -43,10 +42,9 @@ pub struct AcceptedWorkflowCompensation {
 /// This groups all choreography plumbing into one field so application actors
 /// can own `business_state + saga_support` instead of repeating multiple raw
 /// storage fields in every actor.
-pub struct SagaParticipantSupport<J, D>
+pub struct SagaParticipantSupport<S>
 where
-    J: ParticipantJournal,
-    D: ParticipantDedupeStore,
+    S: ParticipantStore,
 {
     pub saga_states: HashMap<SagaId, SagaStateEntry>,
     pub dependency_completions: HashMap<SagaId, HashSet<Box<str>>>,
@@ -56,20 +54,23 @@ where
     pub saga_run_started_at: HashMap<SagaId, u64>,
     pub accepted_workflow_steps: HashMap<SagaId, AcceptedWorkflowStep>,
     pub accepted_workflow_compensations: HashMap<SagaId, AcceptedWorkflowCompensation>,
-    pub resolved_workflow_steps: HashSet<(SagaId, StepExecutionId)>,
-    pub journal: J,
-    pub dedupe: D,
-    pub stats: ParticipantStats,
+    pub resolved_workflow_steps: HashMap<SagaId, HashSet<StepExecutionId>>,
+    pub store: S,
     pub startup_recovery_events: Vec<SagaChoreographyEvent>,
     pub bus: Option<SagaChoreographyBus>,
 }
 
-impl<J, D> SagaParticipantSupport<J, D>
+impl<S> SagaParticipantSupport<S>
 where
-    J: ParticipantJournal,
-    D: ParticipantDedupeStore,
+    S: ParticipantStore,
 {
-    pub fn new(journal: J, dedupe: D) -> Self {
+    pub fn new(store: S) -> Self {
+        match store.max_run_start_millis() {
+            Ok(high_water) => SagaContext::observe_run_start_millis(high_water),
+            Err(error) => {
+                tracing::error!(target: "core::saga", event = "participant_high_water_read_failed", %error)
+            }
+        }
         Self {
             saga_states: HashMap::new(),
             dependency_completions: HashMap::new(),
@@ -79,13 +80,21 @@ where
             saga_run_started_at: HashMap::new(),
             accepted_workflow_steps: HashMap::new(),
             accepted_workflow_compensations: HashMap::new(),
-            resolved_workflow_steps: HashSet::new(),
-            journal,
-            dedupe,
-            stats: ParticipantStats::new(),
+            resolved_workflow_steps: HashMap::new(),
+            store,
             startup_recovery_events: Vec::new(),
             bus: None,
         }
+    }
+
+    pub(crate) fn prune_orphan_run_markers(&mut self) {
+        self.saga_run_started_at.retain(|id, _| {
+            self.saga_states.contains_key(id)
+                || self.dependency_completions.contains_key(id)
+                || self.accepted_workflow_steps.contains_key(id)
+                || self.accepted_workflow_compensations.contains_key(id)
+                || self.terminal_sagas.contains(id)
+        });
     }
 
     pub fn with_startup_recovery_events(mut self, events: Vec<SagaChoreographyEvent>) -> Self {
@@ -128,18 +137,21 @@ where
         execution_id: &StepExecutionId,
     ) -> bool {
         self.resolved_workflow_steps
-            .contains(&(saga_id, execution_id.clone()))
+            .get(&saga_id)
+            .is_some_and(|steps| steps.contains(execution_id))
     }
 
     pub fn resolved_workflow_step_count(&self) -> usize {
-        self.resolved_workflow_steps.len()
+        self.resolved_workflow_steps
+            .values()
+            .map(HashSet::len)
+            .sum::<usize>()
     }
 }
 
-impl<J, D> std::fmt::Debug for SagaParticipantSupport<J, D>
+impl<S> std::fmt::Debug for SagaParticipantSupport<S>
 where
-    J: ParticipantJournal,
-    D: ParticipantDedupeStore,
+    S: ParticipantStore,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SagaParticipantSupport")
@@ -162,25 +174,27 @@ where
             )
             .field(
                 "resolved_workflow_steps_len",
-                &self.resolved_workflow_steps.len(),
+                &self
+                    .resolved_workflow_steps
+                    .values()
+                    .map(HashSet::len)
+                    .sum::<usize>(),
             )
             .field(
                 "startup_recovery_events_len",
                 &self.startup_recovery_events.len(),
             )
             .field("bus_attached", &self.bus.is_some())
-            .field("stats", &self.stats.snapshot())
             .finish()
     }
 }
 
 /// Access trait for embedded first-class saga support.
 pub trait HasSagaParticipantSupport: Send + 'static {
-    type Journal: ParticipantJournal;
-    type Dedupe: ParticipantDedupeStore;
+    type Store: ParticipantStore;
 
-    fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe>;
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe>;
+    fn saga_support(&self) -> &SagaParticipantSupport<Self::Store>;
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Store>;
 }
 
 /// Convenience methods for participants that embed [`SagaParticipantSupport`].
@@ -205,7 +219,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::{InMemoryDedupe, InMemoryJournal, PeerId, SagaContext, SagaId};
+    use crate::{InMemoryParticipantStore, PeerId, SagaContext, SagaId};
 
     use super::*;
 
@@ -229,9 +243,8 @@ mod tests {
             failure: None,
         };
 
-        let mut support =
-            SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new())
-                .with_startup_recovery_events(vec![event.clone()]);
+        let mut support = SagaParticipantSupport::new(InMemoryParticipantStore::new())
+            .with_startup_recovery_events(vec![event.clone()]);
 
         assert!(support.saga_states.is_empty());
         assert!(support.dependency_completions.is_empty());
@@ -250,8 +263,7 @@ mod tests {
             true
         });
 
-        let mut support =
-            SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new());
+        let mut support = SagaParticipantSupport::new(InMemoryParticipantStore::new());
         support.attach_bus(bus);
         let published = support.publish(SagaChoreographyEvent::SagaCompleted {
             context: SagaContext {

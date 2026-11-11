@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use icanact_saga_choreography::durability::fail_accepted_workflow_step;
 use icanact_saga_choreography::*;
-use support::{FaultDedupe, FaultJournal, FaultTrigger, JournalOp};
+use support::{FaultStore, FaultTrigger, JournalOp};
 
 const TYPE: &str = "qa_r5h";
 const SAGA: u64 = 9;
@@ -27,27 +27,80 @@ const SAGA: u64 = 9;
 /// admission readable and targets the strict evidence-versus-cache decision.
 #[derive(Clone)]
 struct Journal {
-    inner: FaultJournal<InMemoryJournal>,
+    inner: FaultStore<InMemoryParticipantStore>,
     fail_read_after_request: Arc<AtomicBool>,
 }
 
 impl Journal {
-    fn new(inner: InMemoryJournal) -> Self {
+    fn new(inner: InMemoryParticipantStore) -> Self {
         Self {
-            inner: FaultJournal::new(inner),
+            inner: FaultStore::new(inner),
             fail_read_after_request: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
 impl std::ops::Deref for Journal {
-    type Target = FaultJournal<InMemoryJournal>;
+    type Target = FaultStore<InMemoryParticipantStore>;
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
 
-impl ParticipantJournal for Journal {
+impl ParticipantStore for Journal {
+    fn check_and_mark(
+        &self,
+        saga_id: SagaId,
+        key: &str,
+    ) -> Result<bool, icanact_saga_choreography::JournalError> {
+        self.inner.check_and_mark(saga_id, key)
+    }
+
+    fn remove_processed(
+        &self,
+        saga_id: SagaId,
+        key: &str,
+    ) -> Result<(), icanact_saga_choreography::JournalError> {
+        self.inner.remove_processed(saga_id, key)
+    }
+
+    fn append_batch(
+        &self,
+        saga_id: SagaId,
+        events: Vec<ParticipantEvent>,
+    ) -> Result<Vec<u64>, icanact_saga_choreography::JournalError> {
+        self.inner.append_batch(saga_id, events)
+    }
+
+    fn admit_and_record_intent(
+        &self,
+        context: &SagaContext,
+        key: &str,
+        trigger: &str,
+    ) -> Result<icanact_saga_choreography::StoreAdmission, icanact_saga_choreography::JournalError>
+    {
+        self.inner.admit_and_record_intent(context, key, trigger)
+    }
+
+    fn unresolved_saga_ids(&self) -> Result<Vec<SagaId>, icanact_saga_choreography::JournalError> {
+        self.inner.unresolved_saga_ids()
+    }
+
+    fn compact_terminal_detail(
+        &self,
+        limit: usize,
+    ) -> Result<usize, icanact_saga_choreography::JournalError> {
+        self.inner.compact_terminal_detail(limit)
+    }
+
+    fn prune_resolved_before(
+        &self,
+        cutoff: u64,
+        limit: usize,
+    ) -> Result<usize, icanact_saga_choreography::JournalError> {
+        self.inner.prune_resolved_before(cutoff, limit)
+    }
+
     fn append(&self, saga_id: SagaId, event: ParticipantEvent) -> Result<u64, JournalError> {
         let owned_request = matches!(&event, ParticipantEvent::CompensationRequestRecorded { .. });
         let sequence = self.inner.append(saga_id, event)?;
@@ -70,8 +123,6 @@ impl ParticipantJournal for Journal {
     }
 }
 
-type Dedupe = FaultDedupe<InMemoryDedupe>;
-
 #[derive(Clone, Copy, Debug)]
 enum Mode {
     Sync,
@@ -87,17 +138,16 @@ struct Counters {
 }
 
 struct Actor {
-    saga: SagaParticipantSupport<Journal, Dedupe>,
+    saga: SagaParticipantSupport<Journal>,
     shared: Arc<Counters>,
 }
 
 impl HasSagaParticipantSupport for Actor {
-    type Journal = Journal;
-    type Dedupe = Dedupe;
-    fn saga_support(&self) -> &SagaParticipantSupport<Journal, Dedupe> {
+    type Store = Journal;
+    fn saga_support(&self) -> &SagaParticipantSupport<Journal> {
         &self.saga
     }
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal, Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal> {
         &mut self.saga
     }
 }
@@ -117,7 +167,6 @@ fn accepted_output() -> StepOutput {
 }
 
 impl SagaParticipant for Actor {
-    type Error = String;
     fn step_name(&self) -> &str {
         "a"
     }
@@ -147,7 +196,6 @@ impl SagaParticipant for Actor {
 }
 
 impl AsyncSagaParticipant for Actor {
-    type Error = String;
     fn step_name(&self) -> &str {
         "a"
     }
@@ -184,30 +232,25 @@ impl AsyncSagaParticipant for Actor {
 
 struct World {
     journal: Journal,
-    dedupe: Dedupe,
     shared: Arc<Counters>,
 }
 
 impl World {
     fn new() -> Self {
         Self {
-            journal: Journal::new(InMemoryJournal::new()),
-            dedupe: FaultDedupe::new(InMemoryDedupe::new()),
+            journal: Journal::new(InMemoryParticipantStore::new()),
             shared: Arc::default(),
         }
     }
     fn actor(&self) -> Actor {
         Actor {
-            saga: SagaParticipantSupport::new(self.journal.clone(), self.dedupe.clone()),
+            saga: SagaParticipantSupport::new(self.journal.clone()),
             shared: self.shared.clone(),
         }
     }
     fn restarted_actor(&self) -> Actor {
         Actor {
-            saga: SagaParticipantSupport::new(
-                self.journal.clone(),
-                FaultDedupe::new(InMemoryDedupe::new()),
-            ),
+            saga: SagaParticipantSupport::new(self.journal.clone()),
             shared: self.shared.clone(),
         }
     }
@@ -395,7 +438,8 @@ fn managed_post_append_read_lag_never_runs_physical_undo() {
             actor
                 .saga_support()
                 .resolved_workflow_steps
-                .contains(&(SagaId::new(SAGA), StepExecutionId::new("exec-1"))),
+                .get(&SagaId::new(SAGA))
+                .is_some_and(|steps| steps.contains(&StepExecutionId::new("exec-1"))),
             "{mode:?}: accepted step marked resolved"
         );
         assert!(matches!(
@@ -513,9 +557,8 @@ fn managed_lag_duplicate_and_cold_restart_resend_without_repeating_work() {
         let first = drive(mode, &mut actor, request_event());
         assert_eq!(acks(&first), 1, "{mode:?}: {first:?}");
         let dup = drive(mode, &mut actor, request_event());
-        // Hot ingress dedupe suppresses the whole duplicate request; a lost
-        // acknowledgement is resent from durable proof by cold/startup recovery.
-        assert_eq!(acks(&dup), 0, "{mode:?}: hot duplicate: {dup:?}");
+        // Duplicate requests resend the durable acknowledgement, never the undo.
+        assert_eq!(acks(&dup), 1, "{mode:?}: hot duplicate: {dup:?}");
         let mut cold = world.restarted_actor();
         let again = drive(mode, &mut cold, request_event());
         assert_eq!(acks(&again), 1, "{mode:?}: {again:?}");

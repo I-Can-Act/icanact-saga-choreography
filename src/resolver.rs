@@ -210,7 +210,6 @@ impl TerminalPolicy {
 #[derive(Clone, Debug)]
 struct SagaResolutionState {
     started_steps: HashSet<Box<str>>,
-    acked_steps: HashSet<Box<str>>,
     completed_steps: HashSet<Box<str>>,
     failed_steps: HashSet<Box<str>>,
     compensable_steps: Vec<Box<str>>,
@@ -274,12 +273,9 @@ struct AcceptedCompensationResolverState {
 
 impl SagaResolutionState {
     fn new(seed_context: &SagaContext, now_millis: u64) -> Self {
-        let started_at_millis = now_millis.max(seed_context.saga_started_at_millis);
-        let progress_at_millis = now_millis.max(started_at_millis);
         Self {
             completed_steps: HashSet::new(),
             started_steps: HashSet::new(),
-            acked_steps: HashSet::new(),
             failed_steps: HashSet::new(),
             compensable_steps: Vec::new(),
             rollback: None,
@@ -289,8 +285,8 @@ impl SagaResolutionState {
             accepted_steps: HashMap::new(),
             accepted_compensations: HashMap::new(),
             run_started_at_millis: seed_context.saga_started_at_millis,
-            overall_anchor_millis: started_at_millis,
-            last_progress_at_millis: progress_at_millis,
+            overall_anchor_millis: now_millis,
+            last_progress_at_millis: now_millis,
             last_context: seed_context.clone(),
             terminal_latched: false,
             terminal_outcome: None,
@@ -335,13 +331,20 @@ impl TerminalResolver {
         let mut resolver = Self::new(policy);
         let mut unpublished = Vec::new();
         for event in events {
+            SagaContext::observe_run_start_millis(event.context().saga_started_at_millis);
             if let Some(index) = unpublished
                 .iter()
                 .position(|candidate| resolver_output_matches(candidate, event))
             {
                 unpublished.remove(index);
             }
-            unpublished.extend(resolver.ingest_at(event, event.context().event_timestamp_millis));
+            // Replay facts first: elapsed deadlines cannot override a later
+            // recorded completion or terminal outcome in this same history.
+            unpublished.extend(resolver.ingest_event_internal(
+                event,
+                event.context().event_timestamp_millis,
+                false,
+            ));
         }
         unpublished.extend(resolver.poll_timeouts());
         (resolver, unpublished)
@@ -351,6 +354,15 @@ impl TerminalResolver {
         &mut self,
         event: &SagaChoreographyEvent,
         now_millis: u64,
+    ) -> Vec<SagaChoreographyEvent> {
+        self.ingest_event_internal(event, now_millis, true)
+    }
+
+    fn ingest_event_internal(
+        &mut self,
+        event: &SagaChoreographyEvent,
+        now_millis: u64,
+        evaluate_timeouts: bool,
     ) -> Vec<SagaChoreographyEvent> {
         if event.context().saga_type.as_ref() != self.policy.saga_type.as_ref() {
             return Vec::new();
@@ -524,10 +536,6 @@ impl TerminalResolver {
                         timeout_outcome: timeout_outcome.clone(),
                     },
                 );
-            }
-            SagaChoreographyEvent::StepAck { context, .. } => {
-                state.started_steps.insert(context.step_name.clone());
-                state.acked_steps.insert(context.step_name.clone());
             }
             SagaChoreographyEvent::StepCompleted {
                 context,
@@ -740,7 +748,7 @@ impl TerminalResolver {
                 .map(SagaChoreographyEvent::event_type);
         }
 
-        if !state.terminal_latched {
+        if evaluate_timeouts && !state.terminal_latched {
             out.extend(timeout_events(&self.policy, state, now_millis));
             if state.terminal_latched && state.terminal_outcome.is_none() {
                 state.terminal_outcome = out
@@ -1060,7 +1068,6 @@ fn is_progress_event(event: &SagaChoreographyEvent) -> bool {
         SagaChoreographyEvent::SagaStarted { .. }
             | SagaChoreographyEvent::StepStarted { .. }
             | SagaChoreographyEvent::StepAccepted { .. }
-            | SagaChoreographyEvent::StepAck { .. }
             | SagaChoreographyEvent::StepCompleted { .. }
             | SagaChoreographyEvent::StepFailed { .. }
             | SagaChoreographyEvent::CompensationRequested { .. }
@@ -1415,7 +1422,6 @@ struct TimeoutDiagnostics {
     completed_steps: String,
     started_steps: String,
     failed_steps: String,
-    acked_steps: String,
 }
 
 impl TimeoutDiagnostics {
@@ -1431,7 +1437,6 @@ impl TimeoutDiagnostics {
         push_non_empty(&mut parts, "blocked_steps", &self.blocked_steps);
         push_non_empty(&mut parts, "completed_steps", &self.completed_steps);
         push_non_empty(&mut parts, "started_steps", &self.started_steps);
-        push_non_empty(&mut parts, "acked_steps", &self.acked_steps);
         push_non_empty(&mut parts, "failed_steps", &self.failed_steps);
         parts.push(format!("policy={policy_id}"));
         parts.join(" ")
@@ -1589,7 +1594,6 @@ fn timeout_diagnostics(policy: &TerminalPolicy, state: &SagaResolutionState) -> 
         completed_steps: sorted_set_values(&state.completed_steps),
         started_steps: sorted_set_values(&state.started_steps),
         failed_steps: sorted_set_values(&state.failed_steps),
-        acked_steps: sorted_set_values(&state.acked_steps),
     }
 }
 
@@ -1612,7 +1616,6 @@ fn emit_timeout_diagnostic(
         blocked_steps = diagnostic.blocked_steps.as_str(),
         completed_steps = diagnostic.completed_steps.as_str(),
         started_steps = diagnostic.started_steps.as_str(),
-        acked_steps = diagnostic.acked_steps.as_str(),
         failed_steps = diagnostic.failed_steps.as_str(),
         last_step = state.last_context.step_name.as_ref()
     );
@@ -1821,6 +1824,211 @@ mod tests {
             saga_started_at_millis: started_at_millis,
             event_timestamp_millis,
         }
+    }
+
+    #[test]
+    fn restore_replays_settled_history_before_expiring_active_work() {
+        let now = SagaContext::now_millis();
+        let past = now.saturating_sub(60_000);
+        let mut policy = open_position_policy(Duration::from_secs(5));
+        policy.overall_timeout = Duration::from_millis(100);
+        let mut events = Vec::new();
+        // Each disposition used to invent a different outcome while replaying
+        // the late sibling, before seeing the recorded completion/terminal.
+        for (id, disposition) in [
+            (80, AcceptedStepTimeoutOutcome::QuarantineSaga),
+            (
+                81,
+                AcceptedStepTimeoutOutcome::FailStep {
+                    requires_compensation: false,
+                },
+            ),
+            (
+                82,
+                AcceptedStepTimeoutOutcome::FailStep {
+                    requires_compensation: true,
+                },
+            ),
+        ] {
+            events.extend([
+                SagaChoreographyEvent::SagaStarted {
+                    context: ctx_at("risk_check", id, past, past),
+                    payload: vec![],
+                },
+                SagaChoreographyEvent::StepCompleted {
+                    context: ctx_at("risk_check", id, past, past + 1),
+                    output: vec![],
+                    saga_input: vec![],
+                    compensation_available: true,
+                },
+                SagaChoreographyEvent::StepAccepted {
+                    context: ctx_at("create_order", id, past, past + 2),
+                    participant_id: "order-manager".into(),
+                    execution_id: StepExecutionId::new(format!("historical-{id}")),
+                    deadline_at_millis: past + 10,
+                    hard_deadline_at_millis: past + 20,
+                    timeouts_enabled: true,
+                    timeout_outcome: disposition,
+                    compensation_available: true,
+                },
+                SagaChoreographyEvent::StepStarted {
+                    context: ctx_at("sibling", id, past, past + 200),
+                },
+                SagaChoreographyEvent::StepCompleted {
+                    context: ctx_at("create_order", id, past, past + 201),
+                    output: vec![],
+                    saga_input: vec![],
+                    compensation_available: true,
+                },
+                SagaChoreographyEvent::SagaCompleted {
+                    context: ctx_at("saga_terminal_resolver", id, past, past + 202),
+                },
+            ]);
+        }
+        // The unresolved control must still expire after all facts are loaded.
+        events.push(SagaChoreographyEvent::SagaStarted {
+            context: ctx_at("risk_check", 83, past, past),
+            payload: vec![],
+        });
+        let (mut restored, out) = TerminalResolver::restore_from_events(policy, &events);
+        assert!(
+            out.iter()
+                .all(|event| event.context().saga_id == SagaId::new(83)),
+            "settled history must not emit timeout/undo/quarantine events: {out:?}"
+        );
+        assert!(
+            matches!(out.as_slice(), [SagaChoreographyEvent::SagaFailed { reason, .. }]
+            if reason.contains("overall_timeout")),
+            "active run must expire once: {out:?}"
+        );
+        assert!(
+            restored.poll_timeouts().is_empty(),
+            "expiry must be latched"
+        );
+    }
+
+    #[test]
+    fn restore_does_not_quarantine_recorded_completed_compensation() {
+        let past = SagaContext::now_millis().saturating_sub(60_000);
+        let events = vec![
+            SagaChoreographyEvent::SagaStarted {
+                context: ctx_at("risk_check", 84, past, past),
+                payload: vec![],
+            },
+            SagaChoreographyEvent::StepCompleted {
+                context: ctx_at("risk_check", 84, past, past + 1),
+                output: vec![],
+                saga_input: vec![],
+                compensation_available: true,
+            },
+            SagaChoreographyEvent::StepFailed {
+                context: ctx_at("create_order", 84, past, past + 2),
+                participant_id: "order-manager".into(),
+                error_code: None,
+                error: "rejected".into(),
+                requires_compensation: true,
+            },
+            SagaChoreographyEvent::CompensationRequested {
+                context: ctx_at("saga_terminal_resolver", 84, past, past + 2),
+                failed_step: "create_order".into(),
+                reason: "rejected".into(),
+                failure: crate::SagaFailureDetails {
+                    step_name: "create_order".into(),
+                    participant_id: "order-manager".into(),
+                    error_code: None,
+                    error_message: "rejected".into(),
+                    at_millis: past + 2,
+                },
+                steps_to_compensate: vec!["risk_check".into()],
+            },
+            SagaChoreographyEvent::CompensationAccepted {
+                context: ctx_at("risk_check", 84, past, past + 3),
+                participant_id: "account-balance".into(),
+                execution_id: StepExecutionId::new("historical-undo"),
+                deadline_at_millis: past + 10,
+                hard_deadline_at_millis: past + 20,
+            },
+            SagaChoreographyEvent::StepCompleted {
+                context: ctx_at("sibling", 84, past, past + 200),
+                output: vec![],
+                saga_input: vec![],
+                compensation_available: false,
+            },
+            SagaChoreographyEvent::CompensationCompleted {
+                context: ctx_at("risk_check", 84, past, past + 201),
+            },
+            SagaChoreographyEvent::SagaFailed {
+                context: ctx_at("saga_terminal_resolver", 84, past, past + 202),
+                reason: "compensation finished after failure at step=create_order".into(),
+                failure: Some(crate::SagaFailureDetails {
+                    step_name: "create_order".into(),
+                    participant_id: "order-manager".into(),
+                    error_code: None,
+                    error_message: "rejected".into(),
+                    at_millis: past + 2,
+                }),
+            },
+        ];
+        let (mut restored, out) = TerminalResolver::restore_from_events(
+            open_position_policy(Duration::from_secs(5)),
+            &events,
+        );
+        assert!(
+            out.is_empty(),
+            "settled undo must not invent output: {out:?}"
+        );
+        assert!(restored.poll_timeouts().is_empty());
+    }
+
+    #[test]
+    fn restore_observes_retained_run_identity_floor() {
+        // Larger than the entire concurrent burst, so allocations alone cannot
+        // accidentally satisfy this assertion without observing the floor.
+        let token = SagaContext::next_run_start_millis() + 1_000_000;
+        let events = [SagaChoreographyEvent::SagaCompleted {
+            context: ctx_at(
+                "saga_terminal_resolver",
+                86,
+                token,
+                SagaContext::now_millis(),
+            ),
+        }];
+        let (_, out) = TerminalResolver::restore_from_events(
+            open_position_policy(Duration::from_secs(5)),
+            &events,
+        );
+        assert!(out.is_empty());
+        assert!(SagaContext::next_run_start_millis() > token);
+    }
+
+    #[test]
+    fn logical_run_token_does_not_delay_overall_timeout() {
+        let observed = SagaContext::now_millis();
+        let token = observed + 50_000;
+        let mut policy = open_position_policy(Duration::from_secs(60));
+        policy.overall_timeout = Duration::from_millis(100);
+        let mut resolver = TerminalResolver::new(policy);
+        assert!(
+            resolver
+                .ingest_at(
+                    &SagaChoreographyEvent::SagaStarted {
+                        context: ctx_at("risk_check", 85, token, observed),
+                        payload: vec![],
+                    },
+                    observed
+                )
+                .is_empty()
+        );
+        let state = &resolver.states[&SagaId::new(85)];
+        assert_eq!(state.run_started_at_millis, token);
+        assert_eq!(state.overall_anchor_millis, observed);
+        assert_eq!(state.last_progress_at_millis, observed);
+        assert!(resolver.poll_timeouts_at(observed + 100).is_empty());
+        assert!(
+            matches!(resolver.poll_timeouts_at(observed + 101).as_slice(),
+            [SagaChoreographyEvent::SagaFailed { reason, .. }] if reason.contains("overall_timeout"))
+        );
+        assert!(resolver.poll_timeouts_at(observed + 102).is_empty());
     }
 
     #[test]

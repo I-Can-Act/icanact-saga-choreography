@@ -9,33 +9,31 @@ mod support;
 use std::cell::RefCell;
 use std::time::Duration;
 
-use icanact_saga_choreography::ParticipantDedupeStore;
 use icanact_saga_choreography::durability::{
     apply_sync_workflow_participant_saga_ingress_with_hooks,
     collect_startup_recovery_events_for_saga_type, recover_accepted_workflow_steps_for_saga_type,
 };
 use icanact_saga_choreography::{
     AcceptedStepPolicy, AcceptedStepTimeoutOutcome, CompensationError, CompensationOutput,
-    HasSagaParticipantSupport, HasSagaWorkflowParticipants, InMemoryDedupe, InMemoryJournal,
-    ParticipantEvent, ParticipantJournal, ParticipantTerminalKind, PeerId, SagaChoreographyEvent,
+    HasSagaParticipantSupport, HasSagaWorkflowParticipants, InMemoryParticipantStore,
+    ParticipantEvent, ParticipantStore, ParticipantTerminalKind, PeerId, SagaChoreographyEvent,
     SagaContext, SagaFailureDetails, SagaId, SagaParticipantSupport, SagaStateExt,
     SagaWorkflowParticipant, StepError, StepExecutionId, StepOutput,
 };
-use support::{FaultDedupe, FaultJournal};
+use support::FaultStore;
 
-type Journal = FaultJournal<InMemoryJournal>;
-type Dedupe = FaultDedupe<InMemoryDedupe>;
+type Journal = FaultStore<InMemoryParticipantStore>;
 
 struct Actor {
-    saga: SagaParticipantSupport<Journal, Dedupe>,
+    saga: SagaParticipantSupport<Journal>,
     comp_calls: usize,
     pay_calls: usize,
 }
 
 impl Actor {
-    fn new(journal: &Journal, dedupe: &Dedupe) -> Self {
+    fn new(journal: &Journal) -> Self {
         Self {
-            saga: SagaParticipantSupport::new(journal.clone(), dedupe.clone()),
+            saga: SagaParticipantSupport::new(journal.clone()),
             comp_calls: 0,
             pay_calls: 0,
         }
@@ -43,12 +41,11 @@ impl Actor {
 }
 
 impl HasSagaParticipantSupport for Actor {
-    type Journal = Journal;
-    type Dedupe = Dedupe;
-    fn saga_support(&self) -> &SagaParticipantSupport<Journal, Dedupe> {
+    type Store = Journal;
+    fn saga_support(&self) -> &SagaParticipantSupport<Journal> {
         &self.saga
     }
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal, Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal> {
         &mut self.saga
     }
 }
@@ -66,7 +63,60 @@ impl HasSagaWorkflowParticipants for Actor {
 }
 
 struct OldJournal(Vec<icanact_saga_choreography::JournalEntry>);
-impl ParticipantJournal for OldJournal {
+impl ParticipantStore for OldJournal {
+    fn check_and_mark(
+        &self,
+        _saga_id: SagaId,
+        _key: &str,
+    ) -> Result<bool, icanact_saga_choreography::JournalError> {
+        unreachable!("read-only recovery fixture")
+    }
+
+    fn remove_processed(
+        &self,
+        _saga_id: SagaId,
+        _key: &str,
+    ) -> Result<(), icanact_saga_choreography::JournalError> {
+        unreachable!("read-only recovery fixture")
+    }
+
+    fn append_batch(
+        &self,
+        _saga_id: SagaId,
+        _events: Vec<ParticipantEvent>,
+    ) -> Result<Vec<u64>, icanact_saga_choreography::JournalError> {
+        unreachable!("read-only recovery fixture")
+    }
+
+    fn admit_and_record_intent(
+        &self,
+        _context: &SagaContext,
+        _key: &str,
+        _trigger: &str,
+    ) -> Result<icanact_saga_choreography::StoreAdmission, icanact_saga_choreography::JournalError>
+    {
+        unreachable!("read-only recovery fixture")
+    }
+
+    fn unresolved_saga_ids(&self) -> Result<Vec<SagaId>, icanact_saga_choreography::JournalError> {
+        self.list_sagas()
+    }
+
+    fn compact_terminal_detail(
+        &self,
+        _limit: usize,
+    ) -> Result<usize, icanact_saga_choreography::JournalError> {
+        unreachable!("read-only recovery fixture")
+    }
+
+    fn prune_resolved_before(
+        &self,
+        _cutoff: u64,
+        _limit: usize,
+    ) -> Result<usize, icanact_saga_choreography::JournalError> {
+        unreachable!("read-only recovery fixture")
+    }
+
     fn append(
         &self,
         _: SagaId,
@@ -117,13 +167,8 @@ fn stale_generic_execution_or_undo_recovers_as_quarantine_with_original_identity
                 event,
             },
         ]);
-        let events = collect_startup_recovery_events_for_saga_type(
-            &journal,
-            &InMemoryDedupe::new(),
-            "pay",
-            "wf_pay",
-        )
-        .unwrap();
+        let events =
+            collect_startup_recovery_events_for_saga_type(&journal, "pay", "wf_pay").unwrap();
         assert!(
             matches!(events.as_slice(), [SagaChoreographyEvent::SagaQuarantined { context, .. }]
             if context.saga_started_at_millis == 10),
@@ -134,11 +179,11 @@ fn stale_generic_execution_or_undo_recovers_as_quarantine_with_original_identity
 
 #[test]
 fn stale_accepted_timeout_cannot_resolve_a_new_run_with_the_same_execution_id() {
-    let journal = Journal::new(InMemoryJournal::new());
-    let dedupe = Dedupe::new(InMemoryDedupe::new());
+    let journal = Journal::new(InMemoryParticipantStore::new());
+
     let c = ctx("wf_accept", "reserve", 300);
     append(&journal, c.saga_id, run_recorded("wf_accept", 300));
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     icanact_saga_choreography::durability::accept_workflow_step(
         &mut actor,
         c.clone(),
@@ -320,8 +365,8 @@ fn started_event() -> ParticipantEvent {
 
 #[test]
 fn recovery_does_not_fold_a_resolved_old_run_into_the_current_run() {
-    let journal = FaultJournal::new(InMemoryJournal::new());
-    let dedupe = FaultDedupe::new(InMemoryDedupe::new());
+    let journal = FaultStore::new(InMemoryParticipantStore::new());
+
     let old = ctx("wf_accept", "reserve", 100);
     let id = old.saga_id;
     append(&journal, id, run_recorded("wf_accept", 100));
@@ -339,8 +384,7 @@ fn recovery_does_not_fold_a_resolved_old_run_into_the_current_run() {
     // at any age and must be quarantined visibly. The resolved old run's accepted step
     // must neither be replayed nor attributed to the new run.
     let events =
-        collect_startup_recovery_events_for_saga_type(&journal, &dedupe, "reserve", "wf_accept")
-            .unwrap();
+        collect_startup_recovery_events_for_saga_type(&journal, "reserve", "wf_accept").unwrap();
     assert!(
         matches!(events.as_slice(),
             [SagaChoreographyEvent::SagaQuarantined { context, .. }]
@@ -348,7 +392,7 @@ fn recovery_does_not_fold_a_resolved_old_run_into_the_current_run() {
         "old run replayed into new run, or the new run's open intent was not quarantined: {events:?}"
     );
 
-    let mut support = SagaParticipantSupport::new(journal.clone(), dedupe.clone());
+    let mut support = SagaParticipantSupport::new(journal.clone());
     recover_accepted_workflow_steps_for_saga_type(&mut support, "reserve", "wf_accept").unwrap();
     assert!(
         support.accepted_workflow_steps.is_empty(),
@@ -358,8 +402,8 @@ fn recovery_does_not_fold_a_resolved_old_run_into_the_current_run() {
 }
 
 #[test]
-fn recovery_hydrates_terminal_fence_for_the_current_run() {
-    let journal = FaultJournal::new(InMemoryJournal::new());
+fn recovery_skips_resolved_run_but_durable_fence_survives() {
+    let journal = FaultStore::new(InMemoryParticipantStore::new());
     let id = ctx("wf_pay", "pay", 100).saga_id;
     append(&journal, id, run_recorded("wf_pay", 100));
     append(&journal, id, started_event());
@@ -369,19 +413,29 @@ fn recovery_hydrates_terminal_fence_for_the_current_run() {
         terminal("wf_pay", 100, ParticipantTerminalKind::Completed),
     );
 
-    let mut support = SagaParticipantSupport::new(journal, FaultDedupe::new(InMemoryDedupe::new()));
+    let mut support = SagaParticipantSupport::new(journal);
     recover_accepted_workflow_steps_for_saga_type(&mut support, "pay", "wf_pay").unwrap();
+    // Startup scans only unresolved runs, so resolved fences stay in storage,
+    // not in an eagerly warmed (bounded) cache.
+    assert!(support.terminal_sagas.is_empty());
+    assert!(support.saga_run_started_at.is_empty());
+    let actor = Actor {
+        saga: support,
+        comp_calls: 0,
+        pay_calls: 0,
+    };
     assert!(
-        support.terminal_sagas.contains(&id),
-        "terminal fence not hydrated"
+        !actor
+            .admit_participant_event_strict(&ctx("wf_pay", "pay", 100))
+            .unwrap()
+            .is_admitted()
     );
-    assert_eq!(support.saga_run_started_at.get(&id), Some(&100));
 }
 
 #[test]
 fn restart_never_auto_resolves_quarantined_accepted_work() {
-    let journal = FaultJournal::new(InMemoryJournal::new());
-    let dedupe = FaultDedupe::new(InMemoryDedupe::new());
+    let journal = FaultStore::new(InMemoryParticipantStore::new());
+
     let run = ctx("wf_accept", "reserve", 100);
     let id = run.saga_id;
     append(&journal, id, run_recorded("wf_accept", 100));
@@ -396,13 +450,12 @@ fn restart_never_auto_resolves_quarantined_accepted_work() {
     let before = journal.read(id).unwrap().len();
 
     let events =
-        collect_startup_recovery_events_for_saga_type(&journal, &dedupe, "reserve", "wf_accept")
-            .unwrap();
+        collect_startup_recovery_events_for_saga_type(&journal, "reserve", "wf_accept").unwrap();
     assert!(
         events.is_empty(),
         "quarantined work auto-resolved: {events:?}"
     );
-    let mut support = SagaParticipantSupport::new(journal.clone(), dedupe);
+    let mut support = SagaParticipantSupport::new(journal.clone());
     recover_accepted_workflow_steps_for_saga_type(&mut support, "reserve", "wf_accept").unwrap();
     assert!(support.accepted_workflow_steps.is_empty());
     assert_eq!(journal.read(id).unwrap().len(), before, "evidence mutated");
@@ -410,8 +463,8 @@ fn restart_never_auto_resolves_quarantined_accepted_work() {
 
 #[test]
 fn singleton_unstarted_compensation_request_is_replayed_and_executes_once() {
-    let journal = FaultJournal::new(InMemoryJournal::new());
-    let dedupe = FaultDedupe::new(InMemoryDedupe::new());
+    let journal = FaultStore::new(InMemoryParticipantStore::new());
+
     let run = ctx("wf_pay", "pay", 100);
     let id = run.saga_id;
     let request_ctx = ctx("wf_pay", "coordinator", 100);
@@ -445,7 +498,7 @@ fn singleton_unstarted_compensation_request_is_replayed_and_executes_once() {
         },
     );
     // The request was already dedupe-marked before the crash.
-    let probe = Actor::new(&journal, &dedupe);
+    let probe = Actor::new(&journal);
     let key = probe.run_dedupe_key(
         &request_ctx,
         &format!(
@@ -453,10 +506,9 @@ fn singleton_unstarted_compensation_request_is_replayed_and_executes_once() {
             request_ctx.trace_id, request_ctx.saga_started_at_millis, request_ctx.step_name
         ),
     );
-    dedupe.mark_processed(id, &key).unwrap();
+    journal.mark_processed(id, &key).unwrap();
 
-    let events =
-        collect_startup_recovery_events_for_saga_type(&journal, &dedupe, "pay", "wf_pay").unwrap();
+    let events = collect_startup_recovery_events_for_saga_type(&journal, "pay", "wf_pay").unwrap();
     let [
         request @ SagaChoreographyEvent::CompensationRequested {
             steps_to_compensate,
@@ -468,7 +520,7 @@ fn singleton_unstarted_compensation_request_is_replayed_and_executes_once() {
     };
     assert_eq!(steps_to_compensate.len(), 1);
 
-    let mut restarted = Actor::new(&journal, &dedupe);
+    let mut restarted = Actor::new(&journal);
     recover_accepted_workflow_steps_for_saga_type(&mut restarted.saga, "pay", "wf_pay").unwrap();
     let emitted = deliver(&mut restarted, request.clone());
     assert_eq!(restarted.comp_calls, 1);
@@ -485,10 +537,10 @@ fn singleton_unstarted_compensation_request_is_replayed_and_executes_once() {
 
 #[test]
 fn accepted_step_recovery_matches_what_ingress_emitted() {
-    let journal = FaultJournal::new(InMemoryJournal::new());
-    let dedupe = FaultDedupe::new(InMemoryDedupe::new());
+    let journal = FaultStore::new(InMemoryParticipantStore::new());
+
     let run = ctx("wf_accept", "reserve", 100);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     let emitted = deliver(
         &mut actor,
         SagaChoreographyEvent::SagaStarted {
@@ -510,8 +562,7 @@ fn accepted_step_recovery_matches_what_ingress_emitted() {
     };
 
     let recovered =
-        collect_startup_recovery_events_for_saga_type(&journal, &dedupe, "reserve", "wf_accept")
-            .unwrap();
+        collect_startup_recovery_events_for_saga_type(&journal, "reserve", "wf_accept").unwrap();
     let [
         SagaChoreographyEvent::StepAccepted {
             execution_id: r_exec,

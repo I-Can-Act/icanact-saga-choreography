@@ -23,13 +23,12 @@ use icanact_saga_choreography::durability::{
     collect_startup_recovery_events_for_saga_type, fail_accepted_workflow_step,
 };
 use icanact_saga_choreography::*;
-use support::{FaultDedupe, FaultJournal, FaultTrigger, JournalOp};
+use support::{FaultStore, FaultTrigger, JournalOp};
 
 const TYPE: &str = "qa_r4p";
 const SAGA: u64 = 7;
 
-type Journal = FaultJournal<InMemoryJournal>;
-type Dedupe = FaultDedupe<InMemoryDedupe>;
+type Journal = FaultStore<InMemoryParticipantStore>;
 
 #[derive(Clone, Copy, Debug)]
 enum Mode {
@@ -46,23 +45,21 @@ struct Counters {
 }
 
 struct Actor {
-    saga: SagaParticipantSupport<Journal, Dedupe>,
+    saga: SagaParticipantSupport<Journal>,
     shared: Arc<Counters>,
 }
 
 impl HasSagaParticipantSupport for Actor {
-    type Journal = Journal;
-    type Dedupe = Dedupe;
-    fn saga_support(&self) -> &SagaParticipantSupport<Journal, Dedupe> {
+    type Store = Journal;
+    fn saga_support(&self) -> &SagaParticipantSupport<Journal> {
         &self.saga
     }
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal, Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal> {
         &mut self.saga
     }
 }
 
 impl SagaParticipant for Actor {
-    type Error = String;
     fn step_name(&self) -> &str {
         "a"
     }
@@ -95,7 +92,6 @@ impl SagaParticipant for Actor {
 }
 
 impl AsyncSagaParticipant for Actor {
-    type Error = String;
     fn step_name(&self) -> &str {
         "a"
     }
@@ -137,32 +133,27 @@ impl AsyncSagaParticipant for Actor {
 
 struct World {
     journal: Journal,
-    dedupe: Dedupe,
     shared: Arc<Counters>,
 }
 
 impl World {
     fn new() -> Self {
         Self {
-            journal: FaultJournal::new(InMemoryJournal::new()),
-            dedupe: FaultDedupe::new(InMemoryDedupe::new()),
+            journal: FaultStore::new(InMemoryParticipantStore::new()),
             shared: Arc::default(),
         }
     }
     /// A cold actor (no volatile state) over the same durable stores.
     fn actor(&self) -> Actor {
         Actor {
-            saga: SagaParticipantSupport::new(self.journal.clone(), self.dedupe.clone()),
+            saga: SagaParticipantSupport::new(self.journal.clone()),
             shared: self.shared.clone(),
         }
     }
-    /// Cold restart where the (volatile) ingress dedupe marker was lost too.
+    /// Cold restart retaining the unified durable journal and dedupe evidence.
     fn restarted_actor(&self) -> Actor {
         Actor {
-            saga: SagaParticipantSupport::new(
-                self.journal.clone(),
-                FaultDedupe::new(InMemoryDedupe::new()),
-            ),
+            saga: SagaParticipantSupport::new(self.journal.clone()),
             shared: self.shared.clone(),
         }
     }
@@ -479,12 +470,11 @@ struct WfActor {
 }
 
 impl HasSagaParticipantSupport for WfActor {
-    type Journal = Journal;
-    type Dedupe = Dedupe;
-    fn saga_support(&self) -> &SagaParticipantSupport<Journal, Dedupe> {
+    type Store = Journal;
+    fn saga_support(&self) -> &SagaParticipantSupport<Journal> {
         &self.inner.saga
     }
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal, Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal> {
         &mut self.inner.saga
     }
 }
@@ -649,13 +639,8 @@ fn workflow_failed_completion_append_publishes_no_ack_and_quarantines() {
 }
 
 fn recover(world: &World) -> Vec<SagaChoreographyEvent> {
-    collect_startup_recovery_events_for_saga_type(
-        &world.journal,
-        &world.dedupe,
-        "accf",
-        "qa_r4p_wf",
-    )
-    .expect("startup recovery")
+    collect_startup_recovery_events_for_saga_type(&world.journal, "accf", "qa_r4p_wf")
+        .expect("startup recovery")
 }
 
 #[test]

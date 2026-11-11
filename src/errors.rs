@@ -253,11 +253,6 @@ impl StepError {
 /// Error from compensation execution
 #[derive(Clone, Debug)]
 pub enum CompensationError {
-    /// Safe to retry - no side effects were applied
-    SafeToRetry {
-        /// Error description
-        reason: Box<str>,
-    },
     /// Ambiguous state - compensation may or may not have applied
     Ambiguous {
         /// Error description
@@ -271,11 +266,6 @@ pub enum CompensationError {
 }
 
 impl CompensationError {
-    /// Check if safe to retry
-    pub fn is_safe_to_retry(&self) -> bool {
-        matches!(self, Self::SafeToRetry { .. })
-    }
-
     /// Check if state is ambiguous
     pub fn is_ambiguous(&self) -> bool {
         matches!(self, Self::Ambiguous { .. })

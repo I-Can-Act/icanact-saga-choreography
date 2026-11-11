@@ -22,7 +22,7 @@ use std::task::{Context, Waker};
 use std::time::{Duration, Instant};
 
 use icanact_saga_choreography::*;
-use support::{FaultDedupe, FaultJournal, FaultTrigger, JournalOp};
+use support::{FaultStore, FaultTrigger, JournalOp};
 
 const TYPE: &str = "qa_rc";
 
@@ -40,8 +40,7 @@ define_saga_workflow_contract! {
     }
 }
 
-type Journal = FaultJournal<InMemoryJournal>;
-type Dedupe = FaultDedupe<InMemoryDedupe>;
+type Journal = FaultStore<InMemoryParticipantStore>;
 
 #[derive(Clone, Copy, Debug)]
 enum Mode {
@@ -67,7 +66,7 @@ struct Counters {
 }
 
 struct Actor {
-    saga: SagaParticipantSupport<Journal, Dedupe>,
+    saga: SagaParticipantSupport<Journal>,
     shared: Arc<Counters>,
     with_effect: bool,
     deps: DependencySpec,
@@ -77,7 +76,7 @@ struct Actor {
 impl Actor {
     fn new(world: &World) -> Self {
         Self {
-            saga: SagaParticipantSupport::new(world.journal.clone(), world.dedupe.clone()),
+            saga: SagaParticipantSupport::new(world.journal.clone()),
             shared: world.shared.clone(),
             with_effect: false,
             deps: DependencySpec::OnSagaStart,
@@ -123,18 +122,16 @@ impl Actor {
 }
 
 impl HasSagaParticipantSupport for Actor {
-    type Journal = Journal;
-    type Dedupe = Dedupe;
-    fn saga_support(&self) -> &SagaParticipantSupport<Journal, Dedupe> {
+    type Store = Journal;
+    fn saga_support(&self) -> &SagaParticipantSupport<Journal> {
         &self.saga
     }
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal, Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal> {
         &mut self.saga
     }
 }
 
 impl SagaParticipant for Actor {
-    type Error = String;
     fn step_name(&self) -> &str {
         "a"
     }
@@ -166,7 +163,6 @@ impl SagaParticipant for Actor {
 }
 
 impl AsyncSagaParticipant for Actor {
-    type Error = String;
     fn step_name(&self) -> &str {
         "a"
     }
@@ -203,15 +199,13 @@ impl AsyncSagaParticipant for Actor {
 
 struct World {
     journal: Journal,
-    dedupe: Dedupe,
     shared: Arc<Counters>,
 }
 
 impl World {
     fn new() -> Self {
         Self {
-            journal: FaultJournal::new(InMemoryJournal::new()),
-            dedupe: FaultDedupe::new(InMemoryDedupe::new()),
+            journal: FaultStore::new(InMemoryParticipantStore::new()),
             shared: Arc::default(),
         }
     }
@@ -385,7 +379,10 @@ fn real_bus(reject_step_started: bool) -> (SagaChoreographyBus, Seen) {
     let bus = SagaChoreographyBus::new();
     bus.register_workflow_contract_provider::<RcContract>()
         .unwrap();
-    bus.register_bound_workflow_step(TYPE, "a").unwrap();
+    bus.subscribe_workflow_step_fn(TYPE, "a", move |event| {
+        !(reject_step_started && is_step_started(event))
+    })
+    .unwrap();
     let seen: Seen = Arc::default();
     let sink = Arc::clone(&seen);
     bus.subscribe_saga_type_fn(TYPE, move |event| {
@@ -786,6 +783,19 @@ fn allof_observations_from_another_run_do_not_count() {
                 },
             )
             .unwrap();
+        world
+            .journal
+            .append(
+                SagaId::new(7),
+                ParticipantEvent::ParticipantTerminalRecorded {
+                    saga_type: TYPE.into(),
+                    saga_started_at_millis: 50,
+                    outcome: ParticipantTerminalKind::Failed,
+                    reason: "old idle run closed".into(),
+                    recorded_at_millis: 2,
+                },
+            )
+            .unwrap();
         let mut actor = allof_actor(&world);
         drive(mode, &mut actor, dep_completed("y", 12, 100));
         assert_eq!(
@@ -803,22 +813,25 @@ fn allof_observations_from_another_run_do_not_count() {
 }
 
 #[test]
-fn allof_observation_is_durable_before_the_input_dedupe_mark() {
+fn allof_observations_are_durable_before_atomic_intent_admission() {
     for mode in MODES {
         let world = World::new();
-        world.dedupe.fail_check_and_mark(FaultTrigger::NthCall(1));
+        world
+            .journal
+            .fail_once(JournalOp::AdmitAndRecordIntent, FaultTrigger::NthCall(1));
         let mut actor = allof_actor(&world);
-        let out = drive(mode, &mut actor, dep_completed("x", 11, 100));
+        drive(mode, &mut actor, dep_completed("x", 11, 100));
+        let out = drive(mode, &mut actor, dep_completed("y", 12, 100));
         assert!(
             has_quarantine(&out),
-            "{mode:?}: failed input mark must stay visible"
+            "{mode:?}: failed atomic admission must stay visible"
         );
         assert_eq!(world.effects(), 0);
         assert!(
             world.rows().iter().any(|event| matches!(event,
             ParticipantEvent::ParticipantDependencyCompletedRecorded { context, .. }
                 if context.step_name.as_ref() == "x")),
-            "{mode:?}: dependency observation must precede even a failed input mark"
+            "{mode:?}: dependency observation must precede even a failed atomic admission"
         );
     }
 }

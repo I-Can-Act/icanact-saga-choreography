@@ -2,24 +2,31 @@ use std::path::PathBuf;
 
 use heed::EnvOpenOptions;
 use heed::types::{Bytes, Str};
-use icanact_saga_choreography::durability::lmdb::{
-    LmdbDedupe, LmdbJournal, open_lmdb_participant_support,
-    open_lmdb_participant_support_for_saga_type,
-};
+use icanact_saga_choreography::LmdbParticipantStore;
 use icanact_saga_choreography::durability::{ActiveSagaExecutionPhase, panic_quarantine_reason};
 use icanact_saga_choreography::{
-    HasSagaParticipantSupport, ParticipantDedupeStore, ParticipantEvent, ParticipantJournal,
-    SagaChoreographyEvent, SagaContext, SagaId, SagaParticipantSupport, SagaStateExt,
+    HasSagaParticipantSupport, ParticipantEvent, ParticipantStore, SagaChoreographyEvent,
+    SagaContext, SagaId, SagaParticipantSupport, SagaStateExt,
 };
 
 #[test]
 fn lmdb_envs_close_on_drop_allowing_many_sequential_participants() {
     let temp = tempfile::tempdir().expect("tempdir should open");
     for iteration in 0..300 {
-        let journal = LmdbJournal::open(&temp.path().join(format!("journal-{iteration}")))
+        let journal = LmdbParticipantStore::open(temp.path(), "test_participant")
             .unwrap_or_else(|err| panic!("journal open failed at iteration {iteration}: {err}"));
-        let dedupe = LmdbDedupe::open(&temp.path().join(format!("dedupe-{iteration}")))
+        let dedupe = LmdbParticipantStore::open(temp.path(), "test_participant")
             .unwrap_or_else(|err| panic!("dedupe open failed at iteration {iteration}: {err}"));
+        journal
+            .append(
+                SagaId::new(iteration),
+                ParticipantEvent::ParticipantRunRecorded {
+                    saga_type: "probe".into(),
+                    saga_started_at_millis: iteration + 1,
+                    recorded_at_millis: iteration + 1,
+                },
+            )
+            .unwrap();
         assert!(
             dedupe
                 .check_and_mark(SagaId::new(iteration), "probe")
@@ -35,11 +42,13 @@ fn lmdb_envs_close_on_drop_allowing_many_sequential_participants() {
 #[test]
 fn lmdb_journal_and_dedupe_preserve_rows_after_drop_and_reopen() {
     let temp = tempfile::tempdir().expect("tempdir should open");
-    let journal_path = temp.path().join("journal");
-    let dedupe_path = temp.path().join("dedupe");
+    let journal_path = temp.path().to_path_buf();
+    let dedupe_path = temp.path().to_path_buf();
     let saga_id = SagaId::new(100);
-    let journal = LmdbJournal::open(&journal_path).expect("journal should open");
-    let dedupe = LmdbDedupe::open(&dedupe_path).expect("dedupe should open");
+    let journal =
+        LmdbParticipantStore::open(&journal_path, "test_participant").expect("journal should open");
+    let dedupe =
+        LmdbParticipantStore::open(&dedupe_path, "test_participant").expect("dedupe should open");
     let sequence = journal
         .append(
             saga_id,
@@ -53,8 +62,10 @@ fn lmdb_journal_and_dedupe_preserve_rows_after_drop_and_reopen() {
     drop(journal);
     drop(dedupe);
 
-    let journal = LmdbJournal::open(&journal_path).expect("journal should reopen");
-    let dedupe = LmdbDedupe::open(&dedupe_path).expect("dedupe should reopen");
+    let journal = LmdbParticipantStore::open(&journal_path, "test_participant")
+        .expect("journal should reopen");
+    let dedupe =
+        LmdbParticipantStore::open(&dedupe_path, "test_participant").expect("dedupe should reopen");
     let rows = journal.read(saga_id).expect("rows should read back");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].sequence, sequence);
@@ -66,39 +77,55 @@ fn lmdb_journal_and_dedupe_preserve_rows_after_drop_and_reopen() {
         }
     ));
     assert_eq!(journal.list_sagas().unwrap(), vec![saga_id]);
-    assert!(dedupe.contains(saga_id, "probe").unwrap());
     assert!(!dedupe.check_and_mark(saga_id, "probe").unwrap());
 }
 
 #[test]
 fn lmdb_journal_and_dedupe_double_open_drop_and_reopen() {
     let temp = tempfile::tempdir().expect("tempdir should open");
-    let journal_path = temp.path().join("journal");
-    let dedupe_path = temp.path().join("dedupe");
-    let journal = LmdbJournal::open(&journal_path).expect("first journal should open");
-    let second_journal = LmdbJournal::open(&journal_path).expect("second journal should open");
-    let dedupe = LmdbDedupe::open(&dedupe_path).expect("first dedupe should open");
-    let second_dedupe = LmdbDedupe::open(&dedupe_path).expect("second dedupe should open");
+    let journal_path = temp.path().to_path_buf();
+    let dedupe_path = temp.path().to_path_buf();
+    let journal = LmdbParticipantStore::open(&journal_path, "test_participant")
+        .expect("first journal should open");
+    let second_journal = LmdbParticipantStore::open(&journal_path, "test_participant")
+        .expect("second journal should open");
+    let dedupe = LmdbParticipantStore::open(&dedupe_path, "test_participant")
+        .expect("first dedupe should open");
+    let second_dedupe = LmdbParticipantStore::open(&dedupe_path, "test_participant")
+        .expect("second dedupe should open");
     drop(journal);
     drop(second_journal);
     drop(dedupe);
     drop(second_dedupe);
 
-    let journal = LmdbJournal::open(&journal_path).expect("journal should reopen");
-    let dedupe = LmdbDedupe::open(&dedupe_path).expect("dedupe should reopen");
+    let journal = LmdbParticipantStore::open(&journal_path, "test_participant")
+        .expect("journal should reopen");
+    let dedupe =
+        LmdbParticipantStore::open(&dedupe_path, "test_participant").expect("dedupe should reopen");
     assert!(journal.list_sagas().unwrap().is_empty());
+    journal
+        .append(
+            SagaId::new(100),
+            ParticipantEvent::StepExecutionStarted {
+                attempt: 1,
+                started_at_millis: 1000,
+            },
+        )
+        .unwrap();
     assert!(dedupe.check_and_mark(SagaId::new(100), "probe").unwrap());
 }
 
 #[test]
 fn lmdb_journal_and_dedupe_drop_preserves_other_same_path_owners() {
     let temp = tempfile::tempdir().expect("tempdir should open");
-    let journal_path = temp.path().join("journal");
-    let dedupe_path = temp.path().join("dedupe");
-    let first_journal = LmdbJournal::open(&journal_path).unwrap();
-    let first_dedupe = LmdbDedupe::open(&dedupe_path).unwrap();
-    let second_journal = LmdbJournal::open(&journal_path.join(".")).unwrap();
-    let second_dedupe = LmdbDedupe::open(&dedupe_path.join(".")).unwrap();
+    let journal_path = temp.path().to_path_buf();
+    let dedupe_path = temp.path().to_path_buf();
+    let first_journal = LmdbParticipantStore::open(&journal_path, "test_participant").unwrap();
+    let first_dedupe = LmdbParticipantStore::open(&dedupe_path, "test_participant").unwrap();
+    let second_journal =
+        LmdbParticipantStore::open(&journal_path.join("."), "test_participant").unwrap();
+    let second_dedupe =
+        LmdbParticipantStore::open(&dedupe_path.join("."), "test_participant").unwrap();
     drop(first_journal);
     drop(first_dedupe);
 
@@ -114,29 +141,29 @@ fn lmdb_journal_and_dedupe_drop_preserves_other_same_path_owners() {
         .unwrap();
     assert_eq!(second_journal.read(saga_id).unwrap().len(), 1);
     assert!(second_dedupe.check_and_mark(saga_id, "probe").unwrap());
-    assert!(second_dedupe.contains(saga_id, "probe").unwrap());
+    assert!(!second_dedupe.check_and_mark(saga_id, "probe").unwrap());
 
-    let third_journal = LmdbJournal::open(&journal_path)
+    let third_journal = LmdbParticipantStore::open(&journal_path, "test_participant")
         .expect("third journal should open while the second owner is alive");
-    let third_dedupe = LmdbDedupe::open(&dedupe_path)
+    let third_dedupe = LmdbParticipantStore::open(&dedupe_path, "test_participant")
         .expect("third dedupe should open while the second owner is alive");
     drop(second_journal);
     drop(second_dedupe);
     assert_eq!(third_journal.read(saga_id).unwrap().len(), 1);
-    assert!(third_dedupe.contains(saga_id, "probe").unwrap());
+    assert!(!third_dedupe.check_and_mark(saga_id, "probe").unwrap());
     drop(third_journal);
     drop(third_dedupe);
 
-    let reopened_journal = LmdbJournal::open(&journal_path).unwrap();
-    let reopened_dedupe = LmdbDedupe::open(&dedupe_path).unwrap();
+    let reopened_journal = LmdbParticipantStore::open(&journal_path, "test_participant").unwrap();
+    let reopened_dedupe = LmdbParticipantStore::open(&dedupe_path, "test_participant").unwrap();
     assert_eq!(reopened_journal.read(saga_id).unwrap().len(), 1);
-    assert!(reopened_dedupe.contains(saga_id, "probe").unwrap());
+    assert!(!reopened_dedupe.check_and_mark(saga_id, "probe").unwrap());
 }
 
 #[test]
 fn lmdb_failed_opens_release_env_ownership() {
     let temp = tempfile::tempdir().expect("tempdir should open");
-    for (name, max_dbs) in [("journal", 16), ("dedupe", 8)] {
+    for (name, max_dbs) in [("participant-a", 16), ("participant-b", 16)] {
         let path = temp.path().join(name);
         std::fs::create_dir_all(&path).unwrap();
         let env = unsafe {
@@ -154,11 +181,8 @@ fn lmdb_failed_opens_release_env_ownership() {
         wtxn.commit().unwrap();
 
         // Keep the seeded env live so all database slots remain occupied.
-        if name == "journal" {
-            LmdbJournal::open(&path).expect_err("database creation must fail");
-        } else {
-            LmdbDedupe::open(&path).expect_err("database creation must fail");
-        }
+        LmdbParticipantStore::open(&path, "test_participant")
+            .expect_err("database creation must fail");
         drop(env);
         assert!(
             heed::env_closing_event(path.canonicalize().unwrap()).is_none(),
@@ -170,11 +194,13 @@ fn lmdb_failed_opens_release_env_ownership() {
 #[test]
 fn lmdb_journal_and_dedupe_roundtrip() {
     let temp = tempfile::tempdir().expect("tempdir should open");
-    let journal_path = temp.path().join("journal");
-    let dedupe_path = temp.path().join("dedupe");
+    let journal_path = temp.path().to_path_buf();
+    let dedupe_path = temp.path().to_path_buf();
 
-    let journal = LmdbJournal::open(&journal_path).expect("journal should open");
-    let dedupe = LmdbDedupe::open(&dedupe_path).expect("dedupe should open");
+    let journal =
+        LmdbParticipantStore::open(&journal_path, "test_participant").expect("journal should open");
+    let dedupe =
+        LmdbParticipantStore::open(&dedupe_path, "test_participant").expect("dedupe should open");
 
     let saga_a = SagaId::new(100);
     let saga_b = SagaId::new(101);
@@ -227,6 +253,19 @@ fn lmdb_journal_and_dedupe_roundtrip() {
     );
 
     assert!(
+        dedupe.check_and_mark(saga_a, "probe").is_err(),
+        "pruned run has no dedupe namespace"
+    );
+    journal
+        .append(
+            saga_a,
+            ParticipantEvent::StepExecutionStarted {
+                attempt: 1,
+                started_at_millis: 2000,
+            },
+        )
+        .unwrap();
+    assert!(
         dedupe
             .check_and_mark(saga_a, "probe")
             .expect("first check_and_mark should succeed")
@@ -237,8 +276,8 @@ fn lmdb_journal_and_dedupe_roundtrip() {
             .expect("second check_and_mark should succeed")
     );
     assert!(
-        dedupe
-            .contains(saga_a, "probe")
+        !dedupe
+            .check_and_mark(saga_a, "probe")
             .expect("contains should succeed")
     );
 
@@ -246,32 +285,30 @@ fn lmdb_journal_and_dedupe_roundtrip() {
         .mark_processed(saga_b, "manual")
         .expect("mark_processed should succeed");
     assert!(
-        dedupe
-            .contains(saga_b, "manual")
+        !dedupe
+            .check_and_mark(saga_b, "manual")
             .expect("contains should succeed")
     );
 
     dedupe.prune(saga_a).expect("prune should succeed");
     assert!(
-        !dedupe
-            .contains(saga_a, "probe")
-            .expect("contains should succeed")
+        dedupe.check_and_mark(saga_a, "probe").is_err(),
+        "administrative prune removes the run and its dedupe namespace"
     );
 }
 
 struct LmdbParticipant {
-    saga: SagaParticipantSupport<LmdbJournal, LmdbDedupe>,
+    saga: SagaParticipantSupport<LmdbParticipantStore>,
 }
 
 impl HasSagaParticipantSupport for LmdbParticipant {
-    type Journal = LmdbJournal;
-    type Dedupe = LmdbDedupe;
+    type Store = LmdbParticipantStore;
 
-    fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support(&self) -> &SagaParticipantSupport<Self::Store> {
         &self.saga
     }
 
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Store> {
         &mut self.saga
     }
 }
@@ -279,8 +316,10 @@ impl HasSagaParticipantSupport for LmdbParticipant {
 #[test]
 fn prune_saga_removes_lmdb_journal_and_dedupe_state() {
     let temp = tempfile::tempdir().expect("tempdir should open");
-    let journal = LmdbJournal::open(&temp.path().join("journal")).expect("journal should open");
-    let dedupe = LmdbDedupe::open(&temp.path().join("dedupe")).expect("dedupe should open");
+    let journal =
+        LmdbParticipantStore::open(temp.path(), "test_participant").expect("journal should open");
+    let dedupe =
+        LmdbParticipantStore::open(temp.path(), "test_participant").expect("dedupe should open");
     let saga_a = SagaId::new(300);
     let saga_b = SagaId::new(301);
 
@@ -307,7 +346,7 @@ fn prune_saga_removes_lmdb_journal_and_dedupe_state() {
         .expect("dedupe mark should succeed");
 
     let mut actor = LmdbParticipant {
-        saga: SagaParticipantSupport::new(journal, dedupe),
+        saga: SagaParticipantSupport::new(journal),
     };
     actor
         .prune_saga_strict(saga_a)
@@ -316,7 +355,7 @@ fn prune_saga_removes_lmdb_journal_and_dedupe_state() {
     assert!(
         actor
             .saga
-            .journal
+            .store
             .read(saga_a)
             .expect("read pruned saga should succeed")
             .is_empty(),
@@ -325,19 +364,30 @@ fn prune_saga_removes_lmdb_journal_and_dedupe_state() {
     assert_eq!(
         actor
             .saga
-            .journal
+            .store
             .list_sagas()
             .expect("list after prune should succeed"),
         vec![saga_b],
         "terminal cleanup must remove only the pruned saga index"
     );
     assert!(
-        !actor
-            .saga
-            .dedupe
-            .contains(saga_a, "started")
-            .expect("contains should succeed"),
-        "terminal cleanup must still prune dedupe rows"
+        actor.saga.store.check_and_mark(saga_a, "started").is_err(),
+        "pruned run cannot retain a dedupe namespace"
+    );
+    actor
+        .saga
+        .store
+        .append(
+            saga_a,
+            ParticipantEvent::StepExecutionStarted {
+                attempt: 1,
+                started_at_millis: 2000,
+            },
+        )
+        .unwrap();
+    assert!(
+        actor.saga.store.check_and_mark(saga_a, "started").unwrap(),
+        "explicit reuse after administrative prune must not retain old dedupe rows"
     );
 }
 
@@ -346,7 +396,7 @@ fn open_support_replays_panic_quarantine_once() {
     let temp = tempfile::tempdir().expect("tempdir should open");
     let base: PathBuf = temp.path().join("support");
 
-    let journal = LmdbJournal::open(&base.join("journal")).expect("journal should open");
+    let journal = LmdbParticipantStore::open(&base, "risk_gate").expect("journal should open");
     let saga_id = SagaId::new(202);
     journal
         .append(
@@ -407,13 +457,15 @@ fn lmdb_open_fails_for_file_paths() {
     std::fs::write(&journal_file, b"not-a-directory").expect("journal file should be created");
     std::fs::write(&dedupe_file, b"not-a-directory").expect("dedupe file should be created");
 
-    let journal_err = LmdbJournal::open(&journal_file).expect_err("file path must fail");
+    let journal_err = LmdbParticipantStore::open(&journal_file, "test_participant")
+        .expect_err("file path must fail");
     assert!(
         !journal_err.to_string().is_empty(),
         "journal open error should include a storage message"
     );
 
-    let dedupe_err = LmdbDedupe::open(&dedupe_file).expect_err("file path must fail");
+    let dedupe_err = LmdbParticipantStore::open(&dedupe_file, "test_participant")
+        .expect_err("file path must fail");
     assert!(
         !dedupe_err.to_string().is_empty(),
         "dedupe open error should include a storage message"
@@ -437,7 +489,7 @@ fn lmdb_journal_rejects_unversioned_persisted_rows() {
             .write_txn()
             .expect("legacy write transaction should open");
         let rows = env
-            .create_database::<Str, Bytes>(&mut wtxn, Some("journal_rows"))
+            .create_database::<Str, Bytes>(&mut wtxn, Some("participant_events"))
             .expect("legacy rows database should open");
         rows.put(
             &mut wtxn,
@@ -448,11 +500,10 @@ fn lmdb_journal_rejects_unversioned_persisted_rows() {
         wtxn.commit().expect("legacy row should commit");
     }
 
-    let err = LmdbJournal::open(&journal_path)
+    let err = LmdbParticipantStore::open(&journal_path, "test_participant")
         .expect_err("unversioned persisted rows must fail closed before decoding");
     assert!(
-        err.to_string()
-            .contains("unversioned saga journal contains rows incompatible"),
+        err.to_string().contains("required=3"),
         "unexpected schema error: {err}"
     );
 }
@@ -471,8 +522,9 @@ mod workflow_reopen {
     };
 
     struct Actor {
-        saga: SagaParticipantSupport<LmdbJournal, LmdbDedupe>,
+        saga: SagaParticipantSupport<LmdbParticipantStore>,
         pay_calls: usize,
+        declared_effect: bool,
         comp_calls: usize,
         last_comp_data: Vec<u8>,
     }
@@ -483,6 +535,7 @@ mod workflow_reopen {
                 saga: open_lmdb_participant_support_for_saga_type(base, "pay", "wf_pay")
                     .expect("support should open"),
                 pay_calls: 0,
+                declared_effect: false,
                 comp_calls: 0,
                 last_comp_data: Vec::new(),
             }
@@ -490,12 +543,11 @@ mod workflow_reopen {
     }
 
     impl HasSagaParticipantSupport for Actor {
-        type Journal = LmdbJournal;
-        type Dedupe = LmdbDedupe;
-        fn saga_support(&self) -> &SagaParticipantSupport<LmdbJournal, LmdbDedupe> {
+        type Store = LmdbParticipantStore;
+        fn saga_support(&self) -> &SagaParticipantSupport<LmdbParticipantStore> {
             &self.saga
         }
-        fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<LmdbJournal, LmdbDedupe> {
+        fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<LmdbParticipantStore> {
             &mut self.saga
         }
     }
@@ -524,9 +576,39 @@ mod workflow_reopen {
             _input: &[u8],
         ) -> Result<StepOutput, StepError> {
             actor.pay_calls += 1;
+            if actor.declared_effect {
+                return Ok(StepOutput::CompletedWithEffect {
+                    output: b"paid".to_vec(),
+                    compensation_data: b"refund".to_vec(),
+                    effect: "payment-outbox".into(),
+                });
+            }
             Ok(StepOutput::Completed {
                 output: b"paid".to_vec(),
                 compensation_data: b"refund".to_vec(),
+            })
+        }
+        fn dispatch_effect(
+            &self,
+            actor: &mut Actor,
+            request: &icanact_saga_choreography::EffectDispatchRequest<'_>,
+        ) -> Result<
+            icanact_saga_choreography::EffectDispatchOutcome,
+            icanact_saga_choreography::EffectDispatchError,
+        > {
+            let rows = actor.saga.store.read(request.context.saga_id).unwrap();
+            assert!(
+                rows.iter().any(|row| matches!(&row.event,
+                ParticipantEvent::StepExecutionCompleted { output, compensation_data, .. }
+                    if output == b"paid" && compensation_data == b"refund")),
+                "declared effect bytes must be durable before dispatch"
+            );
+            assert!(!rows.iter().any(|row| matches!(
+                row.event,
+                ParticipantEvent::ParticipantForwardOutcomeRecorded { .. }
+            )));
+            Ok(icanact_saga_choreography::EffectDispatchOutcome::Durable {
+                receipt: "outbox-1".into(),
             })
         }
         fn compensate_step(
@@ -756,7 +838,7 @@ mod workflow_reopen {
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, SagaChoreographyEvent::StepCompleted { .. })),
+                .any(|e| matches!(e, SagaChoreographyEvent::StepCompleted { saga_input, .. } if saga_input == b"input")),
             "an unconfirmed result must never be resent as success: {events:?}"
         );
     }
@@ -827,7 +909,7 @@ mod workflow_reopen {
             reopened.saga.take_startup_recovery_events().is_empty(),
             "restart must not auto-resolve quarantined work"
         );
-        let entries = reopened.saga.journal.read(run.saga_id).expect("read");
+        let entries = reopened.saga.store.read(run.saga_id).expect("read");
         // A plain completion's single proof append retains the compensation bytes.
         assert!(entries.iter().any(|e| matches!(
             &e.event,
@@ -850,7 +932,7 @@ mod workflow_reopen {
         assert!(
             reopened
                 .saga
-                .journal
+                .store
                 .read(run.saga_id)
                 .unwrap()
                 .iter()
@@ -867,15 +949,63 @@ mod workflow_reopen {
     }
 
     #[test]
+    fn declared_effect_uses_three_commits_and_preserves_predispatch_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let run = ctx(100);
+        {
+            let mut actor = Actor::open(temp.path());
+            actor.declared_effect = true;
+            let env = unsafe {
+                EnvOpenOptions::new()
+                    .max_dbs(16)
+                    .map_size(1024 * 1024 * 1024)
+                    .open(temp.path())
+            }
+            .unwrap();
+            let before = env.info().last_txn_id;
+            let emitted = deliver(&mut actor, start(&run));
+            assert!(
+                emitted
+                    .iter()
+                    .any(|event| matches!(event, SagaChoreographyEvent::StepCompleted { .. }))
+            );
+            assert_eq!(env.info().last_txn_id - before, 3);
+        }
+        let reopened = Actor::open(temp.path());
+        let rows = reopened.saga.store.read(run.saga_id).unwrap();
+        let raw = rows
+            .iter()
+            .position(|row| matches!(row.event, ParticipantEvent::StepExecutionCompleted { .. }))
+            .unwrap();
+        let proof = rows.iter().position(|row| matches!(&row.event,
+            ParticipantEvent::ParticipantForwardOutcomeRecorded { outcome }
+                if outcome.effect.as_deref() == Some("payment-outbox") && outcome.receipt.as_deref() == Some("outbox-1"))).unwrap();
+        assert!(raw < proof);
+    }
+
+    #[test]
     fn plain_completion_is_one_proof_append_that_survives_lmdb_reopen() {
         let temp = tempfile::tempdir().expect("tempdir");
         let run = ctx(100);
         {
             let mut actor = Actor::open(temp.path());
+            let env = unsafe {
+                EnvOpenOptions::new()
+                    .max_dbs(16)
+                    .map_size(1024 * 1024 * 1024)
+                    .open(temp.path())
+            }
+            .unwrap();
+            let before = env.info().last_txn_id;
             deliver(&mut actor, start(&run));
+            assert_eq!(
+                env.info().last_txn_id - before,
+                2,
+                "atomic admission plus proof, not an extra raw completion commit"
+            );
         }
         let reopened = Actor::open(temp.path());
-        let rows = reopened.saga.journal.read(run.saga_id).expect("read");
+        let rows = reopened.saga.store.read(run.saga_id).expect("read");
         assert!(
             !rows
                 .iter()
@@ -914,7 +1044,7 @@ mod workflow_reopen {
             "{resent:?}"
         );
         assert_eq!(reopened.comp_calls, 0, "startup must not undo again");
-        let rows = reopened.saga.journal.read(run.saga_id).expect("read");
+        let rows = reopened.saga.store.read(run.saga_id).expect("read");
         let count = |kind: &str| {
             rows.iter()
                 .filter(|e| format!("{:?}", e.event).starts_with(kind))
@@ -962,7 +1092,7 @@ mod workflow_reopen {
         use std::time::{Duration, Instant};
         let temp = tempfile::tempdir().unwrap();
         let participant_path = temp.path().join("participant");
-        let resolver_path = temp.path().join("resolver");
+        let resolver_path = participant_path.clone();
         let run = ctx(SagaContext::now_millis());
         {
             let mut actor = Actor::open(&participant_path);
@@ -970,8 +1100,13 @@ mod workflow_reopen {
             let bus = SagaChoreographyBus::new();
             bus.register_workflow_contract_provider::<ReopenContract>()
                 .unwrap();
-            bus.register_bound_workflow_step("wf_pay", "pay").unwrap();
-            bus.subscribe_saga_type_fn("wf_pay", |_| true);
+            let inbox = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&inbox);
+            bus.subscribe_workflow_step_fn("wf_pay", "pay", move |event| {
+                sink.lock().unwrap().push(event.clone());
+                true
+            })
+            .unwrap();
             bus.attach_durable_terminal_resolver_for_contract::<ReopenContract, _>(
                 "qa",
                 Arc::clone(&journal),
@@ -979,7 +1114,8 @@ mod workflow_reopen {
             .unwrap();
             bus.activate_terminal_resolver_recovery("wf_pay").unwrap();
             bus.publish_strict(start(&run)).unwrap();
-            for event in deliver(&mut actor, start(&run)) {
+            let admitted_start = inbox.lock().unwrap().remove(0);
+            for event in deliver(&mut actor, admitted_start) {
                 bus.publish_strict(event).unwrap();
             }
             let deadline = Instant::now() + Duration::from_secs(2);
@@ -1004,13 +1140,13 @@ mod workflow_reopen {
         let bus = SagaChoreographyBus::new();
         bus.register_workflow_contract_provider::<ReopenContract>()
             .unwrap();
-        bus.register_bound_workflow_step("wf_pay", "pay").unwrap();
         let fanout = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&fanout);
-        bus.subscribe_saga_type_fn("wf_pay", move |event| {
+        bus.subscribe_workflow_step_fn("wf_pay", "pay", move |event| {
             sink.lock().unwrap().push(event.clone());
             true
-        });
+        })
+        .unwrap();
         bus.attach_durable_terminal_resolver_for_contract::<ReopenContract, _>("qa", journal)
             .unwrap();
         bus.activate_terminal_resolver_recovery("wf_pay").unwrap();
@@ -1039,7 +1175,7 @@ fn lmdb_journal_reads_varied_payload_lengths_and_survives_reopen() {
     let path = temp.path().join("journal");
     let saga = SagaId::new(70);
     {
-        let journal = LmdbJournal::open(&path).expect("open");
+        let journal = LmdbParticipantStore::open(&path, "test_participant").expect("open");
         for len in 0..9usize {
             journal
                 .append(
@@ -1054,7 +1190,7 @@ fn lmdb_journal_reads_varied_payload_lengths_and_survives_reopen() {
         }
         assert_eq!(journal.read(saga).expect("live read").len(), 9);
     }
-    let reopened = LmdbJournal::open(&path).expect("reopen");
+    let reopened = LmdbParticipantStore::open(&path, "test_participant").expect("reopen");
     let entries = reopened.read(saga).expect("reopened read");
     assert_eq!(entries.len(), 9);
     assert!(entries.iter().enumerate().all(|(len, e)| matches!(
@@ -1069,7 +1205,7 @@ fn lmdb_journal_rejects_malformed_archive_rows_instead_of_decoding_them() {
     let path = temp.path().join("journal");
     let saga = SagaId::new(71);
     {
-        let journal = LmdbJournal::open(&path).expect("open");
+        let journal = LmdbParticipantStore::open(&path, "test_participant").expect("open");
         journal
             .append(
                 saga,
@@ -1090,17 +1226,20 @@ fn lmdb_journal_rejects_malformed_archive_rows_instead_of_decoding_them() {
         .expect("raw env");
         let mut wtxn = env.write_txn().expect("write txn");
         let rows = env
-            .create_database::<Str, Bytes>(&mut wtxn, Some("journal_rows"))
+            .create_database::<Str, Bytes>(&mut wtxn, Some("participant_events"))
             .expect("rows db");
-        rows.put(
-            &mut wtxn,
-            &format!("{:020}:{:020}", saga.get(), 99u64),
-            &[0xAB; 37],
-        )
-        .expect("corrupt row");
+        let key = rows
+            .iter(&wtxn)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .0
+            .to_string();
+        rows.put(&mut wtxn, &key, &[0xAB; 37]).expect("corrupt row");
         wtxn.commit().expect("commit");
     }
-    let reopened = LmdbJournal::open(&path).expect("reopen");
+    let reopened = LmdbParticipantStore::open(&path, "test_participant").expect("reopen");
     let err = reopened
         .read(saga)
         .expect_err("a malformed archive must fail validation");
@@ -1124,7 +1263,7 @@ mod allof_reopen {
     };
 
     struct Actor {
-        saga: SagaParticipantSupport<LmdbJournal, LmdbDedupe>,
+        saga: SagaParticipantSupport<LmdbParticipantStore>,
         joins: usize,
     }
 
@@ -1139,12 +1278,11 @@ mod allof_reopen {
     }
 
     impl HasSagaParticipantSupport for Actor {
-        type Journal = LmdbJournal;
-        type Dedupe = LmdbDedupe;
-        fn saga_support(&self) -> &SagaParticipantSupport<LmdbJournal, LmdbDedupe> {
+        type Store = LmdbParticipantStore;
+        fn saga_support(&self) -> &SagaParticipantSupport<LmdbParticipantStore> {
             &self.saga
         }
-        fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<LmdbJournal, LmdbDedupe> {
+        fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<LmdbParticipantStore> {
             &mut self.saga
         }
     }
@@ -1173,8 +1311,12 @@ mod allof_reopen {
             &self,
             actor: &mut Actor,
             _context: &SagaContext,
-            _input: &[u8],
+            input: &[u8],
         ) -> Result<StepOutput, StepError> {
+            assert_eq!(
+                input, b"input",
+                "AllOf must receive immutable SagaStarted payload, not predecessor output"
+            );
             actor.joins += 1;
             Ok(StepOutput::Completed {
                 output: b"joined".to_vec(),
@@ -1232,40 +1374,367 @@ mod allof_reopen {
 
     #[test]
     fn allof_input_seen_before_an_lmdb_reopen_still_fires_the_join() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let run = ctx(100);
-        {
-            let mut actor = Actor::open(temp.path());
-            deliver(
-                &mut actor,
-                SagaChoreographyEvent::SagaStarted {
-                    context: run.clone(),
-                    payload: b"input".to_vec(),
-                },
-            );
-            deliver(&mut actor, dependency(&run, "a"));
-            assert_eq!(actor.joins, 0);
-        }
+        for (first, second) in [("a", "b"), ("b", "a")] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let run = ctx(100);
+            {
+                let mut actor = Actor::open(temp.path());
+                deliver(
+                    &mut actor,
+                    SagaChoreographyEvent::SagaStarted {
+                        context: run.clone(),
+                        payload: b"input".to_vec(),
+                    },
+                );
+                deliver(&mut actor, dependency(&run, first));
+                assert_eq!(actor.joins, 0);
+            }
 
-        // Real close/reopen between the two inputs; the replayed first input is a
-        // persistent-dedupe duplicate, so only the durable observation can carry it.
-        let mut reopened = Actor::open(temp.path());
-        recover_accepted_workflow_steps_for_saga_type(&mut reopened.saga, "join", "wf_join")
-            .expect("recovery hydrates");
-        assert!(reopened.saga.take_startup_recovery_events().is_empty());
-        deliver(&mut reopened, dependency(&run, "a"));
-        assert_eq!(reopened.joins, 0, "a duplicate cannot fire the join alone");
-        let out = deliver(&mut reopened, dependency(&run, "b"));
-        assert_eq!(reopened.joins, 1, "{out:?}");
-        assert!(
+            // Real close/reopen between the two inputs; the replayed first input is a
+            // persistent-dedupe duplicate, so only the durable observation can carry it.
+            let mut reopened = Actor::open(temp.path());
+            recover_accepted_workflow_steps_for_saga_type(&mut reopened.saga, "join", "wf_join")
+                .expect("recovery hydrates");
+            assert!(reopened.saga.take_startup_recovery_events().is_empty());
+            deliver(&mut reopened, dependency(&run, first));
+            assert_eq!(reopened.joins, 0, "a duplicate cannot fire the join alone");
+            let out = deliver(&mut reopened, dependency(&run, second));
+            assert_eq!(reopened.joins, 1, "{out:?}");
+            assert!(
             out.iter()
-                .any(|e| matches!(e, SagaChoreographyEvent::StepCompleted { .. }))
+                .any(|e| matches!(e, SagaChoreographyEvent::StepCompleted { saga_input, .. } if saga_input == b"input"))
         );
 
-        // A second reopen after the join confirmed never re-executes it.
-        drop(reopened);
-        let mut again = Actor::open(temp.path());
-        deliver(&mut again, dependency(&run, "b"));
-        assert_eq!(again.joins, 0);
+            // A second reopen after the join confirmed never re-executes it.
+            drop(reopened);
+            let mut again = Actor::open(temp.path());
+            deliver(&mut again, dependency(&run, second));
+            assert_eq!(again.joins, 0);
+        }
     }
+}
+
+fn open_lmdb_participant_support(
+    base: &std::path::Path,
+    key: &str,
+) -> Result<SagaParticipantSupport<LmdbParticipantStore>, String> {
+    open_lmdb_participant_support_for_saga_type(
+        base,
+        key,
+        icanact_saga_choreography::durability::DEFAULT_RECOVERY_SAGA_TYPE,
+    )
+}
+
+#[cfg(feature = "lmdb")]
+fn open_lmdb_participant_support_for_saga_types(
+    base: &std::path::Path,
+    participant_key: &str,
+    saga_types: &[&str],
+) -> Result<SagaParticipantSupport<icanact_saga_choreography::LmdbParticipantStore>, String> {
+    let store = icanact_saga_choreography::LmdbParticipantStore::open(base, participant_key)
+        .map_err(|err| err.to_string())?;
+    let mut support = SagaParticipantSupport::new(store);
+    let registrations: Vec<_> = saga_types
+        .iter()
+        .map(|kind| (participant_key, *kind))
+        .collect();
+    support.startup_recovery_events =
+        icanact_saga_choreography::durability::collect_startup_recovery_events_for_participants(
+            &mut support,
+            &registrations,
+        )
+        .map_err(|err| format!("{err:?}"))?;
+    Ok(support)
+}
+
+#[cfg(feature = "lmdb")]
+fn open_lmdb_participant_support_for_saga_type(
+    base: &std::path::Path,
+    participant_key: &str,
+    saga_type: &str,
+) -> Result<SagaParticipantSupport<icanact_saga_choreography::LmdbParticipantStore>, String> {
+    open_lmdb_participant_support_for_saga_types(base, participant_key, &[saga_type])
+}
+
+fn lmdb_v3_ctx(saga_id: u64, saga_type: &str, step_name: &str) -> SagaContext {
+    let ts = SagaContext::next_run_start_millis();
+    SagaContext {
+        saga_id: SagaId::new(saga_id),
+        saga_type: saga_type.into(),
+        step_name: step_name.into(),
+        correlation_id: saga_id,
+        causation_id: saga_id,
+        trace_id: saga_id,
+        step_index: 0,
+        attempt: 1,
+        initiator_peer_id: [0; 32],
+        saga_started_at_millis: ts,
+        event_timestamp_millis: ts,
+    }
+}
+
+#[test]
+fn v3_shared_base_isolates_participants_and_resolver_through_maintenance_and_reopen() {
+    use icanact_saga_choreography::{
+        LmdbTerminalResolverJournal, ParticipantTerminalKind, StoreAdmission,
+        TerminalResolverJournal,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path();
+    let run = lmdb_v3_ctx(801, "order_lifecycle", "step");
+    let active = lmdb_v3_ctx(802, "order_lifecycle", "step");
+    let quarantined = lmdb_v3_ctx(803, "order_lifecycle", "step");
+    {
+        let a = LmdbParticipantStore::open(base, "a").unwrap();
+        let b = LmdbParticipantStore::open(&base.join("."), "b").unwrap();
+        let resolver = LmdbTerminalResolverJournal::open(base).unwrap();
+        for store in [&a, &b] {
+            assert_eq!(
+                store
+                    .admit_and_record_intent(&run, "start", "saga_started")
+                    .unwrap(),
+                StoreAdmission::Admitted
+            );
+        }
+        for context in [&run, &active, &quarantined] {
+            resolver
+                .append(SagaChoreographyEvent::SagaStarted {
+                    context: context.clone(),
+                    payload: b"original".to_vec(),
+                })
+                .unwrap();
+        }
+        for context in [&active, &quarantined] {
+            a.admit_and_record_intent(context, "start", "saga_started")
+                .unwrap();
+        }
+        for (context, outcome) in [
+            (&run, ParticipantTerminalKind::Completed),
+            (&quarantined, ParticipantTerminalKind::Quarantined),
+        ] {
+            a.append(
+                context.saga_id,
+                ParticipantEvent::ParticipantTerminalRecorded {
+                    saga_type: context.saga_type.clone(),
+                    saga_started_at_millis: context.saga_started_at_millis,
+                    outcome,
+                    reason: "terminal".into(),
+                    recorded_at_millis: 100,
+                },
+            )
+            .unwrap();
+        }
+        let mut terminal = run.clone();
+        terminal.event_timestamp_millis = 100;
+        resolver
+            .append(SagaChoreographyEvent::SagaCompleted { context: terminal })
+            .unwrap();
+        resolver
+            .append(SagaChoreographyEvent::SagaQuarantined {
+                context: quarantined.clone(),
+                reason: "uncertain".into(),
+                step: "step".into(),
+                participant_id: "a".into(),
+            })
+            .unwrap();
+        assert_eq!(a.compact_terminal_detail(1).unwrap(), 1);
+        assert_eq!(a.read(run.saga_id).unwrap().len(), 1);
+        assert_eq!(
+            b.read(run.saga_id).unwrap().len(),
+            3,
+            "other participant's active run survives"
+        );
+        assert_eq!(resolver.compact_terminal_detail().unwrap(), 1);
+        assert_eq!(resolver.read_saga(run.saga_id).unwrap().len(), 1);
+        assert_eq!(
+            a.prune_resolved_before(100, 1).unwrap(),
+            0,
+            "cutoff is exclusive"
+        );
+        assert_eq!(resolver.prune_resolved_before(100, 1).unwrap(), 0);
+        assert_eq!(a.prune_resolved_before(101, 1).unwrap(), 1);
+        assert_eq!(resolver.prune_resolved_before(101, 1).unwrap(), 1);
+        assert!(!a.read(active.saga_id).unwrap().is_empty());
+        assert!(!a.read(quarantined.saga_id).unwrap().is_empty());
+        assert_eq!(resolver.read_saga(active.saga_id).unwrap().len(), 1);
+        assert_eq!(resolver.read_saga(quarantined.saga_id).unwrap().len(), 2);
+        drop(a);
+        // Dropping one participant must not close the common environment.
+        assert_eq!(
+            b.admit_and_record_intent(&run, "start", "saga_started")
+                .unwrap(),
+            StoreAdmission::Duplicate
+        );
+        resolver.read_all().unwrap();
+    }
+    assert!(base.join("data.mdb").is_file());
+    assert!(!base.join("journal").exists());
+    assert!(!base.join("dedupe").exists());
+    assert!(!base.join("resolver").exists());
+    let a = LmdbParticipantStore::open(base, "a").unwrap();
+    let b = LmdbParticipantStore::open(base, "b").unwrap();
+    let resolver = LmdbTerminalResolverJournal::open(base).unwrap();
+    assert!(a.read(run.saga_id).unwrap().is_empty());
+    assert_eq!(b.read(run.saga_id).unwrap().len(), 3);
+    assert!(resolver.read_saga(run.saga_id).unwrap().is_empty());
+    let before = a.read(active.saga_id).unwrap().last().unwrap().sequence;
+    let after = a
+        .append(
+            active.saga_id,
+            ParticipantEvent::StepExecutionStarted {
+                attempt: 2,
+                started_at_millis: 200,
+            },
+        )
+        .unwrap();
+    assert!(
+        after > before,
+        "maintenance never resets sequence allocation"
+    );
+}
+
+#[test]
+fn accepted_step_and_compensation_renewals_survive_v3_reopen_without_payload_duplication() {
+    use icanact_saga_choreography::durability::{
+        collect_startup_recovery_events_for_participants,
+        record_accepted_workflow_compensation_progress, record_accepted_workflow_step_progress,
+        recover_accepted_workflow_steps_for_saga_type,
+    };
+    use icanact_saga_choreography::{
+        AcceptedStepPolicy, AcceptedStepTimeoutOutcome, StepExecutionId, accept_workflow_step,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let now = SagaContext::now_millis();
+    let step = lmdb_v3_ctx(901, "renewals", "work");
+    let undo = lmdb_v3_ctx(902, "renewals", "work");
+    let forward_id = StepExecutionId::new("forward");
+    let undo_id = StepExecutionId::new("undo");
+    let payload = vec![7; 4096];
+    let compensation = vec![9; 4096];
+    let forward_deadline;
+    let undo_deadline = now + 90_000;
+    {
+        let mut actor = LmdbParticipant {
+            saga: SagaParticipantSupport::new(
+                LmdbParticipantStore::open(temp.path(), "work").unwrap(),
+            ),
+        };
+        accept_workflow_step(
+            &mut actor,
+            step.clone(),
+            "worker".into(),
+            forward_id.clone(),
+            AcceptedStepPolicy {
+                idle_timeout: std::time::Duration::from_secs(60),
+                hard_timeout: std::time::Duration::from_secs(180),
+                timeout_outcome: AcceptedStepTimeoutOutcome::QuarantineSaga,
+            },
+            payload.clone(),
+            compensation.clone(),
+        )
+        .unwrap();
+        let old = actor.saga.accepted_workflow_steps[&step.saga_id].deadline_at_millis;
+        forward_deadline = old + 30_000;
+        let heartbeat = record_accepted_workflow_step_progress(
+            &mut actor,
+            step.saga_id,
+            forward_id.clone(),
+            old - 30_000,
+        )
+        .unwrap();
+        assert!(
+            matches!(heartbeat, SagaChoreographyEvent::StepAccepted { deadline_at_millis, .. } if deadline_at_millis == forward_deadline)
+        );
+        actor
+            .saga
+            .store
+            .append_batch(
+                undo.saga_id,
+                vec![
+                    ParticipantEvent::ParticipantRunRecorded {
+                        saga_type: undo.saga_type.clone(),
+                        saga_started_at_millis: undo.saga_started_at_millis,
+                        recorded_at_millis: now,
+                    },
+                    ParticipantEvent::CompensationRequestRecorded {
+                        context: undo.clone(),
+                        failed_step: "work".into(),
+                        reason: "rollback".into(),
+                        failure: icanact_saga_choreography::SagaFailureDetails {
+                            step_name: "work".into(),
+                            participant_id: "worker".into(),
+                            error_code: None,
+                            error_message: "rollback".into(),
+                            at_millis: now,
+                        },
+                        steps_to_compensate: vec!["work".into()],
+                        requested_at_millis: now,
+                    },
+                    ParticipantEvent::AcceptedCompensationRecorded {
+                        context: undo.clone(),
+                        participant_id: "worker".into(),
+                        execution_id: undo_id.clone(),
+                        saga_input: payload.clone(),
+                        compensation_data: compensation.clone(),
+                        idle_timeout_millis: 60_000,
+                        hard_timeout_millis: 180_000,
+                        accepted_at_millis: now,
+                        deadline_at_millis: now + 60_000,
+                        hard_deadline_at_millis: now + 180_000,
+                    },
+                ],
+            )
+            .unwrap();
+        recover_accepted_workflow_steps_for_saga_type(&mut actor.saga, "work", "renewals").unwrap();
+        let heartbeat = record_accepted_workflow_compensation_progress(
+            &mut actor,
+            undo.saga_id,
+            undo_id.clone(),
+            now + 30_000,
+        )
+        .unwrap();
+        assert!(
+            matches!(heartbeat, SagaChoreographyEvent::CompensationAccepted { deadline_at_millis, .. } if deadline_at_millis == undo_deadline)
+        );
+        for (context, execution, is_compensation) in
+            [(&step, &forward_id, false), (&undo, &undo_id, true)]
+        {
+            let rows = actor.saga.store.read(context.saga_id).unwrap();
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| matches!(
+                        row.event,
+                        ParticipantEvent::AcceptedStepRecorded { .. }
+                            | ParticipantEvent::AcceptedCompensationRecorded { .. }
+                    ))
+                    .count(),
+                1
+            );
+            assert_eq!(rows.iter().filter(|row| matches!(&row.event, ParticipantEvent::AcceptedDeadlineRenewed { context: recorded, execution_id, is_compensation: phase, .. }
+                if recorded.saga_started_at_millis == context.saga_started_at_millis && execution_id == execution && *phase == is_compensation)).count(), 1);
+        }
+    }
+    let mut support =
+        SagaParticipantSupport::new(LmdbParticipantStore::open(temp.path(), "work").unwrap());
+    let replay =
+        collect_startup_recovery_events_for_participants(&mut support, &[("work", "renewals")])
+            .unwrap();
+    assert!(replay.iter().any(|event| matches!(event, SagaChoreographyEvent::StepAccepted { execution_id, deadline_at_millis, .. }
+        if execution_id == &forward_id && *deadline_at_millis == forward_deadline)));
+    assert!(replay.iter().any(|event| matches!(event, SagaChoreographyEvent::CompensationAccepted { execution_id, deadline_at_millis, .. }
+        if execution_id == &undo_id && *deadline_at_millis == undo_deadline)));
+    assert!(
+        !replay
+            .iter()
+            .any(|event| matches!(event, SagaChoreographyEvent::SagaQuarantined { .. }))
+    );
+    let forward = &support.accepted_workflow_steps[&step.saga_id];
+    assert_eq!(forward.deadline_at_millis, forward_deadline);
+    assert_eq!(forward.saga_input, payload);
+    assert_eq!(forward.compensation_data, compensation);
+    let recovered_undo = &support.accepted_workflow_compensations[&undo.saga_id];
+    assert_eq!(recovered_undo.deadline_at_millis, undo_deadline);
+    assert_eq!(recovered_undo.hard_deadline_at_millis, now + 180_000);
+    assert_eq!(recovered_undo.saga_input, payload);
+    assert_eq!(recovered_undo.compensation_data, compensation);
 }

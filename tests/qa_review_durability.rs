@@ -20,22 +20,21 @@ use icanact_saga_choreography::{
     AcceptedStepCompletion, AcceptedStepError, AcceptedStepPolicy, AcceptedStepTimeoutOutcome,
     AsyncSagaParticipant, CompensationError, CompensationOutput, DependencySpec,
     EffectDispatchError, EffectDispatchOutcome, EffectDispatchRequest, HasSagaParticipantSupport,
-    HasSagaWorkflowParticipants, InMemoryDedupe, InMemoryJournal, JournalEntry, JournalError,
-    ParticipantDedupeStore, ParticipantEvent, ParticipantJournal, ParticipantTerminalKind, PeerId,
-    RecoveryDecision, RecoveryPolicy, SagaBoxFuture, SagaChoreographyEvent, SagaContext, SagaId,
-    SagaParticipant, SagaParticipantSupport, SagaStateEntry, SagaStateExt, SagaWorkflowParticipant,
-    StepError, StepExecutionId, StepOutput,
+    HasSagaWorkflowParticipants, InMemoryParticipantStore, JournalEntry, JournalError,
+    ParticipantEvent, ParticipantStore, ParticipantTerminalKind, PeerId, RecoveryDecision,
+    SagaBoxFuture, SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant,
+    SagaParticipantSupport, SagaStateEntry, SagaStateExt, SagaWorkflowParticipant, StepError,
+    StepExecutionId, StepOutput,
 };
 use std::time::Duration;
-use support::{FaultDedupe, FaultJournal, FaultTrigger, JournalOp};
+use support::{FaultStore, FaultTrigger, JournalOp};
 
-type Journal = FaultJournal<InMemoryJournal>;
-type Dedupe = FaultDedupe<InMemoryDedupe>;
+type Journal = FaultStore<InMemoryParticipantStore>;
 
 const SAGA: u64 = 41;
 
 struct Actor {
-    saga: SagaParticipantSupport<Journal, Dedupe>,
+    saga: SagaParticipantSupport<Journal>,
     pay_calls: usize,
     comp_calls: usize,
     any_calls: usize,
@@ -46,9 +45,9 @@ struct Actor {
 }
 
 impl Actor {
-    fn new(journal: &Journal, dedupe: &Dedupe) -> Self {
+    fn new(journal: &Journal) -> Self {
         Self {
-            saga: SagaParticipantSupport::new(journal.clone(), dedupe.clone()),
+            saga: SagaParticipantSupport::new(journal.clone()),
             pay_calls: 0,
             comp_calls: 0,
             any_calls: 0,
@@ -61,12 +60,11 @@ impl Actor {
 }
 
 impl HasSagaParticipantSupport for Actor {
-    type Journal = Journal;
-    type Dedupe = Dedupe;
-    fn saga_support(&self) -> &SagaParticipantSupport<Journal, Dedupe> {
+    type Store = Journal;
+    fn saga_support(&self) -> &SagaParticipantSupport<Journal> {
         &self.saga
     }
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal, Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal> {
         &mut self.saga
     }
 }
@@ -318,11 +316,8 @@ impl SagaWorkflowParticipant<Actor> for Notify {
     hooks!();
 }
 
-fn stores() -> (Journal, Dedupe) {
-    (
-        FaultJournal::new(InMemoryJournal::new()),
-        FaultDedupe::new(InMemoryDedupe::new()),
-    )
+fn stores() -> Journal {
+    FaultStore::new(InMemoryParticipantStore::new())
 }
 
 fn ctx(saga_type: &str, step: &str, started_at: u64) -> SagaContext {
@@ -431,20 +426,68 @@ fn deliver(actor: &mut Actor, event: SagaChoreographyEvent) -> Delivery {
     }
 }
 
-fn recover(
-    journal: &Journal,
-    dedupe: &Dedupe,
-    step: &'static str,
-    ty: &'static str,
-) -> Vec<SagaChoreographyEvent> {
-    collect_startup_recovery_events_for_saga_type(journal, dedupe, step, ty)
+fn recover(journal: &Journal, step: &'static str, ty: &'static str) -> Vec<SagaChoreographyEvent> {
+    collect_startup_recovery_events_for_saga_type(journal, step, ty)
         .expect("startup recovery should collect")
 }
 
 /// Journal view whose rows are all ancient, to prove age is never a stale-run proxy.
 struct Aged(Journal);
 
-impl ParticipantJournal for Aged {
+impl ParticipantStore for Aged {
+    fn check_and_mark(
+        &self,
+        saga_id: SagaId,
+        key: &str,
+    ) -> Result<bool, icanact_saga_choreography::JournalError> {
+        self.0.check_and_mark(saga_id, key)
+    }
+
+    fn remove_processed(
+        &self,
+        saga_id: SagaId,
+        key: &str,
+    ) -> Result<(), icanact_saga_choreography::JournalError> {
+        self.0.remove_processed(saga_id, key)
+    }
+
+    fn append_batch(
+        &self,
+        saga_id: SagaId,
+        events: Vec<ParticipantEvent>,
+    ) -> Result<Vec<u64>, icanact_saga_choreography::JournalError> {
+        self.0.append_batch(saga_id, events)
+    }
+
+    fn admit_and_record_intent(
+        &self,
+        context: &SagaContext,
+        key: &str,
+        trigger: &str,
+    ) -> Result<icanact_saga_choreography::StoreAdmission, icanact_saga_choreography::JournalError>
+    {
+        self.0.admit_and_record_intent(context, key, trigger)
+    }
+
+    fn unresolved_saga_ids(&self) -> Result<Vec<SagaId>, icanact_saga_choreography::JournalError> {
+        self.0.unresolved_saga_ids()
+    }
+
+    fn compact_terminal_detail(
+        &self,
+        limit: usize,
+    ) -> Result<usize, icanact_saga_choreography::JournalError> {
+        self.0.compact_terminal_detail(limit)
+    }
+
+    fn prune_resolved_before(
+        &self,
+        cutoff: u64,
+        limit: usize,
+    ) -> Result<usize, icanact_saga_choreography::JournalError> {
+        self.0.prune_resolved_before(cutoff, limit)
+    }
+
     fn append(&self, saga_id: SagaId, event: ParticipantEvent) -> Result<u64, JournalError> {
         self.0.append(saga_id, event)
     }
@@ -473,44 +516,40 @@ fn entries(journal: &Journal) -> Vec<JournalEntry> {
 
 #[test]
 fn idle_participant_run_record_is_not_stale_execution_however_old() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_idle", "idle", 100);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     let out = deliver(&mut actor, started(&c));
     assert_eq!(out.quarantines(), 0);
     assert!(out.invalid.is_empty(), "{:?}", out.invalid);
     assert!(
-        entries(&journal)
-            .iter()
-            .any(|e| matches!(e.event, ParticipantEvent::ParticipantRunRecorded { .. })),
-        "the idle participant journals a run record"
+        entries(&journal).is_empty(),
+        "irrelevant idle ingress must not create orphan run metadata"
     );
+    // Explicitly retained idle identity is also safe regardless of age.
+    actor.admit_participant_event_strict(&c).unwrap();
 
     let aged = Aged(journal.clone());
-    let events = collect_startup_recovery_events_for_saga_type(&aged, &dedupe, "idle", "wf_idle")
-        .expect("collect");
+    let events =
+        collect_startup_recovery_events_for_saga_type(&aged, "idle", "wf_idle").expect("collect");
     assert!(
         events.is_empty(),
         "idle run must not be quarantined: {events:?}"
     );
 
-    let decision = classify_recovery(
-        &aged.read(SagaId::new(SAGA)).unwrap(),
-        u64::MAX / 2,
-        RecoveryPolicy { stale_after_ms: 1 },
-    );
+    let decision = classify_recovery(&aged.read(SagaId::new(SAGA)).unwrap(), u64::MAX / 2);
     assert_eq!(decision, RecoveryDecision::Continue);
 }
 
 #[test]
 fn healthy_accepted_deadline_is_replayed_not_quarantined_after_restart() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_acc", "acc", SagaContext::now_millis());
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     deliver(&mut actor, started(&c));
     let aged = Aged(journal.clone());
-    let events = collect_startup_recovery_events_for_saga_type(&aged, &dedupe, "acc", "wf_acc")
-        .expect("collect");
+    let events =
+        collect_startup_recovery_events_for_saga_type(&aged, "acc", "wf_acc").expect("collect");
     assert!(
         matches!(
             events.as_slice(),
@@ -526,9 +565,9 @@ fn healthy_accepted_deadline_is_replayed_not_quarantined_after_restart() {
 
 #[test]
 fn open_forward_intent_quarantines_at_startup_within_the_age_window() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_pay", "pay", 100);
-    let actor = Actor::new(&journal, &dedupe);
+    let actor = Actor::new(&journal);
     actor.admit_participant_event_strict(&c).unwrap();
     journal
         .append(
@@ -539,7 +578,7 @@ fn open_forward_intent_quarantines_at_startup_within_the_age_window() {
             },
         )
         .unwrap();
-    let events = recover(&journal, &dedupe, "pay", "wf_pay");
+    let events = recover(&journal, "pay", "wf_pay");
     assert!(
         matches!(events.as_slice(), [SagaChoreographyEvent::SagaQuarantined { context, .. }]
             if context.saga_started_at_millis == 100),
@@ -549,9 +588,9 @@ fn open_forward_intent_quarantines_at_startup_within_the_age_window() {
 
 #[test]
 fn unconfirmed_result_quarantines_visibly_and_is_not_resent() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_pay", "pay", 100);
-    let actor = Actor::new(&journal, &dedupe);
+    let actor = Actor::new(&journal);
     actor.admit_participant_event_strict(&c).unwrap();
     for event in [
         ParticipantEvent::StepExecutionStarted {
@@ -566,7 +605,7 @@ fn unconfirmed_result_quarantines_visibly_and_is_not_resent() {
     ] {
         journal.append(c.saga_id, event).unwrap();
     }
-    let events = recover(&journal, &dedupe, "pay", "wf_pay");
+    let events = recover(&journal, "pay", "wf_pay");
     assert!(
         matches!(
             events.as_slice(),
@@ -578,9 +617,9 @@ fn unconfirmed_result_quarantines_visibly_and_is_not_resent() {
 
 #[test]
 fn confirmed_forward_proof_resends_the_original_completion_without_effects() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_notify", "notify", 100);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     let first = deliver(&mut actor, started(&c));
     let original = first.step_completed().expect("step completed").clone();
     assert_eq!(actor.dispatched, 1);
@@ -600,11 +639,11 @@ fn confirmed_forward_proof_resends_the_original_completion_without_effects() {
     );
 
     // Restart: a fresh actor over the same durable stores.
-    let events = recover(&journal, &dedupe, "notify", "wf_notify");
+    let events = recover(&journal, "notify", "wf_notify");
     assert_eq!(events.len(), 1, "{events:?}");
     assert_eq!(format!("{:?}", events[0]), format!("{original:?}"));
 
-    let mut restarted = Actor::new(&journal, &dedupe);
+    let mut restarted = Actor::new(&journal);
     recover_accepted_workflow_steps_for_saga_type(&mut restarted.saga, "notify", "wf_notify")
         .unwrap();
     assert!(matches!(
@@ -617,19 +656,19 @@ fn confirmed_forward_proof_resends_the_original_completion_without_effects() {
 
 #[test]
 fn forward_proof_write_failure_publishes_no_success_and_never_redispatches() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     journal.fail_once(
         JournalOp::Append,
         FaultTrigger::EventKind("ParticipantForwardOutcomeRecorded"),
     );
     let c = ctx("wf_notify", "notify", 100);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     let out = deliver(&mut actor, started(&c));
     assert_eq!(actor.dispatched, 1, "effect already dispatched once");
     assert!(out.step_completed().is_none(), "{:?}", out.valid);
     assert_eq!(out.quarantines(), 1, "{:?}", out.valid);
 
-    let events = recover(&journal, &dedupe, "notify", "wf_notify");
+    let events = recover(&journal, "notify", "wf_notify");
     assert!(
         events.is_empty()
             || events
@@ -645,13 +684,13 @@ fn forward_proof_write_failure_publishes_no_success_and_never_redispatches() {
 
 #[test]
 fn undo_request_after_cold_restart_runs_with_journaled_compensation() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_pay", "pay", 100);
-    let mut first = Actor::new(&journal, &dedupe);
+    let mut first = Actor::new(&journal);
     deliver(&mut first, started(&c));
     assert_eq!(first.pay_calls, 1);
 
-    let mut restarted = Actor::new(&journal, &dedupe);
+    let mut restarted = Actor::new(&journal);
     let out = deliver(&mut restarted, undo_request(&c, "pay"));
     assert_eq!(restarted.comp_calls, 1, "{:?}", out.valid);
     assert_eq!(restarted.last_comp_data, b"refund");
@@ -667,9 +706,9 @@ fn undo_request_after_cold_restart_runs_with_journaled_compensation() {
 
 #[test]
 fn undo_with_an_unknown_open_undo_intent_quarantines_instead_of_repeating() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_pay", "pay", 100);
-    let mut first = Actor::new(&journal, &dedupe);
+    let mut first = Actor::new(&journal);
     deliver(&mut first, started(&c));
     journal
         .append(
@@ -680,7 +719,7 @@ fn undo_with_an_unknown_open_undo_intent_quarantines_instead_of_repeating() {
             },
         )
         .unwrap();
-    let mut restarted = Actor::new(&journal, &dedupe);
+    let mut restarted = Actor::new(&journal);
     let out = deliver(&mut restarted, undo_request(&c, "pay"));
     assert_eq!(
         restarted.comp_calls, 0,
@@ -695,14 +734,14 @@ fn undo_with_an_unknown_open_undo_intent_quarantines_instead_of_repeating() {
 
 #[test]
 fn confirmed_pure_anyof_branch_is_not_false_quarantined_after_restart() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_any", "x", 100);
-    let mut first = Actor::new(&journal, &dedupe);
+    let mut first = Actor::new(&journal);
     let out = deliver(&mut first, completed_from(&c, "a"));
     assert_eq!(first.any_calls, 1);
     assert!(out.step_completed().is_some());
 
-    let mut restarted = Actor::new(&journal, &dedupe);
+    let mut restarted = Actor::new(&journal);
     let out = deliver(&mut restarted, completed_from(&c, "b"));
     assert_eq!(restarted.any_calls, 0, "no re-execution");
     assert_eq!(out.quarantines(), 0, "{:?}", out.valid);
@@ -712,13 +751,13 @@ fn confirmed_pure_anyof_branch_is_not_false_quarantined_after_restart() {
 
 #[test]
 fn confirmed_anyof_declared_effect_is_not_dispatched_or_quarantined_again_after_restart() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_anyfx", "x", 100);
-    let mut first = Actor::new(&journal, &dedupe);
+    let mut first = Actor::new(&journal);
     deliver(&mut first, completed_from(&c, "a"));
     assert_eq!((first.any_calls, first.dispatched), (1, 1));
 
-    let mut restarted = Actor::new(&journal, &dedupe);
+    let mut restarted = Actor::new(&journal);
     let out = deliver(&mut restarted, completed_from(&c, "b"));
     assert_eq!((restarted.any_calls, restarted.dispatched), (0, 0));
     assert_eq!(
@@ -735,9 +774,9 @@ fn confirmed_anyof_declared_effect_is_not_dispatched_or_quarantined_again_after_
 
 #[test]
 fn ordinary_failure_with_accepted_work_escalates_visibly_and_keeps_late_evidence() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_acc", "acc", 100);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     deliver(&mut actor, started(&c));
     assert!(actor.saga.accepted_workflow_steps.contains_key(&c.saga_id));
 
@@ -786,9 +825,9 @@ fn ordinary_failure_with_accepted_work_escalates_visibly_and_keeps_late_evidence
 
 #[test]
 fn ordinary_failure_with_unreversed_compensable_effect_escalates() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_pay", "pay", 100);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     deliver(&mut actor, started(&c));
     let out = deliver(&mut actor, failed(&c, "later step failed"));
     assert_eq!(out.quarantines(), 1, "{:?}", out.valid);
@@ -797,9 +836,9 @@ fn ordinary_failure_with_unreversed_compensable_effect_escalates() {
 
 #[test]
 fn ordinary_failure_of_an_idle_participant_stays_ordinary() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_idle", "idle", 100);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     deliver(&mut actor, started(&c));
     let out = deliver(&mut actor, failed(&c, "elsewhere"));
     assert_eq!(out.quarantines(), 0, "{:?}", out.valid);
@@ -829,9 +868,9 @@ fn completion() -> AcceptedStepCompletion {
 
 #[test]
 fn accepted_completion_records_forward_proof_matching_the_returned_event() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_acc", "acc", 100);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     accept(&mut actor, &c);
     let event = complete_accepted_workflow_step(
         &mut actor,
@@ -854,9 +893,9 @@ fn accepted_completion_records_forward_proof_matching_the_returned_event() {
 
 #[test]
 fn accepted_completion_fails_closed_when_forward_proof_cannot_be_recorded() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_acc", "acc", 100);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     accept(&mut actor, &c);
     journal.fail_once(
         JournalOp::Append,
@@ -885,9 +924,9 @@ fn accepted_completion_fails_closed_when_forward_proof_cannot_be_recorded() {
 
 #[test]
 fn low_level_resolution_consults_the_journal_not_the_bounded_cache() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_acc", "acc", 100);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     accept(&mut actor, &c);
     // Durable terminal exists, but this process's cache never saw it.
     journal
@@ -923,14 +962,14 @@ fn low_level_resolution_consults_the_journal_not_the_bounded_cache() {
 
 #[test]
 fn low_level_accept_is_rejected_for_a_durably_terminal_run_after_cache_loss() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_acc", "acc", 100);
-    let mut first = Actor::new(&journal, &dedupe);
+    let mut first = Actor::new(&journal);
     first.admit_participant_event_strict(&c).unwrap();
     first
         .retain_terminal_saga_strict(&c, ParticipantTerminalKind::Completed, "done")
         .unwrap();
-    let mut fresh = Actor::new(&journal, &dedupe);
+    let mut fresh = Actor::new(&journal);
     let result = icanact_saga_choreography::durability::accept_workflow_step(
         &mut fresh,
         c.clone(),
@@ -958,13 +997,13 @@ fn low_level_accept_is_rejected_for_a_durably_terminal_run_after_cache_loss() {
 
 #[test]
 fn failed_accepted_metadata_write_keeps_available_compensation_evidence() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     journal.fail_once(
         JournalOp::Append,
         FaultTrigger::EventKind("AcceptedStepRecorded"),
     );
     let c = ctx("wf_acc", "acc", 100);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     let result = icanact_saga_choreography::durability::accept_workflow_step(
         &mut actor,
         c.clone(),
@@ -999,9 +1038,9 @@ fn panic_recovery_uses_the_recorded_run_identity() {
     use icanact_saga_choreography::durability::{
         ActiveSagaExecutionPhase, panic_quarantine_reason,
     };
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_pay", "pay", 777);
-    let actor = Actor::new(&journal, &dedupe);
+    let actor = Actor::new(&journal);
     actor.admit_participant_event_strict(&c).unwrap();
     journal
         .append(
@@ -1012,7 +1051,7 @@ fn panic_recovery_uses_the_recorded_run_identity() {
             },
         )
         .unwrap();
-    let events = recover(&journal, &dedupe, "pay", "wf_pay");
+    let events = recover(&journal, "pay", "wf_pay");
     assert!(
         matches!(events.as_slice(), [SagaChoreographyEvent::SagaQuarantined { context, .. }]
             if context.saga_started_at_millis == 777 && context.saga_type.as_ref() == "wf_pay"),
@@ -1025,7 +1064,7 @@ fn unidentified_panic_history_requires_explicit_reconciliation() {
     use icanact_saga_choreography::durability::{
         ActiveSagaExecutionPhase, panic_quarantine_reason,
     };
-    let (journal, dedupe) = stores();
+    let journal = stores();
     journal
         .append(
             SagaId::new(SAGA),
@@ -1035,16 +1074,16 @@ fn unidentified_panic_history_requires_explicit_reconciliation() {
             },
         )
         .unwrap();
-    let result = collect_startup_recovery_events_for_saga_type(&journal, &dedupe, "pay", "wf_pay");
+    let result = collect_startup_recovery_events_for_saga_type(&journal, "pay", "wf_pay");
     assert!(result.is_err(), "no invented run timestamp: {result:?}");
     assert!(
-        !dedupe
-            .contains(
+        journal
+            .check_and_mark(
                 SagaId::new(SAGA),
                 icanact_saga_choreography::durability::PANIC_QUARANTINE_PUBLISH_KEY
             )
             .unwrap(),
-        "an unreplayable history must not be marked as published"
+        "a fresh probe must win: unreplayable history was not marked as published"
     );
 }
 
@@ -1054,10 +1093,20 @@ fn unidentified_panic_history_requires_explicit_reconciliation() {
 
 #[test]
 fn workflow_terminal_callback_runs_once_for_duplicate_ordinary_terminals() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_idle", "idle", 100);
-    let mut actor = Actor::new(&journal, &dedupe);
-    deliver(&mut actor, started(&c));
+    let mut actor = Actor::new(&journal);
+    assert_eq!(deliver(&mut actor, started(&c)).terminal_callbacks, 0);
+    assert_eq!(
+        deliver(
+            &mut actor,
+            failed(&ctx("foreign", "foreign", 100), "foreign")
+        )
+        .terminal_callbacks,
+        0
+    );
+    assert!(entries(&journal).is_empty());
+    assert!(actor.saga.saga_run_started_at.is_empty());
     assert_eq!(deliver(&mut actor, failed(&c, "x")).terminal_callbacks, 1);
     assert_eq!(
         deliver(&mut actor, failed(&c, "x")).terminal_callbacks,
@@ -1065,7 +1114,7 @@ fn workflow_terminal_callback_runs_once_for_duplicate_ordinary_terminals() {
         "a duplicate terminal replay must not repeat the callback"
     );
     // Cache loss must not matter: the journal fences it.
-    let mut restarted = Actor::new(&journal, &dedupe);
+    let mut restarted = Actor::new(&journal);
     assert_eq!(
         deliver(&mut restarted, failed(&c, "x")).terminal_callbacks,
         0
@@ -1074,10 +1123,11 @@ fn workflow_terminal_callback_runs_once_for_duplicate_ordinary_terminals() {
 
 #[test]
 fn workflow_terminal_callback_is_skipped_for_a_stale_run() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let new = ctx("wf_idle", "idle", 200);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     deliver(&mut actor, started(&new));
+    actor.admit_participant_event_strict(&new).unwrap();
     let stale = ctx("wf_idle", "idle", 100);
     assert_eq!(
         deliver(&mut actor, failed(&stale, "old")).terminal_callbacks,
@@ -1087,9 +1137,9 @@ fn workflow_terminal_callback_is_skipped_for_a_stale_run() {
 
 #[test]
 fn workflow_local_quarantine_notification_still_reaches_the_callback() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_pay", "pay", 100);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     // Local quarantine writes its tombstone before its own publication returns.
     journal.fail_once(
         JournalOp::Append,
@@ -1111,20 +1161,18 @@ fn workflow_local_quarantine_notification_still_reaches_the_callback() {
 }
 
 struct SyncP {
-    saga: SagaParticipantSupport<Journal, Dedupe>,
+    saga: SagaParticipantSupport<Journal>,
 }
 impl HasSagaParticipantSupport for SyncP {
-    type Journal = Journal;
-    type Dedupe = Dedupe;
-    fn saga_support(&self) -> &SagaParticipantSupport<Journal, Dedupe> {
+    type Store = Journal;
+    fn saga_support(&self) -> &SagaParticipantSupport<Journal> {
         &self.saga
     }
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal, Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal> {
         &mut self.saga
     }
 }
 impl SagaParticipant for SyncP {
-    type Error = ();
     fn step_name(&self) -> &str {
         "sync_step"
     }
@@ -1150,12 +1198,30 @@ impl SagaParticipant for SyncP {
 
 #[test]
 fn sync_participant_terminal_callback_is_fenced_for_duplicates_and_foreign_types() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let mut p = SyncP {
-        saga: SagaParticipantSupport::new(journal.clone(), dedupe.clone()),
+        saga: SagaParticipantSupport::new(journal.clone()),
     };
     let count = Cell::new(0usize);
     let c = ctx("wf_sync", "sync_step", 100);
+    for event in [
+        started(&c),
+        failed(&ctx("foreign", "foreign", 100), "foreign"),
+    ] {
+        apply_sync_participant_saga_ingress(
+            &mut p,
+            event,
+            |_, _| count.set(count.get() + 1),
+            |_| {},
+        );
+    }
+    assert_eq!(
+        count.get(),
+        0,
+        "nonterminal and foreign events never authorize callbacks"
+    );
+    assert!(entries(&journal).is_empty());
+    assert!(p.saga.saga_run_started_at.is_empty());
     for _ in 0..2 {
         apply_sync_participant_saga_ingress(
             &mut p,
@@ -1176,20 +1242,18 @@ fn sync_participant_terminal_callback_is_fenced_for_duplicates_and_foreign_types
 }
 
 struct AsyncP {
-    saga: SagaParticipantSupport<Journal, Dedupe>,
+    saga: SagaParticipantSupport<Journal>,
 }
 impl HasSagaParticipantSupport for AsyncP {
-    type Journal = Journal;
-    type Dedupe = Dedupe;
-    fn saga_support(&self) -> &SagaParticipantSupport<Journal, Dedupe> {
+    type Store = Journal;
+    fn saga_support(&self) -> &SagaParticipantSupport<Journal> {
         &self.saga
     }
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal, Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal> {
         &mut self.saga
     }
 }
 impl AsyncSagaParticipant for AsyncP {
-    type Error = ();
     fn step_name(&self) -> &str {
         "async_step"
     }
@@ -1221,12 +1285,32 @@ impl AsyncSagaParticipant for AsyncP {
 
 #[test]
 fn async_participant_terminal_callback_is_fenced_for_duplicates() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let mut p = AsyncP {
-        saga: SagaParticipantSupport::new(journal.clone(), dedupe.clone()),
+        saga: SagaParticipantSupport::new(journal.clone()),
     };
     let count = Cell::new(0usize);
     let c = ctx("wf_async", "async_step", 100);
+    for event in [
+        started(&c),
+        failed(&ctx("foreign", "foreign", 100), "foreign"),
+    ] {
+        let mut fut = std::pin::pin!(apply_async_participant_saga_ingress(
+            &mut p,
+            event,
+            |_, _| count.set(count.get() + 1),
+            |_| {},
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Ready(())));
+    }
+    assert_eq!(
+        count.get(),
+        0,
+        "nonterminal and foreign events never authorize callbacks"
+    );
+    assert!(entries(&journal).is_empty());
+    assert!(p.saga.saga_run_started_at.is_empty());
     for _ in 0..2 {
         let mut fut = std::pin::pin!(apply_async_participant_saga_ingress(
             &mut p,
@@ -1248,12 +1332,12 @@ fn async_participant_terminal_callback_is_fenced_for_duplicates() {
 
 #[test]
 fn late_accepted_completion_after_cold_quarantine_retains_typed_evidence_and_returns_quarantine() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_acc", "acc", 100);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     accept(&mut actor, &c);
     deliver(&mut actor, failed(&c, "timeout"));
-    let mut cold = Actor::new(&journal, &dedupe);
+    let mut cold = Actor::new(&journal);
     recover_accepted_workflow_steps_for_saga_type(&mut cold.saga, "acc", "wf_acc").unwrap();
     let event = complete_accepted_workflow_step(
         &mut cold,
@@ -1278,9 +1362,9 @@ fn late_accepted_completion_after_cold_quarantine_retains_typed_evidence_and_ret
 
 #[test]
 fn late_old_accepted_result_does_not_become_the_successors_generic_result() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let old = ctx("wf_acc", "acc", 100);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     accept(&mut actor, &old);
     // Simulate a pre-upgrade unsafe ordinary failure, followed by a new admitted run.
     journal
@@ -1296,7 +1380,7 @@ fn late_old_accepted_result_does_not_become_the_successors_generic_result() {
         )
         .unwrap();
     let successor = ctx("wf_acc", "acc", 200);
-    let mut cold = Actor::new(&journal, &dedupe);
+    let mut cold = Actor::new(&journal);
     icanact_saga_choreography::accept_workflow_step(
         &mut cold,
         successor.clone(),
@@ -1346,9 +1430,9 @@ fn late_old_accepted_result_does_not_become_the_successors_generic_result() {
 
 #[test]
 fn failed_accepted_result_write_preserves_available_output_and_compensation() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_acc", "acc", 100);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     accept(&mut actor, &c);
     journal.fail_once(
         JournalOp::Append,
@@ -1371,13 +1455,13 @@ fn failed_accepted_result_write_preserves_available_output_and_compensation() {
 
 #[test]
 fn completed_workflow_undo_after_cold_restart_resends_only_its_acknowledgement() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let c = ctx("wf_pay", "pay", 100);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     deliver(&mut actor, started(&c));
     deliver(&mut actor, undo_request(&c, "pay"));
     assert_eq!(actor.comp_calls, 1);
-    let mut cold = Actor::new(&journal, &dedupe);
+    let mut cold = Actor::new(&journal);
     let out = deliver(&mut cold, undo_request(&c, "pay"));
     assert_eq!((cold.pay_calls, cold.comp_calls), (0, 0));
     assert!(
@@ -1392,10 +1476,10 @@ fn completed_workflow_undo_after_cold_restart_resends_only_its_acknowledgement()
 
 #[test]
 fn recognized_foreign_workflow_refusal_does_not_emit_owner_poisoning_quarantine() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let owner = ctx("wf_pay", "pay", 100);
     let foreign = ctx("wf_pay", "pay", 200);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     deliver(&mut actor, started(&owner));
     let out = deliver(&mut actor, started(&foreign));
     assert_eq!(actor.pay_calls, 1);
@@ -1405,4 +1489,167 @@ fn recognized_foreign_workflow_refusal_does_not_emit_owner_poisoning_quarantine(
         out.valid
     );
     assert_eq!(actor.terminal_run_outcome_strict(&owner).unwrap(), None);
+}
+
+#[test]
+fn low_level_accept_admits_successor_before_old_terminal_cache_and_reused_execution_id() {
+    use icanact_saga_choreography::durability::accept_workflow_step;
+    let journal = stores();
+    let old = ctx("wf_acc", "acc", 100);
+    let new = ctx("wf_acc", "acc", 200);
+    let mut actor = Actor::new(&journal);
+    actor.admit_participant_event_strict(&old).unwrap();
+    actor
+        .retain_terminal_saga_strict(&old, ParticipantTerminalKind::Completed, "done")
+        .unwrap();
+    let execution = StepExecutionId::new("reused");
+    actor
+        .saga
+        .resolved_workflow_steps
+        .entry(old.saga_id)
+        .or_default()
+        .insert(execution.clone());
+    assert!(actor.saga.terminal_sagas.contains(&old.saga_id));
+    let accepted = accept_workflow_step(
+        &mut actor,
+        new.clone(),
+        "acc".into(),
+        execution.clone(),
+        AcceptedStepPolicy {
+            idle_timeout: Duration::from_secs(1),
+            hard_timeout: Duration::from_secs(10),
+            timeout_outcome: AcceptedStepTimeoutOutcome::QuarantineSaga,
+        },
+        vec![7],
+        vec![9],
+    )
+    .unwrap();
+    assert!(
+        matches!(accepted, SagaChoreographyEvent::StepAccepted { execution_id, .. } if execution_id == execution)
+    );
+    assert!(!actor.saga.terminal_sagas.contains(&new.saga_id));
+    assert!(
+        !actor
+            .saga
+            .resolved_workflow_steps
+            .contains_key(&new.saga_id)
+    );
+    assert_eq!(actor.saga.saga_run_started_at.get(&new.saga_id), Some(&200));
+    assert_eq!(
+        actor.saga.accepted_workflow_steps[&new.saga_id]
+            .context
+            .saga_started_at_millis,
+        200
+    );
+}
+
+#[test]
+fn workflow_terminal_append_failure_preserves_tracking_and_suppresses_callbacks_until_retry() {
+    for failed_terminal in [false, true] {
+        let journal = stores();
+        let mut actor = Actor::new(&journal);
+        let c = ctx("wf_idle", "idle", 100);
+        actor.admit_participant_event_strict(&c).unwrap();
+        actor.record_saga_run_start(c.saga_id, c.saga_started_at_millis);
+        actor
+            .saga
+            .dependency_completions
+            .entry(c.saga_id)
+            .or_default()
+            .insert("upstream".into());
+        let terminal = if failed_terminal {
+            failed(&c, "clean failure")
+        } else {
+            SagaChoreographyEvent::SagaCompleted { context: c.clone() }
+        };
+        journal.fail_once(
+            JournalOp::Append,
+            FaultTrigger::EventKind("ParticipantTerminalRecorded"),
+        );
+        assert_eq!(deliver(&mut actor, terminal.clone()).terminal_callbacks, 0);
+        assert_eq!(actor.failed_hooks, 0);
+        assert!(!actor.saga.terminal_sagas.contains(&c.saga_id));
+        assert!(actor.saga.dependency_completions[&c.saga_id].contains("upstream"));
+        assert_eq!(actor.terminal_run_outcome_strict(&c).unwrap(), None);
+        assert_eq!(deliver(&mut actor, terminal.clone()).terminal_callbacks, 1);
+        assert!(!actor.saga.dependency_completions.contains_key(&c.saga_id));
+        assert_eq!(actor.failed_hooks, usize::from(failed_terminal));
+        assert_eq!(deliver(&mut actor, terminal).terminal_callbacks, 0);
+        assert_eq!(actor.failed_hooks, usize::from(failed_terminal));
+        assert_eq!(
+            entries(&journal)
+                .iter()
+                .filter(|e| matches!(
+                    e.event,
+                    ParticipantEvent::ParticipantTerminalRecorded { .. }
+                ))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn forward_renewal_append_failure_preserves_deadline_then_compact_renewal_survives_restart() {
+    use icanact_saga_choreography::durability::record_accepted_workflow_step_progress;
+    let journal = stores();
+    let mut actor = Actor::new(&journal);
+    let c = ctx("wf_acc", "acc", 100);
+    accept(&mut actor, &c);
+    let before = actor.saga.accepted_workflow_steps[&c.saga_id].clone();
+    let rows_before = entries(&journal).len();
+    journal.fail_once(
+        JournalOp::Append,
+        FaultTrigger::EventKind("AcceptedDeadlineRenewed"),
+    );
+    let progress = record_accepted_workflow_step_progress(
+        &mut actor,
+        c.saga_id,
+        before.execution_id.clone(),
+        before.deadline_at_millis,
+    );
+    assert!(matches!(
+        progress,
+        Err(AcceptedStepError::Durability { .. })
+    ));
+    let unchanged = &actor.saga.accepted_workflow_steps[&c.saga_id];
+    assert_eq!(unchanged.deadline_at_millis, before.deadline_at_millis);
+    assert_eq!(
+        unchanged.context.event_timestamp_millis,
+        before.context.event_timestamp_millis
+    );
+    assert_eq!(entries(&journal).len(), rows_before);
+    let heartbeat = record_accepted_workflow_step_progress(
+        &mut actor,
+        c.saga_id,
+        before.execution_id.clone(),
+        before.hard_deadline_at_millis,
+    )
+    .unwrap();
+    assert!(
+        matches!(heartbeat, SagaChoreographyEvent::StepAccepted { deadline_at_millis, .. }
+        if deadline_at_millis == before.hard_deadline_at_millis)
+    );
+    let rows = entries(&journal);
+    assert_eq!(rows.len(), rows_before + 1);
+    let renewal = &rows.last().unwrap().event;
+    assert!(matches!(
+        renewal,
+        ParticipantEvent::AcceptedDeadlineRenewed {
+            is_compensation: false,
+            ..
+        }
+    ));
+    assert!(
+        rkyv::to_bytes::<rkyv::rancor::Error>(renewal)
+            .unwrap()
+            .len()
+            < 1024
+    );
+    let mut cold = Actor::new(&journal);
+    recover_accepted_workflow_steps_for_saga_type(&mut cold.saga, "acc", "wf_acc").unwrap();
+    let recovered = &cold.saga.accepted_workflow_steps[&c.saga_id];
+    assert_eq!(recovered.deadline_at_millis, before.hard_deadline_at_millis);
+    assert_eq!(recovered.saga_input, before.saga_input);
+    assert_eq!(recovered.compensation_data, before.compensation_data);
 }

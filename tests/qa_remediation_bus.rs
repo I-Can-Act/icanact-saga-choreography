@@ -25,22 +25,20 @@ define_saga_workflow_contract! {
 }
 
 struct Accepter {
-    saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
+    saga: SagaParticipantSupport<InMemoryParticipantStore>,
 }
 
 impl HasSagaParticipantSupport for Accepter {
-    type Journal = InMemoryJournal;
-    type Dedupe = InMemoryDedupe;
-    fn saga_support(&self) -> &SagaParticipantSupport<InMemoryJournal, InMemoryDedupe> {
+    type Store = InMemoryParticipantStore;
+    fn saga_support(&self) -> &SagaParticipantSupport<InMemoryParticipantStore> {
         &self.saga
     }
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<InMemoryJournal, InMemoryDedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<InMemoryParticipantStore> {
         &mut self.saga
     }
 }
 
 impl SagaParticipant for Accepter {
-    type Error = String;
     fn step_name(&self) -> &str {
         "a"
     }
@@ -111,14 +109,13 @@ fn wait_until(limit: Duration, mut pred: impl FnMut() -> bool) -> bool {
 
 type Seen = Arc<Mutex<Vec<SagaChoreographyEvent>>>;
 
-/// Bus with contract, bound steps, filler subscribers (required-path delivery)
-/// and a capturing subscriber. The resolver is attached by the caller.
+/// Bus with live step roles and a capturing observer. The resolver is attached by the caller.
 fn prepared_bus() -> (SagaChoreographyBus, Seen) {
     let bus = SagaChoreographyBus::new();
     bus.register_workflow_contract_provider::<BusContract>()
         .unwrap();
-    bus.register_bound_workflow_step("qa", "a").unwrap();
-    bus.register_bound_workflow_step("qa", "b").unwrap();
+    bus.subscribe_workflow_step_fn("qa", "a", |_| true).unwrap();
+    bus.subscribe_workflow_step_fn("qa", "b", |_| true).unwrap();
     let seen: Seen = Arc::default();
     let sink = Arc::clone(&seen);
     bus.subscribe_saga_type_fn("qa", move |event| {
@@ -151,7 +148,7 @@ fn durable_bus(journal: Arc<InMemoryTerminalResolverJournal>) -> (SagaChoreograp
 #[test]
 fn recovered_deadline_is_held_until_activation_then_delivered_once() {
     let mut p = Accepter {
-        saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+        saga: SagaParticipantSupport::new(InMemoryParticipantStore::new()),
     };
     let ctx = context(121, "a");
     let accepted = accept_workflow_step(
@@ -177,6 +174,10 @@ fn recovered_deadline_is_held_until_activation_then_delivered_once() {
     let bus = SagaChoreographyBus::new();
     bus.register_workflow_contract_provider::<BusContract>()
         .unwrap();
+    for step in ["a", "b"] {
+        bus.subscribe_workflow_step_fn("qa", step, |_| true)
+            .unwrap();
+    }
     let (tx, rx) = mpsc::channel();
     bus.subscribe_saga_type_fn("qa", move |event| {
         if matches!(event, SagaChoreographyEvent::CompensationRequested { .. }) {
@@ -184,7 +185,7 @@ fn recovered_deadline_is_held_until_activation_then_delivered_once() {
         }
         true
     });
-    bus.attach_durable_terminal_resolver_for_contract::<BusContract, _>("qa", journal)
+    bus.attach_durable_terminal_resolver_for_contract::<BusContract, _>("qa", Arc::clone(&journal))
         .unwrap();
 
     // Deadline (1s) expires well inside this window; nothing may escape.
@@ -197,7 +198,12 @@ fn recovered_deadline_is_held_until_activation_then_delivered_once() {
         .unwrap();
     let request = rx
         .recv_timeout(Duration::from_secs(2))
-        .expect("retained obligation delivered at activation");
+        .unwrap_or_else(|error| {
+            panic!(
+                "retained obligation missing: {error:?}; rows={:?}",
+                journal.read_all().unwrap()
+            )
+        });
     assert!(matches!(
         request,
         SagaChoreographyEvent::CompensationRequested { steps_to_compensate, .. }
@@ -370,7 +376,18 @@ struct Parked {
 
 fn parked_bus(saga_id: u64) -> (Parked, SagaContext) {
     let journal = Arc::new(InMemoryTerminalResolverJournal::default());
-    let (bus, seen) = durable_bus(Arc::clone(&journal));
+    let bus = SagaChoreographyBus::new();
+    bus.register_workflow_contract_provider::<BusContract>()
+        .unwrap();
+    bus.subscribe_workflow_step_fn("qa", "b", |_| true).unwrap();
+    let seen: Seen = Arc::default();
+    let sink = Arc::clone(&seen);
+    bus.subscribe_saga_type_fn("qa", move |event| {
+        sink.lock().unwrap().push(event.clone());
+        true
+    });
+    bus.attach_durable_terminal_resolver_for_contract::<BusContract, _>("qa", Arc::clone(&journal))
+        .unwrap();
     bus.activate_terminal_resolver_recovery_for_contract::<BusContract>()
         .unwrap();
     let (release, rx) = mpsc::channel();
@@ -379,21 +396,37 @@ fn parked_bus(saga_id: u64) -> (Parked, SagaContext) {
         release: Arc::new(Mutex::new(rx)),
         handled: Arc::clone(&handled),
     });
-    bind_sync_participant_channel::<ParkedActor, ()>(&bus, &actor_ref, &["qa"], "saga", 1).unwrap();
+    let sender = Arc::new(Mutex::new(actor_ref.add_channel("saga", 1).unwrap()));
+    let forward = Arc::clone(&sender);
+    bus.subscribe_workflow_step_fn("qa", "a", move |event| {
+        forward
+            .lock()
+            .unwrap()
+            .try_send(SagaParticipantChannel::Saga(event.clone()))
+            .is_ok()
+    })
+    .unwrap();
     let ctx = context(saga_id, "a");
     bus.publish_strict(started(&ctx)).unwrap();
     // Actor parks on the start; the next event fills the single slot.
     assert!(wait_until(Duration::from_secs(1), || handled
         .load(Ordering::SeqCst)
         == 1));
-    // Saturate the bounded channel with benign progress events until the
-    // actor forward starts failing (non-strict publish never escalates).
+    // Fill the actor channel directly: even non-strict bus publication now
+    // quarantines a failed required-role receipt, so it cannot be used to
+    // prepare saturation before the event under test.
     let mut saturated = false;
     for _ in 0..4_096 {
-        let stats = bus.publish(SagaChoreographyEvent::StepStarted {
-            context: ctx.next_step("a".into()),
-        });
-        if stats.delivered < stats.attempted {
+        if sender
+            .lock()
+            .unwrap()
+            .try_send(SagaParticipantChannel::Saga(
+                SagaChoreographyEvent::StepStarted {
+                    context: ctx.next_step("a".into()),
+                },
+            ))
+            .is_err()
+        {
             saturated = true;
             break;
         }
@@ -438,9 +471,13 @@ fn actor_forward_failure_after_effect_quarantines_instead_of_failing() {
         ),
         "{err:?}"
     );
-    assert!(wait_until(Duration::from_secs(1), || count(&p.seen, |e| {
-        matches!(e, SagaChoreographyEvent::SagaQuarantined { .. })
-    }) == 1));
+    assert!(
+        wait_until(Duration::from_secs(1), || count(&p.seen, |e| {
+            matches!(e, SagaChoreographyEvent::SagaQuarantined { .. })
+        }) == 1),
+        "seen={:?}",
+        p.seen.lock().unwrap()
+    );
     no_plain_failure(&p.seen);
     let outcome = p.bus.take_terminal_outcome(ctx.saga_id);
     assert!(
@@ -482,6 +519,7 @@ fn partially_delivered_compensation_retains_reconciliation_evidence() {
             err,
             SagaBusPublishError::PartialDelivery { .. }
                 | SagaBusPublishError::TerminalEscalationPartialDelivery { .. }
+                | SagaBusPublishError::RequiredPathDeliveryShortfall { .. }
         ),
         "{err:?}"
     );
@@ -531,4 +569,99 @@ fn ingress_driven_recovery_output_is_held_until_activation_too() {
         &seen,
         |e| matches!(e, SagaChoreographyEvent::SagaCompleted { .. })
     ) == 1));
+}
+
+#[test]
+fn durable_restore_replays_historical_completion_before_evaluating_timeouts_once() {
+    let journal = Arc::new(InMemoryTerminalResolverJournal::default());
+    let past = SagaContext::now_millis().saturating_sub(120_000);
+    for (id, timeout_outcome) in [
+        (
+            9_301,
+            AcceptedStepTimeoutOutcome::FailStep {
+                requires_compensation: true,
+            },
+        ),
+        (9_302, AcceptedStepTimeoutOutcome::QuarantineSaga),
+    ] {
+        let ctx = context_at(id, "a", past);
+        journal.append(started(&ctx)).unwrap();
+        let mut participant = Accepter {
+            saga: SagaParticipantSupport::new(InMemoryParticipantStore::new()),
+        };
+        let mut accepted = accept_workflow_step(
+            &mut participant,
+            ctx.clone(),
+            "a".into(),
+            StepExecutionId::new(format!("historical-{id}")),
+            AcceptedStepPolicy {
+                idle_timeout: Duration::from_millis(10),
+                hard_timeout: Duration::from_millis(20),
+                timeout_outcome,
+            },
+            vec![9],
+            vec![42],
+        )
+        .unwrap();
+        if let SagaChoreographyEvent::StepAccepted {
+            context,
+            deadline_at_millis,
+            hard_deadline_at_millis,
+            ..
+        } = &mut accepted
+        {
+            context.event_timestamp_millis = past + 1;
+            *deadline_at_millis = past + 10;
+            *hard_deadline_at_millis = past + 20;
+        }
+        journal.append(accepted).unwrap();
+        let mut later = ctx.clone();
+        later.event_timestamp_millis = past + 100;
+        journal
+            .append(SagaChoreographyEvent::StepStarted {
+                context: later.next_step("b".into()),
+            })
+            .unwrap();
+        journal.append(completed(&later, "a")).unwrap();
+        journal.append(completed(&later, "b")).unwrap();
+    }
+    let control = context_at(9_303, "a", past);
+    journal.append(started(&control)).unwrap();
+    let (bus, seen) = durable_bus(Arc::clone(&journal));
+    assert_eq!(count(&seen, |_| true), 0, "recovery outputs stay held");
+    bus.activate_terminal_resolver_recovery_for_contract::<BusContract>()
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(2), || count(
+        &seen,
+        |event| event.terminal_outcome().is_some()
+    ) == 3));
+    std::thread::sleep(Duration::from_millis(200));
+    for id in [9_301, 9_302] {
+        assert_eq!(
+            count(&seen, |event| event.context().saga_id == SagaId::new(id)
+                && matches!(
+                    event,
+                    SagaChoreographyEvent::SagaCompleted { .. }
+                )),
+            1
+        );
+        assert_eq!(
+            count(&seen, |event| event.context().saga_id == SagaId::new(id)
+                && matches!(
+                    event,
+                    SagaChoreographyEvent::StepFailed { .. }
+                        | SagaChoreographyEvent::CompensationRequested { .. }
+                        | SagaChoreographyEvent::SagaQuarantined { .. }
+                )),
+            0
+        );
+    }
+    assert_eq!(
+        count(
+            &seen,
+            |event| matches!(event, SagaChoreographyEvent::SagaFailed { context, reason, .. }
+        if context.saga_id == control.saga_id && reason.contains("overall_timeout"))
+        ),
+        1
+    );
 }
