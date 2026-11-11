@@ -204,16 +204,19 @@ mod lmdb {
     fn compacted_failed_parallel_rollback_reopens_without_invented_output() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context_for("qa_r4_rollback", 8_001, "a", 1_000_000);
-        {
+        let waiter = {
             let journal = Arc::new(LmdbTerminalResolverJournal::open(dir.path()).unwrap());
             let (bus, seen) = durable::<RollbackContract, _>(Arc::clone(&journal));
             drive_failed_parallel_rollback(&bus, &seen, &ctx);
             assert!(journal.compact_terminal_detail().unwrap() > 0);
-        }
+            bus.release_waiter()
+        };
+        assert!(waiter.wait_timeout(LONG));
         // Two restarts: output must not be re-published on every restart.
         for restart in 0..2 {
             let journal = Arc::new(LmdbTerminalResolverJournal::open(dir.path()).unwrap());
             let (bus, seen) = bus_for::<RollbackContract>();
+            let waiter = bus.release_waiter();
             bus.attach_durable_terminal_resolver_for_contract::<RollbackContract, _>(
                 "qa",
                 Arc::clone(&journal),
@@ -255,6 +258,9 @@ mod lmdb {
                 );
                 assert_eq!(count(&seen, is_quarantined), 0);
             }
+            drop(bus);
+            drop(journal);
+            assert!(waiter.wait_timeout(LONG));
         }
     }
 
