@@ -325,6 +325,36 @@ where
         .collect())
 }
 
+fn subscribe_workflows<A, F>(
+    bus: &SagaChoreographyBus,
+    forward: F,
+) -> Result<Vec<FirehoseSubscription>, String>
+where
+    A: HasSagaWorkflowParticipants,
+    F: Fn(&SagaChoreographyEvent) -> bool + Send + Sync + 'static,
+{
+    checked_workflow_saga_types::<A>()?;
+    let forward = Arc::new(forward);
+    let mut subscriptions = Vec::new();
+    for workflow in A::saga_workflows() {
+        for saga_type in workflow.saga_types() {
+            let forward = Arc::clone(&forward);
+            match bus.subscribe_workflow_step_fn(saga_type, workflow.step_name(), move |event| {
+                forward(event)
+            }) {
+                Ok(sub) => subscriptions.push(sub),
+                Err(error) => {
+                    for sub in subscriptions {
+                        bus.unsubscribe(sub);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+    }
+    Ok(subscriptions)
+}
+
 pub fn bind_sync_workflow_participant_channel<A, C>(
     bus: &SagaChoreographyBus,
     actor_ref: &icanact_core::local_sync::SyncActorRef<A>,
@@ -338,8 +368,14 @@ where
     A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
     C: Send + 'static,
 {
-    let saga_types = checked_workflow_saga_types::<A>()?;
-    bind_sync_participant_channel::<A, C>(bus, actor_ref, &saga_types, channel_name, capacity)
+    let forwarder = Arc::new(Mutex::new(SyncChannelForwarder::<A, C>::eager(
+        actor_ref.clone(),
+        channel_name.to_string(),
+        capacity.max(1),
+    )?));
+    subscribe_workflows::<A, _>(bus, move |event| {
+        lock_or_recover(&forwarder).forward(event.clone())
+    })
 }
 
 pub fn bind_sync_workflow_participant_channel_strict<A, C>(
@@ -357,7 +393,6 @@ where
 {
     let subs =
         bind_sync_workflow_participant_channel::<A, C>(bus, actor_ref, channel_name, capacity)?;
-    bus.register_bound_workflow_participants_for_actor::<A>()?;
     Ok(subs)
 }
 
@@ -374,8 +409,14 @@ where
     A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
     C: Send + 'static,
 {
-    let saga_types = checked_workflow_saga_types::<A>()?;
-    bind_sync_participant_channel_lazy::<A, C>(bus, actor_ref, &saga_types, channel_name, capacity)
+    let forwarder = Arc::new(Mutex::new(SyncChannelForwarder::<A, C>::lazy(
+        actor_ref.clone(),
+        channel_name.to_string(),
+        capacity.max(1),
+    )));
+    subscribe_workflows::<A, _>(bus, move |event| {
+        lock_or_recover(&forwarder).forward(event.clone())
+    })
 }
 
 pub fn bind_sync_workflow_participant_channel_lazy_strict<A, C>(
@@ -397,7 +438,6 @@ where
         channel_name,
         capacity,
     )?;
-    bus.register_bound_workflow_participants_for_actor::<A>()?;
     Ok(subs)
 }
 
@@ -439,8 +479,10 @@ where
     A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
     F: Fn(SagaChoreographyEvent) -> A::Tell + Send + Sync + 'static,
 {
-    let saga_types = checked_workflow_saga_types::<A>()?;
-    bind_sync_participant_tell(bus, actor_ref, &saga_types, map_event)
+    let actor_ref = actor_ref.clone();
+    subscribe_workflows::<A, _>(bus, move |event| {
+        actor_ref.try_tell(map_event(event.clone())).is_ok()
+    })
 }
 
 pub fn bind_sync_workflow_participant_tell_strict<A, F>(
@@ -458,7 +500,6 @@ where
     F: Fn(SagaChoreographyEvent) -> A::Tell + Send + Sync + 'static,
 {
     let subs = bind_sync_workflow_participant_tell::<A, F>(bus, actor_ref, map_event)?;
-    bus.register_bound_workflow_participants_for_actor::<A>()?;
     Ok(subs)
 }
 
@@ -554,7 +595,6 @@ where
 {
     let subs =
         bind_async_workflow_participant_channel::<A, C>(bus, actor_ref, channel_name, capacity)?;
-    bus.register_bound_workflow_participants_for_actor::<A>()?;
     Ok(subs)
 }
 
@@ -594,7 +634,6 @@ where
         channel_name,
         capacity,
     )?;
-    bus.register_bound_workflow_participants_for_actor::<A>()?;
     Ok(subs)
 }
 
@@ -626,7 +665,7 @@ where
 mod tests {
     use crate::{
         CompensationError, HasSagaWorkflowParticipants, SagaChoreographyBus, SagaChoreographyEvent,
-        SagaContext, SagaId, SagaTerminalOutcome, SagaWorkflowParticipant, StepError, StepOutput,
+        SagaContext, SagaId, SagaWorkflowParticipant, StepError, StepOutput,
         define_saga_workflow_contract,
     };
     use icanact_core::local_sync::{self, SyncActor};
@@ -830,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn non_strict_workflow_binding_leaves_steps_unbound_and_saga_start_fails() {
+    fn workflow_binding_registers_live_step_routes() {
         let bus = SagaChoreographyBus::new();
         bus.register_workflow_contract_provider::<BindingWorkflowContract>()
             .expect("workflow contract registration should succeed");
@@ -848,17 +887,9 @@ mod tests {
             payload: Vec::new(),
         });
 
-        let Some(SagaTerminalOutcome::Failed { reason, .. }) = bus.take_terminal_outcome(saga_id)
-        else {
-            panic!("expected immediate failure for unbound workflow steps");
-        };
         assert!(
-            reason.contains("workflow contract violation: unbound participant steps"),
-            "unexpected reason: {reason}"
-        );
-        assert!(
-            reason.contains("missing_steps=gate_step"),
-            "unexpected reason: {reason}"
+            bus.take_terminal_outcome(saga_id).is_none(),
+            "workflow bindings now supply live step routes"
         );
 
         for sub in subs {
