@@ -1901,21 +1901,48 @@ struct BusActorLifecycle {
 
 impl Drop for BusActorLifecycle {
     fn drop(&mut self) {
-        let _ = self
-            .terminal_resolver_registry_ref
-            .ask(TerminalResolverRegistryAsk::ShutdownAll);
-        if let Some(handle) = self.terminal_resolver_registry_handle.take() {
-            handle.shutdown();
-        }
-        if let Some(handle) = self.state_handle.take() {
-            handle.shutdown();
-        }
+        let terminal_resolver_registry_handle = self.terminal_resolver_registry_handle.take();
+        let state_handle = self.state_handle.take();
+        let terminal_resolver_registry_ref = self.terminal_resolver_registry_ref.clone();
+        let pending_replies = self.pending_replies.clone();
+        let pending_run_replies = self.pending_run_replies.clone();
+        let cleanup = move || {
+            let _ = terminal_resolver_registry_ref.ask(TerminalResolverRegistryAsk::ShutdownAll);
+            if let Some(handle) = terminal_resolver_registry_handle {
+                handle.shutdown();
+            }
+            if let Some(handle) = state_handle {
+                handle.shutdown();
+            }
 
-        for (_, reply) in self.pending_replies.drain() {
-            let _ = reply.reply(Err("saga bus dropped".to_string()));
-        }
-        for (_, reply) in self.pending_run_replies.drain() {
-            let _ = reply.reply(Err("saga bus dropped".to_string()));
+            for (_, reply) in pending_replies.drain() {
+                let _ = reply.reply(Err("saga bus dropped".to_string()));
+            }
+            for (_, reply) in pending_run_replies.drain() {
+                let _ = reply.reply(Err("saga bus dropped".to_string()));
+            }
+        };
+        // Retain the cleanup if spawning fails: spawn otherwise consumes its closure.
+        let cleanup = Arc::new(Mutex::new(Some(cleanup)));
+        let run_cleanup = move || {
+            let cleanup = cleanup
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(cleanup) = cleanup {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(cleanup));
+            }
+        };
+        if let Err(err) = thread::Builder::new()
+            .name("saga-bus-cleanup".into())
+            .spawn(run_cleanup.clone())
+        {
+            tracing::error!(
+                target: "core::saga",
+                event = "saga_bus_cleanup_thread_spawn_failed",
+                error = %err
+            );
+            run_cleanup();
         }
     }
 }
