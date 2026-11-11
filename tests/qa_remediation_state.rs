@@ -11,44 +11,39 @@ use std::task::{Context, Poll, Waker};
 use icanact_saga_choreography::SagaBoxFuture;
 use icanact_saga_choreography::{
     AsyncSagaParticipant, CompensationError, CompensationOutput, EffectDispatchError,
-    EffectDispatchRequest, HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal,
-    ParticipantAdmission, ParticipantEvent, ParticipantJournal, ParticipantTerminalKind, PeerId,
+    EffectDispatchRequest, HasSagaParticipantSupport, InMemoryParticipantStore,
+    ParticipantAdmission, ParticipantEvent, ParticipantStore, ParticipantTerminalKind, PeerId,
     RunDedupe, SagaContext, SagaId, SagaParticipant, SagaParticipantSupport, SagaStateExt,
     SagaWorkflowParticipant, StepError, StepOutput,
 };
-use support::{FaultDedupe, FaultJournal, FaultTrigger, JournalOp};
+use support::{FaultStore, FaultTrigger, JournalOp};
 
-type Journal = FaultJournal<InMemoryJournal>;
-type Dedupe = FaultDedupe<InMemoryDedupe>;
+type Journal = FaultStore<InMemoryParticipantStore>;
 
 struct Actor {
-    saga: SagaParticipantSupport<Journal, Dedupe>,
+    saga: SagaParticipantSupport<Journal>,
 }
 
 impl Actor {
-    fn new(journal: &Journal, dedupe: &Dedupe) -> Self {
+    fn new(journal: &Journal) -> Self {
         Self {
-            saga: SagaParticipantSupport::new(journal.clone(), dedupe.clone()),
+            saga: SagaParticipantSupport::new(journal.clone()),
         }
     }
 }
 
 impl HasSagaParticipantSupport for Actor {
-    type Journal = Journal;
-    type Dedupe = Dedupe;
-    fn saga_support(&self) -> &SagaParticipantSupport<Journal, Dedupe> {
+    type Store = Journal;
+    fn saga_support(&self) -> &SagaParticipantSupport<Journal> {
         &self.saga
     }
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal, Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal> {
         &mut self.saga
     }
 }
 
-fn stores() -> (Journal, Dedupe) {
-    (
-        FaultJournal::new(InMemoryJournal::new()),
-        FaultDedupe::new(InMemoryDedupe::new()),
-    )
+fn stores() -> Journal {
+    FaultStore::new(InMemoryParticipantStore::new())
 }
 
 fn ctx(saga_type: &str, started_at: u64) -> SagaContext {
@@ -69,9 +64,9 @@ fn ctx(saga_type: &str, started_at: u64) -> SagaContext {
 
 #[test]
 fn terminal_run_stays_fenced_after_reconstruction_and_cache_eviction() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let run = ctx("order", 100);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     assert!(
         actor
             .admit_participant_event_strict(&run)
@@ -83,7 +78,7 @@ fn terminal_run_stays_fenced_after_reconstruction_and_cache_eviction() {
         .unwrap();
 
     // Simulated restart: fresh in-memory caches over the same durable stores.
-    let restarted = Actor::new(&journal, &dedupe);
+    let restarted = Actor::new(&journal);
     assert_eq!(
         restarted.admit_participant_event_strict(&run).unwrap(),
         ParticipantAdmission::TerminalReplay {
@@ -113,10 +108,10 @@ fn terminal_run_stays_fenced_after_reconstruction_and_cache_eviction() {
 
 #[test]
 fn later_ordinary_run_is_admitted_and_older_events_become_stale() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let old = ctx("order", 100);
     let new = ctx("order", 200);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     assert!(
         actor
             .admit_participant_event_strict(&old)
@@ -127,7 +122,7 @@ fn later_ordinary_run_is_admitted_and_older_events_become_stale() {
         .retain_terminal_saga_strict(&old, ParticipantTerminalKind::Failed, "failed")
         .unwrap();
 
-    let restarted = Actor::new(&journal, &dedupe);
+    let restarted = Actor::new(&journal);
     assert!(
         restarted
             .admit_participant_event_strict(&new)
@@ -158,9 +153,9 @@ fn later_ordinary_run_is_admitted_and_older_events_become_stale() {
 
 #[test]
 fn quarantined_run_blocks_reuse_and_retains_all_evidence() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let run = ctx("order", 100);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     actor.admit_participant_event_strict(&run).unwrap();
     assert_eq!(
         actor.check_run_dedupe_strict(&run, "step_started").unwrap(),
@@ -170,7 +165,7 @@ fn quarantined_run_blocks_reuse_and_retains_all_evidence() {
         .retain_terminal_saga_strict(&run, ParticipantTerminalKind::Quarantined, "ambiguous")
         .unwrap();
 
-    let restarted = Actor::new(&journal, &dedupe);
+    let restarted = Actor::new(&journal);
     let admission = restarted
         .admit_participant_event_strict(&ctx("order", 200))
         .unwrap();
@@ -189,7 +184,6 @@ fn quarantined_run_blocks_reuse_and_retains_all_evidence() {
         }
     ));
     assert_eq!(journal.call_count(JournalOp::Prune), 0);
-    assert_eq!(dedupe.prune_calls(), 0);
     assert_eq!(
         restarted
             .check_run_dedupe_strict(&run, "step_started")
@@ -201,8 +195,8 @@ fn quarantined_run_blocks_reuse_and_retains_all_evidence() {
 
 #[test]
 fn a_new_run_cannot_replace_an_unresolved_run() {
-    let (journal, dedupe) = stores();
-    let actor = Actor::new(&journal, &dedupe);
+    let journal = stores();
+    let actor = Actor::new(&journal);
     let active = ctx("order", 100);
     assert!(
         actor
@@ -227,8 +221,8 @@ fn a_new_run_cannot_replace_an_unresolved_run() {
 
 #[test]
 fn run_histories_stay_separate_by_saga_type_and_start() {
-    let (journal, dedupe) = stores();
-    let mut actor = Actor::new(&journal, &dedupe);
+    let journal = stores();
+    let mut actor = Actor::new(&journal);
     let a = ctx("alpha", 100);
     let b = ctx("beta", 100);
     actor.admit_participant_event_strict(&a).unwrap();
@@ -246,9 +240,9 @@ fn run_histories_stay_separate_by_saga_type_and_start() {
 
 #[test]
 fn admission_and_terminal_retention_fail_closed_on_journal_errors() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let run = ctx("order", 100);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
 
     journal.fail_once(JournalOp::Read, FaultTrigger::NthCall(1));
     assert!(actor.admit_participant_event_strict(&run).is_err());
@@ -292,10 +286,11 @@ fn admission_and_terminal_retention_fail_closed_on_journal_errors() {
 
 #[test]
 fn run_dedupe_separates_duplicates_runs_and_errors() {
-    let (journal, dedupe) = stores();
-    let actor = Actor::new(&journal, &dedupe);
+    let journal = stores();
+    let mut actor = Actor::new(&journal);
     let r1 = ctx("order", 100);
     let r2 = ctx("order", 200);
+    actor.admit_participant_event_strict(&r1).unwrap();
     assert_eq!(
         actor.check_run_dedupe_strict(&r1, "k").unwrap(),
         RunDedupe::First
@@ -304,30 +299,42 @@ fn run_dedupe_separates_duplicates_runs_and_errors() {
         actor.check_run_dedupe_strict(&r1, "k").unwrap(),
         RunDedupe::Duplicate
     );
+    actor
+        .retain_terminal_event_strict(
+            &icanact_saga_choreography::SagaChoreographyEvent::SagaFailed {
+                context: r1.clone(),
+                reason: "no effect".into(),
+                failure: None,
+            },
+        )
+        .unwrap();
+    actor.admit_participant_event_strict(&r2).unwrap();
     assert_eq!(
         actor.check_run_dedupe_strict(&r2, "k").unwrap(),
         RunDedupe::First
     );
 
-    dedupe.fail_check_and_mark(FaultTrigger::NthCall(4));
+    journal.fail_once(JournalOp::CheckAndMark, FaultTrigger::NthCall(4));
     assert!(actor.check_run_dedupe_strict(&r1, "other").is_err());
 }
 
 #[test]
-fn legacy_archives_remain_readable_and_variant_layout_is_unchanged() {
+fn current_schema_archives_roundtrip_with_expected_variant_layout() {
     use icanact_saga_choreography::JournalEntry;
-    let legacy = [
-        ParticipantEvent::SagaRegistered {
-            saga_type: "s".into(),
-            step_name: "t".into(),
-            registered_at_millis: 1,
+    let events = [
+        ParticipantEvent::AcceptedDeadlineRenewed {
+            context: ctx("s", 1),
+            execution_id: icanact_saga_choreography::StepExecutionId::new("exec-1"),
+            is_compensation: false,
+            deadline_at_millis: 10,
+            renewed_at_millis: 1,
         },
         ParticipantEvent::Quarantined {
             reason: "r".into(),
             quarantined_at_millis: 2,
         },
     ];
-    for event in legacy {
+    for event in events {
         let entry = JournalEntry {
             sequence: 1,
             recorded_at_millis: 1,
@@ -337,17 +344,19 @@ fn legacy_archives_remain_readable_and_variant_layout_is_unchanged() {
         let back = rkyv::from_bytes::<JournalEntry, rkyv::rancor::Error>(&bytes).unwrap();
         assert_eq!(format!("{back:?}"), format!("{entry:?}"));
     }
-    // Existing variants keep their archived discriminants; new ones are appended.
+    // Current-schema variants have stable archived discriminants. Old schemas are rejected.
     let tag = |event: ParticipantEvent| {
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&event).unwrap();
         let size = size_of::<<ParticipantEvent as rkyv::Archive>::Archived>();
         bytes[bytes.len() - size]
     };
     assert_eq!(
-        tag(ParticipantEvent::SagaRegistered {
-            saga_type: "s".into(),
-            step_name: "t".into(),
-            registered_at_millis: 1
+        tag(ParticipantEvent::AcceptedDeadlineRenewed {
+            context: ctx("s", 1),
+            execution_id: icanact_saga_choreography::StepExecutionId::new("exec-1"),
+            is_compensation: false,
+            deadline_at_millis: 10,
+            renewed_at_millis: 1,
         }),
         0
     );
@@ -390,7 +399,7 @@ fn legacy_archives_remain_readable_and_variant_layout_is_unchanged() {
 
 #[test]
 fn legacy_execution_history_without_identity_requires_reconciliation() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let run = ctx("order", 100);
     journal
         .append(
@@ -401,7 +410,7 @@ fn legacy_execution_history_without_identity_requires_reconciliation() {
             },
         )
         .unwrap();
-    let actor = Actor::new(&journal, &dedupe);
+    let actor = Actor::new(&journal);
     assert!(
         !actor
             .admit_participant_event_strict(&run)
@@ -413,20 +422,10 @@ fn legacy_execution_history_without_identity_requires_reconciliation() {
 }
 
 #[test]
-fn registration_only_legacy_history_can_admit_a_first_run() {
-    let (journal, dedupe) = stores();
+fn empty_store_can_admit_a_first_run() {
+    let journal = stores();
     let run = ctx("order", 100);
-    journal
-        .append(
-            run.saga_id,
-            ParticipantEvent::SagaRegistered {
-                saga_type: "order".into(),
-                step_name: "step".into(),
-                registered_at_millis: 1,
-            },
-        )
-        .unwrap();
-    let actor = Actor::new(&journal, &dedupe);
+    let actor = Actor::new(&journal);
     assert!(
         actor
             .admit_participant_event_strict(&run)
@@ -439,7 +438,6 @@ fn registration_only_legacy_history_can_admit_a_first_run() {
 
 struct Sync;
 impl SagaParticipant for Sync {
-    type Error = ();
     fn step_name(&self) -> &str {
         "s"
     }
@@ -460,7 +458,6 @@ impl SagaParticipant for Sync {
 
 struct Async;
 impl AsyncSagaParticipant for Async {
-    type Error = ();
     fn step_name(&self) -> &str {
         "s"
     }
@@ -529,15 +526,15 @@ fn effect_dispatch_defaults_fail_closed_for_sync_async_and_workflow() {
 
 #[test]
 fn terminal_tombstone_is_terminal_for_startup_recovery() {
-    use icanact_saga_choreography::{RecoveryDecision, RecoveryPolicy, classify_recovery};
-    let (journal, dedupe) = stores();
+    use icanact_saga_choreography::{RecoveryDecision, classify_recovery};
+    let journal = stores();
     let run = ctx("order", 100);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     actor.admit_participant_event_strict(&run).unwrap();
     actor
         .retain_terminal_saga_strict(&run, ParticipantTerminalKind::Completed, "done")
         .unwrap();
     let entries = journal.read(run.saga_id).unwrap();
-    let decision = classify_recovery(&entries, u64::MAX / 2, RecoveryPolicy { stale_after_ms: 1 });
+    let decision = classify_recovery(&entries, u64::MAX / 2);
     assert!(matches!(decision, RecoveryDecision::TerminalNoAction));
 }

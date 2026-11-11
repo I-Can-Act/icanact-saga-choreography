@@ -15,45 +15,6 @@ use super::{ParticipantEvent, SagaId};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
-/// A trait for participant journal storage implementations.
-///
-/// The journal provides durable, append-only storage for events that occur
-/// during SAGA execution. This enables participants to:
-///
-/// - Record events as they happen for recovery purposes
-/// - Replay events to reconstruct state after a crash
-/// - Query which SAGAs have been processed by this participant
-///
-/// Implementations should ensure atomicity of append operations and durability
-/// of stored events. For production use, consider implementations backed by
-/// databases or persistent message queues.
-///
-/// # Thread Safety
-///
-/// All implementations must be `Send + Sync + 'static` as journals are typically
-/// shared across async tasks.
-///
-/// # Example
-///
-/// ```
-/// use icanact_saga_choreography::{
-///     InMemoryParticipantStore, ParticipantEvent, ParticipantStore, SagaId,
-/// };
-///
-/// let journal = InMemoryParticipantStore::new();
-/// let saga_id = SagaId::new(1);
-/// journal.append(
-///     saga_id,
-///     ParticipantEvent::StepExecutionStarted {
-///         attempt: 1,
-///         started_at_millis: 42,
-///     },
-/// )?;
-/// let entries = journal.read(saga_id)?;
-/// assert_eq!(entries.len(), 1);
-/// # Ok::<(), icanact_saga_choreography::JournalError>(())
-/// ```
-
 /// A single entry in the participant's journal.
 ///
 /// Each entry captures an event along with metadata about when and in what

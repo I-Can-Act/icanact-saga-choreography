@@ -7,11 +7,11 @@ use icanact_core::local_async::{self, AsyncActor};
 use icanact_core::local_sync::{self, SyncActor};
 use icanact_saga_choreography::{
     AsyncSagaParticipant, CompensationError, DependencySpec, DeterministicContextBuilder,
-    FailureAuthority, HasSagaParticipantSupport, HasSagaWorkflowParticipants, InMemoryDedupe,
-    InMemoryJournal, ParticipantDedupeStore, ParticipantJournal, SagaChoreographyEvent, SagaId,
-    SagaParticipant, SagaParticipantChannel, SagaParticipantSupport, SagaStateExt,
-    SagaTerminalOutcome, SagaTestWorld, SagaWorkflowContract, SagaWorkflowParticipant, StepError,
-    StepOutput, SuccessCriteria, TerminalPolicy, define_saga_workflow_contract,
+    FailureAuthority, HasSagaParticipantSupport, HasSagaWorkflowParticipants,
+    InMemoryParticipantStore, ParticipantStore, SagaChoreographyEvent, SagaId, SagaParticipant,
+    SagaParticipantChannel, SagaParticipantSupport, SagaStateExt, SagaTerminalOutcome,
+    SagaTestWorld, SagaWorkflowContract, SagaWorkflowParticipant, StepError, StepOutput,
+    SuccessCriteria, TerminalPolicy, define_saga_workflow_contract,
 };
 
 #[derive(Clone, Debug)]
@@ -32,7 +32,7 @@ struct SyncSnapshot {
 }
 
 struct SyncParticipant {
-    saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
+    saga: SagaParticipantSupport<InMemoryParticipantStore>,
     step_name: &'static str,
     dependency: DependencySpec,
     fail_on_execute: bool,
@@ -45,7 +45,7 @@ struct SyncParticipant {
 impl SyncParticipant {
     fn new(step_name: &'static str, dependency: DependencySpec) -> Self {
         Self {
-            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+            saga: SagaParticipantSupport::new(InMemoryParticipantStore::new()),
             step_name,
             dependency,
             fail_on_execute: false,
@@ -61,7 +61,7 @@ impl SyncParticipant {
             .last_saga_id
             .map(|saga_id| {
                 self.saga
-                    .journal
+                    .store
                     .read(saga_id)
                     .expect("participant journal should be readable")
                     .len()
@@ -71,8 +71,8 @@ impl SyncParticipant {
             .last_saga_id
             .map(|saga_id| {
                 self.saga
-                    .dedupe
-                    .contains(
+                    .store
+                    .check_and_mark(
                         saga_id,
                         &self.run_dedupe_key(
                             &DeterministicContextBuilder::default()
@@ -83,6 +83,7 @@ impl SyncParticipant {
                             "1:1700000000000:saga_started:start",
                         ),
                     )
+                    .map(|fresh| !fresh)
                     .expect("dedupe contains should succeed")
             })
             .unwrap_or(false);
@@ -98,21 +99,18 @@ impl SyncParticipant {
 }
 
 impl HasSagaParticipantSupport for SyncParticipant {
-    type Journal = InMemoryJournal;
-    type Dedupe = InMemoryDedupe;
+    type Store = InMemoryParticipantStore;
 
-    fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support(&self) -> &SagaParticipantSupport<Self::Store> {
         &self.saga
     }
 
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Store> {
         &mut self.saga
     }
 }
 
 impl SagaParticipant for SyncParticipant {
-    type Error = String;
-
     fn step_name(&self) -> &str {
         self.step_name
     }
@@ -198,35 +196,32 @@ struct AsyncCtl;
 impl icanact_core::TellAskTell for AsyncCtl {}
 
 struct AsyncParticipant {
-    saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
+    saga: SagaParticipantSupport<InMemoryParticipantStore>,
     executed_inputs: Vec<Vec<u8>>,
 }
 
 impl Default for AsyncParticipant {
     fn default() -> Self {
         Self {
-            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+            saga: SagaParticipantSupport::new(InMemoryParticipantStore::new()),
             executed_inputs: Vec::new(),
         }
     }
 }
 
 impl HasSagaParticipantSupport for AsyncParticipant {
-    type Journal = InMemoryJournal;
-    type Dedupe = InMemoryDedupe;
+    type Store = InMemoryParticipantStore;
 
-    fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support(&self) -> &SagaParticipantSupport<Self::Store> {
         &self.saga
     }
 
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Store> {
         &mut self.saga
     }
 }
 
 impl AsyncSagaParticipant for AsyncParticipant {
-    type Error = String;
-
     fn step_name(&self) -> &str {
         "async_step"
     }
@@ -358,7 +353,7 @@ define_saga_workflow_contract! {
             },
             step_a => {
                 participant: "step-a",
-                depends_on: after [start]
+                depends_on: on_start ()
             },
             step_b => {
                 participant: "step-b",
@@ -383,7 +378,7 @@ define_saga_workflow_contract! {
             },
             async_step => {
                 participant: "async-step",
-                depends_on: after [start]
+                depends_on: on_start ()
             }
         }
     }
@@ -404,7 +399,7 @@ define_saga_workflow_contract! {
             },
             beta_step => {
                 participant: "beta-step",
-                depends_on: after [start]
+                depends_on: on_start ()
             }
         }
     }
@@ -414,30 +409,18 @@ fn register_sync_order_lifecycle_contract(world: &SagaTestWorld) {
     let bus = world.bus();
     bus.register_workflow_contract_provider::<OrderLifecycleSyncTestContract>()
         .expect("sync order_lifecycle test contract registration should succeed");
-    for step in ["start", "step_a", "step_b"] {
-        bus.register_bound_workflow_step("order_lifecycle", step)
-            .expect("sync order_lifecycle test step binding should succeed");
-    }
 }
 
 fn register_async_order_lifecycle_contract(world: &SagaTestWorld) {
     let bus = world.bus();
     bus.register_workflow_contract_provider::<OrderLifecycleAsyncTestContract>()
         .expect("async order_lifecycle test contract registration should succeed");
-    for step in ["start", "async_step"] {
-        bus.register_bound_workflow_step("order_lifecycle", step)
-            .expect("async order_lifecycle test step binding should succeed");
-    }
 }
 
 fn register_workflow_beta_contract(world: &SagaTestWorld) {
     let bus = world.bus();
     bus.register_workflow_contract_provider::<WorkflowBetaTestContract>()
         .expect("workflow_beta test contract registration should succeed");
-    for step in ["start", "beta_step"] {
-        bus.register_bound_workflow_step("workflow_beta", step)
-            .expect("workflow_beta test step binding should succeed");
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -447,7 +430,7 @@ struct WorkflowSnapshot {
 }
 
 struct WorkflowActor {
-    saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
+    saga: SagaParticipantSupport<InMemoryParticipantStore>,
     alpha_inputs: Vec<Vec<u8>>,
     beta_inputs: Vec<Vec<u8>>,
 }
@@ -455,7 +438,7 @@ struct WorkflowActor {
 impl Default for WorkflowActor {
     fn default() -> Self {
         Self {
-            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+            saga: SagaParticipantSupport::new(InMemoryParticipantStore::new()),
             alpha_inputs: Vec::new(),
             beta_inputs: Vec::new(),
         }
@@ -463,14 +446,13 @@ impl Default for WorkflowActor {
 }
 
 impl HasSagaParticipantSupport for WorkflowActor {
-    type Journal = InMemoryJournal;
-    type Dedupe = InMemoryDedupe;
+    type Store = InMemoryParticipantStore;
 
-    fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support(&self) -> &SagaParticipantSupport<Self::Store> {
         &self.saga
     }
 
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Store> {
         &mut self.saga
     }
 }
@@ -587,26 +569,25 @@ impl SyncActor for WorkflowActor {
 }
 
 struct DuplicateWorkflowActor {
-    saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
+    saga: SagaParticipantSupport<InMemoryParticipantStore>,
 }
 
 impl Default for DuplicateWorkflowActor {
     fn default() -> Self {
         Self {
-            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+            saga: SagaParticipantSupport::new(InMemoryParticipantStore::new()),
         }
     }
 }
 
 impl HasSagaParticipantSupport for DuplicateWorkflowActor {
-    type Journal = InMemoryJournal;
-    type Dedupe = InMemoryDedupe;
+    type Store = InMemoryParticipantStore;
 
-    fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support(&self) -> &SagaParticipantSupport<Self::Store> {
         &self.saga
     }
 
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Store> {
         &mut self.saga
     }
 }

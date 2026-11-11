@@ -19,16 +19,15 @@ use std::time::Duration;
 use icanact_saga_choreography::{
     AcceptedStepPolicy, AcceptedStepTimeoutOutcome, AsyncSagaParticipant, CompensationError,
     CompensationOutput, DependencySpec, EffectDispatchError, EffectDispatchOutcome,
-    EffectDispatchRequest, HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal,
-    ParticipantEvent, ParticipantJournal, ParticipantTerminalKind, PeerId, SagaBoxFuture,
-    SagaChoreographyEvent, SagaContext, SagaFailureDetails, SagaId, SagaParticipant,
-    SagaParticipantSupport, SagaStateExt, StepError, StepExecutionId, StepOutput,
-    handle_async_saga_event_with_emit, handle_saga_event_with_emit,
+    EffectDispatchRequest, HasSagaParticipantSupport, InMemoryParticipantStore, ParticipantEvent,
+    ParticipantStore, ParticipantTerminalKind, PeerId, SagaBoxFuture, SagaChoreographyEvent,
+    SagaContext, SagaFailureDetails, SagaId, SagaParticipant, SagaParticipantSupport, SagaStateExt,
+    StepError, StepExecutionId, StepOutput, handle_async_saga_event_with_emit,
+    handle_saga_event_with_emit,
 };
-use support::{FaultDedupe, FaultJournal, FaultTrigger, JournalOp};
+use support::{FaultStore, FaultTrigger, JournalOp};
 
-type Journal = FaultJournal<InMemoryJournal>;
-type Dedupe = FaultDedupe<InMemoryDedupe>;
+type Journal = FaultStore<InMemoryParticipantStore>;
 
 #[derive(Clone, Copy, Debug)]
 enum Mode {
@@ -46,7 +45,7 @@ struct Counters {
 }
 
 struct Actor {
-    saga: SagaParticipantSupport<Journal, Dedupe>,
+    saga: SagaParticipantSupport<Journal>,
     shared: Arc<Counters>,
     with_effect: bool,
     accept: bool,
@@ -57,7 +56,7 @@ struct Actor {
 impl Actor {
     fn new(world: &World) -> Self {
         Self {
-            saga: SagaParticipantSupport::new(world.journal.clone(), world.dedupe.clone()),
+            saga: SagaParticipantSupport::new(world.journal.clone()),
             shared: world.shared.clone(),
             with_effect: false,
             accept: false,
@@ -104,18 +103,16 @@ impl Actor {
 }
 
 impl HasSagaParticipantSupport for Actor {
-    type Journal = Journal;
-    type Dedupe = Dedupe;
-    fn saga_support(&self) -> &SagaParticipantSupport<Journal, Dedupe> {
+    type Store = Journal;
+    fn saga_support(&self) -> &SagaParticipantSupport<Journal> {
         &self.saga
     }
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal, Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal> {
         &mut self.saga
     }
 }
 
 impl SagaParticipant for Actor {
-    type Error = String;
     fn step_name(&self) -> &str {
         "a"
     }
@@ -152,7 +149,6 @@ impl SagaParticipant for Actor {
 }
 
 impl AsyncSagaParticipant for Actor {
-    type Error = String;
     fn step_name(&self) -> &str {
         "a"
     }
@@ -196,15 +192,13 @@ impl AsyncSagaParticipant for Actor {
 
 struct World {
     journal: Journal,
-    dedupe: Dedupe,
     shared: Arc<Counters>,
 }
 
 impl World {
     fn new() -> Self {
         Self {
-            journal: FaultJournal::new(InMemoryJournal::new()),
-            dedupe: FaultDedupe::new(InMemoryDedupe::new()),
+            journal: FaultStore::new(InMemoryParticipantStore::new()),
             shared: Arc::default(),
         }
     }

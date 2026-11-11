@@ -1451,16 +1451,14 @@ fn recover_accepted_workflow_compensation_from_entries(
                 deadline_at_millis,
                 ..
             } => {
-                if *is_compensation == true {
-                    if let Some(pending) = accepted.as_mut() {
-                        if same_run_context(&pending.context, context)
-                            && pending.execution_id == *execution_id
-                        {
-                            pending.deadline_at_millis = pending
-                                .deadline_at_millis
-                                .max((*deadline_at_millis).min(pending.hard_deadline_at_millis));
-                        }
-                    }
+                if *is_compensation
+                    && let Some(pending) = accepted.as_mut()
+                    && same_run_context(&pending.context, context)
+                    && pending.execution_id == *execution_id
+                {
+                    pending.deadline_at_millis = pending
+                        .deadline_at_millis
+                        .max((*deadline_at_millis).min(pending.hard_deadline_at_millis));
                 }
             }
 
@@ -1543,16 +1541,14 @@ fn recover_completed_accepted_compensation_from_entries(
                 deadline_at_millis,
                 ..
             } => {
-                if *is_compensation == true {
-                    if let Some(pending) = accepted.as_mut() {
-                        if same_run_context(&pending.context, context)
-                            && pending.execution_id == *execution_id
-                        {
-                            pending.deadline_at_millis = pending
-                                .deadline_at_millis
-                                .max((*deadline_at_millis).min(pending.hard_deadline_at_millis));
-                        }
-                    }
+                if *is_compensation
+                    && let Some(pending) = accepted.as_mut()
+                    && same_run_context(&pending.context, context)
+                    && pending.execution_id == *execution_id
+                {
+                    pending.deadline_at_millis = pending
+                        .deadline_at_millis
+                        .max((*deadline_at_millis).min(pending.hard_deadline_at_millis));
                 }
             }
 
@@ -1631,16 +1627,14 @@ fn recover_failed_accepted_compensation_from_entries(
                 deadline_at_millis,
                 ..
             } => {
-                if *is_compensation == true {
-                    if let Some(pending) = accepted.as_mut() {
-                        if same_run_context(&pending.context, context)
-                            && pending.execution_id == *execution_id
-                        {
-                            pending.deadline_at_millis = pending
-                                .deadline_at_millis
-                                .max((*deadline_at_millis).min(pending.hard_deadline_at_millis));
-                        }
-                    }
+                if *is_compensation
+                    && let Some(pending) = accepted.as_mut()
+                    && same_run_context(&pending.context, context)
+                    && pending.execution_id == *execution_id
+                {
+                    pending.deadline_at_millis = pending
+                        .deadline_at_millis
+                        .max((*deadline_at_millis).min(pending.hard_deadline_at_millis));
                 }
             }
 
@@ -1964,16 +1958,14 @@ fn recover_accepted_workflow_step_from_entries(
                 deadline_at_millis,
                 ..
             } => {
-                if *is_compensation == false {
-                    if let Some(pending) = accepted.as_mut() {
-                        if same_run_context(&pending.context, context)
-                            && pending.execution_id == *execution_id
-                        {
-                            pending.deadline_at_millis = pending
-                                .deadline_at_millis
-                                .max((*deadline_at_millis).min(pending.hard_deadline_at_millis));
-                        }
-                    }
+                if !*is_compensation
+                    && let Some(pending) = accepted.as_mut()
+                    && same_run_context(&pending.context, context)
+                    && pending.execution_id == *execution_id
+                {
+                    pending.deadline_at_millis = pending
+                        .deadline_at_millis
+                        .max((*deadline_at_millis).min(pending.hard_deadline_at_millis));
                 }
             }
 
@@ -2192,7 +2184,7 @@ where
         .saga_support()
         .resolved_workflow_steps
         .get(&saga_id)
-        .is_some_and(|steps| steps.contains(&execution_id))
+        .is_some_and(|steps| steps.contains(execution_id))
     {
         return Err(AcceptedStepError::AlreadyResolved {
             saga_id,

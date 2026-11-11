@@ -13,15 +13,14 @@ use icanact_saga_choreography::durability::{
 };
 use icanact_saga_choreography::{
     CompensationError, CompensationOutput, EffectDispatchError, EffectDispatchOutcome,
-    EffectDispatchRequest, HasSagaParticipantSupport, HasSagaWorkflowParticipants, InMemoryDedupe,
-    InMemoryJournal, ParticipantEvent, ParticipantJournal, ParticipantTerminalKind, PeerId,
+    EffectDispatchRequest, HasSagaParticipantSupport, HasSagaWorkflowParticipants,
+    InMemoryParticipantStore, ParticipantEvent, ParticipantStore, ParticipantTerminalKind, PeerId,
     SagaChoreographyEvent, SagaContext, SagaId, SagaParticipantSupport, SagaWorkflowParticipant,
     StepError, StepOutput,
 };
-use support::{FaultDedupe, FaultJournal, FaultTrigger};
+use support::{FaultStore, FaultTrigger, JournalOp};
 
-type Journal = FaultJournal<InMemoryJournal>;
-type Dedupe = FaultDedupe<InMemoryDedupe>;
+type Journal = FaultStore<InMemoryParticipantStore>;
 
 #[derive(Clone, Copy)]
 enum DispatchMode {
@@ -30,7 +29,7 @@ enum DispatchMode {
 }
 
 struct Actor {
-    saga: SagaParticipantSupport<Journal, Dedupe>,
+    saga: SagaParticipantSupport<Journal>,
     pay_calls: usize,
     comp_calls: usize,
     dispatched: Vec<(String, Vec<u8>)>,
@@ -38,9 +37,9 @@ struct Actor {
 }
 
 impl Actor {
-    fn new(journal: &Journal, dedupe: &Dedupe) -> Self {
+    fn new(journal: &Journal) -> Self {
         Self {
-            saga: SagaParticipantSupport::new(journal.clone(), dedupe.clone()),
+            saga: SagaParticipantSupport::new(journal.clone()),
             pay_calls: 0,
             comp_calls: 0,
             dispatched: Vec::new(),
@@ -50,12 +49,11 @@ impl Actor {
 }
 
 impl HasSagaParticipantSupport for Actor {
-    type Journal = Journal;
-    type Dedupe = Dedupe;
-    fn saga_support(&self) -> &SagaParticipantSupport<Journal, Dedupe> {
+    type Store = Journal;
+    fn saga_support(&self) -> &SagaParticipantSupport<Journal> {
         &self.saga
     }
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal, Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal> {
         &mut self.saga
     }
 }
@@ -185,11 +183,8 @@ impl SagaWorkflowParticipant<Actor> for PlainEffectWorkflow {
     }
 }
 
-fn stores() -> (Journal, Dedupe) {
-    (
-        FaultJournal::new(InMemoryJournal::new()),
-        FaultDedupe::new(InMemoryDedupe::new()),
-    )
+fn stores() -> Journal {
+    FaultStore::new(InMemoryParticipantStore::new())
 }
 
 fn ctx(saga_type: &str, step: &str, started_at: u64) -> SagaContext {
@@ -252,12 +247,12 @@ fn deliver(actor: &mut Actor, event: SagaChoreographyEvent) -> Delivery {
 
 #[test]
 fn failed_intent_write_prevents_workflow_effect_and_quarantines_visibly() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     journal.fail_once(
-        support::JournalOp::Append,
-        FaultTrigger::EventKind("StepExecutionStarted"),
+        support::JournalOp::AdmitAndRecordIntent,
+        FaultTrigger::NthCall(1),
     );
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     let delivery = deliver(&mut actor, started(&ctx("wf_pay", "pay", 100)));
 
     assert_eq!(
@@ -271,14 +266,14 @@ fn failed_intent_write_prevents_workflow_effect_and_quarantines_visibly() {
 
 #[test]
 fn failed_result_write_cannot_publish_workflow_success() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     // Plain completion now persists its full result in the single proof append;
     // fault that authoritative write rather than a raw row which no longer exists.
     journal.fail_once(
         support::JournalOp::Append,
         FaultTrigger::EventKind("ParticipantForwardOutcomeRecorded"),
     );
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     let delivery = deliver(&mut actor, started(&ctx("wf_pay", "pay", 100)));
 
     assert_eq!(actor.pay_calls, 1);
@@ -303,8 +298,8 @@ fn failed_result_write_cannot_publish_workflow_success() {
 
 #[test]
 fn a_non_owned_undo_request_does_not_consume_the_owned_successor_dedupe_key() {
-    let (journal, dedupe) = stores();
-    let mut actor = Actor::new(&journal, &dedupe);
+    let journal = stores();
+    let mut actor = Actor::new(&journal);
     let c = ctx("wf_pay", "pay", 100);
     deliver(&mut actor, started(&c));
     let request_context = c.next_step("terminal_resolver".into());
@@ -349,9 +344,9 @@ fn a_non_owned_undo_request_does_not_consume_the_owned_successor_dedupe_key() {
 
 #[test]
 fn dedupe_outage_quarantines_visibly_instead_of_being_dropped_by_the_validator() {
-    let (journal, dedupe) = stores();
-    dedupe.fail_check_and_mark(FaultTrigger::NthCall(1));
-    let mut actor = Actor::new(&journal, &dedupe);
+    let journal = stores();
+    journal.fail_once(JournalOp::AdmitAndRecordIntent, FaultTrigger::NthCall(1));
+    let mut actor = Actor::new(&journal);
     let delivery = deliver(&mut actor, started(&ctx("wf_pay", "pay", 100)));
 
     assert_eq!(actor.pay_calls, 0);
@@ -361,16 +356,16 @@ fn dedupe_outage_quarantines_visibly_instead_of_being_dropped_by_the_validator()
 
 #[test]
 fn locally_emitted_quarantine_is_durable_without_bus_loopback() {
-    let (journal, dedupe) = stores();
-    dedupe.fail_check_and_mark(FaultTrigger::NthCall(1));
-    let mut actor = Actor::new(&journal, &dedupe);
+    let journal = stores();
+    journal.fail_once(JournalOp::AdmitAndRecordIntent, FaultTrigger::NthCall(1));
+    let mut actor = Actor::new(&journal);
     let c = ctx("wf_pay", "pay", 100);
     assert!(deliver(&mut actor, started(&c)).has_quarantine());
     assert_eq!(
         icanact_saga_choreography::SagaStateExt::terminal_run_outcome_strict(&actor, &c).unwrap(),
         Some(ParticipantTerminalKind::Quarantined)
     );
-    dedupe.disarm();
+    journal.disarm();
     let mut retry = c;
     retry.trace_id = 999;
     deliver(&mut actor, started(&retry));
@@ -382,8 +377,8 @@ fn locally_emitted_quarantine_is_durable_without_bus_loopback() {
 
 #[test]
 fn changed_delivery_trace_cannot_reexecute_a_durable_workflow_step() {
-    let (journal, dedupe) = stores();
-    let mut actor = Actor::new(&journal, &dedupe);
+    let journal = stores();
+    let mut actor = Actor::new(&journal);
     let c = ctx("wf_pay", "pay", 100);
     deliver(&mut actor, started(&c));
     let mut retry = c;
@@ -394,14 +389,14 @@ fn changed_delivery_trace_cannot_reexecute_a_durable_workflow_step() {
         actor.pay_calls, 1,
         "delivery identity cannot reopen durable execution"
     );
-    assert!(out.has_quarantine());
+    assert!(!out.has_quarantine(), "confirmed replay is safe to ignore");
 }
 
 #[test]
 fn journal_read_outage_during_admission_fails_closed_and_visibly() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     journal.fail_once(support::JournalOp::Read, FaultTrigger::NthCall(1));
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     let delivery = deliver(&mut actor, started(&ctx("wf_pay", "pay", 100)));
 
     assert_eq!(actor.pay_calls, 0);
@@ -411,8 +406,8 @@ fn journal_read_outage_during_admission_fails_closed_and_visibly() {
 
 #[test]
 fn completed_effect_is_dispatched_with_its_identifier_before_success() {
-    let (journal, dedupe) = stores();
-    let mut actor = Actor::new(&journal, &dedupe);
+    let journal = stores();
+    let mut actor = Actor::new(&journal);
     let delivery = deliver(&mut actor, started(&ctx("wf_effect", "notify", 100)));
 
     assert_eq!(
@@ -424,8 +419,8 @@ fn completed_effect_is_dispatched_with_its_identifier_before_success() {
 
 #[test]
 fn ambiguous_dispatch_failure_quarantines_and_never_reports_success() {
-    let (journal, dedupe) = stores();
-    let mut actor = Actor::new(&journal, &dedupe);
+    let journal = stores();
+    let mut actor = Actor::new(&journal);
     actor.dispatch_mode = DispatchMode::Ambiguous;
     let delivery = deliver(&mut actor, started(&ctx("wf_effect", "notify", 100)));
 
@@ -436,8 +431,8 @@ fn ambiguous_dispatch_failure_quarantines_and_never_reports_success() {
 
 #[test]
 fn default_effect_dispatch_fails_closed() {
-    let (journal, dedupe) = stores();
-    let mut actor = Actor::new(&journal, &dedupe);
+    let journal = stores();
+    let mut actor = Actor::new(&journal);
     let delivery = deliver(&mut actor, started(&ctx("wf_plain", "plain", 100)));
 
     assert!(!delivery.has_step_completed(), "{:?}", delivery.valid);
@@ -446,9 +441,9 @@ fn default_effect_dispatch_fails_closed() {
 
 #[test]
 fn completed_run_does_not_repeat_effect_after_restart_and_later_run_is_admitted() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let run = ctx("wf_pay", "pay", 100);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     assert!(deliver(&mut actor, started(&run)).has_step_completed());
     deliver(
         &mut actor,
@@ -459,7 +454,7 @@ fn completed_run_does_not_repeat_effect_after_restart_and_later_run_is_admitted(
     assert_eq!(actor.pay_calls, 1);
 
     // Restart: empty caches over the same durable stores.
-    let mut restarted = Actor::new(&journal, &dedupe);
+    let mut restarted = Actor::new(&journal);
     let replay = deliver(&mut restarted, started(&run));
     assert_eq!(restarted.pay_calls, 0, "terminal run must stay fenced");
     assert!(replay.valid.is_empty() && replay.invalid.is_empty());
@@ -474,9 +469,9 @@ fn completed_run_does_not_repeat_effect_after_restart_and_later_run_is_admitted(
 
 #[test]
 fn quarantined_run_retains_evidence_and_is_not_auto_resolved_or_reused() {
-    let (journal, dedupe) = stores();
+    let journal = stores();
     let run = ctx("wf_pay", "pay", 100);
-    let mut actor = Actor::new(&journal, &dedupe);
+    let mut actor = Actor::new(&journal);
     assert!(deliver(&mut actor, started(&run)).has_step_completed());
     deliver(
         &mut actor,
@@ -507,11 +502,11 @@ fn quarantined_run_retains_evidence_and_is_not_auto_resolved_or_reused() {
 
     // Restart does not auto-resolve it and the id cannot be reused by a new run.
     assert!(
-        collect_startup_recovery_events_for_saga_type(&journal, &dedupe, "pay", "wf_pay")
+        collect_startup_recovery_events_for_saga_type(&journal, "pay", "wf_pay")
             .unwrap()
             .is_empty()
     );
-    let mut restarted = Actor::new(&journal, &dedupe);
+    let mut restarted = Actor::new(&journal);
     let reuse = deliver(&mut restarted, started(&ctx("wf_pay", "pay", 200)));
     assert_eq!(restarted.pay_calls, 0);
     assert!(

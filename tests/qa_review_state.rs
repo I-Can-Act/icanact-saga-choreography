@@ -2,24 +2,20 @@
 use icanact_saga_choreography::*;
 #[allow(unused_imports)]
 mod support;
-use support::{FaultJournal, FaultTrigger, JournalOp};
+use support::{FaultStore, FaultTrigger, JournalOp};
 
-struct Actor(SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>);
+struct Actor(SagaParticipantSupport<InMemoryParticipantStore>);
 impl HasSagaParticipantSupport for Actor {
-    type Journal = InMemoryJournal;
-    type Dedupe = InMemoryDedupe;
-    fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    type Store = InMemoryParticipantStore;
+    fn saga_support(&self) -> &SagaParticipantSupport<Self::Store> {
         &self.0
     }
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Store> {
         &mut self.0
     }
 }
 fn actor() -> Actor {
-    Actor(SagaParticipantSupport::new(
-        InMemoryJournal::new(),
-        InMemoryDedupe::new(),
-    ))
+    Actor(SagaParticipantSupport::new(InMemoryParticipantStore::new()))
 }
 fn ctx(start: u64) -> SagaContext {
     SagaContext {
@@ -265,7 +261,7 @@ fn confirmed_evidence_is_run_scoped_and_survives_cold_reconstruction() {
         .unwrap();
     let mut new = ctx(200);
     actor.admit_participant_event_strict(&new).unwrap();
-    let restarted = Actor(SagaParticipantSupport::new(actor.0.journal, actor.0.dedupe));
+    let restarted = Actor(SagaParticipantSupport::new(actor.0.store));
     let recovered = restarted.participant_run_evidence_strict(&old).unwrap();
     assert_eq!(recovered.compensation_data, vec![42]);
     assert_eq!(recovered.forward_outcome.unwrap().saga_input, vec![8, 9]);
@@ -308,24 +304,20 @@ fn forward_proof_appends_archive_tag_15_and_roundtrips_all_fields() {
         _ => unreachable!(),
     }
 }
-struct FaultActor(SagaParticipantSupport<FaultJournal<InMemoryJournal>, InMemoryDedupe>);
+struct FaultActor(SagaParticipantSupport<FaultStore<InMemoryParticipantStore>>);
 impl HasSagaParticipantSupport for FaultActor {
-    type Journal = FaultJournal<InMemoryJournal>;
-    type Dedupe = InMemoryDedupe;
-    fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    type Store = FaultStore<InMemoryParticipantStore>;
+    fn saga_support(&self) -> &SagaParticipantSupport<Self::Store> {
         &self.0
     }
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Store> {
         &mut self.0
     }
 }
 #[test]
 fn proof_write_and_evidence_read_fail_closed() {
-    let journal = FaultJournal::new(InMemoryJournal::new());
-    let actor = FaultActor(SagaParticipantSupport::new(
-        journal.clone(),
-        InMemoryDedupe::new(),
-    ));
+    let journal = FaultStore::new(InMemoryParticipantStore::new());
+    let actor = FaultActor(SagaParticipantSupport::new(journal.clone()));
     let c = ctx(100);
     actor.admit_participant_event_strict(&c).unwrap();
     actor
