@@ -517,8 +517,14 @@ impl SagaTestWorld {
         actor.attach_saga_bus(self.bus.clone());
         let saga_types: Vec<&'static str> = actor.saga_types().to_vec();
         let (actor_ref, handle) = icanact_core::local_sync::spawn_with_opts(actor, opts);
-        self.register_sync_subscriptions(actor_ref.clone(), &saga_types, map_event);
-        SyncSagaParticipantHandle { actor_ref, handle }
+        let subscriptions =
+            self.register_sync_subscriptions(actor_ref.clone(), &saga_types, map_event);
+        SyncSagaParticipantHandle {
+            actor_ref,
+            handle,
+            bus: self.bus.clone(),
+            subscriptions,
+        }
     }
 
     pub fn spawn_sync_channel_participant<A, C>(
@@ -544,8 +550,12 @@ impl SagaTestWorld {
             channel_capacity,
         )
         .expect("sync participant saga channel binding should succeed");
-        drop(subs);
-        SyncSagaParticipantHandle { actor_ref, handle }
+        SyncSagaParticipantHandle {
+            actor_ref,
+            handle,
+            bus: self.bus.clone(),
+            subscriptions: subs,
+        }
     }
 
     pub fn spawn_sync_workflow_channel_participant<A, C>(
@@ -577,8 +587,12 @@ impl SagaTestWorld {
             channel_capacity,
         )
         .expect("sync workflow participant saga channel binding should succeed");
-        drop(subs);
-        SyncSagaParticipantHandle { actor_ref, handle }
+        SyncSagaParticipantHandle {
+            actor_ref,
+            handle,
+            bus: self.bus.clone(),
+            subscriptions: subs,
+        }
     }
 
     pub fn spawn_sync_participant_args<A, Args, FMake, F>(
@@ -646,8 +660,14 @@ impl SagaTestWorld {
         actor.attach_saga_bus(self.bus.clone());
         let saga_types: Vec<&'static str> = actor.saga_types().to_vec();
         let (actor_ref, handle) = icanact_core::local_async::spawn_with_opts(actor, opts).await;
-        self.register_async_subscriptions(actor_ref.clone(), &saga_types, map_event);
-        AsyncSagaParticipantHandle { actor_ref, handle }
+        let subscriptions =
+            self.register_async_subscriptions(actor_ref.clone(), &saga_types, map_event);
+        AsyncSagaParticipantHandle {
+            actor_ref,
+            handle,
+            bus: self.bus.clone(),
+            subscriptions,
+        }
     }
 
     pub async fn spawn_async_channel_participant<A, C>(
@@ -677,8 +697,12 @@ impl SagaTestWorld {
             channel_capacity,
         )
         .expect("async participant saga channel binding should succeed");
-        drop(subs);
-        AsyncSagaParticipantHandle { actor_ref, handle }
+        AsyncSagaParticipantHandle {
+            actor_ref,
+            handle,
+            bus: self.bus.clone(),
+            subscriptions: subs,
+        }
     }
 
     pub async fn spawn_async_participant_args<A, Args, FMake, F>(
@@ -741,12 +765,14 @@ impl SagaTestWorld {
         actor_ref: icanact_core::local_sync::SyncActorRef<A>,
         saga_types: &[&'static str],
         map_event: F,
-    ) where
+    ) -> Vec<FirehoseSubscription>
+    where
         A: icanact_core::local_sync::SyncActor,
         A::Contract: icanact_core::local_sync::contract::SupportsTell<A>,
         F: Fn(SagaChoreographyEvent) -> A::Tell + Send + Sync + 'static,
     {
         let map_event = Arc::new(map_event);
+        let mut subscriptions = Vec::new();
         for saga_type in saga_types {
             self.ensure_capture_saga_type(saga_type);
             let actor_ref = actor_ref.clone();
@@ -754,8 +780,9 @@ impl SagaTestWorld {
             let sub = self.bus.subscribe_saga_type_fn(saga_type, move |event| {
                 actor_ref.tell(map_event(event.clone()))
             });
-            let _ = sub;
+            subscriptions.push(sub);
         }
+        subscriptions
     }
 
     fn register_async_subscriptions<A, F>(
@@ -763,12 +790,14 @@ impl SagaTestWorld {
         actor_ref: icanact_core::local_async::AsyncActorRef<A>,
         saga_types: &[&'static str],
         map_event: F,
-    ) where
+    ) -> Vec<FirehoseSubscription>
+    where
         A: icanact_core::local_async::AsyncActor,
         A::Contract: icanact_core::local_async::contract::SupportsTell<A>,
         F: Fn(SagaChoreographyEvent) -> A::Tell + Send + Sync + 'static,
     {
         let map_event = Arc::new(map_event);
+        let mut subscriptions = Vec::new();
         for saga_type in saga_types {
             self.ensure_capture_saga_type(saga_type);
             let actor_ref = actor_ref.clone();
@@ -776,8 +805,9 @@ impl SagaTestWorld {
             let sub = self.bus.subscribe_saga_type_fn(saga_type, move |event| {
                 actor_ref.tell(map_event(event.clone()))
             });
-            let _ = sub;
+            subscriptions.push(sub);
         }
+        subscriptions
     }
 }
 
@@ -803,6 +833,8 @@ where
 {
     actor_ref: icanact_core::local_sync::SyncActorRef<A>,
     handle: icanact_core::local_sync::ActorHandle,
+    bus: SagaChoreographyBus,
+    subscriptions: Vec<FirehoseSubscription>,
 }
 
 #[cfg(any(test, feature = "test-harness"))]
@@ -815,6 +847,9 @@ where
     }
 
     pub fn shutdown(self) {
+        for subscription in self.subscriptions {
+            self.bus.unsubscribe(subscription);
+        }
         self.handle.shutdown();
     }
 }
@@ -826,6 +861,8 @@ where
 {
     actor_ref: icanact_core::local_async::AsyncActorRef<A>,
     handle: icanact_core::local_async::ActorHandle,
+    bus: SagaChoreographyBus,
+    subscriptions: Vec<FirehoseSubscription>,
 }
 
 #[cfg(any(test, feature = "test-harness"))]
@@ -838,6 +875,9 @@ where
     }
 
     pub async fn shutdown(self) {
+        for subscription in self.subscriptions {
+            self.bus.unsubscribe(subscription);
+        }
         self.handle.shutdown().await;
     }
 }
