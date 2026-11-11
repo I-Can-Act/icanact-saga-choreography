@@ -70,10 +70,7 @@ mod workflow_contract;
 // Types
 pub use binding::{
     SagaParticipantChannel, bind_async_participant_channel, bind_async_participant_channel_lazy,
-    bind_async_participant_tell, bind_async_workflow_participant_channel,
-    bind_async_workflow_participant_channel_lazy,
-    bind_async_workflow_participant_channel_lazy_strict,
-    bind_async_workflow_participant_channel_strict, bind_sync_participant_channel,
+    bind_async_participant_tell, bind_sync_participant_channel,
     bind_sync_participant_channel_lazy, bind_sync_participant_tell,
     bind_sync_workflow_participant_channel, bind_sync_workflow_participant_channel_lazy,
     bind_sync_workflow_participant_channel_lazy_strict,
