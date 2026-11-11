@@ -54,6 +54,8 @@ mod traits;
 // === Storage ===
 mod dedupe;
 mod journal;
+#[cfg(feature = "lmdb")]
+mod lmdb_owner;
 
 // === Observability ===
 mod observer;
