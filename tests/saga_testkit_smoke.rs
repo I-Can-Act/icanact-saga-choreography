@@ -756,6 +756,34 @@ where
 }
 
 #[test]
+fn participant_shutdown_unsubscribes_from_bus() {
+    let world = SagaTestWorld::new();
+    let participant = world.spawn_sync_channel_participant(
+        SyncParticipant::new("step_a", DependencySpec::OnSagaStart),
+        "saga",
+        1024,
+    );
+    participant.shutdown();
+
+    let context = DeterministicContextBuilder::default()
+        .with_saga_type("order_lifecycle")
+        .with_step_name("step_a")
+        .build();
+    let stats = world.bus().publish(SagaChoreographyEvent::StepCompleted {
+        context,
+        output: Vec::new(),
+        saga_input: Vec::new(),
+        compensation_available: false,
+    });
+
+    assert_eq!(
+        stats.delivered, stats.attempted,
+        "shutdown must leave no dead subscriptions: attempted={}, delivered={}",
+        stats.attempted, stats.delivered
+    );
+}
+
+#[test]
 fn sync_world_runs_real_saga_workflow_and_exposes_actor_state() {
     SagaTestWorld::init_test_logging();
     let world = SagaTestWorld::new();
