@@ -1,5 +1,6 @@
 use std::sync::Mutex;
 
+use crate::journal::{MemoryRuns, RunSummary, context_key};
 use crate::{SagaChoreographyEvent, SagaId};
 
 #[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -20,495 +21,407 @@ pub enum TerminalResolverJournalError {
 
 pub trait TerminalResolverJournal: Send + Sync + 'static {
     fn append(&self, event: SagaChoreographyEvent) -> Result<u64, TerminalResolverJournalError>;
-
     fn read_all(&self) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError>;
-
-    /// Whether [`Self::read_saga`] is a bounded, indexed lookup. The bus only
-    /// evicts its in-memory admission fences when the journal can reload them;
-    /// otherwise every fence stays resident and admission is refused at capacity.
     fn supports_saga_lookup(&self) -> bool {
         false
     }
-
-    /// Every retained row of one saga id, in sequence order. Implementations
-    /// that return `true` from [`Self::supports_saga_lookup`] must do so
-    /// without scanning unrelated history.
-    ///
-    /// The default reports [`TerminalResolverJournalError::Unsupported`]; it
-    /// never silently scans the whole journal.
     fn read_saga(
         &self,
         _saga_id: SagaId,
     ) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError> {
         Err(TerminalResolverJournalError::Unsupported(
-            "this journal does not implement per-saga lookup".into(),
+            "per-saga lookup".into(),
         ))
     }
-
-    /// Indexed per-id read capped before cloning/decoding more than `max_entries`.
-    /// Admission uses this method so one repeatedly reused id cannot turn a cache
-    /// miss into an unbounded history allocation. Implementations advertising
-    /// [`Self::supports_saga_lookup`] must implement it; unsupported is fail-closed,
-    /// not permission to fall back to a global or unbounded read.
     fn read_saga_bounded(
         &self,
         _saga_id: SagaId,
         _max_entries: usize,
     ) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError> {
         Err(TerminalResolverJournalError::Unsupported(
-            "this journal does not implement bounded per-saga lookup".into(),
+            "bounded per-saga lookup".into(),
         ))
     }
-
-    /// Removes ordinarily resolved run detail while retaining its terminal replay
-    /// fence. Every unresolved or quarantined run keeps all evidence. Returns the
-    /// number of rows removed.
-    ///
-    /// The default reports [`TerminalResolverJournalError::Unsupported`]; it
-    /// never pretends to compact.
-    fn compact_terminal_detail(&self) -> Result<u64, TerminalResolverJournalError> {
+    /// Streams unresolved/quarantined evidence without a read_all fallback.
+    /// Visitors must not reenter a writing method on this journal.
+    fn visit_unresolved_runs(
+        &self,
+        _visitor: &mut dyn FnMut(
+            &TerminalResolverJournalEntry,
+        ) -> Result<(), TerminalResolverJournalError>,
+    ) -> Result<(), TerminalResolverJournalError> {
         Err(TerminalResolverJournalError::Unsupported(
-            "this journal does not implement compaction".into(),
+            "streaming unresolved runs".into(),
         ))
+    }
+    /// At most 256 runs and 256 detail deletions in a write transaction.
+    /// Failed-run effect fingerprints and the first terminal fence survive.
+    fn compact_terminal_detail_batched(
+        &self,
+        _batch_limit: usize,
+    ) -> Result<usize, TerminalResolverJournalError> {
+        Err(TerminalResolverJournalError::Unsupported(
+            "compaction".into(),
+        ))
+    }
+    /// Compatibility entry point. Each iteration commits a bounded batch.
+    fn compact_terminal_detail(&self) -> Result<usize, TerminalResolverJournalError> {
+        let mut total = 0;
+        loop {
+            let changed = self.compact_terminal_detail_batched(256)?;
+            total += changed;
+            if changed == 0 {
+                return Ok(total);
+            }
+        }
+    }
+    /// Explicitly ends replay protection for ordinary runs older than cutoff.
+    fn prune_resolved_before(
+        &self,
+        _cutoff_millis: u64,
+        _batch_limit: usize,
+    ) -> Result<usize, TerminalResolverJournalError> {
+        Err(TerminalResolverJournalError::Unsupported("pruning".into()))
     }
 }
 
-#[derive(Default)]
+fn phase(event: &SagaChoreographyEvent) -> u8 {
+    match event {
+        SagaChoreographyEvent::SagaCompleted { .. } => 1,
+        SagaChoreographyEvent::SagaFailed { .. } => 2,
+        SagaChoreographyEvent::SagaQuarantined { .. } => 3,
+        _ => 0,
+    }
+}
+fn keep_effect(entry: &TerminalResolverJournalEntry, summary: &RunSummary) -> bool {
+    summary.phase == 2
+        && matches!(
+            entry.event,
+            SagaChoreographyEvent::StepCompleted {
+                compensation_available: true,
+                ..
+            } | SagaChoreographyEvent::StepAccepted { .. }
+        )
+}
+fn storage(error: impl std::fmt::Display) -> TerminalResolverJournalError {
+    TerminalResolverJournalError::Storage(error.to_string().into())
+}
+
 pub struct InMemoryTerminalResolverJournal {
-    state: Mutex<InMemoryTerminalResolverJournalState>,
+    state: Mutex<MemoryRuns<TerminalResolverJournalEntry>>,
 }
-
-#[derive(Default)]
-struct InMemoryTerminalResolverJournalState {
-    next_sequence: u64,
-    entries: Vec<TerminalResolverJournalEntry>,
-    /// Positions in `entries` per saga id, in append order.
-    by_saga: std::collections::HashMap<u64, Vec<usize>>,
+impl Default for InMemoryTerminalResolverJournal {
+    fn default() -> Self {
+        Self::with_capacity(4096, 4096)
+    }
 }
-
+impl InMemoryTerminalResolverJournal {
+    pub fn with_capacity(terminal_capacity: usize, protected_capacity: usize) -> Self {
+        Self {
+            state: Mutex::new(MemoryRuns::new(terminal_capacity, protected_capacity)),
+        }
+    }
+    fn state(
+        &self,
+    ) -> Result<
+        std::sync::MutexGuard<'_, MemoryRuns<TerminalResolverJournalEntry>>,
+        TerminalResolverJournalError,
+    > {
+        self.state
+            .lock()
+            .map_err(|_| storage("in-memory resolver journal lock poisoned"))
+    }
+}
 impl TerminalResolverJournal for InMemoryTerminalResolverJournal {
     fn append(&self, event: SagaChoreographyEvent) -> Result<u64, TerminalResolverJournalError> {
-        let mut state = self.state.lock().map_err(|_| {
-            TerminalResolverJournalError::Storage(
-                "in-memory terminal resolver journal lock poisoned".into(),
-            )
-        })?;
-        let sequence = state.next_sequence;
+        let mut state = self.state()?;
+        let key = context_key(event.context());
+        state.check_new(&key).map_err(storage)?;
+        let sequence = state.next;
         let next = sequence
             .checked_add(1)
             .ok_or(TerminalResolverJournalError::SequenceExhausted)?;
-        state.next_sequence = next;
-        let position = state.entries.len();
-        state
-            .by_saga
-            .entry(event.context().saga_id.get())
-            .or_default()
-            .push(position);
-        state
-            .entries
-            .push(TerminalResolverJournalEntry { sequence, event });
+        let kind = phase(&event);
+        let at = event.context().event_timestamp_millis;
+        state.insert(
+            key,
+            sequence,
+            TerminalResolverJournalEntry { sequence, event },
+            kind,
+            at,
+        );
+        state.next = next;
         Ok(sequence)
     }
-
     fn supports_saga_lookup(&self) -> bool {
         true
     }
-
     fn read_saga(
         &self,
         saga_id: SagaId,
     ) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError> {
         self.read_saga_bounded(saga_id, usize::MAX)
     }
-
     fn read_saga_bounded(
         &self,
         saga_id: SagaId,
         max_entries: usize,
     ) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError> {
-        let state = self.state.lock().map_err(|_| {
-            TerminalResolverJournalError::Storage(
-                "in-memory terminal resolver journal lock poisoned".into(),
-            )
-        })?;
-        let positions = state
-            .by_saga
-            .get(&saga_id.get())
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        if positions.len() > max_entries {
-            return Err(TerminalResolverJournalError::Storage(
-                format!(
-                    "per-saga lookup capacity exceeded; saga_id={} max_entries={max_entries}",
-                    saga_id.get()
-                )
-                .into(),
-            ));
+        let state = self.state()?;
+        let keys = state.by_saga.get(&saga_id.get());
+        if keys
+            .into_iter()
+            .flatten()
+            .map(|k| state.runs[k].rows.len())
+            .sum::<usize>()
+            > max_entries
+        {
+            return Err(storage("per-saga lookup capacity exceeded"));
         }
-        Ok(positions
-            .iter()
-            .map(|position| state.entries[*position].clone())
-            .collect())
+        let mut rows: Vec<_> = keys
+            .into_iter()
+            .flatten()
+            .flat_map(|key| state.runs[key].rows.values().cloned())
+            .collect();
+        rows.sort_by_key(|e| e.sequence);
+        Ok(rows)
     }
-
     fn read_all(&self) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError> {
-        let state = self.state.lock().map_err(|_| {
-            TerminalResolverJournalError::Storage(
-                "in-memory terminal resolver journal lock poisoned".into(),
-            )
-        })?;
-        Ok(state.entries.clone())
+        let mut rows: Vec<_> = self
+            .state()?
+            .runs
+            .values()
+            .flat_map(|r| r.rows.values().cloned())
+            .collect();
+        rows.sort_by_key(|e| e.sequence);
+        Ok(rows)
+    }
+    fn visit_unresolved_runs(
+        &self,
+        visitor: &mut dyn FnMut(
+            &TerminalResolverJournalEntry,
+        ) -> Result<(), TerminalResolverJournalError>,
+    ) -> Result<(), TerminalResolverJournalError> {
+        let state = self.state()?;
+        for key in &state.unresolved {
+            for entry in state.runs[key].rows.values() {
+                visitor(entry)?;
+            }
+        }
+        Ok(())
+    }
+    fn compact_terminal_detail_batched(
+        &self,
+        batch_limit: usize,
+    ) -> Result<usize, TerminalResolverJournalError> {
+        Ok(self.state()?.maintain(None, batch_limit, keep_effect))
+    }
+    fn prune_resolved_before(
+        &self,
+        cutoff_millis: u64,
+        batch_limit: usize,
+    ) -> Result<usize, TerminalResolverJournalError> {
+        Ok(self
+            .state()?
+            .maintain(Some(cutoff_millis), batch_limit, keep_effect))
     }
 }
 
 #[cfg(feature = "lmdb")]
 pub mod lmdb {
-    use std::collections::{HashMap, HashSet};
+    use super::*;
+    use crate::lmdb_owner::{IndexedStore, LmdbEnvOwner, run_key};
     use std::path::Path;
-
-    use heed::types::{Bytes, Str};
-    use heed::{Database, Env, EnvOpenOptions};
-
-    use crate::lmdb_owner::LmdbEnvOwner;
-
-    use super::{
-        SagaChoreographyEvent, SagaId, TerminalResolverJournal, TerminalResolverJournalEntry,
-        TerminalResolverJournalError,
-    };
-
-    const SCHEMA_KEY: &str = "schema_version";
-    /// Version 2 adds the per-saga lookup index. Version 1 stores are migrated
-    /// (backfilled) on open; version 1 binaries refuse a version 2 store.
-    const SCHEMA_VERSION: &str = "2";
-    const LEGACY_SCHEMA_VERSION: &str = "1";
-    const DEFAULT_MAP_SIZE_BYTES: usize = 256 * 1024 * 1024;
 
     #[derive(Debug)]
     pub struct LmdbTerminalResolverJournal {
-        env: Env,
-        rows: Database<Str, Bytes>,
-        /// `{saga_id:020}:{sequence:020}` -> empty. Maintained in the same write
-        /// transaction as every row insert or delete.
-        saga_index: Database<Str, Bytes>,
-        meta: Database<Str, Str>,
-        // Drop last: release ownership only after all other env handles are gone.
-        _owner: LmdbEnvOwner,
+        db: IndexedStore,
     }
-
     impl LmdbTerminalResolverJournal {
         pub fn open(path: &Path) -> Result<Self, TerminalResolverJournalError> {
-            Self::open_with_map_size(path, DEFAULT_MAP_SIZE_BYTES)
+            let owner = LmdbEnvOwner::acquire(path).map_err(storage)?;
+            Self::with_owner(path, owner)
         }
-
         pub fn open_with_map_size(
             path: &Path,
             map_size_bytes: usize,
         ) -> Result<Self, TerminalResolverJournalError> {
-            std::fs::create_dir_all(path).map_err(storage_error)?;
             let owner = LmdbEnvOwner::open(
                 path,
-                EnvOpenOptions::new().max_dbs(4).map_size(map_size_bytes),
+                heed::EnvOpenOptions::new()
+                    .max_dbs(16)
+                    .map_size(map_size_bytes),
             )
-            .map_err(storage_error)?;
-            let env = owner.env();
-            let mut wtxn = env.write_txn().map_err(storage_error)?;
-            let rows = env
-                .create_database::<Str, Bytes>(&mut wtxn, Some("resolver_events"))
-                .map_err(storage_error)?;
-            let saga_index = env
-                .create_database::<Str, Bytes>(&mut wtxn, Some("resolver_saga_index"))
-                .map_err(storage_error)?;
-            let meta = env
-                .create_database::<Str, Str>(&mut wtxn, Some("resolver_meta"))
-                .map_err(storage_error)?;
-            match meta.get(&wtxn, SCHEMA_KEY).map_err(storage_error)? {
-                Some(version) if version == SCHEMA_VERSION => {}
-                Some(version) if version == LEGACY_SCHEMA_VERSION => {
-                    // One transaction: the rebuilt index and the new version
-                    // commit together or not at all.
-                    saga_index.clear(&mut wtxn).map_err(storage_error)?;
-                    let mut keys = Vec::new();
-                    for row in rows.iter(&wtxn).map_err(storage_error)? {
-                        let (_, bytes) = row.map_err(storage_error)?;
-                        let entry = decode_entry(bytes)?;
-                        keys.push(index_key(entry.event.context().saga_id, entry.sequence));
-                    }
-                    for key in &keys {
-                        saga_index.put(&mut wtxn, key, &[]).map_err(storage_error)?;
-                    }
-                    meta.put(&mut wtxn, SCHEMA_KEY, SCHEMA_VERSION)
-                        .map_err(storage_error)?;
-                }
-                Some(version) => {
-                    return Err(TerminalResolverJournalError::Storage(
-                        format!(
-                            "incompatible terminal resolver journal schema: stored={version} required={SCHEMA_VERSION}"
-                        )
-                        .into(),
-                    ));
-                }
-                None => {
-                    meta.put(&mut wtxn, SCHEMA_KEY, SCHEMA_VERSION)
-                        .map_err(storage_error)?;
-                    meta.put(&mut wtxn, "next_sequence", "1")
-                        .map_err(storage_error)?;
-                }
-            }
-            wtxn.commit().map_err(storage_error)?;
+            .map_err(storage)?;
+            Self::with_owner(path, owner)
+        }
+        fn with_owner(
+            path: &Path,
+            owner: LmdbEnvOwner,
+        ) -> Result<Self, TerminalResolverJournalError> {
             Ok(Self {
-                env: env.clone(),
-                rows,
-                saga_index,
-                meta,
-                _owner: owner,
+                db: IndexedStore::open(owner, path, "resolver", "r:".into()).map_err(storage)?,
             })
         }
-
         #[cfg(test)]
         pub(super) fn seed_next_sequence_for_test(&self, value: u64) {
-            let mut wtxn = self.env.write_txn().unwrap();
-            self.meta
-                .put(&mut wtxn, "next_sequence", &value.to_string())
+            let mut txn = self.db.env.write_txn().unwrap();
+            self.db
+                .meta
+                .put(&mut txn, &self.db.counter, &value.to_string())
                 .unwrap();
-            wtxn.commit().unwrap();
+            txn.commit().unwrap();
         }
-
         #[cfg(test)]
         pub(super) fn next_sequence_for_test(&self) -> String {
-            let rtxn = self.env.read_txn().unwrap();
-            self.meta
-                .get(&rtxn, "next_sequence")
+            let txn = self.db.env.read_txn().unwrap();
+            self.db
+                .meta
+                .get(&txn, &self.db.counter)
                 .unwrap()
                 .unwrap()
                 .to_owned()
         }
-
         #[cfg(test)]
         pub(super) fn raw_rows_for_test(&self) -> Vec<(String, Vec<u8>)> {
-            let rtxn = self.env.read_txn().unwrap();
-            self.rows
-                .iter(&rtxn)
+            let txn = self.db.env.read_txn().unwrap();
+            self.db
+                .rows
+                .iter(&txn)
                 .unwrap()
-                .map(|row| {
-                    let (k, v) = row.unwrap();
+                .map(|r| {
+                    let (k, v) = r.unwrap();
                     (k.to_owned(), v.to_vec())
                 })
                 .collect()
         }
-
-        fn next_sequence(
-            meta: &Database<Str, Str>,
-            wtxn: &mut heed::RwTxn<'_>,
-        ) -> Result<u64, TerminalResolverJournalError> {
-            let Some(raw) = meta.get(wtxn, "next_sequence").map_err(storage_error)? else {
-                return Err(TerminalResolverJournalError::Storage(
-                    "terminal resolver journal next_sequence is missing".into(),
-                ));
-            };
-            let sequence = raw.parse::<u64>().map_err(storage_error)?;
-            let next = sequence
-                .checked_add(1)
-                .ok_or(TerminalResolverJournalError::SequenceExhausted)?
-                .to_string();
-            meta.put(wtxn, "next_sequence", &next)
-                .map_err(storage_error)?;
-            Ok(sequence)
-        }
     }
-
     impl TerminalResolverJournal for LmdbTerminalResolverJournal {
         fn append(
             &self,
             event: SagaChoreographyEvent,
         ) -> Result<u64, TerminalResolverJournalError> {
-            let mut wtxn = self.env.write_txn().map_err(storage_error)?;
-            let sequence = Self::next_sequence(&self.meta, &mut wtxn)?;
+            let mut txn = self.db.env.write_txn().map_err(storage)?;
+            let key =
+                run_key(&self.db.namespace, &context_key(event.context())).map_err(storage)?;
+            let sequence = self.db.next(&mut txn, 1).map_err(|e| {
+                if e == "sequence space exhausted" {
+                    TerminalResolverJournalError::SequenceExhausted
+                } else {
+                    storage(e)
+                }
+            })?;
+            let kind = phase(&event);
+            let at = event.context().event_timestamp_millis;
             let entry = TerminalResolverJournalEntry { sequence, event };
-            let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&entry).map_err(storage_error)?;
-            let key = format!("{sequence:020}");
-            if self.rows.get(&wtxn, &key).map_err(storage_error)?.is_some() {
-                return Err(TerminalResolverJournalError::Storage(
-                    format!("terminal resolver journal row already exists for sequence {sequence}")
-                        .into(),
-                ));
-            }
-            self.rows
-                .put(&mut wtxn, &key, encoded.as_ref())
-                .map_err(storage_error)?;
-            self.saga_index
-                .put(
-                    &mut wtxn,
-                    &index_key(entry.event.context().saga_id, sequence),
-                    &[],
-                )
-                .map_err(storage_error)?;
-            wtxn.commit().map_err(storage_error)?;
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&entry).map_err(storage)?;
+            self.db
+                .put_row(&mut txn, &key, sequence, &bytes, kind, at)
+                .map_err(storage)?;
+            txn.commit().map_err(storage)?;
             Ok(sequence)
         }
-
         fn supports_saga_lookup(&self) -> bool {
             true
         }
-
         fn read_saga(
             &self,
             saga_id: SagaId,
         ) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError> {
             self.read_saga_bounded(saga_id, usize::MAX)
         }
-
         fn read_saga_bounded(
             &self,
             saga_id: SagaId,
             max_entries: usize,
         ) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError> {
-            let rtxn = self.env.read_txn().map_err(storage_error)?;
-            let prefix = format!("{:020}:", saga_id.get());
-            let mut entries = Vec::new();
-            for row in self
-                .saga_index
-                .prefix_iter(&rtxn, &prefix)
-                .map_err(storage_error)?
-            {
-                let (key, _) = row.map_err(storage_error)?;
-                if entries.len() == max_entries {
-                    return Err(TerminalResolverJournalError::Storage(
-                        format!("per-saga lookup capacity exceeded; saga_id={} max_entries={max_entries}", saga_id.get()).into(),
-                    ));
+            let txn = self.db.env.read_txn().map_err(storage)?;
+            let prefix = format!("{}{:020}:", self.db.namespace, saga_id.get());
+            let mut rows = Vec::new();
+            for row in self.db.rows.prefix_iter(&txn, &prefix).map_err(storage)? {
+                let (key, bytes) = row.map_err(storage)?;
+                if rows.len() == max_entries {
+                    return Err(storage("per-saga lookup capacity exceeded"));
                 }
-                let sequence = key
-                    .strip_prefix(prefix.as_str())
-                    .ok_or_else(|| storage_error("malformed saga index key"))?;
-                let Some(bytes) = self.rows.get(&rtxn, sequence).map_err(storage_error)? else {
-                    return Err(TerminalResolverJournalError::Storage(
-                        format!("saga index references a missing row: {key}").into(),
-                    ));
-                };
-                let entry = decode_entry(bytes)?;
-                let indexed_sequence: u64 = sequence.parse().map_err(storage_error)?;
-                if entry.sequence != indexed_sequence || entry.event.context().saga_id != saga_id {
-                    return Err(storage_error("saga index row identity mismatch"));
-                }
-                entries.push(entry);
+                rows.push(decode_indexed_entry(key, bytes)?);
             }
-            Ok(entries)
+            rows.sort_by_key(|e| e.sequence);
+            Ok(rows)
         }
-
         fn read_all(
             &self,
         ) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError> {
-            let rtxn = self.env.read_txn().map_err(storage_error)?;
-            let iter = self.rows.iter(&rtxn).map_err(storage_error)?;
-            let mut entries = Vec::new();
-            for row in iter {
-                let (_, bytes) = row.map_err(storage_error)?;
-                entries.push(decode_entry(bytes)?);
+            let txn = self.db.env.read_txn().map_err(storage)?;
+            let mut rows = Vec::new();
+            for row in self.db.rows.iter(&txn).map_err(storage)? {
+                let (key, bytes) = row.map_err(storage)?;
+                rows.push(decode_indexed_entry(key, bytes)?);
             }
-            entries.sort_by_key(|entry| entry.sequence);
-            Ok(entries)
+            rows.sort_by_key(|e| e.sequence);
+            Ok(rows)
         }
-
-        fn compact_terminal_detail(&self) -> Result<u64, TerminalResolverJournalError> {
-            let mut wtxn = self.env.write_txn().map_err(storage_error)?;
-            let mut decoded = Vec::new();
-            for row in self.rows.iter(&wtxn).map_err(storage_error)? {
-                let (key, bytes) = row.map_err(storage_error)?;
-                decoded.push((key.to_owned(), decode_entry(bytes)?));
-            }
-            // Quarantine remains unresolved even if contradictory ordinary
-            // terminal evidence also exists. Maintenance is not reconciliation.
-            let mut quarantined = HashSet::new();
-            let mut fences: HashMap<RunKey, (u64, bool)> = HashMap::new();
-            for (_, entry) in &decoded {
-                if matches!(entry.event, SagaChoreographyEvent::SagaQuarantined { .. }) {
-                    quarantined.insert(run_key(&entry.event));
-                } else if is_terminal(&entry.event) {
-                    fences.entry(run_key(&entry.event)).or_insert((
-                        entry.sequence,
-                        matches!(entry.event, SagaChoreographyEvent::SagaFailed { .. }),
-                    ));
+        fn visit_unresolved_runs(
+            &self,
+            visitor: &mut dyn FnMut(
+                &TerminalResolverJournalEntry,
+            ) -> Result<(), TerminalResolverJournalError>,
+        ) -> Result<(), TerminalResolverJournalError> {
+            let txn = self.db.env.read_txn().map_err(storage)?;
+            for run in self.db.unresolved.iter(&txn).map_err(storage)? {
+                let (key, _) = run.map_err(storage)?;
+                for row in self.db.rows.prefix_iter(&txn, key).map_err(storage)? {
+                    let (row_key, bytes) = row.map_err(storage)?;
+                    visitor(&decode_indexed_entry(row_key, bytes)?)?;
                 }
             }
-            let mut removed = 0u64;
-            for (key, entry) in &decoded {
-                let run = run_key(&entry.event);
-                if quarantined.contains(&run) {
-                    continue;
-                }
-                let Some((fence, failed)) = fences.get(&run) else {
-                    continue; // unresolved run: keep everything
-                };
-                // A failed run may still see a replay of an effect it already
-                // knew; keeping those fingerprints lets that replay be told apart
-                // from genuinely new uncertainty. A successful run needs none.
-                if *failed && is_effect_evidence(&entry.event) {
-                    continue;
-                }
-                if *fence != entry.sequence {
-                    self.rows.delete(&mut wtxn, key).map_err(storage_error)?;
-                    self.saga_index
-                        .delete(
-                            &mut wtxn,
-                            &index_key(entry.event.context().saga_id, entry.sequence),
-                        )
-                        .map_err(storage_error)?;
-                    removed += 1;
-                }
-            }
-            // next_sequence is untouched so removed sequences are never reused.
-            wtxn.commit().map_err(storage_error)?;
-            Ok(removed)
+            Ok(())
+        }
+        fn compact_terminal_detail_batched(
+            &self,
+            batch_limit: usize,
+        ) -> Result<usize, TerminalResolverJournalError> {
+            self.db
+                .maintain(
+                    None,
+                    batch_limit,
+                    |key, bytes, summary| {
+                        Ok(keep_effect(
+                            &decode_indexed_entry(key, bytes).map_err(|e| e.to_string())?,
+                            summary,
+                        ))
+                    },
+                    None,
+                )
+                .map_err(storage)
+        }
+        fn prune_resolved_before(
+            &self,
+            cutoff_millis: u64,
+            batch_limit: usize,
+        ) -> Result<usize, TerminalResolverJournalError> {
+            self.db
+                .maintain(Some(cutoff_millis), batch_limit, |_, _, _| Ok(false), None)
+                .map_err(storage)
         }
     }
-
-    type RunKey = (u64, Box<str>, u64);
-
-    fn run_key(event: &SagaChoreographyEvent) -> RunKey {
-        let context = event.context();
-        (
-            context.saga_id.get(),
-            context.saga_type.clone(),
-            context.saga_started_at_millis,
-        )
+    fn decode_indexed_entry(
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<TerminalResolverJournalEntry, TerminalResolverJournalError> {
+        let entry = decode_entry(bytes)?;
+        let run = run_key("r:", &context_key(entry.event.context())).map_err(storage)?;
+        if key != format!("{run}{:020}", entry.sequence) {
+            return Err(storage("resolver index row identity mismatch"));
+        }
+        Ok(entry)
     }
-
-    fn index_key(saga_id: SagaId, sequence: u64) -> String {
-        format!("{:020}:{sequence:020}", saga_id.get())
-    }
-
-    /// Compensable completions and accepted steps: the effect fingerprints.
-    fn is_effect_evidence(event: &SagaChoreographyEvent) -> bool {
-        matches!(
-            event,
-            SagaChoreographyEvent::StepCompleted {
-                compensation_available: true,
-                ..
-            } | SagaChoreographyEvent::StepAccepted { .. }
-        )
-    }
-
-    fn is_terminal(event: &SagaChoreographyEvent) -> bool {
-        matches!(
-            event,
-            SagaChoreographyEvent::SagaCompleted { .. }
-                | SagaChoreographyEvent::SagaFailed { .. }
-                | SagaChoreographyEvent::SagaQuarantined { .. }
-        )
-    }
-
-    /// Decodes a validated archive from an explicitly aligned owned copy;
-    /// LMDB value slices carry no alignment guarantee.
     fn decode_entry(
         bytes: &[u8],
     ) -> Result<TerminalResolverJournalEntry, TerminalResolverJournalError> {
-        let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(bytes.len());
+        let mut aligned = rkyv::util::AlignedVec::<16>::new();
         aligned.extend_from_slice(bytes);
         rkyv::from_bytes::<TerminalResolverJournalEntry, rkyv::rancor::Error>(&aligned)
-            .map_err(storage_error)
-    }
-
-    fn storage_error(error: impl std::fmt::Display) -> TerminalResolverJournalError {
-        TerminalResolverJournalError::Storage(error.to_string().into())
+            .map_err(storage)
     }
 }
 
@@ -682,5 +595,270 @@ mod tests {
         let result = journal.append(event(2));
         assert!(result.is_err(), "existing key must not be overwritten");
         assert_eq!(before, journal.raw_rows_for_test());
+    }
+}
+
+#[cfg(test)]
+mod wave1c_tests {
+    use super::*;
+    use crate::DeterministicContextBuilder;
+    fn start(id: u64) -> SagaChoreographyEvent {
+        crate::saga_started(
+            DeterministicContextBuilder::default()
+                .with_saga_id(id)
+                .build(),
+            vec![],
+        )
+    }
+    fn exercise(journal: &impl TerminalResolverJournal) {
+        for id in 0..5 {
+            let e = start(id);
+            let context = e.context().clone();
+            journal.append(e).unwrap();
+            if id > 1 {
+                journal
+                    .append(SagaChoreographyEvent::SagaCompleted { context })
+                    .unwrap();
+            }
+        }
+        let mut count = 0;
+        journal
+            .visit_unresolved_runs(&mut |_entry| {
+                count += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(journal.compact_terminal_detail_batched(1).unwrap(), 1);
+        assert_eq!(journal.prune_resolved_before(u64::MAX, 1).unwrap(), 1);
+        assert!(!journal.read_saga(SagaId::new(0)).unwrap().is_empty());
+    }
+    fn effect_and_quarantine_preservation(journal: &impl TerminalResolverJournal) {
+        for id in 0..3 {
+            let e = start(id);
+            let context = e.context().clone();
+            journal.append(e).unwrap();
+            journal
+                .append(SagaChoreographyEvent::StepCompleted {
+                    context: context.clone(),
+                    output: vec![1],
+                    saga_input: vec![2],
+                    compensation_available: true,
+                })
+                .unwrap();
+            if id == 0 {
+                journal
+                    .append(SagaChoreographyEvent::SagaFailed {
+                        context,
+                        reason: "failed".into(),
+                        failure: None,
+                    })
+                    .unwrap();
+            } else {
+                journal
+                    .append(SagaChoreographyEvent::SagaQuarantined {
+                        context: context.clone(),
+                        reason: "q".into(),
+                        step: "step".into(),
+                        participant_id: "p".into(),
+                    })
+                    .unwrap();
+                journal
+                    .append(SagaChoreographyEvent::SagaCompleted { context })
+                    .unwrap();
+            }
+        }
+        while journal.compact_terminal_detail_batched(1).unwrap() != 0 {}
+        let failed = journal.read_saga(SagaId::new(0)).unwrap();
+        assert_eq!(failed.len(), 2);
+        assert!(
+            failed
+                .iter()
+                .any(|e| matches!(e.event, SagaChoreographyEvent::StepCompleted { .. }))
+        );
+        assert_eq!(journal.read_saga(SagaId::new(1)).unwrap().len(), 4);
+        let mut visits = 0;
+        journal
+            .visit_unresolved_runs(&mut |_| {
+                visits += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(visits, 8);
+        assert_eq!(journal.prune_resolved_before(u64::MAX, 1).unwrap(), 1);
+        assert_eq!(journal.read_saga(SagaId::new(2)).unwrap().len(), 4);
+        assert!(
+            journal
+                .visit_unresolved_runs(&mut |_| Err(storage("visitor stop")))
+                .is_err()
+        );
+    }
+    #[test]
+    fn memory_failed_effects_and_quarantine_survive_compaction() {
+        effect_and_quarantine_preservation(&InMemoryTerminalResolverJournal::default());
+    }
+    #[cfg(feature = "lmdb")]
+    #[test]
+    fn lmdb_failed_effects_and_quarantine_survive_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        effect_and_quarantine_preservation(
+            &lmdb::LmdbTerminalResolverJournal::open(dir.path()).unwrap(),
+        );
+    }
+    #[test]
+    fn memory_default_fifo_caps_4096_ordinary_runs() {
+        let journal = InMemoryTerminalResolverJournal::default();
+        for id in 0..4098 {
+            journal
+                .append(SagaChoreographyEvent::SagaCompleted {
+                    context: start(id).context().clone(),
+                })
+                .unwrap();
+        }
+        assert_eq!(journal.read_all().unwrap().len(), 4096);
+        assert!(journal.read_saga(SagaId::new(1)).unwrap().is_empty());
+    }
+
+    fn run_batch_bound(journal: &impl TerminalResolverJournal) {
+        for id in 0..300 {
+            let e = start(id);
+            let context = e.context().clone();
+            journal.append(e).unwrap();
+            journal
+                .append(SagaChoreographyEvent::SagaCompleted { context })
+                .unwrap();
+        }
+        assert_eq!(
+            journal.compact_terminal_detail_batched(usize::MAX).unwrap(),
+            256
+        );
+        assert_eq!(journal.read_all().unwrap().len(), 344);
+        assert_eq!(journal.compact_terminal_detail_batched(256).unwrap(), 44);
+        assert_eq!(journal.compact_terminal_detail_batched(256).unwrap(), 0);
+        assert_eq!(
+            journal.prune_resolved_before(u64::MAX, usize::MAX).unwrap(),
+            256
+        );
+        assert_eq!(journal.read_all().unwrap().len(), 44);
+        assert_eq!(journal.prune_resolved_before(u64::MAX, 256).unwrap(), 44);
+        assert_eq!(journal.append(start(500)).unwrap(), 601);
+    }
+    #[test]
+    fn memory_maintenance_limits_runs_per_batch() {
+        run_batch_bound(&InMemoryTerminalResolverJournal::default());
+    }
+    #[cfg(feature = "lmdb")]
+    #[test]
+    fn lmdb_maintenance_limits_runs_per_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        run_batch_bound(&lmdb::LmdbTerminalResolverJournal::open(dir.path()).unwrap());
+    }
+    #[cfg(feature = "lmdb")]
+    #[test]
+    fn lmdb_partial_compaction_resumes_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lmdb::LmdbTerminalResolverJournal::open(dir.path()).unwrap();
+        let e = start(1);
+        let context = e.context().clone();
+        for _ in 0..600 {
+            journal.append(e.clone()).unwrap();
+        }
+        journal
+            .append(SagaChoreographyEvent::SagaCompleted { context })
+            .unwrap();
+        assert_eq!(journal.compact_terminal_detail_batched(256).unwrap(), 1);
+        assert_eq!(journal.read_all().unwrap().len(), 345);
+        drop(journal);
+        let journal = lmdb::LmdbTerminalResolverJournal::open(dir.path()).unwrap();
+        assert_eq!(journal.compact_terminal_detail_batched(256).unwrap(), 1);
+        assert_eq!(journal.read_all().unwrap().len(), 89);
+        assert_eq!(journal.compact_terminal_detail_batched(256).unwrap(), 1);
+        assert_eq!(journal.read_all().unwrap().len(), 1);
+        assert_eq!(journal.append(start(2)).unwrap(), 602);
+    }
+    #[test]
+    fn custom_streaming_reports_unsupported_without_read_all_fallback() {
+        struct Custom;
+        impl TerminalResolverJournal for Custom {
+            fn append(
+                &self,
+                _: SagaChoreographyEvent,
+            ) -> Result<u64, TerminalResolverJournalError> {
+                unreachable!()
+            }
+            fn read_all(
+                &self,
+            ) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError>
+            {
+                panic!("must not load history")
+            }
+        }
+        let journal: &dyn TerminalResolverJournal = &Custom;
+        assert!(matches!(
+            journal.visit_unresolved_runs(&mut |_| Ok(())),
+            Err(TerminalResolverJournalError::Unsupported(_))
+        ));
+        assert!(matches!(
+            journal.compact_terminal_detail(),
+            Err(TerminalResolverJournalError::Unsupported(_))
+        ));
+    }
+    #[cfg(feature = "lmdb")]
+    #[test]
+    fn lmdb_index_identity_mismatch_is_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lmdb::LmdbTerminalResolverJournal::open(dir.path()).unwrap();
+        let sequence = journal.append(start(1)).unwrap();
+        let owner = crate::lmdb_owner::LmdbEnvOwner::acquire(dir.path()).unwrap();
+        let mut txn = owner.env().write_txn().unwrap();
+        let rows = owner
+            .env()
+            .open_database::<heed::types::Str, heed::types::Bytes>(&txn, Some("resolver_events"))
+            .unwrap()
+            .unwrap();
+        let key = rows
+            .iter(&txn)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .0
+            .to_owned();
+        let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&TerminalResolverJournalEntry {
+            sequence,
+            event: start(2),
+        })
+        .unwrap();
+        rows.put(&mut txn, &key, &encoded).unwrap();
+        txn.commit().unwrap();
+        assert!(journal.read_saga(SagaId::new(1)).is_err());
+        assert!(journal.visit_unresolved_runs(&mut |_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn memory_streaming_and_bounded_maintenance() {
+        exercise(&InMemoryTerminalResolverJournal::default());
+    }
+    #[test]
+    fn memory_ordinary_fifo_cap() {
+        let journal = InMemoryTerminalResolverJournal::with_capacity(2, 8);
+        for id in 0..5 {
+            let e = start(id);
+            let context = e.context().clone();
+            journal.append(e).unwrap();
+            if id > 0 {
+                journal
+                    .append(SagaChoreographyEvent::SagaCompleted { context })
+                    .unwrap();
+            }
+        }
+        assert!(journal.read_saga(SagaId::new(1)).unwrap().is_empty());
+        assert_eq!(journal.read_saga(SagaId::new(0)).unwrap().len(), 1);
+    }
+    #[cfg(feature = "lmdb")]
+    #[test]
+    fn lmdb_streaming_and_bounded_maintenance() {
+        let dir = tempfile::tempdir().unwrap();
+        exercise(&lmdb::LmdbTerminalResolverJournal::open(dir.path()).unwrap());
     }
 }

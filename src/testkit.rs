@@ -246,7 +246,6 @@ pub struct SagaTestWorld {
 #[cfg(any(test, feature = "test-harness"))]
 impl SagaTestWorld {
     pub fn new() -> Self {
-        crate::bus::ensure_saga_sync_pool_capacity();
         let (transcript_ref, transcript_handle) =
             icanact_core::local_sync::spawn(TranscriptActor::default());
         Self {

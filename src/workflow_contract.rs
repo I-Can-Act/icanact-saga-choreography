@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{SuccessCriteria, TerminalPolicy};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkflowDependencySpec {
     OnSagaStart,
     After(&'static str),
@@ -10,7 +10,7 @@ pub enum WorkflowDependencySpec {
     AllOf(&'static [&'static str]),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SagaWorkflowStepContract {
     pub step_name: &'static str,
     pub participant_id: &'static str,
@@ -173,6 +173,63 @@ pub(crate) fn required_path_steps_from_success_criteria(
         collect_required_path_step(step.as_ref(), &by_step, &mut required_path);
     }
     required_path
+}
+
+pub(crate) fn workflow_satisfiable(
+    steps: &[SagaWorkflowStepContract],
+    criteria: &SuccessCriteria,
+    live: &HashSet<Box<str>>,
+) -> bool {
+    fn reachable<'a>(
+        name: &'a str,
+        by_step: &HashMap<&str, &SagaWorkflowStepContract>,
+        live: &HashSet<Box<str>>,
+        memo: &mut HashMap<&'a str, bool>,
+    ) -> bool {
+        if let Some(result) = memo.get(name) {
+            return *result;
+        }
+        // Also makes malformed cyclic input fail closed; validated DAGs visit
+        // every vertex and dependency at most once.
+        memo.insert(name, false);
+        let result = live.contains(name)
+            && by_step.get(name).is_some_and(|step| match step.depends_on {
+                WorkflowDependencySpec::OnSagaStart => true,
+                WorkflowDependencySpec::After(dep) => reachable(dep, by_step, live, memo),
+                WorkflowDependencySpec::AllOf(deps) => {
+                    !deps.is_empty() && deps.iter().all(|dep| reachable(dep, by_step, live, memo))
+                }
+                WorkflowDependencySpec::AnyOf(deps) => {
+                    deps.iter().any(|dep| reachable(dep, by_step, live, memo))
+                }
+            });
+        memo.insert(name, result);
+        result
+    }
+    let by_step = steps.iter().map(|step| (step.step_name, step)).collect();
+    let mut memo = HashMap::new();
+    match criteria {
+        SuccessCriteria::AllOf(required) => {
+            !required.is_empty()
+                && required
+                    .iter()
+                    .all(|name| reachable(name, &by_step, live, &mut memo))
+        }
+        SuccessCriteria::AnyOf(required) => required
+            .iter()
+            .any(|name| reachable(name, &by_step, live, &mut memo)),
+        SuccessCriteria::Quorum {
+            group_steps,
+            required_count,
+        } => {
+            *required_count > 0
+                && group_steps
+                    .iter()
+                    .filter(|name| reachable(name, &by_step, live, &mut memo))
+                    .count()
+                    >= *required_count
+        }
+    }
 }
 
 fn collect_required_path_step(
@@ -406,6 +463,43 @@ mod tests {
             stalled_timeout: Duration::from_secs(10),
             workflow_steps: &[],
         }
+    }
+
+    #[test]
+    fn boolean_anyof_requires_one_live_branch_and_allof_requires_all() {
+        let steps = [
+            SagaWorkflowStepContract {
+                step_name: "a",
+                participant_id: "a",
+                depends_on: WorkflowDependencySpec::OnSagaStart,
+            },
+            SagaWorkflowStepContract {
+                step_name: "b",
+                participant_id: "b",
+                depends_on: WorkflowDependencySpec::OnSagaStart,
+            },
+            SagaWorkflowStepContract {
+                step_name: "end",
+                participant_id: "end",
+                depends_on: WorkflowDependencySpec::AnyOf(&["a", "b"]),
+            },
+        ];
+        let criteria = SuccessCriteria::AllOf(["end".into()].into_iter().collect());
+        let live = ["a".into(), "end".into()].into_iter().collect();
+        assert!(super::workflow_satisfiable(&steps, &criteria, &live));
+        assert!(!super::workflow_satisfiable(
+            &steps,
+            &criteria,
+            &["end".into()].into_iter().collect()
+        ));
+        let mut all = steps;
+        all[2].depends_on = WorkflowDependencySpec::AllOf(&["a", "b"]);
+        assert!(!super::workflow_satisfiable(&all, &criteria, &live));
+        let quorum = SuccessCriteria::Quorum {
+            group_steps: ["a".into(), "b".into()].into_iter().collect(),
+            required_count: 2,
+        };
+        assert!(!super::workflow_satisfiable(&steps, &quorum, &live));
     }
 
     #[test]
