@@ -4642,6 +4642,20 @@ pub mod lmdb {
         meta: Database<Str, Str>,
     }
 
+    impl Drop for LmdbJournal {
+        fn drop(&mut self) {
+            // heed 0.20 keeps envs in a process-global cache until prepared for
+            // closing. Never wait here: drop may run on a scheduler worker.
+            // prepare_for_closing panics if the path was already prepared (e.g.
+            // two handles opened on one path share one cached env); a drop must
+            // never panic, so absorb that case.
+            let env = self.env.clone();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _ = env.prepare_for_closing();
+            }));
+        }
+    }
+
     impl LmdbJournal {
         pub fn open(path: &Path) -> Result<Self, JournalError> {
             std::fs::create_dir_all(path)
@@ -4857,6 +4871,20 @@ pub mod lmdb {
     pub struct LmdbDedupe {
         env: Env,
         entries: Database<Str, Str>,
+    }
+
+    impl Drop for LmdbDedupe {
+        fn drop(&mut self) {
+            // heed 0.20 keeps envs in a process-global cache until prepared for
+            // closing. Never wait here: drop may run on a scheduler worker.
+            // prepare_for_closing panics if the path was already prepared (e.g.
+            // two handles opened on one path share one cached env); a drop must
+            // never panic, so absorb that case.
+            let env = self.env.clone();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _ = env.prepare_for_closing();
+            }));
+        }
     }
 
     impl LmdbDedupe {
