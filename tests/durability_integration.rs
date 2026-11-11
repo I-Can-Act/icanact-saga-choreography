@@ -147,8 +147,8 @@ fn lmdb_open_recovers_accepted_step_metadata_for_restart_completion() {
     let ctx = context(90, ORDER_LIFECYCLE, TEST_STEP);
     let execution_id = StepExecutionId::new("external-90");
     let policy = AcceptedStepPolicy {
-        idle_timeout: std::time::Duration::from_millis(100),
-        hard_timeout: std::time::Duration::from_millis(250),
+        idle_timeout: std::time::Duration::from_secs(60),
+        hard_timeout: std::time::Duration::from_secs(60),
         timeout_outcome: AcceptedStepTimeoutOutcome::FailStep {
             requires_compensation: false,
         },
