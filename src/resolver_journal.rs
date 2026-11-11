@@ -191,6 +191,20 @@ pub mod lmdb {
         meta: Database<Str, Str>,
     }
 
+    impl Drop for LmdbTerminalResolverJournal {
+        fn drop(&mut self) {
+            // heed 0.20 keeps envs in a process-global cache until prepared for
+            // closing. Never wait here: drop may run on a scheduler worker.
+            // prepare_for_closing panics if the path was already prepared (e.g.
+            // two handles opened on one path share one cached env); a drop must
+            // never panic, so absorb that case.
+            let env = self.env.clone();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _ = env.prepare_for_closing();
+            }));
+        }
+    }
+
     impl LmdbTerminalResolverJournal {
         pub fn open(path: &Path) -> Result<Self, TerminalResolverJournalError> {
             Self::open_with_map_size(path, DEFAULT_MAP_SIZE_BYTES)
@@ -521,6 +535,53 @@ mod tests {
                 .build(),
             Vec::new(),
         )
+    }
+
+    #[test]
+    fn resolver_journal_envs_close_on_drop() {
+        let dir = tempfile::tempdir().expect("tempdir should open");
+        for iteration in 0..600 {
+            let journal = LmdbTerminalResolverJournal::open(
+                &dir.path().join(format!("resolver-{iteration}")),
+            )
+            .unwrap_or_else(|err| panic!("resolver open failed at iteration {iteration}: {err}"));
+            drop(journal);
+        }
+    }
+
+    #[test]
+    fn resolver_journal_preserves_rows_after_drop_and_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir should open");
+        let journal = LmdbTerminalResolverJournal::open(dir.path()).unwrap();
+        let sequence = journal.append(event(100)).unwrap();
+        drop(journal);
+
+        let journal = LmdbTerminalResolverJournal::open(dir.path()).unwrap();
+        let rows = journal.read_all().expect("rows should read back");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sequence, sequence);
+        assert!(matches!(
+            &rows[0].event,
+            crate::SagaChoreographyEvent::SagaStarted { context, .. }
+                if context.saga_id == crate::SagaId::new(100)
+        ));
+        let saga_rows = journal.read_saga(crate::SagaId::new(100)).unwrap();
+        assert_eq!(saga_rows.len(), 1);
+        assert_eq!(saga_rows[0].sequence, sequence);
+        assert_eq!(journal.append(event(101)).unwrap(), sequence + 1);
+    }
+
+    #[test]
+    fn resolver_journal_double_open_drop_and_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir should open");
+        let journal = LmdbTerminalResolverJournal::open(dir.path()).unwrap();
+        let second_journal = LmdbTerminalResolverJournal::open(dir.path()).unwrap();
+        drop(journal);
+        drop(second_journal);
+
+        let journal = LmdbTerminalResolverJournal::open(dir.path()).unwrap();
+        assert!(journal.read_all().unwrap().is_empty());
+        assert_eq!(journal.append(event(100)).unwrap(), 1);
     }
 
     #[test]
