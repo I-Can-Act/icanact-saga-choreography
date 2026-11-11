@@ -20,6 +20,12 @@ To make an actor saga-capable:
 2. implement `HasSagaParticipantSupport`
 3. implement `SagaParticipant`
 4. route incoming `SagaChoreographyEvent` messages through `apply_sync_participant_saga_ingress(...)` or `apply_async_participant_saga_ingress(...)`
+5. attach the bus to the embedded support (`saga.attach_bus(bus.clone())`, or
+   `SagaParticipantSupportExt::attach_saga_bus`) before the actor can receive saga
+   events. The ingress helpers republish emitted events through the attached bus;
+   with no bus attached, emitted events reach only the emit hooks and are not
+   published. `SagaTestWorld::spawn_*` attaches the world bus for tests; the
+   `bind_*` subscription helpers cannot do it for a running actor.
 
 To make a workflow startup-safe (required for non-test runtime):
 
@@ -124,7 +130,8 @@ impl SagaParticipant for StepAActor {
 
 ## Startup Registration Pattern
 
-Use startup wiring like this:
+Use startup wiring like this (the LMDB resolver journal requires the crate's
+`lmdb` Cargo feature):
 
 ```rust,ignore
 use std::path::Path;
@@ -174,7 +181,9 @@ For actors implementing `HasSagaWorkflowParticipants`, prefer:
 - `bind_sync_workflow_participant_tell_strict(...)`
 - `bind_async_workflow_participant_channel_strict(...)`
 
-These bind the subscriber path and auto-register workflow steps as bound.
+These bind the subscriber path and auto-register workflow steps as bound. They do
+not attach the bus to the actor's embedded support; the actor must do that itself
+(step 5 above) or ingress output cannot be republished.
 Do not register steps as bound unless a real participant is wired for that step; otherwise the saga can still stall after start.
 Production restart recovery requires the durable resolver attachment above. The
 non-durable attachment used by `SagaTestWorld` is intentionally scoped to isolated tests.
@@ -248,11 +257,12 @@ When your actor receives a saga event inside its normal actor command handling, 
 
 ```rust
 use icanact_saga_choreography::{
-    apply_sync_participant_saga_ingress, SagaChoreographyEvent,
+    SagaChoreographyEvent, SagaParticipant, SagaStateExt,
+    apply_sync_participant_saga_ingress,
 };
 
 fn on_saga_event(
-    actor: &mut impl SagaParticipant + icanact_saga_choreography::SagaStateExt,
+    actor: &mut (impl SagaParticipant + SagaStateExt),
     event: SagaChoreographyEvent,
 ) {
     apply_sync_participant_saga_ingress(actor, event, |_actor, _incoming| {}, |_invalid| {});
@@ -263,7 +273,7 @@ For async participants, use `apply_async_participant_saga_ingress(...)` with the
 
 ## E2E Test Example
 
-When you want to test the real saga workflow code without rewriting the actor for tests, use `SagaTestWorld` behind the `test-harness` feature.
+When you want to test the real saga workflow code without rewriting the actor for tests, use `SagaTestWorld` behind the `test-harness` feature. The snippet below is schematic (`MyActor` is a participant actor shaped like `StepAActor` above, with a `snapshot()` reply); `tests/saga_testkit_smoke.rs` in this repository is the compiling reference for the current `SyncActor`/`SagaTestWorld` surface.
 
 ```rust,ignore
 use std::time::Duration;
@@ -284,6 +294,9 @@ impl SyncActor for MyActor {
     type Tell = MyCmd;
     type Ask = ();
     type Reply = MySnapshot;
+    type Channel = icanact_saga_choreography::SagaParticipantChannel<()>;
+    type PubSub = ();
+    type Broadcast = ();
 
     fn handle_tell(&mut self, msg: Self::Tell) {
         match msg {
@@ -366,6 +379,9 @@ journal clone before store close/reopen. See [operations.md](operations.md).
 ## Notes
 
 - `SagaParticipantSupport` is the canonical integration path.
+- `saga_type` values are used as bus topics: they must be non-empty, at most 256
+  bytes, ASCII, and contain no whitespace or control characters. Publishing or
+  subscribing with an invalid saga type panics in the bus topic check.
 - The crate stays storage-generic; your app can choose in-memory, LMDB, or another backend.
 - Keep your actor business logic generic to your domain; this crate does not impose any actor module structure.
 - For e2e tests, prefer `SagaTestWorld` over manually looping on low-level handlers in unit-style tests.

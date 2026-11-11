@@ -2,11 +2,15 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Thread-safe statistics tracker for a saga participant.
+/// Thread-safe statistics counters for a saga participant.
 ///
-/// Tracks counters for various saga lifecycle events, enabling monitoring
+/// Provides counter storage for saga lifecycle events, enabling monitoring
 /// of participant activity, success rates, and error conditions.
 /// All counters use atomic operations for safe concurrent access.
+///
+/// The framework does not currently increment these counters (including the
+/// instance embedded in `SagaParticipantSupport`): they only move when
+/// application code updates the public fields itself, as in the example.
 ///
 /// # Example
 ///

@@ -122,13 +122,14 @@ impl ParticipantRunEvidence {
 /// [`crate::HasSagaParticipantSupport`]. Manual `SagaStateExt` implementations
 /// are intentionally not supported.
 ///
-/// # Implementation Requirements
+/// # How to get this trait
 ///
-/// Implementors must provide:
-/// - Mutable and immutable access to the saga state map
-/// - Access to the participant journal for event persistence
-/// - Access to the deduplication store for idempotency tracking
-/// - A monotonic timestamp source for time-based operations
+/// Do not implement `SagaStateExt` yourself. Embed
+/// [`crate::SagaParticipantSupport`] and implement
+/// [`crate::HasSagaParticipantSupport`] (`saga_support`/`saga_support_mut`,
+/// with journal and dedupe associated types); the blanket implementation
+/// then supplies state-map, journal and dedupe access plus the shared
+/// strict admission/replay protocol.
 ///
 /// # Example
 ///
@@ -273,10 +274,13 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
         &self.saga_support().dedupe
     }
 
-    /// Returns the current timestamp in milliseconds.
+    /// Returns the current wall-clock timestamp in milliseconds since the
+    /// Unix epoch.
     ///
-    /// This should return a monotonically increasing value suitable for
-    /// time-based operations such as timeouts and expiration checks.
+    /// This is system time, not a monotonic clock: run identity and deadline
+    /// bookkeeping are expressed in epoch milliseconds, so a system-clock
+    /// jump can move observed deadlines. On clock error it logs and
+    /// returns 0.
     fn now_millis(&self) -> u64 {
         match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             Ok(duration) => duration.as_millis() as u64,

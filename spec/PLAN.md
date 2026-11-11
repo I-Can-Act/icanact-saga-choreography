@@ -1,974 +1,205 @@
-# Choreography-Based SAGA Architecture Plan
+# Choreography-Based SAGA: Design Specification
 
-## Progress
+This specification describes the `icanact-saga-choreography` crate as implemented on
+`main` at `5af675f`. It replaces the pre-implementation design draft previously held
+in this file (preserved in git history); that draft's module layout, per-actor
+`state_ext.rs` boilerplate, `RetryPolicy`, `handle_saga_event`, and Deribit example
+structure do not exist in the crate and must not be used. Operational procedures live
+in [`docs/operations.md`](../docs/operations.md), integration steps in
+[`docs/integration_guide.md`](../docs/integration_guide.md), and breaking-change notes
+in [`docs/migration.md`](../docs/migration.md). This file holds design only: no
+execution status or verification claims.
 
-- completed: embedded `SagaParticipantSupport<J, D>` support object added
-- completed: `HasSagaParticipantSupport<J, D>` access trait added
-- completed: blanket `SagaStateExt` implementation for embedded support added
-- completed: crate-internal tests migrated to the embedded support path where needed
-- completed: one real downstream integration pattern validated by migrating `rust_bot_v2` execution saga actors onto embedded support
-- completed: canonical crate docs now prefer embedded saga support over manual `SagaStateExt` plumbing
-- completed: quality-gate validation and follow-up fixes
+## Purpose
 
-## Canonical Integration Note
+Choreography-based saga coordination native to `icanact-core` actors: actors are the
+service boundaries, and saga participation is actor behavior over a pub/sub event bus
+rather than a central orchestrator process. A saga progresses by choreography events;
+failure is handled by serialized reverse compensation, with quarantine whenever an
+outcome is ambiguous. The crate fails closed on uncertain effects and never promises
+exactly-once external execution.
 
-The embedded `saga: SagaParticipantSupport<J, D>` model is now the canonical integration path.
-
-Historical references in this document to per-actor flat fields and dedicated `state_ext.rs` boilerplate are obsolete and should not be used for any new integration.
-
-## Verified
-
-- cargo fmt --check
-- cargo check --all-targets
-- cargo test --all-targets
-- RUSTFLAGS='-D warnings' cargo test --all-targets
-
-## Executive Summary
-
-A choreography-based SAGA pattern that integrates **natively** with `icanact-core` actors.
-
-**Key Principle**: Actors ARE the microservices. Saga choreography is just another actor behavior using tell/ask/pubsub.
-
----
-
-## Clear Separation: Framework vs Actor Implementation
-
-### Framework Level (`icanact-saga-choreography` crate)
-
-Everything in this crate is **reusable** and **common** to all saga participants:
+## Module Map (as implemented)
 
 ```
-icanact-saga-choreography/
-├── src/
-│   ├── lib.rs                    # Re-exports
-│   │
-│   ├── types/                    # CORE TYPES (framework provides)
-│   │   ├── mod.rs
-│   │   ├── context.rs            # SagaId, SagaContext, PeerId
-│   │   ├── idempotency.rs        # IdempotencyKey
-│   │   └── timestamp.rs          # Timestamp utilities
-│   │
-│   ├── state/                    # TYPESTATE STATES (framework provides)
-│   │   ├── mod.rs
-│   │   ├── markers.rs            # StepState, TerminalState traits
-│   │   ├── states.rs             # Idle, Triggered, Executing, Completed, Failed, Compensating, Compensated, Quarantined
-│   │   ├── container.rs          # SagaParticipantState<S>, SagaStateEntry
-│   │   └── transitions.rs        # State transition impls
-│   │
-│   ├── events/                   # EVENTS (framework provides)
-│   │   ├── mod.rs
-│   │   ├── choreography.rs       # SagaChoreographyEvent
-│   │   └── participant.rs        # ParticipantEvent
-│   │
-│   ├── errors.rs                 # StepOutput, StepError, CompensationError
-│   │
-│   ├── traits/                   # TRAITS (actor implements)
-│   │   ├── mod.rs
-│   │   ├── participant.rs        # SagaParticipant trait
-│   │   ├── state_ext.rs          # SagaStateExt trait
-│   │   └── subscription.rs       # DependencySpec, RetryPolicy
-│   │
-│   ├── storage/                  # STORAGE TRAITS (framework provides, actor supplies impl)
-│   │   ├── mod.rs
-│   │   ├── journal.rs            # ParticipantJournal trait
-│   │   ├── dedupe.rs             # ParticipantDedupeStore trait
-│   │   └── heed_impl.rs          # Heed (LMDB) implementation
-│   │
-│   ├── observability/            # OBSERVABILITY (framework provides)
-│   │   ├── mod.rs
-│   │   ├── stats.rs              # ParticipantStats
-│   │   └── observer.rs           # SagaObserver trait
-│   │
-│   └── helpers/                  # HELPERS (framework provides)
-        ├── mod.rs
-        ├── handler.rs            # handle_saga_event()
-        ├── execution.rs          # execute_step_wrapper(), compensate_wrapper()
-        └── recovery.rs           # recover_sagas()
+src/
+├── lib.rs                 # crate docs and public re-exports
+├── context.rs             # SagaId, SagaContext, PeerId, StepId
+├── events.rs              # SagaChoreographyEvent, ParticipantEvent (archived)
+├── errors.rs              # StepOutput, StepError, Compensation*, effect dispatch
+├── state.rs               # typestate participant states and transitions
+├── support.rs             # SagaParticipantSupport<J, D>, HasSagaParticipantSupport
+├── state_ext.rs           # SagaStateExt blanket protocol (strict admission/replay)
+├── traits.rs              # SagaParticipant, AsyncSagaParticipant,
+│                          # SagaWorkflowParticipant, DependencySpec
+├── helpers.rs             # sync/async step execution & compensation protocol
+├── durability.rs          # managed ingress (apply_*), accepted-step lifecycle,
+│                          # recovery, lmdb submodule (LmdbJournal/LmdbDedupe)
+├── journal.rs / dedupe.rs # ParticipantJournal / ParticipantDedupeStore + in-memory
+├── lmdb_owner.rs          # path-keyed LMDB env ownership (feature `lmdb`)
+├── bus.rs                 # SagaChoreographyBus: admission gate, resolver hosting,
+│                          # terminal replies, release waiter
+├── binding.rs             # participant subscription/binding helpers (strict variants)
+├── workflow_contract.rs   # SagaWorkflowContract, define_saga_workflow_contract!
+├── resolver.rs            # TerminalResolver state machine and TerminalPolicy
+├── resolver_journal.rs    # TerminalResolverJournal (+ LMDB impl, schema 2)
+├── reply_registry.rs      # terminal waiter handles
+├── observer.rs / stats.rs # observer callback vocabulary; participant counters
+└── testkit.rs             # SagaTestWorld and deterministic helpers
+                           # (feature `test-harness`, or crate tests)
 ```
 
-### Actor Level (what YOU implement for each saga participant)
-
-Each actor that participates in sagas follows this **consistent structure**:
-
-```
-src/actors/my-actor/
-├── mod.rs                        # Re-exports
-├── actor.rs                      # Core actor (impl Actor)
-├── business.rs                   # Business logic (pure functions, no actor deps)
-├── messaging.rs                  # Message types (Command enum)
-│
-├── saga/                         # SAGA IMPLEMENTATION (actor-specific)
-│   ├── mod.rs                    # Re-exports saga impl
-│   ├── participant.rs            # impl SagaParticipant for MyActor
-│   ├── state_ext.rs              # impl SagaStateExt for MyActor
-│   ├── handler.rs                # Saga event handler (calls helpers)
-│   └── types.rs                  # Actor-specific saga types (optional)
-│
-├── tests/
-│   ├── unit.rs                   # Unit tests
-│   ├── integration.rs            # Integration with wire mocks
-│   └── saga.rs                   # Saga-specific tests
-│
-└── architecture.md               # Actor purpose, diagrams, saga role
-```
-
----
-
-## What the Actor Implements
-
-### Required: Two Traits
-
-Every saga participant implements exactly **two traits**:
-
-#### 1. `SagaStateExt` - Infrastructure Access
-
-```rust
-// File: src/actors/my-actor/saga/state_ext.rs
-
-use icanact_saga_choreography::{SagaStateExt, SagaId, SagaStateEntry, 
-    ParticipantJournal, ParticipantDedupeStore};
-use std::collections::HashMap;
-use std::sync::Arc;
-
-impl SagaStateExt for MyActor {
-    /// Provide access to saga states map
-    fn saga_states(&mut self) -> &mut HashMap<SagaId, SagaStateEntry> {
-        &mut self.saga_states
-    }
-    
-    /// Provide access to journal
-    fn saga_journal(&self) -> &Arc<dyn ParticipantJournal> {
-        &self.saga_journal
-    }
-    
-    /// Provide access to dedupe store
-    fn saga_dedupe(&self) -> &Arc<dyn ParticipantDedupeStore> {
-        &self.saga_dedupe
-    }
-    
-    /// Provide time source
-    fn now_millis(&self) -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
-    }
-}
-```
-
-#### 2. `SagaParticipant` - Business Behavior
-
-```rust
-// File: src/actors/my-actor/saga/participant.rs
-
-use icanact_saga_choreography::{
-    SagaParticipant, SagaContext, DependencySpec, RetryPolicy,
-    StepOutput, StepError, CompensationError,
-};
-
-impl SagaParticipant for MyActor {
-    type Error = MyError;
-    
-    // === REQUIRED: Identity ===
-    
-    fn step_name(&self) -> &str {
-        "my_step"  // This actor's step name in the saga
-    }
-    
-    fn saga_types(&self) -> &[&'static str] {
-        &["my_workflow"]  // Which saga types this actor joins
-    }
-    
-    // === REQUIRED: Forward Step ===
-    
-    fn execute_step(
-        &mut self,
-        context: &SagaContext,
-        input: &[u8],
-    ) -> Result<StepOutput, StepError> {
-        // 1. Deserialize input
-        let my_input: MyStepInput = bincode::deserialize(input)
-            .map_err(|e| StepError::Terminal { 
-                reason: format!("deserialize: {}", e).into() 
-            })?;
-        
-        // 2. Call business logic (pure function, testable)
-        let result = business::execute_my_step(&my_input, &self.dependencies)
-            .map_err(|e| StepError::RequireCompensation { 
-                reason: e.to_string().into() 
-            })?;
-        
-        // 3. Return output + compensation data
-        Ok(StepOutput::Completed {
-            output: bincode::serialize(&result.output).unwrap_or_default(),
-            compensation_data: bincode::serialize(&result.undo_info).unwrap_or_default(),
-        })
-    }
-    
-    // === REQUIRED: Compensation ===
-    
-    fn compensate_step(
-        &mut self,
-        context: &SagaContext,
-        compensation_data: &[u8],
-    ) -> Result<(), CompensationError> {
-        let undo_info: UndoInfo = bincode::deserialize(compensation_data)
-            .map_err(|e| CompensationError::Terminal { 
-                reason: format!("deserialize: {}", e).into() 
-            })?;
-        
-        business::compensate_my_step(&undo_info, &self.dependencies)
-            .map_err(|e| CompensationError::Ambiguous { 
-                reason: e.to_string().into() 
-            })
-    }
-    
-    // === OPTIONAL: Configuration ===
-    
-    fn depends_on(&self) -> DependencySpec {
-        DependencySpec::After("previous_step")  // When to execute
-    }
-    
-    fn retry_policy(&self) -> RetryPolicy {
-        RetryPolicy {
-            max_attempts: 3,
-            initial_delay_millis: 1000,
-            max_delay_millis: 10000,
-            backoff_multiplier: 2.0,
-        }
-    }
-    
-    // === OPTIONAL: Hooks ===
-    
-    fn on_saga_completed(&mut self, context: &SagaContext) {
-        tracing::info!(saga_id = %context.saga_id, "Saga completed");
-    }
-    
-    fn on_quarantined(&mut self, context: &SagaContext, reason: &str) {
-        tracing::error!(saga_id = %context.saga_id, reason = %reason, "Quarantined");
-    }
-}
-```
-
-### Required: Actor State Fields
-
-The actor struct must include these fields:
-
-```rust
-// File: src/actors/my-actor/actor.rs
-
-use icanact_saga_choreography::{
-    SagaId, SagaStateEntry, ParticipantJournal, 
-    ParticipantDedupeStore, ParticipantStats,
-};
-use std::collections::HashMap;
-use std::sync::Arc;
-
-pub struct MyActor {
-    // === Business State ===
-    pub orders: HashMap<OrderId, Order>,
-    
-    // === Actor Dependencies ===
-    pub ws_actor: MailboxAddr<WSCommand>,
-    pub db_actor: MailboxAddr<DbCommand>,
-    
-    // === SAGA STATE (required for SagaStateExt) ===
-    pub saga_states: HashMap<SagaId, SagaStateEntry>,
-    pub saga_journal: Arc<dyn ParticipantJournal>,
-    pub saga_dedupe: Arc<dyn ParticipantDedupeStore>,
-    pub saga_stats: Arc<ParticipantStats>,
-}
-```
-
-### Required: Message Variant
-
-The actor's command enum must include a saga event variant:
-
-```rust
-// File: src/actors/my-actor/messaging.rs
-
-use icanact_saga_choreography::SagaChoreographyEvent;
-
-pub enum MyActorCommand {
-    // Business commands
-    DoSomething { /* ... */ },
-    
-    // Saga event (from pubsub subscription)
-    SagaEvent { event: SagaChoreographyEvent },
-    
-    // Admin
-    RecoverSagas { reply_to: ReplyTo<Vec<SagaId>> },
-    GetSagaStats { reply_to: ReplyTo<ParticipantStatsSnapshot> },
-}
-```
-
-### Required: Handler Integration
-
-Wire saga events to the handler in Actor::handle:
-
-```rust
-// File: src/actors/my-actor/actor.rs
-
-use icanact_core::Actor;
-use icanact_saga_choreography::handle_saga_event;
-
-impl Actor for MyActor {
-    type Msg = MyActorCommand;
-    
-    fn handle(&mut self, msg: Self::Msg) {
-        match msg {
-            MyActorCommand::DoSomething { .. } => {
-                // Business logic
-            }
-            
-            // Wire saga events to framework handler
-            MyActorCommand::SagaEvent { event } => {
-                handle_saga_event(self, event);
-            }
-            
-            MyActorCommand::RecoverSagas { reply_to } => {
-                let ids = icanact_saga_choreography::recover_sagas(self);
-                let _ = reply_tell(reply_to, ids);
-            }
-            
-            MyActorCommand::GetSagaStats { reply_to } => {
-                let _ = reply_tell(reply_to, self.saga_stats.snapshot());
-            }
-        }
-    }
-}
-```
-
----
-
-## Summary: Actor Checklist
-
-For each saga participant, create these files:
-
-| File | Purpose | Framework or Actor? |
-|------|---------|---------------------|
-| `saga/mod.rs` | Re-exports | **Actor** |
-| `saga/participant.rs` | `impl SagaParticipant` | **Actor** (business logic) |
-| `saga/state_ext.rs` | `impl SagaStateExt` | **Actor** (boilerplate) |
-| `saga/handler.rs` | Optional custom handling | **Actor** (rarely needed) |
-| `saga/types.rs` | Actor-specific types | **Actor** (if needed) |
-| Actor struct fields | saga_states, journal, dedupe, stats | **Actor** |
-| Command enum | `SagaEvent { event }` variant | **Actor** |
-| Actor::handle | Wire to `handle_saga_event()` | **Actor** |
-
----
-
-## Framework Exports (what you USE)
-
-```rust
-// From icanact-saga-choreography, you use:
-
-// Types
-pub use crate::types::{SagaId, SagaContext, PeerId, IdempotencyKey};
-
-// State (typestate)
-pub use crate::state::{
-    SagaParticipantState, SagaStateEntry, TimestampedEvent,
-    Idle, Triggered, Executing, Completed, Failed,
-    Compensating, Compensated, Quarantined,
-};
-
-// Events
-pub use crate::events::{SagaChoreographyEvent, ParticipantEvent};
-
-// Errors
-pub use crate::errors::{StepOutput, StepError, CompensationError};
-
-// Traits (implement these)
-pub use crate::traits::{SagaParticipant, SagaStateExt, DependencySpec, RetryPolicy};
-
-// Storage
-pub use crate::storage::{ParticipantJournal, ParticipantDedupeStore, HeedJournal, HeedDedupe};
-
-// Observability
-pub use crate::observability::{ParticipantStats, ParticipantStatsSnapshot, SagaObserver};
-
-// Helpers
-pub use crate::helpers::{handle_saga_event, execute_step_wrapper, compensate_wrapper, recover_sagas};
-```
-
----
-
-## Storage: Heed (LMDB)
-
-We use **heed** (LMDB wrapper) for persistent storage - same as the existing icanact-saga.
-
-### Why Heed/LMDB
-
-- **Very fast** - Memory-mapped, minimal overhead
-- **Per-actor** - Each actor can have its own database/env
-- **ACID** - Durable writes, crash recovery
-- **Battle-tested** - LMDB is extremely stable
-- **Already integrated** - Consistent with icanact-saga
-
-### Storage Trait Abstraction
-
-```rust
-pub trait ParticipantJournal: Send + Sync + 'static {
-    fn append(&self, saga_id: SagaId, event: ParticipantEvent) -> Result<u64, JournalError>;
-    fn read(&self, saga_id: SagaId) -> Result<Vec<JournalEntry>, JournalError>;
-    fn list_sagas(&self) -> Result<Vec<SagaId>, JournalError>;
-}
-
-pub trait ParticipantDedupeStore: Send + Sync + 'static {
-    fn check_and_mark(&self, saga_id: SagaId, key: &str) -> Result<bool, DedupeError>;
-    fn prune(&self, saga_id: SagaId) -> Result<(), DedupeError>;
-}
-```
-
-### Heed Implementation
-
-```rust
-// storage/heed_impl.rs
-
-use heed::{Env, Database, types::*};
-use std::sync::Arc;
-
-pub struct HeedJournal {
-    env: Arc<Env>,
-    db: Database<OwnedType<u64>, ByteSlice>,  // saga_id -> events
-}
-
-pub struct HeedDedupe {
-    env: Arc<Env>,
-    db: Database<ByteSlice, Unit>,  // (saga_id, key) -> ()
-}
-```
-
----
-
-## Deribit Order Example Structure
-
-```
-examples/deribit/
-├── main.rs                          # Bootstrap all actors
-├── saga/
-│   ├── mod.rs                       # Deribit saga types
-│   └── types.rs                     # DeribitOrderPayload, etc.
-│
-├── actors/
-│   ├── risk_manager/                # SAGA INITIATOR
-│   │   ├── mod.rs
-│   │   ├── actor.rs                 # impl Actor, starts sagas
-│   │   ├── messaging.rs
-│   │   ├── business.rs
-│   │   └── saga/
-│   │       ├── mod.rs
-│   │       ├── participant.rs       # impl SagaParticipant
-│   │       └── state_ext.rs         # impl SagaStateExt
-│   │
-│   ├── order_placer/                # STEP: prepare_order
-│   │   ├── mod.rs
-│   │   ├── actor.rs
-│   │   ├── messaging.rs
-│   │   ├── business.rs
-│   │   └── saga/
-│   │       ├── mod.rs
-│   │       ├── participant.rs       # depends_on: OnSagaStart
-│   │       └── state_ext.rs
-│   │
-│   ├── order_coordinator/           # STEP: place_order
-│   │   ├── mod.rs
-│   │   ├── actor.rs
-│   │   ├── messaging.rs
-│   │   ├── business.rs
-│   │   └── saga/
-│   │       ├── mod.rs
-│   │       ├── participant.rs       # depends_on: After("prepare_order")
-│   │       └── state_ext.rs
-│   │
-│   ├── deribit_ws/                  # NOT a saga participant (just WS handler)
-│   │   ├── mod.rs
-│   │   ├── actor.rs                 # async actor, owns WS connection
-│   │   ├── messaging.rs
-│   │   └── business.rs
-│   │
-│   └── order_monitor/               # Optional: monitors order state
-│       ├── mod.rs
-│       ├── actor.rs
-│       ├── messaging.rs
-│       └── saga/
-│           ├── mod.rs
-│           ├── participant.rs       # depends_on: After("place_order")
-│           └── state_ext.rs
-```
-
----
-
-## Actor Structure Template
-
-Copy this for each new saga participant:
-
-```
-src/actors/{actor-name}/
-├── mod.rs
-├── actor.rs              # struct MyActor, impl Actor
-├── messaging.rs          # pub enum MyActorCommand
-├── business.rs           # pub fn execute_step(...), pub fn compensate(...)
-│
-├── saga/
-│   ├── mod.rs            # pub mod participant; pub mod state_ext;
-│   ├── participant.rs    # impl SagaParticipant for MyActor
-│   ├── state_ext.rs      # impl SagaStateExt for MyActor
-│   └── types.rs          # (optional) actor-specific types
-│
-├── tests/
-│   ├── mod.rs
-│   ├── unit.rs
-│   └── saga.rs
-│
-└── architecture.md
-```
-
-### File Templates
-
-#### `mod.rs`
-```rust
-mod actor;
-mod messaging;
-mod business;
-mod saga;
-
-pub use actor::MyActor;
-pub use messaging::MyActorCommand;
-```
-
-#### `actor.rs`
-```rust
-use icanact_core::local_sync::{Actor, MailboxAddr, ReplyTo};
-use icanact_saga_choreography::{
-    SagaId, SagaStateEntry, ParticipantJournal, 
-    ParticipantDedupeStore, ParticipantStats, handle_saga_event,
-};
-use std::collections::HashMap;
-use std::sync::Arc;
-
-pub struct MyActor {
-    // Business state
-    // ...
-    
-    // Dependencies
-    // ...
-    
-    // Saga state (required)
-    saga_states: HashMap<SagaId, SagaStateEntry>,
-    saga_journal: Arc<dyn ParticipantJournal>,
-    saga_dedupe: Arc<dyn ParticipantDedupeStore>,
-    saga_stats: Arc<ParticipantStats>,
-}
-
-impl MyActor {
-    pub fn new(
-        saga_journal: Arc<dyn ParticipantJournal>,
-        saga_dedupe: Arc<dyn ParticipantDedupeStore>,
-    ) -> Self {
-        Self {
-            saga_states: HashMap::new(),
-            saga_journal,
-            saga_dedupe,
-            saga_stats: Arc::new(ParticipantStats::new()),
-        }
-    }
-}
-
-impl Actor for MyActor {
-    type Msg = super::messaging::MyActorCommand;
-    
-    fn handle(&mut self, msg: Self::Msg) {
-        use super::messaging::MyActorCommand::*;
-        
-        match msg {
-            SagaEvent { event } => handle_saga_event(self, event),
-            RecoverSagas { reply_to } => { /* ... */ },
-            GetSagaStats { reply_to } => { /* ... */ },
-            // Business messages...
-            _ => {}
-        }
-    }
-}
-```
-
-#### `messaging.rs`
-```rust
-use icanact_core::local_sync::ReplyTo;
-use icanact_saga_choreography::{SagaChoreographyEvent, SagaId, ParticipantStatsSnapshot};
-
-pub enum MyActorCommand {
-    // Business commands
-    DoSomething { reply_to: ReplyTo<Result<(), Box<str>>> },
-    
-    // Saga (required)
-    SagaEvent { event: SagaChoreographyEvent },
-    RecoverSagas { reply_to: ReplyTo<Vec<SagaId>> },
-    GetSagaStats { reply_to: ReplyTo<ParticipantStatsSnapshot> },
-}
-```
-
-#### `saga/mod.rs`
-```rust
-pub mod participant;
-pub mod state_ext;
-// pub mod types;  // if needed
-```
-
-#### `saga/participant.rs`
-```rust
-use crate::{MyActor, MyError};
-use icanact_saga_choreography::{
-    SagaParticipant, SagaContext, DependencySpec, RetryPolicy,
-    StepOutput, StepError, CompensationError,
-};
-
-impl SagaParticipant for MyActor {
-    type Error = MyError;
-    
-    fn step_name(&self) -> &str { "my_step" }
-    fn saga_types(&self) -> &[&'static str] { &["my_workflow"] }
-    
-    fn execute_step(&mut self, ctx: &SagaContext, input: &[u8]) 
-        -> Result<StepOutput, StepError> 
-    {
-        // Call business.rs
-        todo!()
-    }
-    
-    fn compensate_step(&mut self, ctx: &SagaContext, data: &[u8]) 
-        -> Result<(), CompensationError> 
-    {
-        // Call business.rs
-        todo!()
-    }
-    
-    fn depends_on(&self) -> DependencySpec {
-        DependencySpec::OnSagaStart  // or After("other_step")
-    }
-}
-```
-
-#### `saga/state_ext.rs`
-```rust
-use crate::MyActor;
-use icanact_saga_choreography::{SagaStateExt, SagaId, SagaStateEntry,
-    ParticipantJournal, ParticipantDedupeStore};
-use std::collections::HashMap;
-use std::sync::Arc;
-
-impl SagaStateExt for MyActor {
-    fn saga_states(&mut self) -> &mut HashMap<SagaId, SagaStateEntry> {
-        &mut self.saga_states
-    }
-    
-    fn saga_journal(&self) -> &Arc<dyn ParticipantJournal> {
-        &self.saga_journal
-    }
-    
-    fn saga_dedupe(&self) -> &Arc<dyn ParticipantDedupeStore> {
-        &self.saga_dedupe
-    }
-    
-    fn now_millis(&self) -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
-    }
-}
-```
-
-#### `business.rs`
-```rust
-/// Pure business logic - no actor dependencies, easily testable
-pub fn execute_step(input: &StepInput, deps: &Dependencies) 
-    -> Result<StepResult, BusinessError> 
-{
-    // Pure logic here
-    todo!()
-}
-
-pub fn compensate(undo_info: &UndoInfo, deps: &Dependencies) 
-    -> Result<(), CompensationError> 
-{
-    // Pure logic here
-    todo!()
-}
-```
-
----
-
-## Key Design Decisions
-
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| **Framework vs Actor** | Framework provides types/traits/helpers, actor implements 2 traits | Clear separation, minimal per-actor code |
-| **State Storage** | In actor struct (HashMap<SagaId, SagaStateEntry>) | Local, fast, actor owns its state |
-| **Persistent Storage** | Heed (LMDB) | Fast, per-actor, already used in icanact-saga |
-| **Event Handling** | `handle_saga_event()` helper | Single function call in Actor::handle |
-| **Business Logic** | Separate file, pure functions | Testable, no actor deps |
-
----
-
-## Deribit Order Example in `icanact-examples`
-
-The full Deribit order workflow example should be created in the `icanact-examples` repository:
-
-```
-icanact-examples/
-├── Cargo.toml                          # Add icanact-saga-choreography dependency
-│
-└── examples/
-    └── deribit-order-saga/
-        ├── Cargo.toml
-        │
-        ├── src/
-        │   ├── main.rs                 # Bootstrap
-        │   │
-        │   ├── saga/
-        │   │   ├── mod.rs
-        │   │   └── types.rs            # DeribitOrderPayload, etc.
-        │   │
-        │   └── actors/
-        │       ├── mod.rs
-        │       │
-        │       ├── ta_signal/           # Signal generator
-        │       │   ├── mod.rs
-        │       │   ├── actor.rs
-        │       │   ├── messaging.rs
-        │       │   ├── business.rs
-        │       │   └── tests/
-        │       │       └── mod.rs
-        │       │
-        │       ├── risk_manager/        # SAGA INITIATOR
-        │       │   ├── mod.rs
-        │       │   ├── actor.rs
-        │       │   ├── messaging.rs
-        │       │   ├── business.rs
-        │       │   ├── saga/
-        │       │   │   ├── mod.rs
-        │       │   │   ├── participant.rs
-        │       │   │   └── state_ext.rs
-        │       │   └── tests/
-        │       │       └── saga.rs
-        │       │
-        │       ├── order_placer/        # STEP: prepare_order
-        │       │   ├── mod.rs
-        │       │   ├── actor.rs
-        │       │   ├── messaging.rs
-        │       │   ├── business.rs
-        │       │   ├── saga/
-        │       │   │   ├── mod.rs
-        │       │   │   ├── participant.rs
-        │       │   │   └── state_ext.rs
-        │       │   └── tests/
-        │       │
-        │       ├── order_coordinator/   # STEP: place_order
-        │       │   ├── mod.rs
-        │       │   ├── actor.rs
-        │       │   ├── messaging.rs
-        │       │   ├── business.rs
-        │       │   ├── saga/
-        │       │   │   ├── mod.rs
-        │       │   │   ├── participant.rs
-        │       │   │   └── state_ext.rs
-        │       │   └── tests/
-        │       │
-        │       ├── deribit_ws/          # NOT a saga participant
-        │       │   ├── mod.rs
-        │       │   ├── actor.rs         # async actor
-        │       │   ├── messaging.rs
-        │       │   └── business.rs
-        │       │
-        │       ├── order_monitor/       # STEP: monitor_order
-        │       │   ├── mod.rs
-        │       │   ├── actor.rs
-        │       │   ├── messaging.rs
-        │       │   ├── business.rs
-        │       │   ├── saga/
-        │       │   │   ├── mod.rs
-        │       │   │   ├── participant.rs
-        │       │   │   └── state_ext.rs
-        │       │   └── tests/
-        │       │
-        │       └── rate_limiter/        # NOT a saga participant
-        │           ├── mod.rs
-        │           ├── actor.rs
-        │           ├── messaging.rs
-        │           └── tests/
-        │
-        └── architecture.md              # Overview, flow diagrams
-```
-
-### Example Cargo.toml
-
-```toml
-[package]
-name = "deribit-order-saga"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-icanact-core = { path = "../../icanact-core" }
-icanact-saga-choreography = { path = "../../icanact-saga-choreography" }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros"] }
-tracing = "0.1"
-tracing-subscriber = "0.3"
-serde = { version = "1", features = ["derive"] }
-bincode = "1.3"
-uuid = { version = "1", features = ["v4"] }
-
-[dev-dependencies]
-tempfile = "3"
-```
-
-### Flow Diagram (for architecture.md)
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        DERIBIT ORDER SAGA FLOW                               │
-│                                                                             │
-│  Market Data                                                                │
-│      │                                                                      │
-│      ▼                                                                      │
-│  ┌──────────────┐                                                          │
-│  │ TASignal     │ SignalEvent                                              │
-│  │ Actor        │──────────────────┐                                       │
-│  │ (sync)       │                  │                                       │
-│  └──────────────┘                  ▼                                       │
-│                           ┌──────────────┐                                  │
-│                           │RiskManager   │                                  │
-│                           │ Actor        │                                  │
-│                           │ (sync)       │                                  │
-│                           │              │                                  │
-│                           │ GO ──────────┼──▶ SagaStarted ──────────────┐  │
-│                           │ NOGO         │   (pubsub)                   │  │
-│                           └──────────────┘                               │  │
-│                                   ▲                                       │  │
-│                                   │ check                                 │  │
-│                           ┌──────┴───────┐                                │  │
-│                           │RateLimiter   │                                │  │
-│                           │ Actor        │                                │  │
-│                           └──────────────┘                                │  │
-│                                                                          │  │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │  │
-│  │                      SAGA: deribit_order                             │  │  │
-│  │                                                                      │  │  │
-│  │  SagaStarted ─────────────────────────────────────────────────────▶ │  │  │
-│  │       │                                                              │  │  │
-│  │       ▼                                                              │  │  │
-│  │  ┌──────────────┐                                                    │  │  │
-│  │  │OrderPlacer   │ prepare_order                                      │  │  │
-│  │  │ Actor        │─────────────────────┐                              │  │  │
-│  │  │ (sync)       │                     │                              │  │  │
-│  │  │ saga/        │                     ▼                              │  │  │
-│  │  └──────────────┘              StepCompleted ──────────────────┐    │  │  │
-│  │       depends_on:               (prepare_order)                │    │  │  │
-│  │       OnSagaStart                                              │    │  │  │
-│  │                                                                ▼    │  │  │
-│  │  ┌──────────────┐                                         ┌────┴───┐│  │  │
-│  │  │OrderCoord    │ place_order                             │Deribit ││  │  │
-│  │  │ Actor        │◀────────────────────────────────────────│WS      ││  │  │
-│  │  │ (sync)       │              ask                         │Actor   ││  │  │
-│  │  │ saga/        │                                         │(async) ││  │  │
-│  │  └──────────────┘                                         └────────┘│  │  │
-│  │       depends_on:                                                   │  │  │
-│  │       After("prepare_order")                                        │  │  │
-│  │       │                                                             │  │  │
-│  │       ▼                                                             │  │  │
-│  │  StepCompleted (place_order) ───────────────────────────────────┐  │  │  │
-│  │       │                                                          │  │  │  │
-│  │       ▼                                                          │  │  │  │
-│  │  ┌──────────────┐                                                │  │  │  │
-│  │  │OrderMonitor  │ monitor_order                                  │  │  │  │
-│  │  │ Actor        │◀──────────────── order updates ────────────────┘  │  │  │
-│  │  │ (sync)       │                                                   │  │  │
-│  │  │ saga/        │                                                   │  │  │
-│  │  └──────────────┘                                                   │  │  │
-│  │       │                                                             │  │  │
-│  │       ▼ (order filled)                                              │  │  │
-│  │  SagaCompleted ◀────────────────────────────────────────────────────┘  │  │
-│  │                                                                       │  │
-│  │  ON FAILURE:                                                          │  │
-│  │       │                                                               │  │  │
-│  │       ▼                                                               │  │  │
-│  │  CompensationRequested ───────────────────────────────────────────────┼──┘
-│  │       │                                                               │
-│  │       ▼                                                               │
-│  │  Each participant with Completed state:                               │
-│  │       compensate_step()                                               │
-│  │       emit CompensationCompleted                                      │
-│  │                                                                       │
-│  └───────────────────────────────────────────────────────────────────────┘
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Test Infrastructure
-
-The example includes comprehensive test infrastructure:
-
-```
-deribit-order-saga/
-├── tests/
-│   ├── common/
-│   │   └── mod.rs           # Test harness, SagaEventCollector, MockWSBehavior
-│   ├── mock_ws.rs           # Mock Deribit WS actor with connection kill
-│   └── e2e_saga_tests.rs    # 18+ e2e tests covering edge cases
-```
-
-#### Mock WebSocket Actor
-
-The `MockDeribitWSActor` provides controlled responses for testing:
-
-```rust
-let ws_behavior = MockWSBehavior {
-    place_order_response: Some(Ok(DeribitWSResponse::OrderPlaced {
-        order_id: "order-test-123".into(),
-    })),
-    cancel_order_response: Some(Ok(DeribitWSResponse::OrderCancelled)),
-    should_drop_connection: false,
-    delay_millis: 0,
-};
-
-let harness = TestHarness::with_behavior(ws_behavior);
-```
-
-#### Connection Kill Testing
-
-Simulate connection failures during saga execution:
-
-```rust
-// Kill connection during order placement
-let ws_behavior = MockWSBehavior {
-    should_drop_connection: true,
-    ..Default::default()
-};
-let harness = TestHarness::with_behavior(ws_behavior);
-
-// Or kill connection after order placed (during compensation)
-harness.drop_ws_connection();
-```
-
-#### E2E Test Coverage
-
-| Test | Description |
-|------|-------------|
-| `test_happy_path_order_placed_and_filled` | Complete successful order flow |
-| `test_risk_rejected_low_confidence` | Signal rejected, no saga started |
-| `test_instrument_blocked_during_active_saga` | Concurrent orders blocked |
-| `test_order_rejected_triggers_compensation` | Order reject → compensation |
-| `test_connection_kill_during_order_placement` | WS drop during ask |
-| `test_connection_kill_during_compensation` | WS drop during cancel |
-| `test_ws_error_response` | Error response handling |
-| `test_multiple_different_instruments` | Parallel sagas |
-| `test_sell_signal_flow` | Sell order flow |
-| `test_duplicate_event_handling` | Idempotency verification |
-| `test_order_filled_completes_saga` | Monitor → SagaCompleted |
-| `test_order_cancelled_fails_saga` | Monitor → SagaFailed |
-| `test_exposure_limit_exceeded` | Risk limit enforcement |
-| `test_concurrent_sagas_different_instruments` | Parallel execution |
-| `test_saga_quarantine_on_compensation_failure` | Quarantine flow |
-| `test_circuit_breaker_on_repeated_failures` | Repeated failures |
+## Core Model
+
+- A **run** is identified by `(saga_type, saga_id, saga_started_at_millis)`. Redelivery
+  keeps the original context; a later run reusing an ID needs a strictly later start
+  and ordinary resolution of every previous identified run.
+- Participants exchange `SagaChoreographyEvent` values on the bus topic named by
+  `saga_type`: `SagaStarted`, `StepStarted`, `StepAccepted`, `StepCompleted`,
+  `StepFailed`, `CompensationRequested`, `CompensationStarted`,
+  `CompensationAccepted`, `CompensationCompleted`, `CompensationFailed`,
+  `SagaCompleted`, `SagaFailed`, `SagaQuarantined`.
+- Each participant actor embeds one `SagaParticipantSupport<J, D>` owning its volatile
+  per-run state (keyed by `SagaId`), journal `J`, dedupe store `D`, accepted-step
+  metadata, and an optional attached `SagaChoreographyBus`.
+- Participant-local state uses the typestate machine in `state.rs`
+  (`Idle → Triggered → Executing → Completed | Failed | Compensating | Quarantined`,
+  `Completed → Compensating → Compensated | Failed | Quarantined`).
+
+## Actor Integration Contract
+
+For each saga participant the application provides:
+
+1. A `saga: SagaParticipantSupport<J, D>` field on the actor.
+2. `HasSagaParticipantSupport` exposing that field. `SagaStateExt` is then
+   blanket-implemented; it is never implemented directly and there are no per-actor
+   state/journal/dedupe fields to wire.
+3. Business behavior via `SagaParticipant` (sync), `AsyncSagaParticipant` (async), or
+   `SagaWorkflowParticipant` objects registered through
+   `HasSagaWorkflowParticipants` (one actor, several workflow contracts). Required
+   surface: step name, saga types, `execute_step`, `compensate_step`; optional:
+   `depends_on` (`DependencySpec`), terminal hooks, identity overrides, and
+   `dispatch_effect` for `StepOutput::CompletedWithEffect`.
+4. A saga-event route into the actor (a command/tell variant, or preferably a
+   dedicated `SagaParticipantChannel`), forwarded to the managed ingress helpers
+   `apply_sync_participant_saga_ingress`, `apply_async_participant_saga_ingress`, or
+   the workflow variants. The low-level `handle_saga_event_with_emit` /
+   `handle_async_saga_event_with_emit` functions are the protocol core beneath those
+   helpers, not the runtime entry point.
+5. Bus attachment (`SagaParticipantSupport::attach_bus`) before ingress, so the
+   managed helpers can validate and republish emitted events. Subscription/binding
+   helpers in `binding.rs` (`bind_*_strict` for workflow actors) subscribe the actor
+   and register bound steps; they do not attach the bus.
+
+The crate imposes no actor folder layout. Application code owns actor construction,
+business state, and message enums.
+
+## Workflow Contracts and the Startup Gate
+
+Each saga type declares a `SagaWorkflowContract` (usually via
+`define_saga_workflow_contract!`): `saga_type`, `first_step`, the step graph with
+dependencies (`on_start`, `after`, `any_of`, `all_of`), failure authority, required
+(terminal) steps, and overall/stalled timeouts. `validate_workflow_contract` rejects
+invalid contracts at registration (duplicate steps, undeclared dependencies, cycles,
+missing required terminal steps, invalid policy).
+
+A `SagaStarted` is only fanned out when all of the following hold; admission
+(durable run reservation) happens before contract diagnostics, and a refused start
+never fabricates failure for an existing owner:
+
+1. the run is admitted (durable starts are journaled and reserved before fanout);
+2. a terminal policy/resolver is attached (`attach_terminal_resolver*`, durable in
+   production);
+3. a workflow contract is registered, the start step equals `first_step`, and every
+   declared step is bound (`register_bound_workflow_step` or strict binding helpers) —
+   violations publish a diagnostic `SagaFailed` and make `publish_strict` return an
+   admission error;
+4. for durable resolvers, recovery has been activated
+   (`activate_terminal_resolver_recovery_for_contract`). Non-durable attachment starts
+   activated.
+
+Live fanout below the required minimum (`required_path_steps + terminal_resolver`)
+quarantines the run, because an effect owner may already have received the event.
+
+## Terminal Resolution
+
+The `TerminalResolver` owns per-run completion: success criteria, failure authority,
+`overall_timeout` (wall clock) and `stalled_timeout` (reset by progress), plus
+per-step accepted deadlines (`AcceptedStepPolicy`: idle/hard timeouts and
+`FailStep`/`QuarantineSaga` outcome). Invariants:
+
+- Rollback is serialized: one compensation owner at a time, in reverse
+  effect-completion order; accepted compensation must reach authoritative completion
+  before the queue advances or terminal failure publishes.
+- Forward timeout with known effects starts rollback (with renewed budgets); expiry
+  or failure with unresolved rollback quarantines with evidence retained.
+- Success and failure differ: late effects after `SagaCompleted` keep the successful
+  effect, while after failure they escalate to quarantine, potentially superseding an
+  already-returned `SagaFailed` or a successor run's ordinary outcome.
+- Replay fences are durable: terminal and quarantine outcomes are journaled, and
+  managed ingress rejects stale or replayed runs after restart; volatile caches are
+  never authority.
+
+## Execution Rules
+
+- Managed ingress records durable intent before business execution and publishes
+  `StepStarted` (attached bus) strictly before the step runs; a failed intent write
+  prevents the effect, and a failed result write never publishes success.
+- Plain `Completed` is committed by one strict journal proof append
+  (`ParticipantForwardOutcomeRecorded`) before publication. Declared effects
+  (`CompletedWithEffect`) persist result/compensation first, then call
+  `dispatch_effect`, which fails closed (`Unsupported`) by default; only a returned
+  `EffectDispatchOutcome::Durable { receipt }` allows success publication. A declared
+  effect without compensation capability is irreversible.
+- Accepted steps (`StepOutput::Accepted`) persist metadata, input, and compensation
+  data before `StepAccepted` publishes; they resolve later through the accepted-step
+  completion/failure/progress helpers, never hand-built lifecycle events.
+  `FailStep(requires_compensation = false)` is an explicit safe/no-undo remote
+  contract, not cancellation.
+- AllOf dependency observations are journaled before they are marked seen, so a
+  restart restores join progress for the exact run.
+
+## Storage
+
+- Traits: `ParticipantJournal` (append/read/list/prune of `ParticipantEvent`) and
+  `ParticipantDedupeStore` (atomic check-and-mark). Built in: in-memory
+  implementations, and LMDB/Heed implementations (`durability::lmdb::{LmdbJournal,
+  LmdbDedupe}`, feature `lmdb`). Applications may implement the traits for other
+  durable stores.
+- `ParticipantEvent` is an rkyv archive; variants are only appended, never
+  renumbered (current appended range includes run identity, terminal tombstones,
+  reconciliation evidence, forward-outcome proof, and dependency observations).
+  Readers must be upgraded before writers emit newer records.
+- Dedupe markers are run-scoped (`(saga_started_at_millis, saga_type)` prefixed to
+  the event key) and retained as replay fences; `prune`/`prune_saga*` are
+  destructive administrative primitives, never routine cleanup.
+- The resolver journal (`TerminalResolverJournal`) retains saga-wide history;
+  its LMDB schema is 2 (schema 1 is backfilled transactionally on open), and safe
+  compaction (`compact_terminal_detail`) preserves unresolved runs and every fence.
+
+## Failure Philosophy
+
+Any uncertainty — failed durable write, dedupe outage, partial delivery, unconfirmed
+result, ambiguous undo, lost acknowledgement without proof — quarantines with
+evidence retained instead of reporting success or ordinary failure. There is no
+repair or safe-clear API: blocked legacy history and quarantines are reconciled by
+the application out of band, and a genuinely new business operation uses a new saga
+ID. External effects and application hooks must be idempotent under stable
+application-owned keys.
+
+## Testing
+
+`SagaTestWorld` (feature `test-harness`) runs real actors against a real
+`SagaChoreographyBus` with transcript capture and terminal waits
+(`DeterministicContextBuilder`, `spawn_*_participant`, accepted-step helpers).
+Deterministic `drive_scenario`/`drive_workflow_scenario` helpers support narrower
+unit tests. `tests/saga_testkit_smoke.rs` is the compiling reference for the testkit
+surface.
+
+## Non-Goals
+
+- No exactly-once guarantee, durable message transport, or external-effect atomicity.
+- No library-managed external outbox; declared-effect hooks are application handoffs.
+- No administrative repair, safe-clear, or automatic quarantine pruning.
+- No prescribed application module structure, serialization format for payloads, or
+  deployment/load certification.
