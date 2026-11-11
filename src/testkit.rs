@@ -436,6 +436,25 @@ impl SagaTestWorld {
         Ok(self.publish(event))
     }
 
+    pub fn record_accepted_compensation_progress<A>(
+        &self,
+        actor: &mut A,
+        saga_id: SagaId,
+        execution_id: StepExecutionId,
+        now_millis: u64,
+    ) -> Result<icanact_core::local::PublishStats, AcceptedStepError>
+    where
+        A: SagaStateExt,
+    {
+        let event = crate::record_accepted_workflow_compensation_progress(
+            actor,
+            saga_id,
+            execution_id,
+            now_millis,
+        )?;
+        Ok(self.publish(event))
+    }
+
     pub fn fail_accepted_step<A>(
         &self,
         actor: &mut A,
@@ -884,42 +903,39 @@ where
 #[cfg(test)]
 mod tests {
     use crate::{
-        CompensationError, DependencySpec, HasSagaParticipantSupport, InMemoryDedupe,
-        InMemoryJournal, SagaParticipantSupport, StepError, StepOutput,
+        CompensationError, DependencySpec, HasSagaParticipantSupport, InMemoryParticipantStore,
+        SagaParticipantSupport, StepError, StepOutput,
     };
 
     use super::*;
 
     struct TestParticipant {
-        saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
+        saga: SagaParticipantSupport<InMemoryParticipantStore>,
         called: bool,
     }
 
     impl Default for TestParticipant {
         fn default() -> Self {
             Self {
-                saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+                saga: SagaParticipantSupport::new(InMemoryParticipantStore::new()),
                 called: false,
             }
         }
     }
 
     impl HasSagaParticipantSupport for TestParticipant {
-        type Journal = InMemoryJournal;
-        type Dedupe = InMemoryDedupe;
+        type Store = InMemoryParticipantStore;
 
-        fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+        fn saga_support(&self) -> &SagaParticipantSupport<Self::Store> {
             &self.saga
         }
 
-        fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+        fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Store> {
             &mut self.saga
         }
     }
 
     impl SagaParticipant for TestParticipant {
-        type Error = String;
-
         fn step_name(&self) -> &str {
             "risk_check"
         }

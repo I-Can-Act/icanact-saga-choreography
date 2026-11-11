@@ -210,7 +210,6 @@ impl TerminalPolicy {
 #[derive(Clone, Debug)]
 struct SagaResolutionState {
     started_steps: HashSet<Box<str>>,
-    acked_steps: HashSet<Box<str>>,
     completed_steps: HashSet<Box<str>>,
     failed_steps: HashSet<Box<str>>,
     compensable_steps: Vec<Box<str>>,
@@ -277,7 +276,6 @@ impl SagaResolutionState {
         Self {
             completed_steps: HashSet::new(),
             started_steps: HashSet::new(),
-            acked_steps: HashSet::new(),
             failed_steps: HashSet::new(),
             compensable_steps: Vec::new(),
             rollback: None,
@@ -538,10 +536,6 @@ impl TerminalResolver {
                         timeout_outcome: timeout_outcome.clone(),
                     },
                 );
-            }
-            SagaChoreographyEvent::StepAck { context, .. } => {
-                state.started_steps.insert(context.step_name.clone());
-                state.acked_steps.insert(context.step_name.clone());
             }
             SagaChoreographyEvent::StepCompleted {
                 context,
@@ -1074,7 +1068,6 @@ fn is_progress_event(event: &SagaChoreographyEvent) -> bool {
         SagaChoreographyEvent::SagaStarted { .. }
             | SagaChoreographyEvent::StepStarted { .. }
             | SagaChoreographyEvent::StepAccepted { .. }
-            | SagaChoreographyEvent::StepAck { .. }
             | SagaChoreographyEvent::StepCompleted { .. }
             | SagaChoreographyEvent::StepFailed { .. }
             | SagaChoreographyEvent::CompensationRequested { .. }
@@ -1429,7 +1422,6 @@ struct TimeoutDiagnostics {
     completed_steps: String,
     started_steps: String,
     failed_steps: String,
-    acked_steps: String,
 }
 
 impl TimeoutDiagnostics {
@@ -1445,7 +1437,6 @@ impl TimeoutDiagnostics {
         push_non_empty(&mut parts, "blocked_steps", &self.blocked_steps);
         push_non_empty(&mut parts, "completed_steps", &self.completed_steps);
         push_non_empty(&mut parts, "started_steps", &self.started_steps);
-        push_non_empty(&mut parts, "acked_steps", &self.acked_steps);
         push_non_empty(&mut parts, "failed_steps", &self.failed_steps);
         parts.push(format!("policy={policy_id}"));
         parts.join(" ")
@@ -1603,7 +1594,6 @@ fn timeout_diagnostics(policy: &TerminalPolicy, state: &SagaResolutionState) -> 
         completed_steps: sorted_set_values(&state.completed_steps),
         started_steps: sorted_set_values(&state.started_steps),
         failed_steps: sorted_set_values(&state.failed_steps),
-        acked_steps: sorted_set_values(&state.acked_steps),
     }
 }
 
@@ -1626,7 +1616,6 @@ fn emit_timeout_diagnostic(
         blocked_steps = diagnostic.blocked_steps.as_str(),
         completed_steps = diagnostic.completed_steps.as_str(),
         started_steps = diagnostic.started_steps.as_str(),
-        acked_steps = diagnostic.acked_steps.as_str(),
         failed_steps = diagnostic.failed_steps.as_str(),
         last_step = state.last_context.step_name.as_ref()
     );

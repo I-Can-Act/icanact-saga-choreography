@@ -6,12 +6,11 @@ use crate::support::{AcceptedWorkflowCompensation, AcceptedWorkflowStep};
 use crate::{
     AcceptedCompensationCompletion, AcceptedCompensationFailure, AcceptedStepCompletion,
     AcceptedStepError, AcceptedStepFailure, AcceptedStepPolicy, AcceptedStepTimeoutOutcome,
-    AsyncSagaParticipant, CompensationOutput, DedupeError, HasSagaParticipantSupport,
-    HasSagaWorkflowParticipants, JournalEntry, JournalError, ParticipantAdmission,
-    ParticipantDedupeStore, ParticipantEvent, ParticipantForwardOutcome, ParticipantJournal,
-    ParticipantTerminalKind, RunDedupe, SagaChoreographyEvent, SagaContext, SagaId,
+    AsyncSagaParticipant, HasSagaParticipantSupport, HasSagaWorkflowParticipants, JournalEntry,
+    JournalError, ParticipantAdmission, ParticipantEvent, ParticipantForwardOutcome,
+    ParticipantStore, ParticipantTerminalKind, SagaChoreographyEvent, SagaContext, SagaId,
     SagaParticipant, SagaParticipantSupport, SagaStateEntry, SagaStateExt, SagaWorkflowParticipant,
-    StepExecutionId, StepOutput, handle_async_saga_event_with_emit, handle_saga_event_with_emit,
+    StepExecutionId,
 };
 
 pub const PANIC_QUARANTINE_REASON_PREFIX: &str = "panic_during_active_";
@@ -27,11 +26,7 @@ pub enum RecoveryCollectionError {
     },
     MarkDedupe {
         saga_id: SagaId,
-        source: DedupeError,
-    },
-    ResetDedupe {
-        saga_id: SagaId,
-        source: DedupeError,
+        source: JournalError,
     },
     MissingCompensationState {
         saga_id: SagaId,
@@ -156,6 +151,7 @@ where
             source,
         })?;
 
+    admit_low_level_accept(actor, &context, &execution_id)?;
     if actor.saga_support().terminal_sagas.contains(&saga_id) {
         return Err(AcceptedStepError::AlreadyTerminal {
             saga_id,
@@ -165,7 +161,8 @@ where
     if actor
         .saga_support()
         .resolved_workflow_steps
-        .contains(&(saga_id, execution_id.clone()))
+        .get(&saga_id)
+        .is_some_and(|steps| steps.contains(&execution_id))
     {
         return Err(AcceptedStepError::AlreadyResolved {
             saga_id,
@@ -182,10 +179,6 @@ where
             execution_id,
         });
     }
-    // The bounded in-memory latch is never the authority: durable run identity and
-    // forward evidence decide whether new work may be accepted.
-    admit_low_level_accept(actor, &context, &execution_id)?;
-
     let accepted_at_millis = actor.now_millis();
     let mut accepted_context = context;
     accepted_context.event_timestamp_millis = accepted_at_millis;
@@ -263,7 +256,7 @@ where
 /// Durable admission for the public low-level accept. Consults the journal for run
 /// identity and any existing forward execution evidence for this run.
 fn admit_low_level_accept<A>(
-    actor: &A,
+    actor: &mut A,
     context: &SagaContext,
     execution_id: &StepExecutionId,
 ) -> Result<(), AcceptedStepError>
@@ -288,7 +281,10 @@ where
         Err(source) => return Err(durability(format!("{source:?}"))),
     }
     match actor.forward_execution_recorded_strict(context) {
-        Ok(false) => Ok(()),
+        Ok(false) => {
+            crate::helpers::reset_in_memory_run_if_changed(actor, context);
+            Ok(())
+        }
         Ok(true) => Err(durability(
             "forward execution already has durable intent/evidence; reconciliation required".into(),
         )),
@@ -538,7 +534,7 @@ fn retain_late_accepted_completion<A: SagaStateExt>(
         error: format!("{source:?}").into(),
     };
     let entries = actor
-        .saga_journal()
+        .saga_store()
         .read(saga_id)
         .map_err(|source| durability(SagaStateStoreError::Journal(source)))?;
     let mut identified: Option<SagaContext> = None;
@@ -928,99 +924,159 @@ where
     Ok(accepted)
 }
 
-pub fn record_accepted_workflow_step_progress<A>(
+/// Persist the renewed idle deadline before returning a choreography heartbeat.
+pub fn record_accepted_workflow_step_progress<A: SagaStateExt>(
     actor: &mut A,
     saga_id: SagaId,
     execution_id: StepExecutionId,
     now_millis: u64,
-) -> Result<SagaChoreographyEvent, AcceptedStepError>
-where
-    A: SagaStateExt,
-{
-    if actor.saga_support().terminal_sagas.contains(&saga_id) {
-        return Err(AcceptedStepError::AlreadyTerminal {
-            saga_id,
-            execution_id,
-        });
-    }
-    if actor
-        .saga_support()
-        .resolved_workflow_steps
-        .contains(&(saga_id, execution_id.clone()))
-    {
-        return Err(AcceptedStepError::AlreadyResolved {
-            saga_id,
-            execution_id,
-        });
-    }
-    if let Some(context) = actor
+) -> Result<SagaChoreographyEvent, AcceptedStepError> {
+    let accepted = actor
         .saga_support()
         .accepted_workflow_steps
         .get(&saga_id)
-        .map(|accepted| accepted.context.clone())
-    {
-        match actor.terminal_run_outcome_strict(&context) {
-            Ok(None) => {}
-            Ok(Some(_)) => {
-                return Err(AcceptedStepError::AlreadyTerminal {
-                    saga_id,
-                    execution_id,
-                });
-            }
-            Err(source) => {
-                return Err(AcceptedStepError::Durability {
-                    saga_id,
-                    execution_id,
-                    error: format!("{source:?}").into(),
-                });
-            }
-        }
-    }
-    let Some(accepted) = actor
-        .saga_support_mut()
-        .accepted_workflow_steps
-        .get_mut(&saga_id)
-    else {
-        return Err(AcceptedStepError::NotFound {
+        .cloned()
+        .ok_or_else(|| AcceptedStepError::NotFound {
             saga_id,
-            execution_id,
-        });
-    };
+            execution_id: execution_id.clone(),
+        })?;
     if accepted.execution_id != execution_id {
         return Err(AcceptedStepError::ExecutionIdMismatch {
             saga_id,
-            expected: accepted.execution_id.clone(),
+            expected: accepted.execution_id,
             actual: execution_id,
         });
     }
-    let next_idle_deadline =
-        now_millis.saturating_add(accepted.policy.idle_timeout.as_millis() as u64);
-    accepted.deadline_at_millis = next_idle_deadline.min(accepted.hard_deadline_at_millis);
-    let mut context = accepted.context.clone();
+    let deadline_at_millis = now_millis
+        .saturating_add(accepted.policy.idle_timeout.as_millis() as u64)
+        .min(accepted.hard_deadline_at_millis)
+        .max(accepted.deadline_at_millis);
+    persist_deadline_renewal(
+        actor,
+        &accepted.context,
+        &execution_id,
+        false,
+        deadline_at_millis,
+        now_millis,
+    )?;
+    actor
+        .saga_support_mut()
+        .accepted_workflow_steps
+        .get_mut(&saga_id)
+        .unwrap()
+        .deadline_at_millis = deadline_at_millis;
+    let mut context = accepted.context;
     context.event_timestamp_millis = now_millis;
-    let mut accepted_snapshot = accepted.clone();
-    accepted_snapshot.context = context.clone();
-    let participant_id = accepted_snapshot.participant_id.clone();
-    let deadline_at_millis = accepted.deadline_at_millis;
-    let hard_deadline_at_millis = accepted.hard_deadline_at_millis;
-    let timeout_outcome = accepted_snapshot.policy.timeout_outcome.clone();
-    record_accepted_step_metadata(actor, &accepted_snapshot).map_err(|source| {
-        AcceptedStepError::Durability {
-            saga_id,
-            execution_id: execution_id.clone(),
-            error: format!("{source:?}").into(),
-        }
-    })?;
     Ok(SagaChoreographyEvent::StepAccepted {
         context,
-        participant_id,
+        participant_id: accepted.participant_id,
         execution_id,
         deadline_at_millis,
-        hard_deadline_at_millis,
+        hard_deadline_at_millis: accepted.hard_deadline_at_millis,
         timeouts_enabled: true,
-        timeout_outcome,
-        compensation_available: !accepted_snapshot.compensation_data.is_empty(),
+        timeout_outcome: accepted.policy.timeout_outcome,
+        compensation_available: !accepted.compensation_data.is_empty(),
     })
+}
+
+/// Persist the renewed idle deadline before returning a choreography heartbeat.
+pub fn record_accepted_workflow_compensation_progress<A: SagaStateExt>(
+    actor: &mut A,
+    saga_id: SagaId,
+    execution_id: StepExecutionId,
+    now_millis: u64,
+) -> Result<SagaChoreographyEvent, AcceptedStepError> {
+    let accepted = actor
+        .saga_support()
+        .accepted_workflow_compensations
+        .get(&saga_id)
+        .cloned()
+        .ok_or_else(|| AcceptedStepError::NotFound {
+            saga_id,
+            execution_id: execution_id.clone(),
+        })?;
+    if accepted.execution_id != execution_id {
+        return Err(AcceptedStepError::ExecutionIdMismatch {
+            saga_id,
+            expected: accepted.execution_id,
+            actual: execution_id,
+        });
+    }
+    let deadline_at_millis = now_millis
+        .saturating_add(accepted.policy.idle_timeout.as_millis() as u64)
+        .min(accepted.hard_deadline_at_millis)
+        .max(accepted.deadline_at_millis);
+    persist_deadline_renewal(
+        actor,
+        &accepted.context,
+        &execution_id,
+        true,
+        deadline_at_millis,
+        now_millis,
+    )?;
+    actor
+        .saga_support_mut()
+        .accepted_workflow_compensations
+        .get_mut(&saga_id)
+        .unwrap()
+        .deadline_at_millis = deadline_at_millis;
+    let mut context = accepted.context;
+    context.event_timestamp_millis = now_millis;
+    Ok(SagaChoreographyEvent::CompensationAccepted {
+        context,
+        participant_id: accepted.participant_id,
+        execution_id,
+        deadline_at_millis,
+        hard_deadline_at_millis: accepted.hard_deadline_at_millis,
+    })
+}
+
+fn persist_deadline_renewal<A: SagaStateExt>(
+    actor: &A,
+    context: &SagaContext,
+    execution_id: &StepExecutionId,
+    is_compensation: bool,
+    deadline_at_millis: u64,
+    renewed_at_millis: u64,
+) -> Result<(), AcceptedStepError> {
+    let saga_id = context.saga_id;
+    let durability = |source: SagaStateStoreError| AcceptedStepError::Durability {
+        saga_id,
+        execution_id: execution_id.clone(),
+        error: source.to_string().into(),
+    };
+    if actor
+        .terminal_run_outcome_strict(context)
+        .map_err(durability)?
+        .is_some()
+    {
+        return Err(AcceptedStepError::AlreadyTerminal {
+            saga_id,
+            execution_id: execution_id.clone(),
+        });
+    }
+    if !is_compensation
+        && actor
+            .saga_support()
+            .has_resolved_workflow_step(saga_id, execution_id)
+    {
+        return Err(AcceptedStepError::AlreadyResolved {
+            saga_id,
+            execution_id: execution_id.clone(),
+        });
+    }
+    actor
+        .record_event_strict(
+            saga_id,
+            ParticipantEvent::AcceptedDeadlineRenewed {
+                context: context.clone(),
+                execution_id: execution_id.clone(),
+                is_compensation,
+                deadline_at_millis,
+                renewed_at_millis,
+            },
+        )
+        .map_err(durability)
 }
 
 fn record_accepted_step_metadata<A>(
@@ -1119,7 +1175,8 @@ fn current_run(entries: &[JournalEntry]) -> CurrentRun<'_> {
                 outcome.context.saga_type.as_ref(),
                 outcome.context.saga_started_at_millis,
             )),
-            ParticipantEvent::CompensationRequestRecorded { context, .. }
+            ParticipantEvent::AcceptedDeadlineRenewed { context, .. }
+            | ParticipantEvent::CompensationRequestRecorded { context, .. }
             | ParticipantEvent::AcceptedStepRecorded { context, .. }
             | ParticipantEvent::AcceptedCompensationRecorded { context, .. }
             | ParticipantEvent::ParticipantReconciliationEvidence { context, .. } => {
@@ -1148,14 +1205,13 @@ fn current_run(entries: &[JournalEntry]) -> CurrentRun<'_> {
     }
 }
 
-fn hydrate_run_fence<J, D>(
-    support: &mut SagaParticipantSupport<J, D>,
+fn hydrate_run_fence<S>(
+    support: &mut SagaParticipantSupport<S>,
     saga_id: SagaId,
     started_at_millis: u64,
     terminal: bool,
 ) where
-    J: ParticipantJournal,
-    D: ParticipantDedupeStore,
+    S: ParticipantStore,
 {
     support
         .saga_run_started_at
@@ -1172,217 +1228,242 @@ fn hydrate_run_fence<J, D>(
     }
 }
 
-/// Run-scoped form of [`workflow_dedupe_key_for_event`], matching
-/// `SagaStateExt::run_dedupe_key` so recovery resets the exact marker ingress sets.
-fn scoped_workflow_dedupe_key(request: &SagaChoreographyEvent) -> String {
-    let context = request.context();
-    format!(
-        "run\u{1f}{}\u{1f}{}\u{1f}{}",
-        context.saga_started_at_millis,
-        context.saga_type,
-        workflow_dedupe_key_for_event(request)
-    )
-}
-
-pub fn recover_accepted_workflow_steps_for_saga_type<J, D>(
-    support: &mut SagaParticipantSupport<J, D>,
-    step_name: &'static str,
-    saga_type: &'static str,
-) -> Result<(), RecoveryCollectionError>
-where
-    J: ParticipantJournal,
-    D: ParticipantDedupeStore,
-{
-    let saga_ids = support
-        .journal
-        .list_sagas()
+pub fn recover_accepted_workflow_steps_for_saga_type<S: ParticipantStore>(
+    support: &mut SagaParticipantSupport<S>,
+    step_name: &str,
+    saga_type: &str,
+) -> Result<(), RecoveryCollectionError> {
+    let ids = support
+        .store
+        .unresolved_saga_ids()
         .map_err(RecoveryCollectionError::ListSagas)?;
-    let now_millis = SagaContext::now_millis();
-    for saga_id in saga_ids {
-        let all_entries = support
-            .journal
+    let now = SagaContext::now_millis();
+    for saga_id in ids {
+        let entries = support
+            .store
             .read(saga_id)
             .map_err(|source| RecoveryCollectionError::ReadSaga { saga_id, source })?;
-        let run = current_run(&all_entries);
-        if let Some((run_type, run_started)) = run.identity
-            && run_type == saga_type
-        {
-            hydrate_run_fence(support, saga_id, run_started, run.terminal.is_some());
-        }
-        if run.terminal.is_some() {
-            // Resolved (completed, failed or quarantined) runs are never resumed or
-            // auto-resolved on restart; their evidence stays in the journal.
-            continue;
-        }
-        if let Some((run_type, run_started)) = run.identity
-            && run_type == saga_type
-        {
-            // Durable AllOf inputs of the current run only; never dependency_fired.
-            let seen: std::collections::HashSet<Box<str>> = all_entries
-                .iter()
-                .filter_map(|entry| match &entry.event {
-                    ParticipantEvent::ParticipantDependencyCompletedRecorded {
-                        context, ..
-                    } if context.saga_type.as_ref() == run_type
+        hydrate_recovered_run(support, saga_id, &entries, step_name, saga_type, now)?;
+    }
+    support.prune_orphan_run_markers();
+    Ok(())
+}
+
+fn hydrate_recovered_run<S: ParticipantStore>(
+    support: &mut SagaParticipantSupport<S>,
+    saga_id: SagaId,
+    all_entries: &[JournalEntry],
+    step_name: &str,
+    saga_type: &str,
+    now_millis: u64,
+) -> Result<(), RecoveryCollectionError> {
+    let run = current_run(all_entries);
+    if let Some((run_type, run_started)) = run.identity
+        && run_type == saga_type
+    {
+        hydrate_run_fence(support, saga_id, run_started, run.terminal.is_some());
+    }
+    if run.terminal.is_some() {
+        // Resolved (completed, failed or quarantined) runs are never resumed or
+        // auto-resolved on restart; their evidence stays in the journal.
+        return Ok(());
+    }
+    if let Some((run_type, run_started)) = run.identity
+        && run_type == saga_type
+    {
+        // Durable AllOf inputs of the current run only; never dependency_fired.
+        let seen: std::collections::HashSet<Box<str>> = all_entries
+            .iter()
+            .filter_map(|entry| match &entry.event {
+                ParticipantEvent::ParticipantDependencyCompletedRecorded { context, .. }
+                    if context.saga_type.as_ref() == run_type
                         && context.saga_started_at_millis == run_started =>
-                    {
-                        Some(context.step_name.clone())
-                    }
-                    _ => None,
-                })
-                .collect();
-            if !seen.is_empty() {
-                support.dependency_completions.insert(saga_id, seen);
-            }
-        }
-        let entries = run.entries;
-        if entries.iter().any(|entry| {
-            matches!(
-                entry.event,
-                ParticipantEvent::ParticipantReconciliationEvidence { .. }
-            )
-        }) {
-            continue; // human reconciliation, never automatic re-execution
-        }
-        if let Some(request) = recover_unstarted_compensation_request_from_entries(entries)
-            && request.context().saga_type.as_ref() == saga_type
-            && compensation_request_targets_step(&request, step_name)
-            && recover_accepted_workflow_step_from_entries(entries).is_none()
-        {
-            let Some((output, compensation_data, completed_at_millis)) =
-                recover_completed_step_effect_for_unstarted_compensation(entries)
-            else {
-                return Err(RecoveryCollectionError::MissingCompensationState { saga_id });
-            };
-            if compensation_data.is_empty() {
-                return Err(RecoveryCollectionError::MissingCompensationState { saga_id });
-            }
-            let mut context = request.context().clone();
-            context.step_name = step_name.into();
-            let state = crate::SagaParticipantState::new(
-                saga_id,
-                context.saga_type.clone(),
-                context.step_name.clone(),
-                context.correlation_id,
-                context.trace_id,
-                context.initiator_peer_id,
-                context.saga_started_at_millis,
-            )
-            .trigger("step_recovered", completed_at_millis)
-            .start_execution(completed_at_millis)
-            .complete(output, compensation_data, completed_at_millis);
-            support
-                .saga_states
-                .insert(saga_id, SagaStateEntry::Completed(state));
-        }
-        if let Some(accepted) = recover_accepted_workflow_compensation_from_entries(entries) {
-            if accepted.context.saga_type.as_ref() != saga_type
-                || accepted.context.step_name.as_ref() != step_name
-                || accepted.deadline_at_millis < now_millis
-                || accepted.hard_deadline_at_millis < now_millis
-            {
-                continue;
-            }
-            let state = crate::SagaParticipantState::new(
-                saga_id,
-                accepted.context.saga_type.clone(),
-                accepted.context.step_name.clone(),
-                accepted.context.correlation_id,
-                accepted.context.trace_id,
-                accepted.context.initiator_peer_id,
-                accepted.context.saga_started_at_millis,
-            )
-            .trigger("compensation_accepted", accepted.accepted_at_millis)
-            .start_execution(accepted.accepted_at_millis)
-            .start_compensation(accepted.accepted_at_millis);
-            support
-                .saga_states
-                .insert(saga_id, SagaStateEntry::Compensating(state));
-            support
-                .accepted_workflow_compensations
-                .insert(saga_id, accepted);
-            continue;
-        }
-        if let Some(accepted) = recover_accepted_workflow_step_from_entries(entries) {
-            let expired = accepted.deadline_at_millis < now_millis
-                || accepted.hard_deadline_at_millis < now_millis;
-            let retain_expired_for_compensation = expired
-                && !accepted.compensation_data.is_empty()
-                && matches!(
-                    &accepted.policy.timeout_outcome,
-                    AcceptedStepTimeoutOutcome::FailStep {
-                        requires_compensation: true
-                    }
-                );
-            if accepted.context.saga_type.as_ref() != saga_type
-                || accepted.context.step_name.as_ref() != step_name
-                || (expired && !retain_expired_for_compensation)
-            {
-                continue;
-            }
-            let execution_id = accepted.execution_id.clone();
-            let forward_execution_resolved = retain_expired_for_compensation
-                || accepted_step_failure_requiring_compensation(entries).is_some();
-            let state = crate::SagaParticipantState::new(
-                saga_id,
-                accepted.context.saga_type.clone(),
-                accepted.context.step_name.clone(),
-                accepted.context.correlation_id,
-                accepted.context.trace_id,
-                accepted.context.initiator_peer_id,
-                accepted.context.saga_started_at_millis,
-            )
-            .trigger("step_accepted", accepted.accepted_at_millis)
-            .start_execution(accepted.accepted_at_millis);
-            support
-                .saga_states
-                .insert(saga_id, SagaStateEntry::Executing(state));
-            support.accepted_workflow_steps.insert(saga_id, accepted);
-            if forward_execution_resolved {
-                support
-                    .resolved_workflow_steps
-                    .insert((saga_id, execution_id));
-            }
-            continue;
-        }
-        // A confirmed forward proof hydrates the completed state and marks the
-        // dependency as fired, so replayed upstream events cannot re-execute it.
-        if let Some(outcome) = RunProgress::scan(entries).confirmed_clean()
-            && outcome.context.saga_type.as_ref() == saga_type
-            && outcome.context.step_name.as_ref() == step_name
-        {
-            let at = outcome.recorded_at_millis;
-            let state = crate::SagaParticipantState::new(
-                saga_id,
-                outcome.context.saga_type.clone(),
-                outcome.context.step_name.clone(),
-                outcome.context.correlation_id,
-                outcome.context.trace_id,
-                outcome.context.initiator_peer_id,
-                outcome.context.saga_started_at_millis,
-            )
-            .trigger("step_recovered", at)
-            .start_execution(at)
-            .complete(
-                outcome.output.clone(),
-                outcome.compensation_data.clone(),
-                at,
-            );
-            support
-                .saga_states
-                .insert(saga_id, SagaStateEntry::Completed(state));
-            support.dependency_fired.insert(saga_id);
+                {
+                    Some(context.step_name.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        if !seen.is_empty() {
+            support.dependency_completions.insert(saga_id, seen);
         }
     }
+    let entries = run.entries;
+    if entries.iter().any(|entry| {
+        matches!(
+            entry.event,
+            ParticipantEvent::ParticipantReconciliationEvidence { .. }
+        )
+    }) {
+        return Ok(()); // human reconciliation, never automatic re-execution
+    }
+    if let Some(request) = recover_unstarted_compensation_request_from_entries(entries)
+        && request.context().saga_type.as_ref() == saga_type
+        && compensation_request_targets_step(&request, step_name)
+        && recover_accepted_workflow_step_from_entries(entries).is_none()
+    {
+        let Some((output, compensation_data, completed_at_millis)) =
+            recover_completed_step_effect_for_unstarted_compensation(entries)
+        else {
+            return Err(RecoveryCollectionError::MissingCompensationState { saga_id });
+        };
+        if compensation_data.is_empty() {
+            return Err(RecoveryCollectionError::MissingCompensationState { saga_id });
+        }
+        let mut context = request.context().clone();
+        context.step_name = step_name.into();
+        let state = crate::SagaParticipantState::new(
+            saga_id,
+            context.saga_type.clone(),
+            context.step_name.clone(),
+            context.correlation_id,
+            context.trace_id,
+            context.initiator_peer_id,
+            context.saga_started_at_millis,
+        )
+        .trigger("step_recovered", completed_at_millis)
+        .start_execution(completed_at_millis)
+        .complete(output, compensation_data, completed_at_millis);
+        support
+            .saga_states
+            .insert(saga_id, SagaStateEntry::Completed(state));
+    }
+    if let Some(accepted) = recover_accepted_workflow_compensation_from_entries(entries) {
+        if accepted.context.saga_type.as_ref() != saga_type
+            || accepted.context.step_name.as_ref() != step_name
+            || accepted.deadline_at_millis < now_millis
+            || accepted.hard_deadline_at_millis < now_millis
+        {
+            return Ok(());
+        }
+        let state = crate::SagaParticipantState::new(
+            saga_id,
+            accepted.context.saga_type.clone(),
+            accepted.context.step_name.clone(),
+            accepted.context.correlation_id,
+            accepted.context.trace_id,
+            accepted.context.initiator_peer_id,
+            accepted.context.saga_started_at_millis,
+        )
+        .trigger("compensation_accepted", accepted.accepted_at_millis)
+        .start_execution(accepted.accepted_at_millis)
+        .start_compensation(accepted.accepted_at_millis);
+        support
+            .saga_states
+            .insert(saga_id, SagaStateEntry::Compensating(state));
+        support
+            .accepted_workflow_compensations
+            .insert(saga_id, accepted);
+        return Ok(());
+    }
+    if let Some(accepted) = recover_accepted_workflow_step_from_entries(entries) {
+        let expired = accepted.deadline_at_millis < now_millis
+            || accepted.hard_deadline_at_millis < now_millis;
+        let retain_expired_for_compensation = expired
+            && !accepted.compensation_data.is_empty()
+            && matches!(
+                &accepted.policy.timeout_outcome,
+                AcceptedStepTimeoutOutcome::FailStep {
+                    requires_compensation: true
+                }
+            );
+        if accepted.context.saga_type.as_ref() != saga_type
+            || accepted.context.step_name.as_ref() != step_name
+            || (expired && !retain_expired_for_compensation)
+        {
+            return Ok(());
+        }
+        let execution_id = accepted.execution_id.clone();
+        let forward_execution_resolved = retain_expired_for_compensation
+            || accepted_step_failure_requiring_compensation(entries).is_some();
+        let state = crate::SagaParticipantState::new(
+            saga_id,
+            accepted.context.saga_type.clone(),
+            accepted.context.step_name.clone(),
+            accepted.context.correlation_id,
+            accepted.context.trace_id,
+            accepted.context.initiator_peer_id,
+            accepted.context.saga_started_at_millis,
+        )
+        .trigger("step_accepted", accepted.accepted_at_millis)
+        .start_execution(accepted.accepted_at_millis);
+        support
+            .saga_states
+            .insert(saga_id, SagaStateEntry::Executing(state));
+        support.accepted_workflow_steps.insert(saga_id, accepted);
+        if forward_execution_resolved {
+            support
+                .resolved_workflow_steps
+                .entry(saga_id)
+                .or_default()
+                .insert(execution_id);
+        }
+        return Ok(());
+    }
+    // A confirmed forward proof hydrates the completed state and marks the
+    // dependency as fired, so replayed upstream events cannot re-execute it.
+    if let Some(outcome) = RunProgress::scan(entries).confirmed_clean()
+        && outcome.context.saga_type.as_ref() == saga_type
+        && outcome.context.step_name.as_ref() == step_name
+    {
+        let at = outcome.recorded_at_millis;
+        let state = crate::SagaParticipantState::new(
+            saga_id,
+            outcome.context.saga_type.clone(),
+            outcome.context.step_name.clone(),
+            outcome.context.correlation_id,
+            outcome.context.trace_id,
+            outcome.context.initiator_peer_id,
+            outcome.context.saga_started_at_millis,
+        )
+        .trigger("step_recovered", at)
+        .start_execution(at)
+        .complete(
+            outcome.output.clone(),
+            outcome.compensation_data.clone(),
+            at,
+        );
+        support
+            .saga_states
+            .insert(saga_id, SagaStateEntry::Completed(state));
+        support.dependency_fired.insert(saga_id);
+    }
     Ok(())
+}
+
+fn same_run_context(left: &SagaContext, right: &SagaContext) -> bool {
+    left.saga_id == right.saga_id
+        && left.saga_type == right.saga_type
+        && left.saga_started_at_millis == right.saga_started_at_millis
+        && left.step_name == right.step_name
 }
 
 fn recover_accepted_workflow_compensation_from_entries(
     entries: &[JournalEntry],
 ) -> Option<AcceptedWorkflowCompensation> {
-    let mut accepted = None;
+    let mut accepted: Option<AcceptedWorkflowCompensation> = None;
     for entry in entries {
         match &entry.event {
+            ParticipantEvent::AcceptedDeadlineRenewed {
+                context,
+                execution_id,
+                is_compensation,
+                deadline_at_millis,
+                ..
+            } => {
+                if *is_compensation == true {
+                    if let Some(pending) = accepted.as_mut() {
+                        if same_run_context(&pending.context, context)
+                            && pending.execution_id == *execution_id
+                        {
+                            pending.deadline_at_millis = pending
+                                .deadline_at_millis
+                                .max((*deadline_at_millis).min(pending.hard_deadline_at_millis));
+                        }
+                    }
+                }
+            }
+
             ParticipantEvent::AcceptedCompensationRecorded {
                 context,
                 participant_id,
@@ -1451,10 +1532,30 @@ fn recover_compensation_request_from_entries(
 fn recover_completed_accepted_compensation_from_entries(
     entries: &[JournalEntry],
 ) -> Option<(AcceptedWorkflowCompensation, u64)> {
-    let mut accepted = None;
+    let mut accepted: Option<AcceptedWorkflowCompensation> = None;
     let mut completed = None;
     for entry in entries {
         match &entry.event {
+            ParticipantEvent::AcceptedDeadlineRenewed {
+                context,
+                execution_id,
+                is_compensation,
+                deadline_at_millis,
+                ..
+            } => {
+                if *is_compensation == true {
+                    if let Some(pending) = accepted.as_mut() {
+                        if same_run_context(&pending.context, context)
+                            && pending.execution_id == *execution_id
+                        {
+                            pending.deadline_at_millis = pending
+                                .deadline_at_millis
+                                .max((*deadline_at_millis).min(pending.hard_deadline_at_millis));
+                        }
+                    }
+                }
+            }
+
             ParticipantEvent::ParticipantForwardOutcomeRecorded { .. }
             | ParticipantEvent::ParticipantDependencyCompletedRecorded { .. } => {}
             ParticipantEvent::CompensationRequestRecorded { .. } => {
@@ -1503,8 +1604,7 @@ fn recover_completed_accepted_compensation_from_entries(
                 accepted = None;
                 completed = None;
             }
-            ParticipantEvent::SagaRegistered { .. }
-            | ParticipantEvent::ParticipantRunRecorded { .. }
+            ParticipantEvent::ParticipantRunRecorded { .. }
             | ParticipantEvent::ParticipantTerminalRecorded { .. }
             | ParticipantEvent::StepTriggered { .. }
             | ParticipantEvent::StepExecutionStarted { .. }
@@ -1520,10 +1620,30 @@ fn recover_completed_accepted_compensation_from_entries(
 fn recover_failed_accepted_compensation_from_entries(
     entries: &[JournalEntry],
 ) -> Option<(AcceptedWorkflowCompensation, Box<str>, bool, u64)> {
-    let mut accepted = None;
+    let mut accepted: Option<AcceptedWorkflowCompensation> = None;
     let mut failed = None;
     for entry in entries {
         match &entry.event {
+            ParticipantEvent::AcceptedDeadlineRenewed {
+                context,
+                execution_id,
+                is_compensation,
+                deadline_at_millis,
+                ..
+            } => {
+                if *is_compensation == true {
+                    if let Some(pending) = accepted.as_mut() {
+                        if same_run_context(&pending.context, context)
+                            && pending.execution_id == *execution_id
+                        {
+                            pending.deadline_at_millis = pending
+                                .deadline_at_millis
+                                .max((*deadline_at_millis).min(pending.hard_deadline_at_millis));
+                        }
+                    }
+                }
+            }
+
             ParticipantEvent::ParticipantForwardOutcomeRecorded { .. }
             | ParticipantEvent::ParticipantDependencyCompletedRecorded { .. } => {}
             ParticipantEvent::CompensationRequestRecorded { .. } => {
@@ -1581,8 +1701,7 @@ fn recover_failed_accepted_compensation_from_entries(
                 accepted = None;
                 failed = None;
             }
-            ParticipantEvent::SagaRegistered { .. }
-            | ParticipantEvent::ParticipantRunRecorded { .. }
+            ParticipantEvent::ParticipantRunRecorded { .. }
             | ParticipantEvent::ParticipantTerminalRecorded { .. }
             | ParticipantEvent::StepTriggered { .. }
             | ParticipantEvent::StepExecutionStarted { .. }
@@ -1627,7 +1746,7 @@ fn recover_unstarted_compensation_request_from_entries(
             | ParticipantEvent::CompensationFailed { .. }
             | ParticipantEvent::Quarantined { .. }
             | ParticipantEvent::ParticipantReconciliationEvidence { .. } => request = None,
-            ParticipantEvent::SagaRegistered { .. }
+            ParticipantEvent::AcceptedDeadlineRenewed { .. }
             | ParticipantEvent::ParticipantRunRecorded { .. }
             | ParticipantEvent::ParticipantTerminalRecorded { .. }
             | ParticipantEvent::StepTriggered { .. }
@@ -1691,7 +1810,7 @@ fn recover_completed_step_effect_for_unstarted_compensation(
             | ParticipantEvent::ParticipantReconciliationEvidence { .. } => {
                 effect_at_request = None
             }
-            ParticipantEvent::SagaRegistered { .. }
+            ParticipantEvent::AcceptedDeadlineRenewed { .. }
             | ParticipantEvent::ParticipantRunRecorded { .. }
             | ParticipantEvent::ParticipantTerminalRecorded { .. }
             | ParticipantEvent::StepTriggered { .. }
@@ -1835,9 +1954,29 @@ fn recover_proven_undo_acknowledgement(
 fn recover_accepted_workflow_step_from_entries(
     entries: &[JournalEntry],
 ) -> Option<AcceptedWorkflowStep> {
-    let mut accepted = None;
+    let mut accepted: Option<AcceptedWorkflowStep> = None;
     for entry in entries {
         match &entry.event {
+            ParticipantEvent::AcceptedDeadlineRenewed {
+                context,
+                execution_id,
+                is_compensation,
+                deadline_at_millis,
+                ..
+            } => {
+                if *is_compensation == false {
+                    if let Some(pending) = accepted.as_mut() {
+                        if same_run_context(&pending.context, context)
+                            && pending.execution_id == *execution_id
+                        {
+                            pending.deadline_at_millis = pending
+                                .deadline_at_millis
+                                .max((*deadline_at_millis).min(pending.hard_deadline_at_millis));
+                        }
+                    }
+                }
+            }
+
             // The strict proof is the sole record of an authoritative completion.
             ParticipantEvent::ParticipantForwardOutcomeRecorded { .. } => accepted = None,
             ParticipantEvent::ParticipantDependencyCompletedRecorded { .. } => {}
@@ -1882,8 +2021,7 @@ fn recover_accepted_workflow_step_from_entries(
             | ParticipantEvent::ParticipantReconciliationEvidence { .. } => {
                 accepted = None;
             }
-            ParticipantEvent::SagaRegistered { .. }
-            | ParticipantEvent::ParticipantRunRecorded { .. }
+            ParticipantEvent::ParticipantRunRecorded { .. }
             | ParticipantEvent::ParticipantTerminalRecorded { .. }
             | ParticipantEvent::StepTriggered { .. }
             | ParticipantEvent::StepExecutionStarted { .. }
@@ -1928,7 +2066,7 @@ fn accepted_step_failure_requiring_compensation(
             | ParticipantEvent::ParticipantReconciliationEvidence { .. } => {
                 failure = None;
             }
-            ParticipantEvent::SagaRegistered { .. }
+            ParticipantEvent::AcceptedDeadlineRenewed { .. }
             | ParticipantEvent::ParticipantRunRecorded { .. }
             | ParticipantEvent::ParticipantTerminalRecorded { .. }
             | ParticipantEvent::StepTriggered { .. }
@@ -2053,7 +2191,8 @@ where
     if actor
         .saga_support()
         .resolved_workflow_steps
-        .contains(&(saga_id, execution_id.clone()))
+        .get(&saga_id)
+        .is_some_and(|steps| steps.contains(&execution_id))
     {
         return Err(AcceptedStepError::AlreadyResolved {
             saga_id,
@@ -2115,7 +2254,9 @@ pub(crate) fn mark_accepted_step_resolved<A>(
     actor
         .saga_support_mut()
         .resolved_workflow_steps
-        .insert((saga_id, execution_id));
+        .entry(saga_id)
+        .or_default()
+        .insert(execution_id);
 }
 
 /// A resolver-origin accepted-step timeout that carries no compensation durably
@@ -2126,7 +2267,7 @@ pub(crate) fn mark_accepted_step_resolved<A>(
 /// current unresolved run may be resolved, so an old context can never resolve a
 /// successor. A failed durable write keeps the metadata and the unresolved
 /// evidence visible.
-fn mark_matching_accepted_step_failed<A>(actor: &mut A, event: &SagaChoreographyEvent)
+pub(crate) fn mark_matching_accepted_step_failed<A>(actor: &mut A, event: &SagaChoreographyEvent)
 where
     A: SagaStateExt,
 {
@@ -2161,7 +2302,7 @@ where
     }
     let execution_id = accepted.execution_id.clone();
     let accepted_context = accepted.context.clone();
-    match actor.saga_journal().read(saga_id) {
+    match actor.saga_store().read(saga_id) {
         Ok(entries) => {
             let run = current_run(&entries);
             if run.terminal.is_none() {
@@ -2250,18 +2391,24 @@ pub fn apply_sync_participant_saga_ingress_with_hooks<P, FApplyTerminal, FOnInva
     FOnInvalid: FnMut(&SagaChoreographyEvent),
     FOnEmitted: FnMut(&mut P, &SagaChoreographyEvent),
 {
-    if !participant
-        .saga_types()
-        .iter()
-        .any(|saga_type| *saga_type == event.context().saga_type.as_ref())
-        || terminal_callback_permitted(participant, &event)
-    {
-        apply_terminal_side_effects(participant, &event);
-    }
-    mark_matching_accepted_step_failed(participant, &event);
-
     let mut emitted = Vec::new();
-    handle_saga_event_with_emit(participant, event, |next_event| emitted.push(next_event));
+    let terminal_event = event.clone();
+    let retained = crate::helpers::handle_saga_event_core(
+        participant,
+        event,
+        |next_event| emitted.push(next_event),
+        |actor, start| {
+            publish_workflow_step_started(
+                actor,
+                start,
+                &mut on_invalid_transition,
+                &mut on_emitted_transition,
+            )
+        },
+    );
+    if retained {
+        apply_terminal_side_effects(participant, &terminal_event);
+    }
 
     let saga_bus = participant.saga_support().bus.clone();
     for next_event in emitted {
@@ -2275,13 +2422,11 @@ pub fn apply_sync_participant_saga_ingress_with_hooks<P, FApplyTerminal, FOnInva
             continue;
         }
 
-        on_emitted_transition(participant, &next_event);
-
-        // The helper already published `StepStarted` strictly before business work;
-        // the buffered copy only feeds hooks and validation, never a second publish.
         if matches!(next_event, SagaChoreographyEvent::StepStarted { .. }) {
             continue;
         }
+        on_emitted_transition(participant, &next_event);
+
         if let Some(bus) = &saga_bus
             && let Err(err) = bus.publish_strict(next_event)
         {
@@ -2290,51 +2435,6 @@ pub fn apply_sync_participant_saga_ingress_with_hooks<P, FApplyTerminal, FOnInva
                 event = "participant_ingress_emit_publish_failed",
                 error = ?err
             );
-        }
-    }
-}
-
-/// Fences arbitrary terminal side-effect callbacks before they run. Non-terminal
-/// events always pass. A terminal event reaches the callback only when it is this
-/// run's first ordinary terminal (admitted) or a local quarantine notification (never
-/// stale, and never for a run another owner holds). Duplicate or stale ordinary
-/// terminals, foreign-run refusals, storage errors, and an ordinary failure that must
-/// escalate to quarantine are all suppressed here; the handler reports escalations.
-fn terminal_callback_permitted<A>(actor: &A, event: &SagaChoreographyEvent) -> bool
-where
-    A: SagaStateExt,
-{
-    let quarantine = matches!(event, SagaChoreographyEvent::SagaQuarantined { .. });
-    if !quarantine
-        && !matches!(
-            event,
-            SagaChoreographyEvent::SagaCompleted { .. } | SagaChoreographyEvent::SagaFailed { .. }
-        )
-    {
-        return true;
-    }
-    let context = event.context();
-    match actor.admit_participant_event_strict(context) {
-        Ok(ParticipantAdmission::Admitted) => {
-            if matches!(event, SagaChoreographyEvent::SagaFailed { .. }) {
-                match actor.participant_run_evidence_strict(context) {
-                    Ok(evidence) => !evidence.failure_requires_quarantine(),
-                    Err(_) => false,
-                }
-            } else {
-                true
-            }
-        }
-        Ok(ParticipantAdmission::TerminalReplay { .. }) => quarantine,
-        Ok(_) => false,
-        Err(error) => {
-            tracing::error!(
-                target: "core::saga",
-                event = "terminal_callback_admission_failed",
-                saga_id = context.saga_id.get(),
-                error = %error
-            );
-            false
         }
     }
 }
@@ -2397,7 +2497,6 @@ pub fn apply_sync_workflow_participant_saga_ingress_with_hooks<
     FOnInvalid: FnMut(&SagaChoreographyEvent),
     FOnEmitted: FnMut(&mut A, &SagaChoreographyEvent),
 {
-    mark_matching_accepted_step_failed(actor, &event);
     let workflow = match workflow_for_event::<A>(&event) {
         Ok(Some(workflow)) => workflow,
         Ok(None) => return,
@@ -2423,10 +2522,6 @@ pub fn apply_sync_workflow_participant_saga_ingress_with_hooks<
         }
     };
 
-    if terminal_callback_permitted(actor, &event) {
-        apply_terminal_side_effects(actor, &event);
-    }
-
     let mut emitted = Vec::new();
     // Managed `StepStarted` is published strictly, after durable intent and before
     // business execution, so the resolver can see running work. Validation and the
@@ -2439,13 +2534,17 @@ pub fn apply_sync_workflow_participant_saga_ingress_with_hooks<
             &mut on_emitted_transition,
         )
     };
-    handle_workflow_saga_event_with_emit(
+    let terminal_event = event.clone();
+    let retained = crate::helpers::handle_workflow_saga_event_with_emit(
         actor,
         workflow,
         event,
         |next_event| emitted.push(next_event),
         &mut publish_start,
     );
+    if retained {
+        apply_terminal_side_effects(actor, &terminal_event);
+    }
 
     let saga_bus = actor.saga_support().bus.clone();
     for next_event in emitted {
@@ -2457,6 +2556,9 @@ pub fn apply_sync_workflow_participant_saga_ingress_with_hooks<
             continue;
         }
 
+        if matches!(next_event, SagaChoreographyEvent::StepStarted { .. }) {
+            continue;
+        }
         on_emitted_transition(actor, &next_event);
 
         if let Some(bus) = &saga_bus
@@ -2498,1173 +2600,6 @@ where
         .map_err(|error| format!("step start publication failed; effect not run: {error:?}").into())
 }
 
-fn handle_workflow_saga_event_with_emit<A, F, S>(
-    actor: &mut A,
-    workflow: &'static dyn SagaWorkflowParticipant<A>,
-    event: SagaChoreographyEvent,
-    mut emit: F,
-    start: &mut S,
-) where
-    A: HasSagaParticipantSupport,
-    F: FnMut(SagaChoreographyEvent),
-    S: FnMut(&mut A, SagaChoreographyEvent) -> Result<(), Box<str>>,
-{
-    let context = event.context().clone();
-    let now = actor.now_millis();
-
-    if !workflow
-        .saga_types()
-        .iter()
-        .any(|t| *t == context.saga_type.as_ref())
-    {
-        return;
-    }
-
-    if matches!(event, SagaChoreographyEvent::CompensationRequested { .. })
-        && !compensation_request_targets_step(&event, workflow.step_name())
-    {
-        return; // ownership precedes admission/dedupe, including legacy lists
-    }
-    let is_terminal_event = matches!(
-        event,
-        SagaChoreographyEvent::SagaCompleted { .. }
-            | SagaChoreographyEvent::SagaFailed { .. }
-            | SagaChoreographyEvent::SagaQuarantined { .. }
-    );
-    let needs_admission = is_terminal_event
-        || matches!(
-            event,
-            SagaChoreographyEvent::SagaStarted { .. }
-                | SagaChoreographyEvent::StepCompleted { .. }
-                | SagaChoreographyEvent::CompensationRequested { .. }
-        );
-    let quarantine_closed = |actor: &mut A, emit: &mut F, reason: Box<str>| {
-        quarantine_workflow_step_failure(actor, workflow, &context, reason, now, emit);
-    };
-
-    // The durable journal, not a bounded in-memory latch, decides whether this run
-    // may be processed: terminal replays and stale runs are dropped, while an
-    // unresolved/quarantined/legacy owner of the saga id fails closed visibly.
-    if needs_admission {
-        match actor.admit_participant_event_strict(&context) {
-            Ok(ParticipantAdmission::Admitted) => {}
-            Ok(ParticipantAdmission::TerminalReplay { outcome })
-                if matches!(event, SagaChoreographyEvent::SagaQuarantined { .. })
-                    && outcome != ParticipantTerminalKind::Quarantined => {}
-            Ok(
-                ParticipantAdmission::TerminalReplay { .. } | ParticipantAdmission::StaleRun { .. },
-            ) => {
-                return;
-            }
-            Ok(rejected) => {
-                // A recognized foreign owner/replay refusal is not new effect
-                // uncertainty. Fabricating quarantine for the refused run would
-                // poison the legitimate owner through the resolver's family fence.
-                tracing::warn!(target: "core::saga", event = "workflow_participant_admission_rejected",
-                    saga_id = %context.saga_id, saga_type = %context.saga_type,
-                    run_started_at = context.saga_started_at_millis, admission = ?rejected);
-                return;
-            }
-            Err(err) => {
-                tracing::error!(
-                    target: "core::saga",
-                    event = "workflow_participant_admission_failed",
-                    saga_id = context.saga_id.get(),
-                    error = %err
-                );
-                if !is_terminal_event {
-                    quarantine_closed(
-                        actor,
-                        &mut emit,
-                        format!("workflow participant admission failed: {err}").into(),
-                    );
-                    return;
-                }
-            }
-        }
-    }
-
-    // An AllOf input is durably observed before anything volatile (dedupe mark, seen
-    // set) can consume it, so a restart between inputs cannot lose it.
-    if let SagaChoreographyEvent::StepCompleted { .. } = &event
-        && let crate::DependencySpec::AllOf(steps) = workflow.depends_on()
-        && steps.contains(&context.step_name.as_ref())
-        && let Err(reason) = record_allof_dependency(actor, &context)
-    {
-        quarantine_closed(actor, &mut emit, reason);
-        return;
-    }
-
-    // Idempotency is marked before workflow execution so replayed upstream
-    // events do not duplicate business side effects. The marker is scoped to the
-    // run identity. A crash between this mark and the durable StepExecutionStarted
-    // entry is fail-loud rather than resumed: startup recovery has no durable
-    // execution intent and the terminal resolver must fail or quarantine the saga.
-    // Terminal events are idempotent through their durable tombstone instead.
-    if !is_terminal_event {
-        let dedupe_key = workflow_dedupe_key_for_event(&event);
-        match actor.check_run_dedupe_strict(&context, &dedupe_key) {
-            Ok(RunDedupe::First) => {}
-            Ok(RunDedupe::Duplicate) => return,
-            Err(err) => {
-                quarantine_closed(
-                    actor,
-                    &mut emit,
-                    format!("workflow dedupe check failed: {err}").into(),
-                );
-                return;
-            }
-        }
-    }
-    mark_matching_accepted_step_failed(actor, &event);
-    if !is_terminal_event
-        && needs_admission
-        && actor
-            .saga_support()
-            .saga_run_started_at
-            .get(&context.saga_id)
-            .copied()
-            != Some(context.saga_started_at_millis)
-    {
-        actor.unlatch_terminal_saga(context.saga_id);
-        actor.clear_in_memory_saga_run_tracking(context.saga_id);
-        actor.record_saga_run_start(context.saga_id, context.saga_started_at_millis);
-    }
-
-    match event {
-        SagaChoreographyEvent::SagaStarted { payload, .. }
-            if workflow.depends_on().is_on_saga_start() =>
-        {
-            execute_workflow_step_with_emit(
-                actor,
-                workflow,
-                context.clone(),
-                payload,
-                now,
-                &mut emit,
-                start,
-            );
-        }
-        SagaChoreographyEvent::SagaStarted { .. } => {}
-        SagaChoreographyEvent::StepCompleted {
-            context: step_ctx,
-            output,
-            saga_input,
-            ..
-        } => {
-            let dependency_spec = workflow.depends_on();
-            if matches!(&dependency_spec, crate::DependencySpec::AllOf(steps)
-                if steps.contains(&step_ctx.step_name.as_ref()))
-                && let Err(reason) = hydrate_allof_dependencies(actor, &context)
-            {
-                quarantine_closed(actor, &mut emit, reason);
-                return;
-            }
-            let should_fire = workflow_dependency_should_fire(
-                actor,
-                context.saga_id,
-                &dependency_spec,
-                &step_ctx.step_name,
-            );
-            if should_fire {
-                let next_context = context.next_step(workflow.step_name().into());
-                let input = if dependency_spec.prefers_original_saga_input() {
-                    saga_input
-                } else {
-                    output
-                };
-                execute_workflow_step_with_emit(
-                    actor,
-                    workflow,
-                    next_context,
-                    input,
-                    now,
-                    &mut emit,
-                    start,
-                );
-            }
-        }
-        SagaChoreographyEvent::CompensationRequested {
-            failed_step,
-            reason,
-            failure,
-            steps_to_compensate,
-            ..
-        } => {
-            if steps_to_compensate
-                .first()
-                .is_some_and(|step| step.as_ref() == workflow.step_name())
-            {
-                compensate_workflow_with_emit(
-                    actor,
-                    workflow,
-                    &context,
-                    failed_step,
-                    reason,
-                    failure,
-                    steps_to_compensate,
-                    now,
-                    &mut emit,
-                );
-            }
-        }
-        SagaChoreographyEvent::SagaCompleted { .. } => {
-            retain_workflow_terminal(
-                actor,
-                &context,
-                ParticipantTerminalKind::Completed,
-                "saga completed",
-            );
-            workflow.on_saga_completed(actor, &context);
-            actor.clear_in_memory_saga_run_tracking(context.saga_id);
-        }
-        SagaChoreographyEvent::SagaFailed { reason, .. } => {
-            // An ordinary failure may only be ordinary when this participant has no
-            // unknown or unreversed work. Otherwise escalate visibly, retaining the
-            // accepted metadata and in-memory state for reconciliation.
-            let unresolved = match actor.participant_run_evidence_strict(&context) {
-                Ok(evidence) => evidence.failure_requires_quarantine(),
-                Err(error) => {
-                    tracing::error!(
-                        target: "core::saga",
-                        event = "workflow_failure_evidence_unavailable",
-                        saga_id = context.saga_id.get(),
-                        error = %error
-                    );
-                    true
-                }
-            };
-            if unresolved {
-                quarantine_workflow_step_failure(
-                    actor,
-                    workflow,
-                    &context,
-                    format!(
-                        "{reason}; unresolved participant intent/effect/undo requires reconciliation"
-                    )
-                    .into(),
-                    now,
-                    &mut emit,
-                );
-            } else {
-                retain_workflow_terminal(actor, &context, ParticipantTerminalKind::Failed, &reason);
-                workflow.on_saga_failed(actor, &context, &reason);
-                actor.clear_in_memory_saga_run_tracking(context.saga_id);
-            }
-        }
-        SagaChoreographyEvent::SagaQuarantined { reason, .. } => {
-            // Quarantine retains in-memory state and accepted metadata together with
-            // the journal and dedupe evidence until an operator resolves it.
-            retain_workflow_terminal(
-                actor,
-                &context,
-                ParticipantTerminalKind::Quarantined,
-                &reason,
-            );
-            workflow.on_quarantined(actor, &context, &reason);
-        }
-        _ => {}
-    }
-}
-
-/// Durably retains the terminal tombstone for this run. The journal, dedupe and
-/// accepted-step evidence are never pruned. If the durable write fails the
-/// in-memory latch is still set so this process does not repeat the run.
-fn retain_workflow_terminal<A>(
-    actor: &mut A,
-    context: &SagaContext,
-    outcome: ParticipantTerminalKind,
-    reason: &str,
-) where
-    A: HasSagaParticipantSupport,
-{
-    if let Err(error) = actor.retain_terminal_saga_strict(context, outcome, reason) {
-        tracing::error!(
-            target: "core::saga",
-            event = "workflow_terminal_retention_failed",
-            saga_id = context.saga_id.get(),
-            error = %error
-        );
-        actor.record_saga_run_start(context.saga_id, context.saga_started_at_millis);
-        actor.latch_terminal_saga(context.saga_id);
-    }
-}
-
-/// Durably records an incoming AllOf dependency completion for exactly this run
-/// (once). Failure is a visible-quarantine reason; it never authorizes execution.
-fn record_allof_dependency<A>(actor: &A, context: &SagaContext) -> Result<(), Box<str>>
-where
-    A: HasSagaParticipantSupport,
-{
-    let durable = actor
-        .completed_dependency_steps_strict(context)
-        .map_err(|error| Box::<str>::from(format!("dependency history unavailable: {error}")))?;
-    if durable.contains(&context.step_name) {
-        return Ok(());
-    }
-    actor
-        .record_dependency_completion_strict(context)
-        .map_err(|error| {
-            Box::<str>::from(format!(
-                "dependency observation persistence failed: {error}"
-            ))
-        })
-}
-
-/// Rebuilds this run's AllOf seen-set from the durable observations, so inputs seen
-/// before a restart or a cleared volatile cache still count.
-fn hydrate_allof_dependencies<A>(actor: &mut A, context: &SagaContext) -> Result<(), Box<str>>
-where
-    A: HasSagaParticipantSupport,
-{
-    let durable = actor
-        .completed_dependency_steps_strict(context)
-        .map_err(|error| Box::<str>::from(format!("dependency history unavailable: {error}")))?;
-    actor
-        .dependency_completions()
-        .entry(context.saga_id)
-        .or_default()
-        .extend(durable);
-    Ok(())
-}
-
-fn workflow_dependency_should_fire<A>(
-    actor: &mut A,
-    saga_id: SagaId,
-    dependency_spec: &crate::DependencySpec,
-    completed_step: &str,
-) -> bool
-where
-    A: HasSagaParticipantSupport,
-{
-    match dependency_spec {
-        crate::DependencySpec::OnSagaStart => false,
-        crate::DependencySpec::After(step) => {
-            if completed_step != *step {
-                return false;
-            }
-            actor.dependency_fired().insert(saga_id)
-        }
-        crate::DependencySpec::AnyOf(steps) => {
-            if !steps.contains(&completed_step) {
-                return false;
-            }
-            actor.dependency_fired().insert(saga_id)
-        }
-        crate::DependencySpec::AllOf(steps) => {
-            if !steps.contains(&completed_step) {
-                return false;
-            }
-            {
-                let seen = actor.dependency_completions().entry(saga_id).or_default();
-                seen.insert(completed_step.into());
-                if !steps.iter().all(|step| seen.contains(*step)) {
-                    return false;
-                }
-            }
-            actor.dependency_fired().insert(saga_id)
-        }
-    }
-}
-
-fn workflow_dedupe_key_for_event(event: &SagaChoreographyEvent) -> String {
-    let context = event.context();
-    match event {
-        SagaChoreographyEvent::CompensationRequested { failed_step, .. } => format!(
-            "{}:{}:{}:{}:{}",
-            context.trace_id,
-            context.saga_started_at_millis,
-            event.event_type(),
-            context.step_name,
-            failed_step
-        ),
-        _ => format!(
-            "{}:{}:{}:{}",
-            context.trace_id,
-            context.saga_started_at_millis,
-            event.event_type(),
-            context.step_name
-        ),
-    }
-}
-
-/// Already-fired forward work has a confirmed business result and, for a
-/// declared effect, its durable receipt. Neither kind may be re-executed.
-fn confirmed_clean_forward(evidence: &crate::ParticipantRunEvidence) -> bool {
-    evidence
-        .forward_outcome
-        .as_ref()
-        .is_some_and(|outcome| outcome.effect.is_none() || outcome.receipt.is_some())
-        && !evidence.forward_intent_open
-        && !evidence.accepted_forward_pending
-        && !evidence.undo_intent_open
-        && !evidence.undo_completed
-        && !evidence.quarantined
-        && !evidence.needs_reconciliation
-}
-
-fn execute_workflow_step_with_emit<A, F, S>(
-    actor: &mut A,
-    workflow: &'static dyn SagaWorkflowParticipant<A>,
-    context: SagaContext,
-    input: Vec<u8>,
-    now: u64,
-    emit: &mut F,
-    start: &mut S,
-) where
-    A: HasSagaParticipantSupport,
-    F: FnMut(SagaChoreographyEvent),
-    S: FnMut(&mut A, SagaChoreographyEvent) -> Result<(), Box<str>>,
-{
-    let saga_id = context.saga_id;
-    let state = crate::SagaParticipantState::new(
-        saga_id,
-        context.saga_type.clone(),
-        workflow.step_name().into(),
-        context.correlation_id,
-        context.trace_id,
-        context.initiator_peer_id,
-        context.saga_started_at_millis,
-    )
-    .trigger("dependency_satisfied", now)
-    .start_execution(now);
-
-    let refusal = match actor.forward_execution_recorded_strict(&context) {
-        Ok(false) => None,
-        Ok(true) => match actor.participant_run_evidence_strict(&context) {
-            // A confirmed dependency-triggered step has already fired, including
-            // a declared dispatch with its durable receipt.
-            // It is neither re-executed nor an error. A replayed start never qualifies.
-            Ok(evidence)
-                if !workflow.depends_on().is_on_saga_start()
-                    && confirmed_clean_forward(&evidence) =>
-            {
-                actor.dependency_fired().insert(saga_id);
-                return;
-            }
-            Ok(_) => Some(
-                "forward execution already has durable intent/evidence; reconciliation required"
-                    .into(),
-            ),
-            Err(error) => Some(format!("forward execution history unavailable: {error}").into()),
-        },
-        Err(error) => Some(format!("forward execution history unavailable: {error}").into()),
-    };
-    if let Some(reason) = refusal {
-        quarantine_workflow_step_failure(actor, workflow, &context, reason, now, emit);
-        return;
-    }
-    // Durable execution intent comes first: without it the business effect must not run.
-    let intent = actor.record_event_strict(
-        saga_id,
-        ParticipantEvent::StepExecutionStarted {
-            attempt: 1,
-            started_at_millis: now,
-        },
-    );
-    actor
-        .saga_states()
-        .insert(saga_id, SagaStateEntry::Executing(state));
-    if let Err(error) = intent {
-        quarantine_workflow_step_failure(
-            actor,
-            workflow,
-            &context,
-            format!("execution intent persistence failed: {error}").into(),
-            now,
-            emit,
-        );
-        return;
-    }
-
-    // Strict start publication precedes the business effect. A start that cannot
-    // be made visible quarantines instead of running unseen work.
-    if let Err(reason) = start(
-        actor,
-        SagaChoreographyEvent::StepStarted {
-            context: context.next_step(workflow.step_name().into()),
-        },
-    ) {
-        quarantine_workflow_step_failure(actor, workflow, &context, reason, now, emit);
-        return;
-    }
-    match workflow.execute_step(actor, &context, &input) {
-        Ok(output) => complete_workflow_step(actor, workflow, &context, input, output, now, emit),
-        Err(error) => fail_workflow_step(actor, workflow, &context, error, now, emit),
-    }
-}
-
-fn complete_workflow_step<A, F>(
-    actor: &mut A,
-    workflow: &'static dyn SagaWorkflowParticipant<A>,
-    context: &SagaContext,
-    saga_input: Vec<u8>,
-    output: crate::StepOutput,
-    now: u64,
-    emit: &mut F,
-) where
-    A: HasSagaParticipantSupport,
-    F: FnMut(SagaChoreographyEvent),
-{
-    let saga_id = context.saga_id;
-    if let StepOutput::Accepted {
-        execution_id,
-        policy,
-        compensation_data,
-    } = output
-    {
-        match accept_started_workflow_step(
-            actor,
-            context.next_step(workflow.step_name().into()),
-            workflow.participant_id_owned(),
-            execution_id,
-            policy,
-            saga_input,
-            compensation_data,
-        ) {
-            Ok(event) => emit(event),
-            Err(error) => quarantine_workflow_step_failure(
-                actor,
-                workflow,
-                context,
-                format!("accepted workflow step persistence failed: {error:?}").into(),
-                now,
-                emit,
-            ),
-        }
-        return;
-    }
-    let (out_data, comp_data, effect) = match output {
-        crate::StepOutput::Completed {
-            output,
-            compensation_data,
-        } => (output, compensation_data, None),
-        crate::StepOutput::CompletedWithEffect {
-            output,
-            compensation_data,
-            effect,
-        } => (output, compensation_data, Some(effect)),
-        StepOutput::Accepted { .. } => unreachable!("accepted output returned above"),
-    };
-
-    // A declared effect preserves its result and compensation bytes before dispatch:
-    // that raw row is the only durable trace of work already handed off, so it is
-    // genuinely unconfirmed until the post-handoff proof. A plain completion has no
-    // dispatch window, so its single strict proof append (below) carries the full
-    // result; writing a raw row first would only create a false uncertainty window.
-    if effect.is_some()
-        && let Err(error) = actor.record_event_strict(
-            saga_id,
-            ParticipantEvent::StepExecutionCompleted {
-                output: out_data.clone(),
-                compensation_data: comp_data.clone(),
-                completed_at_millis: now,
-            },
-        )
-    {
-        let reason: Box<str> = format!("step result persistence failed: {error}").into();
-        if let Err(evidence_error) =
-            actor.retain_reconciliation_evidence_strict(context, &out_data, &comp_data, &reason)
-        {
-            tracing::error!(target: "core::saga", event = "workflow_reconciliation_evidence_failed",
-                saga_id = saga_id.get(), error = %evidence_error);
-        }
-        quarantine_workflow_step_failure(actor, workflow, context, reason, now, emit);
-        return;
-    }
-    let declared_effect = effect.is_some();
-    let mut receipt_evidence: Option<Box<str>> = None;
-    if let Some(effect) = effect.as_ref() {
-        // The effect must be handed to the workflow's dispatch hook and acknowledged
-        // durably before success can be recorded or published. Every failure
-        // (including the fail-closed default) quarantines for reconciliation.
-        let request = crate::EffectDispatchRequest {
-            context,
-            effect,
-            output: &out_data,
-            compensation_data: &comp_data,
-        };
-        match workflow.dispatch_effect(actor, &request) {
-            Ok(crate::EffectDispatchOutcome::Durable { receipt }) => {
-                tracing::info!(
-                    target: "core::saga",
-                    event = "workflow_effect_dispatched",
-                    saga_id = saga_id.get(),
-                    effect = %effect,
-                    receipt = %receipt
-                );
-                receipt_evidence = Some(receipt);
-            }
-            Err(error) => {
-                quarantine_workflow_step_failure(
-                    actor,
-                    workflow,
-                    context,
-                    format!("effect dispatch failed: {error}").into(),
-                    now,
-                    emit,
-                );
-                return;
-            }
-        }
-    }
-
-    // Strict forward proof: business work and any declared effect succeeded. It is
-    // durable before success is published, and carries the exact completion event so
-    // recovery resends it verbatim without re-running anything. A failed write
-    // quarantines; the raw result stays journaled as unconfirmed evidence.
-    let completion = ParticipantForwardOutcome {
-        context: context.next_step(workflow.step_name().into()),
-        output: out_data.clone(),
-        saga_input,
-        compensation_data: comp_data.clone(),
-        effect,
-        receipt: receipt_evidence,
-        recorded_at_millis: actor.now_millis(),
-    };
-    if let Err(error) = actor.record_forward_outcome_strict(&completion) {
-        let reason: Box<str> = format!("forward outcome proof persistence failed: {error}").into();
-        if !declared_effect
-            && let Err(evidence_error) =
-                actor.retain_reconciliation_evidence_strict(context, &out_data, &comp_data, &reason)
-        {
-            // No raw row exists for a plain completion; keep its typed bytes visible.
-            tracing::error!(target: "core::saga", event = "workflow_reconciliation_evidence_failed",
-                saga_id = saga_id.get(), error = %evidence_error);
-        }
-        quarantine_workflow_step_failure(actor, workflow, context, reason, now, emit);
-        return;
-    }
-
-    if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&saga_id) {
-        let new_state = state.complete(out_data, comp_data, now);
-        actor
-            .saga_states()
-            .insert(saga_id, SagaStateEntry::Completed(new_state));
-    }
-
-    emit(completion.completion_event());
-}
-
-fn quarantine_workflow_step_failure<A, F>(
-    actor: &mut A,
-    workflow: &'static dyn SagaWorkflowParticipant<A>,
-    context: &SagaContext,
-    reason: Box<str>,
-    now: u64,
-    emit: &mut F,
-) where
-    A: HasSagaParticipantSupport,
-    F: FnMut(SagaChoreographyEvent),
-{
-    let saga_id = context.saga_id;
-    let quarantined = match actor.saga_states().remove(&saga_id) {
-        Some(SagaStateEntry::Executing(state)) => Some(state.quarantine(reason.clone(), now)),
-        Some(SagaStateEntry::Completed(state)) => Some(
-            state
-                .start_compensation(now)
-                .quarantine(reason.clone(), now),
-        ),
-        Some(SagaStateEntry::Compensating(state)) => Some(state.quarantine(reason.clone(), now)),
-        Some(other) => {
-            actor.saga_states().insert(saga_id, other);
-            None
-        }
-        None => None,
-    };
-    if let Some(state) = quarantined {
-        actor
-            .saga_states()
-            .insert(saga_id, SagaStateEntry::Quarantined(state));
-    }
-    retain_workflow_terminal(
-        actor,
-        context,
-        ParticipantTerminalKind::Quarantined,
-        &reason,
-    );
-    workflow.on_quarantined(actor, context, &reason);
-    actor.record_event(
-        saga_id,
-        ParticipantEvent::Quarantined {
-            reason: reason.clone(),
-            quarantined_at_millis: now,
-        },
-    );
-    emit(SagaChoreographyEvent::SagaQuarantined {
-        context: context.next_step(workflow.step_name().into()),
-        reason,
-        step: workflow.step_name().into(),
-        participant_id: workflow.participant_id_owned(),
-    });
-}
-
-fn quarantine_workflow_compensation_request_persistence_failure<A, F>(
-    actor: &mut A,
-    workflow: &'static dyn SagaWorkflowParticipant<A>,
-    context: &SagaContext,
-    reason: Box<str>,
-    now: u64,
-    emit: &mut F,
-) where
-    A: HasSagaParticipantSupport,
-    F: FnMut(SagaChoreographyEvent),
-{
-    quarantine_workflow_step_failure(actor, workflow, context, reason, now, emit);
-}
-
-fn fail_workflow_step<A, F>(
-    actor: &mut A,
-    workflow: &'static dyn SagaWorkflowParticipant<A>,
-    context: &SagaContext,
-    error: crate::StepError,
-    now: u64,
-    emit: &mut F,
-) where
-    A: HasSagaParticipantSupport,
-    F: FnMut(SagaChoreographyEvent),
-{
-    let saga_id = context.saga_id;
-    let (reason, requires_comp) = match error {
-        crate::StepError::Terminal { reason } => (reason, false),
-        crate::StepError::RequireCompensation { reason } => (reason, true),
-    };
-
-    if let Err(error) = actor.record_event_strict(
-        saga_id,
-        ParticipantEvent::StepExecutionFailed {
-            error: reason.clone(),
-            requires_compensation: requires_comp,
-            failed_at_millis: now,
-        },
-    ) {
-        quarantine_workflow_step_failure(
-            actor,
-            workflow,
-            context,
-            format!("step failure persistence failed: {error}; original failure: {reason}").into(),
-            now,
-            emit,
-        );
-        return;
-    }
-
-    if let Some(SagaStateEntry::Executing(state)) = actor.saga_states().remove(&saga_id) {
-        let new_state = state.fail(reason.clone(), requires_comp, now);
-        actor
-            .saga_states()
-            .insert(saga_id, SagaStateEntry::Failed(new_state));
-    }
-
-    emit(SagaChoreographyEvent::StepFailed {
-        context: context.next_step(workflow.step_name().into()),
-        participant_id: workflow.participant_id_owned(),
-        error_code: None,
-        error: reason,
-        requires_compensation: requires_comp,
-    });
-}
-
-/// Rebuilds the completed-step state needed to undo after a cold restart from the
-/// current run's journal evidence. `Ok(None)` means there is nothing to undo; an
-/// `Err` is a visible-quarantine reason (unreadable or uncertain undo history).
-fn completed_state_from_journal<A>(
-    actor: &A,
-    workflow: &'static dyn SagaWorkflowParticipant<A>,
-    context: &SagaContext,
-    now: u64,
-) -> Result<Option<SagaStateEntry>, Box<str>>
-where
-    A: HasSagaParticipantSupport,
-{
-    let evidence = actor
-        .participant_run_evidence_strict(context)
-        .map_err(|error| Box::<str>::from(format!("undo evidence unavailable: {error}")))?;
-    if evidence.undo_completed {
-        return Ok(None);
-    }
-    if evidence.undo_intent_open || evidence.quarantined || evidence.needs_reconciliation {
-        return Err(
-            "undo request found uncertain undo/reconciliation evidence; \
-             refusing to repeat or skip the undo"
-                .into(),
-        );
-    }
-    if evidence.compensation_data.is_empty() {
-        return Ok(None);
-    }
-    let state = crate::SagaParticipantState::new(
-        context.saga_id,
-        context.saga_type.clone(),
-        workflow.step_name().into(),
-        context.correlation_id,
-        context.trace_id,
-        context.initiator_peer_id,
-        context.saga_started_at_millis,
-    )
-    .trigger("undo_recovered_from_journal", now)
-    .start_execution(now)
-    .complete(evidence.output, evidence.compensation_data, now);
-    Ok(Some(SagaStateEntry::Completed(state)))
-}
-
-#[allow(clippy::too_many_arguments)] // signature refactor deferred to W6 R23
-fn compensate_workflow_with_emit<A, F>(
-    actor: &mut A,
-    workflow: &'static dyn SagaWorkflowParticipant<A>,
-    context: &SagaContext,
-    failed_step: Box<str>,
-    request_reason: Box<str>,
-    failure: crate::SagaFailureDetails,
-    steps_to_compensate: Vec<Box<str>>,
-    now: u64,
-    emit: &mut F,
-) where
-    A: HasSagaParticipantSupport,
-    F: FnMut(SagaChoreographyEvent),
-{
-    let saga_id = context.saga_id;
-    if let Err(error) = actor.record_event_strict(
-        saga_id,
-        ParticipantEvent::CompensationRequestRecorded {
-            context: context.clone(),
-            failed_step,
-            reason: request_reason,
-            failure,
-            steps_to_compensate,
-            requested_at_millis: now,
-        },
-    ) {
-        quarantine_workflow_compensation_request_persistence_failure(
-            actor,
-            workflow,
-            context,
-            format!("compensation request persistence failed: {error:?}").into(),
-            now,
-            emit,
-        );
-        return;
-    }
-    let accepted_recovery_data = actor
-        .saga_support()
-        .accepted_workflow_steps
-        .get(&saga_id)
-        .map(|accepted| {
-            (
-                accepted.saga_input.clone(),
-                accepted.compensation_data.clone(),
-            )
-        });
-    match actor.participant_run_evidence_strict(context) {
-        Ok(evidence) if no_effect_rejection_proven(&evidence) => {
-            complete_no_effect_workflow_compensation(actor, workflow, context, now, emit);
-            return;
-        }
-        Ok(evidence)
-            if evidence.undo_completed
-                && !evidence.undo_intent_open
-                && !evidence.needs_reconciliation
-                && !evidence.quarantined =>
-        {
-            // Hydrate the proved terminal projection too: managed ingress validates
-            // emitted acknowledgements against Compensated, not an empty cache.
-            let state = crate::SagaParticipantState::new(
-                saga_id,
-                context.saga_type.clone(),
-                workflow.step_name().into(),
-                context.correlation_id,
-                context.trace_id,
-                context.initiator_peer_id,
-                context.saga_started_at_millis,
-            )
-            .trigger("undo_recovered", now)
-            .start_execution(now)
-            .complete(evidence.output, evidence.compensation_data, now)
-            .start_compensation(now)
-            .complete_compensation(now);
-            actor
-                .saga_states()
-                .insert(saga_id, SagaStateEntry::Compensated(state));
-            emit(SagaChoreographyEvent::CompensationCompleted {
-                context: context.next_step(workflow.step_name().into()),
-            });
-            return;
-        }
-        Err(error) => {
-            quarantine_workflow_step_failure(
-                actor,
-                workflow,
-                context,
-                format!("undo acknowledgement evidence unavailable: {error}").into(),
-                now,
-                emit,
-            );
-            return;
-        }
-        _ => {}
-    }
-    let state_entry = match actor.saga_states().remove(&saga_id) {
-        Some(entry) => Some(entry),
-        // No volatile state (cold restart): the journal is the source of truth.
-        None => match completed_state_from_journal(actor, workflow, context, now) {
-            Ok(entry) => entry,
-            Err(reason) => {
-                quarantine_workflow_step_failure(actor, workflow, context, reason, now, emit);
-                return;
-            }
-        },
-    };
-    let (saga_input, comp_data, compensating_state) = match state_entry {
-        Some(SagaStateEntry::Completed(state)) => {
-            let comp_data = state.state.compensation_data.clone();
-            (Vec::new(), comp_data, state.start_compensation(now))
-        }
-        Some(SagaStateEntry::Executing(state)) => {
-            let Some((saga_input, comp_data)) = accepted_recovery_data else {
-                actor
-                    .saga_states()
-                    .insert(saga_id, SagaStateEntry::Executing(state));
-                return;
-            };
-            (saga_input, comp_data, state.start_compensation(now))
-        }
-        Some(other) => {
-            actor.saga_states().insert(saga_id, other);
-            return;
-        }
-        None => return,
-    };
-    actor
-        .saga_states()
-        .insert(saga_id, SagaStateEntry::Compensating(compensating_state));
-    if let Some(accepted) = actor
-        .saga_support_mut()
-        .accepted_workflow_steps
-        .remove(&saga_id)
-    {
-        mark_accepted_step_resolved(actor, saga_id, accepted.execution_id);
-    }
-
-    if let Err(error) = actor.record_event_strict(
-        saga_id,
-        ParticipantEvent::CompensationStarted {
-            attempt: 1,
-            started_at_millis: now,
-        },
-    ) {
-        fail_workflow_compensation(
-            actor,
-            workflow,
-            context,
-            crate::CompensationError::Ambiguous {
-                reason: format!("compensation intent persistence failed: {error}").into(),
-            },
-            now,
-            emit,
-        );
-        return;
-    }
-
-    match workflow.compensate_step(actor, context, &comp_data) {
-        Ok(CompensationOutput::Completed) => {
-            complete_workflow_compensation(actor, workflow, context, now, emit)
-        }
-        Ok(CompensationOutput::Accepted {
-            execution_id,
-            policy,
-        }) => match accept_started_workflow_compensation(
-            actor,
-            context.next_step(workflow.step_name().into()),
-            workflow.participant_id_owned(),
-            execution_id,
-            policy,
-            saga_input,
-            comp_data,
-        ) {
-            Ok(event) => emit(event),
-            Err(error) => fail_workflow_compensation(
-                actor,
-                workflow,
-                context,
-                crate::CompensationError::Ambiguous {
-                    reason: format!("accepted compensation persistence failed: {error:?}").into(),
-                },
-                now,
-                emit,
-            ),
-        },
-        Err(error) => fail_workflow_compensation(actor, workflow, context, error, now, emit),
-    }
-}
-
-/// Answers an owned request for a durably rejected (no-effect) forward step: the
-/// completion proof is strictly persisted BEFORE publication and no business undo
-/// runs. A failed append quarantines and publishes nothing; the request stays owned.
-fn complete_no_effect_workflow_compensation<A, F>(
-    actor: &mut A,
-    workflow: &'static dyn SagaWorkflowParticipant<A>,
-    context: &SagaContext,
-    now: u64,
-    emit: &mut F,
-) where
-    A: HasSagaParticipantSupport,
-    F: FnMut(SagaChoreographyEvent),
-{
-    let saga_id = context.saga_id;
-    if let Err(error) = actor.record_event_strict(
-        saga_id,
-        ParticipantEvent::CompensationCompleted {
-            completed_at_millis: now,
-        },
-    ) {
-        quarantine_workflow_step_failure(
-            actor,
-            workflow,
-            context,
-            format!("no-effect compensation proof persistence failed: {error}").into(),
-            now,
-            emit,
-        );
-        return;
-    }
-    let state = crate::SagaParticipantState::new(
-        saga_id,
-        context.saga_type.clone(),
-        workflow.step_name().into(),
-        context.correlation_id,
-        context.trace_id,
-        context.initiator_peer_id,
-        context.saga_started_at_millis,
-    )
-    .trigger("no_effect_rejection", now)
-    .start_execution(now)
-    .complete(Vec::new(), Vec::new(), now)
-    .start_compensation(now)
-    .complete_compensation(now);
-    actor
-        .saga_states()
-        .insert(saga_id, SagaStateEntry::Compensated(state));
-    emit(SagaChoreographyEvent::CompensationCompleted {
-        context: context.next_step(workflow.step_name().into()),
-    });
-    workflow.on_compensation_completed(actor, context);
-}
-
-fn complete_workflow_compensation<A, F>(
-    actor: &mut A,
-    workflow: &'static dyn SagaWorkflowParticipant<A>,
-    context: &SagaContext,
-    now: u64,
-    emit: &mut F,
-) where
-    A: HasSagaParticipantSupport,
-    F: FnMut(SagaChoreographyEvent),
-{
-    let saga_id = context.saga_id;
-
-    if let Err(error) = actor.record_event_strict(
-        saga_id,
-        ParticipantEvent::CompensationCompleted {
-            completed_at_millis: now,
-        },
-    ) {
-        fail_workflow_compensation(
-            actor,
-            workflow,
-            context,
-            crate::CompensationError::Ambiguous {
-                reason: format!("compensation result persistence failed: {error}").into(),
-            },
-            now,
-            emit,
-        );
-        return;
-    }
-
-    if let Some(SagaStateEntry::Compensating(state)) = actor.saga_states().remove(&saga_id) {
-        let new_state = state.complete_compensation(now);
-        actor
-            .saga_states()
-            .insert(saga_id, SagaStateEntry::Compensated(new_state));
-    }
-
-    emit(SagaChoreographyEvent::CompensationCompleted {
-        context: context.next_step(workflow.step_name().into()),
-    });
-
-    workflow.on_compensation_completed(actor, context);
-}
-
-fn fail_workflow_compensation<A, F>(
-    actor: &mut A,
-    workflow: &'static dyn SagaWorkflowParticipant<A>,
-    context: &SagaContext,
-    error: crate::CompensationError,
-    now: u64,
-    emit: &mut F,
-) where
-    A: HasSagaParticipantSupport,
-    F: FnMut(SagaChoreographyEvent),
-{
-    let saga_id = context.saga_id;
-    let (reason, is_ambiguous) = match error {
-        crate::CompensationError::SafeToRetry { reason } => (reason, false),
-        crate::CompensationError::Ambiguous { reason } => (reason, true),
-        crate::CompensationError::Terminal { reason } => (reason, false),
-    };
-
-    if let Some(SagaStateEntry::Compensating(state)) = actor.saga_states().remove(&saga_id) {
-        if is_ambiguous {
-            let new_state = state.quarantine(reason.clone(), now);
-            actor
-                .saga_states()
-                .insert(saga_id, SagaStateEntry::Quarantined(new_state));
-        } else {
-            let new_state = state.fail(reason.clone(), false, now);
-            actor
-                .saga_states()
-                .insert(saga_id, SagaStateEntry::Failed(new_state));
-        }
-    }
-
-    if is_ambiguous {
-        actor.record_event(
-            saga_id,
-            ParticipantEvent::Quarantined {
-                reason: reason.clone(),
-                quarantined_at_millis: now,
-            },
-        );
-    } else {
-        actor.record_event(
-            saga_id,
-            ParticipantEvent::CompensationFailed {
-                error: reason.clone(),
-                is_ambiguous,
-                failed_at_millis: now,
-            },
-        );
-    }
-
-    let event_context = context.next_step(workflow.step_name().into());
-    emit(SagaChoreographyEvent::CompensationFailed {
-        context: event_context.clone(),
-        participant_id: workflow.participant_id_owned(),
-        error: reason.clone(),
-        is_ambiguous,
-    });
-    if is_ambiguous {
-        emit(SagaChoreographyEvent::SagaQuarantined {
-            context: event_context,
-            reason: reason.clone(),
-            step: workflow.step_name().into(),
-            participant_id: workflow.participant_id_owned(),
-        });
-    }
-
-    workflow.on_quarantined(actor, context, &reason);
-}
-
 pub async fn apply_async_participant_saga_ingress<P, FApplyTerminal, FOnInvalid>(
     participant: &mut P,
     event: SagaChoreographyEvent,
@@ -3702,19 +2637,25 @@ pub async fn apply_async_participant_saga_ingress_with_hooks<
     FOnInvalid: FnMut(&SagaChoreographyEvent),
     FOnEmitted: FnMut(&mut P, &SagaChoreographyEvent),
 {
-    if !participant
-        .saga_types()
-        .iter()
-        .any(|saga_type| *saga_type == event.context().saga_type.as_ref())
-        || terminal_callback_permitted(participant, &event)
-    {
-        apply_terminal_side_effects(participant, &event);
-    }
-    mark_matching_accepted_step_failed(participant, &event);
-
     let mut emitted = Vec::new();
-    handle_async_saga_event_with_emit(participant, event, |next_event| emitted.push(next_event))
-        .await;
+    let terminal_event = event.clone();
+    let retained = crate::helpers::handle_async_saga_event_core(
+        participant,
+        event,
+        |next_event| emitted.push(next_event),
+        |actor, start| {
+            publish_workflow_step_started(
+                actor,
+                start,
+                &mut on_invalid_transition,
+                &mut on_emitted_transition,
+            )
+        },
+    )
+    .await;
+    if retained {
+        apply_terminal_side_effects(participant, &terminal_event);
+    }
 
     let saga_bus = participant.saga_support().bus.clone();
     for next_event in emitted {
@@ -3728,13 +2669,11 @@ pub async fn apply_async_participant_saga_ingress_with_hooks<
             continue;
         }
 
-        on_emitted_transition(participant, &next_event);
-
-        // The helper already published `StepStarted` strictly before business work;
-        // the buffered copy only feeds hooks and validation, never a second publish.
         if matches!(next_event, SagaChoreographyEvent::StepStarted { .. }) {
             continue;
         }
+        on_emitted_transition(participant, &next_event);
+
         if let Some(bus) = &saga_bus
             && let Err(err) = bus.publish_strict(next_event)
         {
@@ -3821,22 +2760,21 @@ where
     }
 }
 
-pub fn publish_active_saga_panic_quarantine<J, D>(
-    saga: &mut SagaParticipantSupport<J, D>,
+pub fn publish_active_saga_panic_quarantine<S>(
+    saga: &mut SagaParticipantSupport<S>,
     context: &SagaContext,
     phase: ActiveSagaExecutionPhase,
     panic_payload: &(dyn std::any::Any + Send),
     step_name: &str,
     participant_id: Box<str>,
 ) where
-    J: ParticipantJournal,
-    D: ParticipantDedupeStore,
+    S: ParticipantStore,
 {
     let message = panic_message_from_payload(panic_payload);
     let reason = panic_quarantine_reason(phase, message.as_ref());
     let now = SagaContext::now_millis();
 
-    if let Err(err) = saga.journal.append(
+    if let Err(err) = saga.store.append(
         context.saga_id,
         ParticipantEvent::Quarantined {
             reason: reason.clone(),
@@ -3863,7 +2801,7 @@ pub fn publish_active_saga_panic_quarantine<J, D>(
             Ok(stats) => {
                 if stats.delivered > 0
                     && let Err(err) = saga
-                        .dedupe
+                        .store
                         .mark_processed(context.saga_id, PANIC_QUARANTINE_PUBLISH_KEY)
                 {
                     tracing::error!(
@@ -3894,40 +2832,7 @@ pub enum RecoveryDecision {
     TerminalNoAction,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct RecoveryPolicy {
-    pub stale_after_ms: u64,
-}
-
-impl Default for RecoveryPolicy {
-    fn default() -> Self {
-        static STALE_AFTER_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let stale_after_ms =
-            *STALE_AFTER_MS.get_or_init(|| match std::env::var("SAGA_RECOVERY_MAX_AGE_MS") {
-                Ok(raw) => match raw.parse::<u64>() {
-                    Ok(value) => value,
-                    Err(err) => {
-                        tracing::error!(
-                            target: "core::saga",
-                            event = "saga_recovery_max_age_parse_failed",
-                            env = "SAGA_RECOVERY_MAX_AGE_MS",
-                            value = %raw,
-                            error = %err
-                        );
-                        5 * 60 * 1000
-                    }
-                },
-                Err(_) => 5 * 60 * 1000,
-            });
-        Self { stale_after_ms }
-    }
-}
-
-pub fn classify_recovery(
-    entries: &[JournalEntry],
-    now_ms: u64,
-    _policy: RecoveryPolicy, // retained for API compatibility: age is not a safety proxy
-) -> RecoveryDecision {
+pub fn classify_recovery(entries: &[JournalEntry], now_ms: u64) -> RecoveryDecision {
     let Some(last) = entries.last() else {
         return RecoveryDecision::TerminalNoAction;
     };
@@ -4050,29 +2955,19 @@ impl<'a> RunProgress<'a> {
     }
 }
 
-pub fn collect_startup_recovery_events<J: ParticipantJournal, D: ParticipantDedupeStore>(
-    journal: &J,
-    dedupe: &D,
-    step_name: &'static str,
+pub fn collect_startup_recovery_events<S: ParticipantStore>(
+    journal: &S,
+    step_name: &str,
 ) -> Result<Vec<SagaChoreographyEvent>, RecoveryCollectionError> {
-    collect_startup_recovery_events_for_saga_type(
-        journal,
-        dedupe,
-        step_name,
-        DEFAULT_RECOVERY_SAGA_TYPE,
-    )
+    collect_startup_recovery_events_for_saga_type(journal, step_name, DEFAULT_RECOVERY_SAGA_TYPE)
 }
 
-pub fn collect_startup_recovery_events_for_saga_type<
-    J: ParticipantJournal,
-    D: ParticipantDedupeStore,
->(
-    journal: &J,
-    dedupe: &D,
-    step_name: &'static str,
-    saga_type: &'static str,
+pub fn collect_startup_recovery_events_for_saga_type<S: ParticipantStore>(
+    journal: &S,
+    step_name: &str,
+    saga_type: &str,
 ) -> Result<Vec<SagaChoreographyEvent>, RecoveryCollectionError> {
-    collect_startup_recovery_events_for_saga_type_inner(journal, saga_type, dedupe, step_name, true)
+    collect_startup_recovery_events_for_saga_type_inner(journal, saga_type, step_name, true)
 }
 
 fn recorded_saga_type(entries: &[JournalEntry]) -> Option<&str> {
@@ -4080,12 +2975,12 @@ fn recorded_saga_type(entries: &[JournalEntry]) -> Option<&str> {
         ParticipantEvent::ParticipantForwardOutcomeRecorded { outcome } => {
             Some(outcome.context.saga_type.as_ref())
         }
-        ParticipantEvent::SagaRegistered { saga_type, .. }
-        | ParticipantEvent::ParticipantRunRecorded { saga_type, .. }
+        ParticipantEvent::ParticipantRunRecorded { saga_type, .. }
         | ParticipantEvent::ParticipantTerminalRecorded { saga_type, .. } => {
             Some(saga_type.as_ref())
         }
-        ParticipantEvent::CompensationRequestRecorded { context, .. }
+        ParticipantEvent::AcceptedDeadlineRenewed { context, .. }
+        | ParticipantEvent::CompensationRequestRecorded { context, .. }
         | ParticipantEvent::AcceptedStepRecorded { context, .. }
         | ParticipantEvent::AcceptedCompensationRecorded { context, .. }
         | ParticipantEvent::ParticipantReconciliationEvidence { context, .. }
@@ -4103,282 +2998,317 @@ fn recorded_saga_type(entries: &[JournalEntry]) -> Option<&str> {
     })
 }
 
-fn collect_startup_recovery_events_for_saga_type_inner<
-    J: ParticipantJournal,
-    D: ParticipantDedupeStore,
->(
-    journal: &J,
-    saga_type: &'static str,
-    dedupe: &D,
-    step_name: &'static str,
+fn collect_startup_recovery_events_for_saga_type_inner<S: ParticipantStore>(
+    store: &S,
+    saga_type: &str,
+    step_name: &str,
     allow_untyped_recovery: bool,
 ) -> Result<Vec<SagaChoreographyEvent>, RecoveryCollectionError> {
-    let mut out = Vec::new();
-    let policy = RecoveryPolicy::default();
+    let ids = store
+        .unresolved_saga_ids()
+        .map_err(RecoveryCollectionError::ListSagas)?;
     let now = SagaContext::now_millis();
-    let saga_ids = match journal.list_sagas() {
-        Ok(ids) => ids,
-        Err(err) => return Err(RecoveryCollectionError::ListSagas(err)),
-    };
-    for saga_id in saga_ids {
-        let all_entries = match journal.read(saga_id) {
-            Ok(entries) => entries,
-            Err(err) => {
-                return Err(RecoveryCollectionError::ReadSaga {
-                    saga_id,
-                    source: err,
-                });
+    let mut out = Vec::new();
+    for saga_id in ids {
+        let entries = store
+            .read(saga_id)
+            .map_err(|source| RecoveryCollectionError::ReadSaga { saga_id, source })?;
+        out.extend(collect_recovered_run(
+            store,
+            saga_id,
+            &entries,
+            step_name,
+            saga_type,
+            allow_untyped_recovery,
+            now,
+        )?);
+    }
+    Ok(out)
+}
+
+/// Recover every registered participant in one unresolved-index pass and one read per saga.
+pub fn collect_startup_recovery_events_for_participants<S: ParticipantStore>(
+    support: &mut SagaParticipantSupport<S>,
+    registrations: &[(&str, &str)],
+) -> Result<Vec<SagaChoreographyEvent>, RecoveryCollectionError> {
+    let ids = support
+        .store
+        .unresolved_saga_ids()
+        .map_err(RecoveryCollectionError::ListSagas)?;
+    let now = SagaContext::now_millis();
+    let mut out = Vec::new();
+    for saga_id in ids {
+        let entries = support
+            .store
+            .read(saga_id)
+            .map_err(|source| RecoveryCollectionError::ReadSaga { saga_id, source })?;
+        let recorded = recorded_saga_type(&entries);
+        for &(step_name, saga_type) in registrations {
+            if recorded.is_some_and(|recorded| recorded != saga_type) {
+                continue;
             }
-        };
-        if all_entries.is_empty() {
-            continue;
+            out.extend(collect_recovered_run(
+                &support.store,
+                saga_id,
+                &entries,
+                step_name,
+                saga_type,
+                false,
+                now,
+            )?);
+            hydrate_recovered_run(support, saga_id, &entries, step_name, saga_type, now)?;
         }
-        match recorded_saga_type(&all_entries) {
-            Some(recorded) if recorded != saga_type => continue,
-            None if !allow_untyped_recovery => continue,
-            Some(_) | None => {}
+        if recorded.is_none() && !entries.is_empty() {
+            return Err(unidentified_run_error(saga_id, "startup history"));
         }
-        let run = current_run(&all_entries);
-        if run.terminal.is_some() {
-            // A durably resolved run (completed, failed or quarantined) is never
-            // resumed or auto-resolved; quarantined evidence waits for an operator.
-            continue;
-        }
-        let entries = run.entries;
-        if let Some((context, reason)) = entries.iter().rev().find_map(|entry| match &entry.event {
-            ParticipantEvent::ParticipantReconciliationEvidence {
-                context, reason, ..
-            } if context.saga_type.as_ref() == saga_type => Some((context, reason)),
-            _ => None,
-        }) {
+    }
+    support.prune_orphan_run_markers();
+    Ok(out)
+}
+
+fn collect_recovered_run<S: ParticipantStore>(
+    journal: &S,
+    saga_id: SagaId,
+    all_entries: &[JournalEntry],
+    step_name: &str,
+    saga_type: &str,
+    allow_untyped_recovery: bool,
+    now: u64,
+) -> Result<Vec<SagaChoreographyEvent>, RecoveryCollectionError> {
+    let mut out = Vec::new();
+    if all_entries.is_empty() {
+        return Ok(out);
+    }
+    match recorded_saga_type(all_entries) {
+        Some(recorded) if recorded != saga_type => return Ok(out),
+        None if !allow_untyped_recovery => return Ok(out),
+        Some(_) | None => {}
+    }
+    let run = current_run(all_entries);
+    if run.terminal.is_some() {
+        // A durably resolved run (completed, failed or quarantined) is never
+        // resumed or auto-resolved; quarantined evidence waits for an operator.
+        return Ok(out);
+    }
+    let entries = run.entries;
+    if let Some((context, reason)) = entries.iter().rev().find_map(|entry| match &entry.event {
+        ParticipantEvent::ParticipantReconciliationEvidence {
+            context, reason, ..
+        } if context.saga_type.as_ref() == saga_type => Some((context, reason)),
+        _ => None,
+    }) {
+        out.push(SagaChoreographyEvent::SagaQuarantined {
+            context: context.next_step(step_name.into()),
+            reason: reason.clone(),
+            step: step_name.into(),
+            participant_id: step_name.into(),
+        });
+        return Ok(out);
+    }
+    // Recovery only acts on durable journal evidence. If a persistent
+    // dedupe store marked an upstream event but the participant crashed
+    // before journaling StepExecutionStarted, there is no local execution
+    // intent to resume here; the saga remains externally visible and is
+    // resolved by terminal timeout policy instead of silent replay.
+    if let Some((accepted, error, is_ambiguous, failed_at_millis)) =
+        recover_failed_accepted_compensation_from_entries(entries)
+        && accepted.context.saga_type.as_ref() == saga_type
+        && accepted.context.step_name.as_ref() == step_name
+    {
+        let Some(request) = recover_compensation_request_from_entries(entries) else {
             out.push(SagaChoreographyEvent::SagaQuarantined {
-                context: context.next_step(step_name.into()),
-                reason: reason.clone(),
-                step: step_name.into(),
-                participant_id: step_name.into(),
-            });
-            continue;
-        }
-        // Recovery only acts on durable journal evidence. If a persistent
-        // dedupe store marked an upstream event but the participant crashed
-        // before journaling StepExecutionStarted, there is no local execution
-        // intent to resume here; the saga remains externally visible and is
-        // resolved by terminal timeout policy instead of silent replay.
-        if let Some((accepted, error, is_ambiguous, failed_at_millis)) =
-            recover_failed_accepted_compensation_from_entries(entries)
-            && accepted.context.saga_type.as_ref() == saga_type
-            && accepted.context.step_name.as_ref() == step_name
-        {
-            let Some(request) = recover_compensation_request_from_entries(entries) else {
-                out.push(SagaChoreographyEvent::SagaQuarantined {
-                    context: accepted.context.clone(),
-                    reason:
-                        "failed accepted compensation recovery missing durable compensation request"
-                            .into(),
-                    step: accepted.context.step_name.clone(),
-                    participant_id: accepted.participant_id,
-                });
-                continue;
-            };
-            let mut context = accepted.context;
-            context.event_timestamp_millis = failed_at_millis;
-            out.push(request);
-            out.push(SagaChoreographyEvent::CompensationFailed {
-                context,
+                context: accepted.context.clone(),
+                reason:
+                    "failed accepted compensation recovery missing durable compensation request"
+                        .into(),
+                step: accepted.context.step_name.clone(),
                 participant_id: accepted.participant_id,
+            });
+            return Ok(out);
+        };
+        let mut context = accepted.context;
+        context.event_timestamp_millis = failed_at_millis;
+        out.push(request);
+        out.push(SagaChoreographyEvent::CompensationFailed {
+            context,
+            participant_id: accepted.participant_id,
+            error,
+            is_ambiguous,
+        });
+        return Ok(out);
+    }
+    if let Some((accepted, completed_at_millis)) =
+        recover_completed_accepted_compensation_from_entries(entries)
+        && accepted.context.saga_type.as_ref() == saga_type
+        && accepted.context.step_name.as_ref() == step_name
+    {
+        let Some(request) = recover_compensation_request_from_entries(entries) else {
+            out.push(SagaChoreographyEvent::SagaQuarantined {
+                context: accepted.context.clone(),
+                reason:
+                    "completed accepted compensation recovery missing durable compensation request"
+                        .into(),
+                step: accepted.context.step_name.clone(),
+                participant_id: accepted.participant_id,
+            });
+            return Ok(out);
+        };
+        let mut context = accepted.context;
+        context.event_timestamp_millis = completed_at_millis;
+        out.push(request);
+        out.push(SagaChoreographyEvent::CompensationCompleted { context });
+        return Ok(out);
+    }
+    if let Some(accepted) = recover_accepted_workflow_compensation_from_entries(entries)
+        && accepted.context.saga_type.as_ref() == saga_type
+        && accepted.context.step_name.as_ref() == step_name
+    {
+        let Some(request) = recover_compensation_request_from_entries(entries) else {
+            out.push(SagaChoreographyEvent::SagaQuarantined {
+                context: accepted.context.clone(),
+                reason: "accepted compensation recovery missing durable compensation request"
+                    .into(),
+                step: accepted.context.step_name.clone(),
+                participant_id: accepted.participant_id,
+            });
+            return Ok(out);
+        };
+        out.push(request);
+        out.push(startup_accepted_compensation_replay_event(&accepted));
+        if let Some(timeout_event) = startup_accepted_compensation_timeout_event(accepted, now) {
+            out.push(timeout_event);
+        }
+        return Ok(out);
+    }
+    // Undo proven locally (request, intent and completion are all durable) but
+    // never acknowledged: resend only the original-run acknowledgement. No new
+    // request, no physical undo, no invented identity.
+    if let Some(ack) =
+        recover_proven_undo_acknowledgement(entries, run.identity, saga_type, step_name)
+    {
+        out.push(ack);
+        return Ok(out);
+    }
+    if let Some(request) = recover_unstarted_compensation_request_from_entries(entries)
+        && request.context().saga_type.as_ref() == saga_type
+        && compensation_request_targets_step(&request, step_name)
+    {
+        let accepted_effect = recover_accepted_workflow_step_from_entries(entries)
+            .is_some_and(|accepted| !accepted.compensation_data.is_empty());
+        let completed_effect = recover_completed_step_effect_for_unstarted_compensation(entries)
+            .is_some_and(|(_, compensation_data, _)| !compensation_data.is_empty());
+        let no_effect_rejection = run.identity.is_some_and(|identity| {
+            request.context().saga_type.as_ref() == identity.0
+                && request.context().saga_started_at_millis == identity.1
+                && rejected_without_effect_in_entries(entries, identity)
+        });
+        if !accepted_effect && !completed_effect && !no_effect_rejection {
+            out.push(SagaChoreographyEvent::SagaQuarantined {
+                context: request.context().clone(),
+                reason: "unstarted compensation recovery missing durable compensation state".into(),
+                step: request.context().step_name.clone(),
+                participant_id: request.context().step_name.clone(),
+            });
+            return Ok(out);
+        }
+        out.push(request);
+        return Ok(out);
+    }
+    if let Some(accepted) = recover_accepted_workflow_step_from_entries(entries)
+        && accepted.context.saga_type.as_ref() == saga_type
+        && accepted.context.step_name.as_ref() == step_name
+    {
+        if let Some((error, failed_at_millis)) =
+            accepted_step_failure_requiring_compensation(entries)
+        {
+            out.push(startup_accepted_step_failure_hydration_event(&accepted));
+            out.push(startup_accepted_step_failure_event(
+                &accepted,
+                None,
                 error,
-                is_ambiguous,
-            });
-            continue;
+                failed_at_millis,
+            ));
+            return Ok(out);
         }
-        if let Some((accepted, completed_at_millis)) =
-            recover_completed_accepted_compensation_from_entries(entries)
-            && accepted.context.saga_type.as_ref() == saga_type
-            && accepted.context.step_name.as_ref() == step_name
-        {
-            let Some(request) = recover_compensation_request_from_entries(entries) else {
-                out.push(SagaChoreographyEvent::SagaQuarantined {
-                    context: accepted.context.clone(),
-                    reason:
-                        "completed accepted compensation recovery missing durable compensation request"
-                            .into(),
-                    step: accepted.context.step_name.clone(),
-                    participant_id: accepted.participant_id,
-                });
-                continue;
-            };
-            let mut context = accepted.context;
-            context.event_timestamp_millis = completed_at_millis;
-            out.push(request);
-            out.push(SagaChoreographyEvent::CompensationCompleted { context });
-            continue;
-        }
-        if let Some(accepted) = recover_accepted_workflow_compensation_from_entries(entries)
-            && accepted.context.saga_type.as_ref() == saga_type
-            && accepted.context.step_name.as_ref() == step_name
-        {
-            let Some(request) = recover_compensation_request_from_entries(entries) else {
-                out.push(SagaChoreographyEvent::SagaQuarantined {
-                    context: accepted.context.clone(),
-                    reason: "accepted compensation recovery missing durable compensation request"
-                        .into(),
-                    step: accepted.context.step_name.clone(),
-                    participant_id: accepted.participant_id,
-                });
-                continue;
-            };
-            out.push(request);
-            out.push(startup_accepted_compensation_replay_event(&accepted));
-            if let Some(timeout_event) = startup_accepted_compensation_timeout_event(accepted, now)
-            {
-                out.push(timeout_event);
-            }
-            continue;
-        }
-        // Undo proven locally (request, intent and completion are all durable) but
-        // never acknowledged: resend only the original-run acknowledgement. No new
-        // request, no physical undo, no invented identity.
-        if let Some(ack) =
-            recover_proven_undo_acknowledgement(entries, run.identity, saga_type, step_name)
-        {
-            out.push(ack);
-            continue;
-        }
-        if let Some(request) = recover_unstarted_compensation_request_from_entries(entries)
-            && request.context().saga_type.as_ref() == saga_type
-            && compensation_request_targets_step(&request, step_name)
-        {
-            let accepted_effect = recover_accepted_workflow_step_from_entries(entries)
-                .is_some_and(|accepted| !accepted.compensation_data.is_empty());
-            let completed_effect =
-                recover_completed_step_effect_for_unstarted_compensation(entries)
-                    .is_some_and(|(_, compensation_data, _)| !compensation_data.is_empty());
-            let no_effect_rejection = run.identity.is_some_and(|identity| {
-                request.context().saga_type.as_ref() == identity.0
-                    && request.context().saga_started_at_millis == identity.1
-                    && rejected_without_effect_in_entries(entries, identity)
-            });
-            if !accepted_effect && !completed_effect && !no_effect_rejection {
-                out.push(SagaChoreographyEvent::SagaQuarantined {
-                    context: request.context().clone(),
-                    reason: "unstarted compensation recovery missing durable compensation state"
-                        .into(),
-                    step: request.context().step_name.clone(),
-                    participant_id: request.context().step_name.clone(),
-                });
-                continue;
-            }
-            // Reset the run-scoped marker ingress sets today and the unscoped marker
-            // written by journals that predate run identity.
-            for dedupe_key in [
-                scoped_workflow_dedupe_key(&request),
-                workflow_dedupe_key_for_event(&request),
-            ] {
-                dedupe
-                    .remove_processed(saga_id, &dedupe_key)
-                    .map_err(|source| RecoveryCollectionError::ResetDedupe { saga_id, source })?;
-            }
-            out.push(request);
-            continue;
-        }
-        if let Some(accepted) = recover_accepted_workflow_step_from_entries(entries)
-            && accepted.context.saga_type.as_ref() == saga_type
-            && accepted.context.step_name.as_ref() == step_name
-        {
-            if let Some((error, failed_at_millis)) =
-                accepted_step_failure_requiring_compensation(entries)
+        if let Some(timeout_event) = startup_accepted_step_timeout_event(accepted.clone(), now) {
+            if let SagaChoreographyEvent::StepFailed {
+                context,
+                error_code,
+                error,
+                requires_compensation: true,
+                ..
+            } = timeout_event
             {
                 out.push(startup_accepted_step_failure_hydration_event(&accepted));
                 out.push(startup_accepted_step_failure_event(
                     &accepted,
-                    None,
-                    error,
-                    failed_at_millis,
-                ));
-                continue;
-            }
-            if let Some(timeout_event) = startup_accepted_step_timeout_event(accepted.clone(), now)
-            {
-                if let SagaChoreographyEvent::StepFailed {
-                    context,
                     error_code,
                     error,
-                    requires_compensation: true,
-                    ..
-                } = timeout_event
-                {
-                    out.push(startup_accepted_step_failure_hydration_event(&accepted));
-                    out.push(startup_accepted_step_failure_event(
-                        &accepted,
-                        error_code,
-                        error,
-                        context.event_timestamp_millis,
-                    ));
-                } else {
-                    out.push(timeout_event);
-                }
-                continue;
+                    context.event_timestamp_millis,
+                ));
+            } else {
+                out.push(timeout_event);
             }
-            out.push(startup_accepted_step_replay_event(&accepted));
-            continue;
+            return Ok(out);
         }
-        if let Some(outcome) = RunProgress::scan(entries).confirmed_clean()
-            && outcome.context.saga_type.as_ref() == saga_type
-            && outcome.context.step_name.as_ref() == step_name
-        {
-            // Forward success is durably proven (business work and any declared
-            // effect), so the original completion is resent verbatim; nothing re-runs.
-            out.push(outcome.completion_event());
-            continue;
+        out.push(startup_accepted_step_replay_event(&accepted));
+        return Ok(out);
+    }
+    if let Some(outcome) = RunProgress::scan(entries).confirmed_clean()
+        && outcome.context.saga_type.as_ref() == saga_type
+        && outcome.context.step_name.as_ref() == step_name
+    {
+        // Forward success is durably proven (business work and any declared
+        // effect), so the original completion is resent verbatim; nothing re-runs.
+        out.push(outcome.completion_event());
+        return Ok(out);
+    }
+    match classify_recovery(entries, now) {
+        RecoveryDecision::QuarantineStale => {
+            let Some((_, started_at)) = &run.identity else {
+                return Err(unidentified_run_error(saga_id, "unresolved execution/undo"));
+            };
+            let mut context = recovery_context_for_saga_type(saga_id, step_name, saga_type);
+            context.saga_started_at_millis = *started_at;
+            out.push(SagaChoreographyEvent::SagaQuarantined {
+                context,
+                reason: RunProgress::scan(entries)
+                    .uncertainty()
+                    .unwrap_or("startup recovery found unresolved execution/undo")
+                    .into(),
+                step: step_name.into(),
+                participant_id: step_name.into(),
+            });
         }
-        match classify_recovery(entries, now, policy) {
-            RecoveryDecision::QuarantineStale => {
-                let Some((_, started_at)) = &run.identity else {
-                    return Err(unidentified_run_error(saga_id, "unresolved execution/undo"));
-                };
+        RecoveryDecision::ReplayPanicQuarantine => {
+            // The panic row carries no identity; only the journal's recorded run
+            // identity may be used. Never invent a run timestamp.
+            let Some((_, started_at)) = &run.identity else {
+                return Err(unidentified_run_error(saga_id, "panic quarantine"));
+            };
+            let should_emit = match journal.check_and_mark(saga_id, PANIC_QUARANTINE_PUBLISH_KEY) {
+                Ok(value) => value,
+                Err(err) => {
+                    return Err(RecoveryCollectionError::MarkDedupe {
+                        saga_id,
+                        source: err,
+                    });
+                }
+            };
+            if should_emit {
+                let reason = panic_quarantine_reason_from_entries(entries)
+                    .unwrap_or_else(|| Box::<str>::from("panic quarantined during execution"));
                 let mut context = recovery_context_for_saga_type(saga_id, step_name, saga_type);
                 context.saga_started_at_millis = *started_at;
                 out.push(SagaChoreographyEvent::SagaQuarantined {
                     context,
-                    reason: RunProgress::scan(entries)
-                        .uncertainty()
-                        .unwrap_or("startup recovery found unresolved execution/undo")
-                        .into(),
+                    reason,
                     step: step_name.into(),
                     participant_id: step_name.into(),
                 });
             }
-            RecoveryDecision::ReplayPanicQuarantine => {
-                // The panic row carries no identity; only the journal's recorded run
-                // identity may be used. Never invent a run timestamp.
-                let Some((_, started_at)) = &run.identity else {
-                    return Err(unidentified_run_error(saga_id, "panic quarantine"));
-                };
-                let should_emit = match dedupe.check_and_mark(saga_id, PANIC_QUARANTINE_PUBLISH_KEY)
-                {
-                    Ok(value) => value,
-                    Err(err) => {
-                        return Err(RecoveryCollectionError::MarkDedupe {
-                            saga_id,
-                            source: err,
-                        });
-                    }
-                };
-                if should_emit {
-                    let reason = panic_quarantine_reason_from_entries(entries)
-                        .unwrap_or_else(|| Box::<str>::from("panic quarantined during execution"));
-                    let mut context = recovery_context_for_saga_type(saga_id, step_name, saga_type);
-                    context.saga_started_at_millis = *started_at;
-                    out.push(SagaChoreographyEvent::SagaQuarantined {
-                        context,
-                        reason,
-                        step: step_name.into(),
-                        participant_id: step_name.into(),
-                    });
-                }
-            }
-            RecoveryDecision::Continue | RecoveryDecision::TerminalNoAction => {}
         }
+        RecoveryDecision::Continue | RecoveryDecision::TerminalNoAction => {}
     }
     Ok(out)
 }
@@ -4480,8 +3410,8 @@ fn startup_accepted_compensation_timeout_event(
 
 fn recovery_context_for_saga_type(
     saga_id: SagaId,
-    step_name: &'static str,
-    saga_type: &'static str,
+    step_name: &str,
+    saga_type: &str,
 ) -> SagaContext {
     let now = SagaContext::now_millis();
     SagaContext {
@@ -4581,494 +3511,6 @@ pub fn open_saga_lmdb_actor<A: SagaLmdbBackedActor>(
     A::open_with_saga_lmdb_base(actor_id, saga_lmdb_base)
 }
 
-#[cfg(feature = "lmdb")]
-pub mod lmdb {
-    use std::path::Path;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    use heed::types::{Bytes, Str};
-    use heed::{Database, Env, EnvOpenOptions};
-
-    use crate::lmdb_owner::LmdbEnvOwner;
-
-    use super::{
-        DEFAULT_RECOVERY_SAGA_TYPE, collect_startup_recovery_events_for_saga_type_inner,
-        recover_accepted_workflow_steps_for_saga_type,
-    };
-    use crate::{
-        DedupeError, JournalEntry, JournalError, ParticipantDedupeStore, ParticipantEvent,
-        ParticipantJournal, SagaId, SagaParticipantSupport,
-    };
-
-    const DEFAULT_LMDB_MAP_SIZE_BYTES: usize = 1024 * 1024 * 1024;
-    const SAGA_LMDB_MAP_SIZE_ENV: &str = "SAGA_LMDB_MAP_SIZE_BYTES";
-    const JOURNAL_SCHEMA_KEY: &str = "journal_schema_version";
-    const JOURNAL_SCHEMA_VERSION: &str = "2";
-
-    fn lmdb_map_size_bytes() -> Result<usize, Box<str>> {
-        match std::env::var(SAGA_LMDB_MAP_SIZE_ENV) {
-            Ok(raw) => match raw.parse::<usize>() {
-                Ok(value) if value > 0 => Ok(value),
-                Ok(_) => Err(format!("{SAGA_LMDB_MAP_SIZE_ENV} must be greater than zero").into()),
-                Err(err) => Err(format!("{SAGA_LMDB_MAP_SIZE_ENV} parse failed: {err}").into()),
-            },
-            Err(std::env::VarError::NotPresent) => Ok(DEFAULT_LMDB_MAP_SIZE_BYTES),
-            Err(err) => Err(format!("{SAGA_LMDB_MAP_SIZE_ENV} read failed: {err}").into()),
-        }
-    }
-
-    fn now_millis() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
-    }
-
-    fn key_saga_seq(saga_id: SagaId, seq: u64) -> String {
-        format!("{:020}:{:020}", saga_id.get(), seq)
-    }
-
-    fn key_saga_prefix(saga_id: SagaId) -> String {
-        format!("{:020}:", saga_id.get())
-    }
-
-    fn key_saga_index(saga_id: SagaId) -> String {
-        format!("{:020}", saga_id.get())
-    }
-
-    #[derive(Debug)]
-    pub struct LmdbJournal {
-        env: Env,
-        rows: Database<Str, Bytes>,
-        saga_index: Database<Str, Str>,
-        meta: Database<Str, Str>,
-        // Drop last: release ownership only after all other env handles are gone.
-        _owner: LmdbEnvOwner,
-    }
-
-    impl LmdbJournal {
-        pub fn open(path: &Path) -> Result<Self, JournalError> {
-            std::fs::create_dir_all(path)
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            let map_size = lmdb_map_size_bytes().map_err(JournalError::Storage)?;
-            let owner =
-                LmdbEnvOwner::open(path, EnvOpenOptions::new().max_dbs(16).map_size(map_size))
-                    .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            let env = owner.env();
-            let mut wtxn = env
-                .write_txn()
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            let rows = env
-                .create_database::<Str, Bytes>(&mut wtxn, Some("journal_rows"))
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            let saga_index = env
-                .create_database::<Str, Str>(&mut wtxn, Some("journal_saga_index"))
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            let meta = env
-                .create_database::<Str, Str>(&mut wtxn, Some("journal_meta"))
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            let stored_schema = meta
-                .get(&wtxn, JOURNAL_SCHEMA_KEY)
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            match stored_schema {
-                Some(version) if version == JOURNAL_SCHEMA_VERSION => {}
-                Some(version) => {
-                    return Err(JournalError::Storage(
-                        format!(
-                            "incompatible saga journal schema version: stored={version} required={JOURNAL_SCHEMA_VERSION}"
-                        )
-                        .into(),
-                    ));
-                }
-                None => {
-                    let has_unversioned_rows = {
-                        let mut iter = rows
-                            .iter(&wtxn)
-                            .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-                        match iter.next() {
-                            Some(row) => {
-                                row.map_err(|err| JournalError::Storage(err.to_string().into()))?;
-                                true
-                            }
-                            None => false,
-                        }
-                    };
-                    if has_unversioned_rows {
-                        return Err(JournalError::Storage(
-                            format!(
-                                "unversioned saga journal contains rows incompatible with required schema version {JOURNAL_SCHEMA_VERSION}"
-                            )
-                            .into(),
-                        ));
-                    }
-                    meta.put(&mut wtxn, JOURNAL_SCHEMA_KEY, JOURNAL_SCHEMA_VERSION)
-                        .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-                }
-            }
-            wtxn.commit()
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            Ok(Self {
-                env: env.clone(),
-                rows,
-                saga_index,
-                meta,
-                _owner: owner,
-            })
-        }
-
-        fn next_sequence(
-            rows: &Database<Str, Bytes>,
-            meta: &Database<Str, Str>,
-            wtxn: &mut heed::RwTxn<'_>,
-        ) -> Result<u64, JournalError> {
-            let storage = |msg: String| JournalError::Storage(msg.into());
-            let stored = meta
-                .get(wtxn, "next_sequence")
-                .map_err(|err| storage(err.to_string()))?;
-            let next = match stored {
-                Some(raw) => raw.parse::<u64>().map_err(|err| {
-                    storage(format!("corrupt journal next_sequence {raw:?}: {err}"))
-                })?,
-                None => {
-                    let has_rows = rows
-                        .iter(wtxn)
-                        .map_err(|err| storage(err.to_string()))?
-                        .next()
-                        .is_some();
-                    if has_rows {
-                        return Err(storage(
-                            "journal next_sequence metadata missing while rows exist".to_owned(),
-                        ));
-                    }
-                    1
-                }
-            };
-            if next == 0 {
-                return Err(storage("journal next_sequence is zero".to_owned()));
-            }
-            let after = next
-                .checked_add(1)
-                .ok_or_else(|| storage("journal sequence space exhausted".to_owned()))?;
-            meta.put(wtxn, "next_sequence", &after.to_string())
-                .map_err(|err| storage(err.to_string()))?;
-            Ok(next)
-        }
-    }
-
-    impl ParticipantJournal for LmdbJournal {
-        fn append(&self, saga_id: SagaId, event: ParticipantEvent) -> Result<u64, JournalError> {
-            let mut wtxn = self
-                .env
-                .write_txn()
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            let sequence = Self::next_sequence(&self.rows, &self.meta, &mut wtxn)?;
-            let entry = JournalEntry {
-                sequence,
-                recorded_at_millis: now_millis(),
-                event,
-            };
-            let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&entry)
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            self.rows
-                .put_with_flags(
-                    &mut wtxn,
-                    heed::PutFlags::NO_OVERWRITE,
-                    &key_saga_seq(saga_id, sequence),
-                    encoded.as_ref(),
-                )
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            self.saga_index
-                .put(&mut wtxn, &key_saga_index(saga_id), "1")
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            wtxn.commit()
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            Ok(sequence)
-        }
-
-        fn read(&self, saga_id: SagaId) -> Result<Vec<JournalEntry>, JournalError> {
-            let rtxn = self
-                .env
-                .read_txn()
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            let prefix = key_saga_prefix(saga_id);
-            let mut entries = Vec::new();
-            let iter = self
-                .rows
-                .prefix_iter(&rtxn, &prefix)
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            for row in iter {
-                let (_, v) = row.map_err(|err| JournalError::Storage(err.to_string().into()))?;
-                // LMDB value slices carry no archive alignment guarantee: copy into an
-                // explicitly aligned buffer, then decode with archive validation.
-                let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(v.len());
-                aligned.extend_from_slice(v);
-                let decoded: JournalEntry =
-                    rkyv::from_bytes::<JournalEntry, rkyv::rancor::Error>(&aligned)
-                        .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-                entries.push(decoded);
-            }
-            entries.sort_by_key(|e| e.sequence);
-            Ok(entries)
-        }
-
-        fn list_sagas(&self) -> Result<Vec<SagaId>, JournalError> {
-            let rtxn = self
-                .env
-                .read_txn()
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            let mut out = Vec::new();
-            let iter = self
-                .saga_index
-                .iter(&rtxn)
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            for row in iter {
-                let (k, _) = row.map_err(|err| JournalError::Storage(err.to_string().into()))?;
-                if let Ok(id) = k.parse::<u64>() {
-                    out.push(SagaId::new(id));
-                }
-            }
-            out.sort_by_key(|id| id.get());
-            Ok(out)
-        }
-
-        fn prune(&self, saga_id: SagaId) -> Result<(), JournalError> {
-            let mut wtxn = self
-                .env
-                .write_txn()
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            let prefix = key_saga_prefix(saga_id);
-            let mut iter = self
-                .rows
-                .prefix_iter_mut(&mut wtxn, &prefix)
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            while iter.next().is_some() {
-                unsafe { iter.del_current() }
-                    .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            }
-            drop(iter);
-            self.saga_index
-                .delete(&mut wtxn, &key_saga_index(saga_id))
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            wtxn.commit()
-                .map_err(|err| JournalError::Storage(err.to_string().into()))?;
-            Ok(())
-        }
-    }
-
-    #[derive(Debug)]
-    pub struct LmdbDedupe {
-        env: Env,
-        entries: Database<Str, Str>,
-        // Drop last: release ownership only after all other env handles are gone.
-        _owner: LmdbEnvOwner,
-    }
-
-    impl LmdbDedupe {
-        pub fn open(path: &Path) -> Result<Self, DedupeError> {
-            std::fs::create_dir_all(path)
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            let map_size = lmdb_map_size_bytes().map_err(DedupeError::Storage)?;
-            let owner =
-                LmdbEnvOwner::open(path, EnvOpenOptions::new().max_dbs(8).map_size(map_size))
-                    .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            let env = owner.env();
-            let mut wtxn = env
-                .write_txn()
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            let entries = env
-                .create_database::<Str, Str>(&mut wtxn, Some("dedupe_entries"))
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            wtxn.commit()
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            Ok(Self {
-                env: env.clone(),
-                entries,
-                _owner: owner,
-            })
-        }
-
-        fn key(saga_id: SagaId, key: &str) -> String {
-            format!("{:020}:{key}", saga_id.get())
-        }
-    }
-
-    impl ParticipantDedupeStore for LmdbDedupe {
-        fn check_and_mark(&self, saga_id: SagaId, key: &str) -> Result<bool, DedupeError> {
-            let full_key = Self::key(saga_id, key);
-            let mut wtxn = self
-                .env
-                .write_txn()
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            if self
-                .entries
-                .get(&wtxn, &full_key)
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?
-                .is_some()
-            {
-                return Ok(false);
-            }
-            self.entries
-                .put(&mut wtxn, &full_key, "1")
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            wtxn.commit()
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            Ok(true)
-        }
-
-        fn contains(&self, saga_id: SagaId, key: &str) -> Result<bool, DedupeError> {
-            let rtxn = self
-                .env
-                .read_txn()
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            self.entries
-                .get(&rtxn, &Self::key(saga_id, key))
-                .map(|v| v.is_some())
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))
-        }
-
-        fn mark_processed(&self, saga_id: SagaId, key: &str) -> Result<(), DedupeError> {
-            let mut wtxn = self
-                .env
-                .write_txn()
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            self.entries
-                .put(&mut wtxn, &Self::key(saga_id, key), "1")
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            wtxn.commit()
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            Ok(())
-        }
-
-        fn remove_processed(&self, saga_id: SagaId, key: &str) -> Result<(), DedupeError> {
-            let mut wtxn = self
-                .env
-                .write_txn()
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            self.entries
-                .delete(&mut wtxn, &Self::key(saga_id, key))
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            wtxn.commit()
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            Ok(())
-        }
-
-        fn prune(&self, saga_id: SagaId) -> Result<(), DedupeError> {
-            let mut wtxn = self
-                .env
-                .write_txn()
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            let prefix = key_saga_prefix(saga_id);
-            let mut iter = self
-                .entries
-                .prefix_iter_mut(&mut wtxn, &prefix)
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            while iter.next().is_some() {
-                unsafe { iter.del_current() }
-                    .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            }
-            drop(iter);
-            wtxn.commit()
-                .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            Ok(())
-        }
-    }
-
-    pub fn open_lmdb_participant_support(
-        base: &Path,
-        step_name: &'static str,
-    ) -> Result<SagaParticipantSupport<LmdbJournal, LmdbDedupe>, String> {
-        open_lmdb_participant_support_for_saga_type(base, step_name, DEFAULT_RECOVERY_SAGA_TYPE)
-    }
-
-    pub fn open_lmdb_participant_support_for_saga_type(
-        base: &Path,
-        step_name: &'static str,
-        saga_type: &'static str,
-    ) -> Result<SagaParticipantSupport<LmdbJournal, LmdbDedupe>, String> {
-        open_lmdb_participant_support_for_saga_types(base, step_name, &[saga_type])
-    }
-
-    pub fn open_lmdb_participant_support_for_saga_types(
-        base: &Path,
-        step_name: &'static str,
-        saga_types: &[&'static str],
-    ) -> Result<SagaParticipantSupport<LmdbJournal, LmdbDedupe>, String> {
-        if saga_types.is_empty() {
-            return Err("at least one recovery saga type is required".to_string());
-        }
-        let journal = LmdbJournal::open(&base.join("journal")).map_err(|err| err.to_string())?;
-        let dedupe = LmdbDedupe::open(&base.join("dedupe")).map_err(|err| err.to_string())?;
-        let mut startup_recovery_events = Vec::new();
-        for saga_type in saga_types {
-            let mut events = collect_startup_recovery_events_for_saga_type_inner(
-                &journal,
-                saga_type,
-                &dedupe,
-                step_name,
-                saga_types.len() == 1,
-            )
-            .map_err(|err| {
-                format!("startup recovery collection failed for saga_type={saga_type}: {err:?}")
-            })?;
-            startup_recovery_events.append(&mut events);
-        }
-        let mut support = SagaParticipantSupport::new(journal, dedupe)
-            .with_startup_recovery_events(startup_recovery_events);
-        for saga_type in saga_types {
-            recover_accepted_workflow_steps_for_saga_type(&mut support, step_name, saga_type)
-                .map_err(|err| {
-                    format!("accepted step recovery failed for saga_type={saga_type}: {err:?}")
-                })?;
-        }
-        Ok(support)
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn contains_returns_error_when_reader_slots_are_exhausted() {
-            let temp = tempfile::tempdir().expect("tempdir should open");
-            let path = temp.path().join("lmdb-dedupe-readers");
-            std::fs::create_dir_all(&path).expect("lmdb path should be created");
-
-            let owner = LmdbEnvOwner::open(&path, EnvOpenOptions::new().max_dbs(8).max_readers(1))
-                .expect("env should open");
-            let env = owner.env();
-            let mut wtxn = env.write_txn().expect("write txn should open");
-            let entries = env
-                .create_database::<Str, Str>(&mut wtxn, Some("dedupe_entries"))
-                .expect("dedupe database should be created");
-            wtxn.commit().expect("setup write txn should commit");
-
-            let dedupe = LmdbDedupe {
-                env: env.clone(),
-                entries,
-                _owner: owner,
-            };
-            let saga_id = SagaId::new(404);
-            dedupe
-                .mark_processed(saga_id, "probe")
-                .expect("mark_processed should succeed");
-
-            let held_reader = dedupe.env.read_txn().expect("held reader should open");
-            assert!(
-                dedupe.contains(saga_id, "probe").is_err(),
-                "contains should surface read_txn reader slot failure"
-            );
-            drop(held_reader);
-
-            assert!(
-                dedupe
-                    .contains(saga_id, "probe")
-                    .expect("contains should recover after reader pressure"),
-                "contains should recover once reader slot pressure is released"
-            );
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -5078,38 +3520,610 @@ mod tests {
     };
     use crate::{
         DependencySpec, DeterministicContextBuilder, HasSagaParticipantSupport,
-        HasSagaWorkflowParticipants, InMemoryDedupe, InMemoryJournal, ParticipantJournal,
+        HasSagaWorkflowParticipants, InMemoryParticipantStore, ParticipantStore,
         SagaParticipantSupport, SagaWorkflowParticipant, StepOutput,
     };
     use std::path::PathBuf;
 
+    #[test]
+    fn workflow_nonterminal_does_not_apply_terminal_side_effects() {
+        let mut actor = WorkflowTestActor::default();
+        let mut calls = 0;
+        let mut context = DeterministicContextBuilder::default().build();
+        context.saga_type = "alpha_workflow".into();
+        apply_sync_workflow_participant_saga_ingress_with_hooks(
+            &mut actor,
+            crate::SagaChoreographyEvent::SagaStarted {
+                context,
+                payload: vec![7],
+            },
+            |_, _| calls += 1,
+            |_| {},
+            |_, _| {},
+        );
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn local_quarantine_echo_reaches_terminal_callback() {
+        use crate::SagaStateExt;
+        let mut actor = WorkflowTestActor::default();
+        let context = DeterministicContextBuilder::default()
+            .with_saga_type("alpha_workflow")
+            .build();
+        actor
+            .retain_terminal_saga_strict(
+                &context,
+                crate::ParticipantTerminalKind::Quarantined,
+                "local failure",
+            )
+            .unwrap();
+        let mut calls = 0;
+        super::apply_sync_workflow_participant_saga_ingress(
+            &mut actor,
+            crate::SagaChoreographyEvent::SagaQuarantined {
+                context,
+                reason: "local failure".into(),
+                step: "alpha_step".into(),
+                participant_id: "alpha_step".into(),
+            },
+            |_, _| calls += 1,
+            |_| {},
+        );
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_callbacks_require_persisted_tombstone_in_every_mode() {
+        use crate::SagaStateExt;
+        for mode in 0..3 {
+            for failed in [false, true] {
+                let mut actor = WorkflowTestActor::default();
+                let context = DeterministicContextBuilder::default()
+                    .with_saga_type("alpha_workflow")
+                    .build();
+                actor.record_saga_run_start(context.saga_id, context.saga_started_at_millis);
+                actor
+                    .saga
+                    .dependency_completions
+                    .entry(context.saga_id)
+                    .or_default()
+                    .insert("upstream".into());
+                let event = if failed {
+                    crate::SagaChoreographyEvent::SagaFailed {
+                        context: context.clone(),
+                        reason: "clean failure".into(),
+                        failure: None,
+                    }
+                } else {
+                    crate::SagaChoreographyEvent::SagaCompleted {
+                        context: context.clone(),
+                    }
+                };
+                actor
+                    .saga
+                    .store
+                    .fail
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                let mut external = 0;
+                for retry in 0..3 {
+                    match mode {
+                        0 => super::apply_sync_participant_saga_ingress(
+                            &mut actor,
+                            event.clone(),
+                            |_, _| external += 1,
+                            |_| {},
+                        ),
+                        1 => {
+                            super::apply_async_participant_saga_ingress(
+                                &mut actor,
+                                event.clone(),
+                                |_, _| external += 1,
+                                |_| {},
+                            )
+                            .await
+                        }
+                        _ => super::apply_sync_workflow_participant_saga_ingress(
+                            &mut actor,
+                            event.clone(),
+                            |_, _| external += 1,
+                            |_| {},
+                        ),
+                    }
+                    if retry == 0 {
+                        assert_eq!(external, 0);
+                        assert_eq!(actor.terminal_hooks, 0);
+                        assert!(!actor.saga.terminal_sagas.contains(&context.saga_id));
+                        assert!(
+                            actor
+                                .saga
+                                .dependency_completions
+                                .contains_key(&context.saga_id)
+                        );
+                        actor
+                            .saga
+                            .store
+                            .fail
+                            .store(false, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        assert_eq!(external, 1);
+                        assert_eq!(actor.terminal_hooks, 1);
+                        assert!(
+                            !actor
+                                .saga
+                                .dependency_completions
+                                .contains_key(&context.saga_id)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compensation_renewal_is_durable_capped_and_replayed_without_payload_duplication() {
+        let (mut actor, context, _) = accepted_actor();
+        let execution = crate::StepExecutionId::new("undo");
+        super::accept_started_workflow_compensation(
+            &mut actor,
+            context.clone(),
+            "worker".into(),
+            execution.clone(),
+            crate::AcceptedStepPolicy {
+                idle_timeout: std::time::Duration::from_secs(1),
+                hard_timeout: std::time::Duration::from_secs(10),
+                timeout_outcome: crate::AcceptedStepTimeoutOutcome::QuarantineSaga,
+            },
+            vec![7; 4096],
+            vec![9; 4096],
+        )
+        .unwrap();
+        let hard =
+            actor.saga.accepted_workflow_compensations[&context.saga_id].hard_deadline_at_millis;
+        let heartbeat = super::record_accepted_workflow_compensation_progress(
+            &mut actor,
+            context.saga_id,
+            execution.clone(),
+            hard,
+        )
+        .unwrap();
+        assert!(
+            matches!(heartbeat, crate::SagaChoreographyEvent::CompensationAccepted { deadline_at_millis, .. } if deadline_at_millis == hard)
+        );
+        let entries = actor.saga.store.read(context.saga_id).unwrap();
+        assert!(matches!(
+            entries.last().unwrap().event,
+            crate::ParticipantEvent::AcceptedDeadlineRenewed {
+                is_compensation: true,
+                ..
+            }
+        ));
+        let archived =
+            rkyv::to_bytes::<rkyv::rancor::Error>(&entries.last().unwrap().event).unwrap();
+        assert!(archived.len() < 1024);
+        assert_eq!(
+            super::recover_accepted_workflow_compensation_from_entries(&entries)
+                .unwrap()
+                .deadline_at_millis,
+            hard
+        );
+        actor
+            .saga
+            .store
+            .fail
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            super::record_accepted_workflow_compensation_progress(
+                &mut actor,
+                context.saga_id,
+                execution,
+                hard + 1
+            )
+            .is_err()
+        );
+        assert_eq!(
+            actor.saga.accepted_workflow_compensations[&context.saga_id].deadline_at_millis,
+            hard
+        );
+    }
+
+    #[test]
+    fn renewal_replay_matches_run_execution_and_phase_and_never_resurrects_completion() {
+        let (mut actor, context, execution) = accepted_actor();
+        let old = actor.saga.accepted_workflow_steps[&context.saga_id].deadline_at_millis;
+        let mut foreign = context.clone();
+        foreign.saga_started_at_millis += 1;
+        for (context, execution_id, is_compensation) in [
+            (foreign, execution.clone(), false),
+            (context.clone(), crate::StepExecutionId::new("wrong"), false),
+            (context.clone(), execution.clone(), true),
+        ] {
+            actor
+                .saga
+                .store
+                .append(
+                    context.saga_id,
+                    crate::ParticipantEvent::AcceptedDeadlineRenewed {
+                        context,
+                        execution_id,
+                        is_compensation,
+                        deadline_at_millis: old + 500,
+                        renewed_at_millis: old,
+                    },
+                )
+                .unwrap();
+        }
+        let entries = actor.saga.store.read(context.saga_id).unwrap();
+        assert_eq!(
+            super::recover_accepted_workflow_step_from_entries(&entries)
+                .unwrap()
+                .deadline_at_millis,
+            old
+        );
+        super::record_accepted_workflow_step_progress(
+            &mut actor,
+            context.saga_id,
+            execution.clone(),
+            old,
+        )
+        .unwrap();
+        let entries = actor.saga.store.read(context.saga_id).unwrap();
+        assert_eq!(
+            super::recover_accepted_workflow_step_from_entries(&entries)
+                .unwrap()
+                .deadline_at_millis,
+            old + 1000
+        );
+        super::complete_accepted_workflow_step(
+            &mut actor,
+            context.saga_id,
+            execution.clone(),
+            crate::AcceptedStepCompletion {
+                completed_at_millis: old,
+                output: vec![42],
+                compensation_data: vec![],
+            },
+        )
+        .unwrap();
+        actor
+            .saga
+            .store
+            .append(
+                context.saga_id,
+                crate::ParticipantEvent::AcceptedDeadlineRenewed {
+                    context: context.clone(),
+                    execution_id: execution,
+                    is_compensation: false,
+                    deadline_at_millis: old + 5000,
+                    renewed_at_millis: old,
+                },
+            )
+            .unwrap();
+        assert!(
+            super::recover_accepted_workflow_step_from_entries(
+                &actor.saga.store.read(context.saga_id).unwrap()
+            )
+            .is_none()
+        );
+    }
+
+    #[cfg(feature = "lmdb")]
+    #[test]
+    fn renewed_deadlines_survive_lmdb_reopen() {
+        let (mut actor, context, execution) = accepted_actor();
+        let old = actor.saga.accepted_workflow_steps[&context.saga_id].deadline_at_millis;
+        super::record_accepted_workflow_step_progress(&mut actor, context.saga_id, execution, old)
+            .unwrap();
+        let entries = actor.saga.store.read(context.saga_id).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::LmdbParticipantStore::open(dir.path(), "renewals").unwrap();
+        store
+            .append_batch(
+                context.saga_id,
+                entries.into_iter().map(|row| row.event).collect(),
+            )
+            .unwrap();
+        drop(store);
+        let store = crate::LmdbParticipantStore::open(dir.path(), "renewals").unwrap();
+        let mut support = SagaParticipantSupport::new(store);
+        let events = super::collect_startup_recovery_events_for_participants(
+            &mut support,
+            &[(context.step_name.as_ref(), context.saga_type.as_ref())],
+        )
+        .unwrap();
+        assert!(
+            matches!(&events[0], crate::SagaChoreographyEvent::StepAccepted { deadline_at_millis, .. } if *deadline_at_millis == old + 1000)
+        );
+        assert_eq!(
+            support.accepted_workflow_steps[&context.saga_id].deadline_at_millis,
+            old + 1000
+        );
+        assert_eq!(
+            support.accepted_workflow_steps[&context.saga_id].saga_input,
+            vec![7; 4096]
+        );
+    }
+
+    #[derive(Default)]
+    struct FaultStore {
+        inner: InMemoryParticipantStore,
+        fail: std::sync::atomic::AtomicBool,
+        commits: std::sync::atomic::AtomicUsize,
+        reads: std::sync::atomic::AtomicUsize,
+        scans: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ParticipantStore for FaultStore {
+        fn append(
+            &self,
+            id: crate::SagaId,
+            event: crate::ParticipantEvent,
+        ) -> Result<u64, crate::JournalError> {
+            if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(crate::JournalError::Storage(
+                    "injected append failure".into(),
+                ));
+            }
+            self.commits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.append(id, event)
+        }
+        fn read(&self, id: crate::SagaId) -> Result<Vec<crate::JournalEntry>, crate::JournalError> {
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.read(id)
+        }
+        fn list_sagas(&self) -> Result<Vec<crate::SagaId>, crate::JournalError> {
+            panic!("startup must use unresolved index")
+        }
+        fn prune(&self, id: crate::SagaId) -> Result<(), crate::JournalError> {
+            self.inner.prune(id)
+        }
+        fn append_batch(
+            &self,
+            id: crate::SagaId,
+            events: Vec<crate::ParticipantEvent>,
+        ) -> Result<Vec<u64>, crate::JournalError> {
+            if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(crate::JournalError::Storage(
+                    "injected batch failure".into(),
+                ));
+            }
+            self.commits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.append_batch(id, events)
+        }
+        fn admit_and_record_intent(
+            &self,
+            c: &crate::SagaContext,
+            key: &str,
+            trigger: &str,
+        ) -> Result<crate::StoreAdmission, crate::JournalError> {
+            if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(crate::JournalError::Storage(
+                    "injected admission failure".into(),
+                ));
+            }
+            let result = self.inner.admit_and_record_intent(c, key, trigger)?;
+            if matches!(result, crate::StoreAdmission::Admitted) {
+                self.commits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(result)
+        }
+        fn unresolved_saga_ids(&self) -> Result<Vec<crate::SagaId>, crate::JournalError> {
+            self.scans
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.unresolved_saga_ids()
+        }
+        fn compact_terminal_detail(&self, limit: usize) -> Result<usize, crate::JournalError> {
+            self.inner.compact_terminal_detail(limit)
+        }
+        fn prune_resolved_before(
+            &self,
+            cutoff: u64,
+            limit: usize,
+        ) -> Result<usize, crate::JournalError> {
+            self.inner.prune_resolved_before(cutoff, limit)
+        }
+        fn check_and_mark(
+            &self,
+            id: crate::SagaId,
+            key: &str,
+        ) -> Result<bool, crate::JournalError> {
+            self.inner.check_and_mark(id, key)
+        }
+        fn remove_processed(
+            &self,
+            id: crate::SagaId,
+            key: &str,
+        ) -> Result<(), crate::JournalError> {
+            self.inner.remove_processed(id, key)
+        }
+    }
+
+    fn accepted_actor() -> (
+        WorkflowTestActor,
+        crate::SagaContext,
+        crate::StepExecutionId,
+    ) {
+        let mut actor = WorkflowTestActor::default();
+        let context = DeterministicContextBuilder::default().build();
+        let execution = crate::StepExecutionId::new("accepted");
+        super::accept_workflow_step(
+            &mut actor,
+            context.clone(),
+            "worker".into(),
+            execution.clone(),
+            crate::AcceptedStepPolicy {
+                idle_timeout: std::time::Duration::from_secs(1),
+                hard_timeout: std::time::Duration::from_secs(10),
+                timeout_outcome: crate::AcceptedStepTimeoutOutcome::QuarantineSaga,
+            },
+            vec![7; 4096],
+            vec![9; 4096],
+        )
+        .unwrap();
+        (actor, context, execution)
+    }
+
+    #[test]
+    fn startup_reads_each_unresolved_run_once_across_registrations() {
+        let (mut actor, mut context, _) = accepted_actor();
+        context.saga_id = crate::SagaId::new(2);
+        context.saga_type = "another".into();
+        super::accept_workflow_step(
+            &mut actor,
+            context.clone(),
+            "worker".into(),
+            crate::StepExecutionId::new("another"),
+            crate::AcceptedStepPolicy {
+                idle_timeout: std::time::Duration::from_secs(1),
+                hard_timeout: std::time::Duration::from_secs(10),
+                timeout_outcome: crate::AcceptedStepTimeoutOutcome::QuarantineSaga,
+            },
+            vec![7],
+            vec![],
+        )
+        .unwrap();
+        let mut support = SagaParticipantSupport::new(actor.saga.store);
+        support
+            .store
+            .reads
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let events = super::collect_startup_recovery_events_for_participants(
+            &mut support,
+            &[
+                (context.step_name.as_ref(), "order_lifecycle"),
+                (context.step_name.as_ref(), "another"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(support.accepted_workflow_steps.len(), 2);
+        assert_eq!(
+            support
+                .store
+                .scans
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            support
+                .store
+                .reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+    }
+
+    #[test]
+    fn renewal_failure_keeps_old_deadline() {
+        let (mut actor, context, execution) = accepted_actor();
+        let old = actor.saga.accepted_workflow_steps[&context.saga_id].deadline_at_millis;
+        actor
+            .saga
+            .store
+            .fail
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            super::record_accepted_workflow_step_progress(
+                &mut actor,
+                context.saga_id,
+                execution,
+                old
+            )
+            .is_err()
+        );
+        assert_eq!(
+            actor.saga.accepted_workflow_steps[&context.saga_id].deadline_at_millis,
+            old
+        );
+    }
+
+    #[test]
+    fn renewal_records_compact_payload_free_evidence() {
+        let (mut actor, context, execution) = accepted_actor();
+        let now = actor.saga.accepted_workflow_steps[&context.saga_id].deadline_at_millis;
+        super::record_accepted_workflow_step_progress(&mut actor, context.saga_id, execution, now)
+            .unwrap();
+        let entries = actor.saga.store.read(context.saga_id).unwrap();
+        assert!(matches!(
+            entries.last().unwrap().event,
+            crate::ParticipantEvent::AcceptedDeadlineRenewed {
+                is_compensation: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn low_level_accept_admits_successor_before_old_terminal_cache() {
+        use crate::SagaStateExt;
+        let mut actor = WorkflowTestActor::default();
+        let mut context = DeterministicContextBuilder::default().build();
+        actor
+            .retain_terminal_saga_strict(
+                &context,
+                crate::ParticipantTerminalKind::Completed,
+                "done",
+            )
+            .unwrap();
+        context.saga_started_at_millis += 1;
+        assert!(
+            super::accept_workflow_step(
+                &mut actor,
+                context,
+                "worker".into(),
+                crate::StepExecutionId::new("new"),
+                crate::AcceptedStepPolicy {
+                    idle_timeout: std::time::Duration::from_secs(1),
+                    hard_timeout: std::time::Duration::from_secs(10),
+                    timeout_outcome: crate::AcceptedStepTimeoutOutcome::QuarantineSaga
+                },
+                vec![7],
+                vec![]
+            )
+            .is_ok()
+        );
+    }
+
     struct WorkflowTestActor {
-        saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
+        saga: SagaParticipantSupport<FaultStore>,
         active: Option<ActiveSagaExecution>,
         alpha_calls: usize,
         beta_calls: usize,
+        inputs: Vec<Vec<u8>>,
+        kind: u8,
+        dispatched: usize,
+        terminal_hooks: usize,
+        dependencies: DependencySpec,
     }
 
     impl Default for WorkflowTestActor {
         fn default() -> Self {
             Self {
-                saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+                saga: SagaParticipantSupport::new(FaultStore::default()),
                 active: None,
                 alpha_calls: 0,
                 beta_calls: 0,
+                inputs: Vec::new(),
+                kind: 0,
+                dispatched: 0,
+                terminal_hooks: 0,
+                dependencies: DependencySpec::OnSagaStart,
             }
         }
     }
 
     impl HasSagaParticipantSupport for WorkflowTestActor {
-        type Journal = InMemoryJournal;
-        type Dedupe = InMemoryDedupe;
+        type Store = FaultStore;
 
-        fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+        fn saga_support(&self) -> &SagaParticipantSupport<Self::Store> {
             &self.saga
         }
 
-        fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+        fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Store> {
             &mut self.saga
         }
     }
@@ -5120,13 +4134,23 @@ mod tests {
         }
     }
 
-    struct AlphaWorkflow;
+    struct AlphaWorkflow(DependencySpec);
     struct BetaWorkflow;
 
-    static ALPHA_WORKFLOW: AlphaWorkflow = AlphaWorkflow;
+    static ALPHA_WORKFLOW: AlphaWorkflow = AlphaWorkflow(DependencySpec::OnSagaStart);
+    static AFTER_WORKFLOW: AlphaWorkflow = AlphaWorkflow(DependencySpec::After("upstream"));
+    static ANY_WORKFLOW: AlphaWorkflow =
+        AlphaWorkflow(DependencySpec::AnyOf(&["upstream", "other"]));
+    static ALLOF_WORKFLOW: AlphaWorkflow =
+        AlphaWorkflow(DependencySpec::AllOf(&["upstream", "other"]));
     static BETA_WORKFLOW: BetaWorkflow = BetaWorkflow;
-    static WORKFLOWS: [&'static dyn SagaWorkflowParticipant<WorkflowTestActor>; 2] =
-        [&ALPHA_WORKFLOW, &BETA_WORKFLOW];
+    static WORKFLOWS: [&'static dyn SagaWorkflowParticipant<WorkflowTestActor>; 5] = [
+        &ALPHA_WORKFLOW,
+        &BETA_WORKFLOW,
+        &AFTER_WORKFLOW,
+        &ANY_WORKFLOW,
+        &ALLOF_WORKFLOW,
+    ];
 
     impl SagaWorkflowParticipant<WorkflowTestActor> for AlphaWorkflow {
         fn step_name(&self) -> &'static str {
@@ -5134,7 +4158,12 @@ mod tests {
         }
 
         fn saga_types(&self) -> &[&'static str] {
-            &["alpha_workflow"]
+            match self.0 {
+                DependencySpec::OnSagaStart => &["alpha_workflow"],
+                DependencySpec::After(_) => &["after_workflow"],
+                DependencySpec::AnyOf(_) => &["any_workflow"],
+                DependencySpec::AllOf(_) => &["allof_workflow"],
+            }
         }
 
         fn execute_step(
@@ -5144,10 +4173,30 @@ mod tests {
             _input: &[u8],
         ) -> Result<crate::StepOutput, crate::StepError> {
             actor.alpha_calls += 1;
-            Ok(StepOutput::Completed {
-                output: Vec::new(),
-                compensation_data: Vec::new(),
-            })
+            actor.inputs.push(_input.to_vec());
+            match actor.kind {
+                0 => Ok(StepOutput::Completed {
+                    output: vec![42],
+                    compensation_data: vec![9],
+                }),
+                1 => Ok(StepOutput::CompletedWithEffect {
+                    output: vec![42],
+                    compensation_data: vec![9],
+                    effect: "dispatch".into(),
+                }),
+                2 => Ok(StepOutput::Accepted {
+                    execution_id: crate::StepExecutionId::new("work"),
+                    policy: crate::AcceptedStepPolicy {
+                        idle_timeout: std::time::Duration::from_secs(1),
+                        hard_timeout: std::time::Duration::from_secs(10),
+                        timeout_outcome: crate::AcceptedStepTimeoutOutcome::QuarantineSaga,
+                    },
+                    compensation_data: vec![9],
+                }),
+                _ => Err(crate::StepError::Terminal {
+                    reason: "failed".into(),
+                }),
+            }
         }
 
         fn compensate_step(
@@ -5157,6 +4206,30 @@ mod tests {
             _compensation_data: &[u8],
         ) -> Result<crate::CompensationOutput, crate::CompensationError> {
             Ok(crate::CompensationOutput::Completed)
+        }
+        fn depends_on(&self) -> DependencySpec {
+            self.0.clone()
+        }
+
+        fn dispatch_effect(
+            &self,
+            actor: &mut WorkflowTestActor,
+            request: &crate::EffectDispatchRequest<'_>,
+        ) -> Result<crate::EffectDispatchOutcome, crate::EffectDispatchError> {
+            let entries = actor.saga.store.read(request.context.saga_id).unwrap();
+            assert!(
+                matches!(&entries.last().unwrap().event, crate::ParticipantEvent::StepExecutionCompleted { output, compensation_data, .. } if output == &[42] && compensation_data == &[9])
+            );
+            actor.dispatched += 1;
+            Ok(crate::EffectDispatchOutcome::Durable {
+                receipt: "receipt".into(),
+            })
+        }
+        fn on_saga_completed(&self, actor: &mut WorkflowTestActor, _: &crate::SagaContext) {
+            actor.terminal_hooks += 1;
+        }
+        fn on_saga_failed(&self, actor: &mut WorkflowTestActor, _: &crate::SagaContext, _: &str) {
+            actor.terminal_hooks += 1;
         }
     }
 
@@ -5199,6 +4272,288 @@ mod tests {
     impl HasSagaWorkflowParticipants for WorkflowTestActor {
         fn saga_workflows() -> &'static [&'static dyn SagaWorkflowParticipant<Self>] {
             &WORKFLOWS
+        }
+    }
+
+    impl crate::SagaParticipant for WorkflowTestActor {
+        fn step_name(&self) -> &str {
+            "alpha_step"
+        }
+        fn saga_types(&self) -> &[&'static str] {
+            &[
+                "alpha_workflow",
+                "after_workflow",
+                "any_workflow",
+                "allof_workflow",
+            ]
+        }
+        fn depends_on(&self) -> DependencySpec {
+            self.dependencies.clone()
+        }
+        fn execute_step(
+            &mut self,
+            context: &crate::SagaContext,
+            input: &[u8],
+        ) -> Result<StepOutput, crate::StepError> {
+            ALPHA_WORKFLOW.execute_step(self, context, input)
+        }
+        fn compensate_step(
+            &mut self,
+            context: &crate::SagaContext,
+            data: &[u8],
+        ) -> Result<crate::CompensationOutput, crate::CompensationError> {
+            ALPHA_WORKFLOW.compensate_step(self, context, data)
+        }
+        fn dispatch_effect(
+            &mut self,
+            request: &crate::EffectDispatchRequest<'_>,
+        ) -> Result<crate::EffectDispatchOutcome, crate::EffectDispatchError> {
+            ALPHA_WORKFLOW.dispatch_effect(self, request)
+        }
+        fn on_saga_completed(&mut self, _: &crate::SagaContext) {
+            self.terminal_hooks += 1;
+        }
+        fn on_saga_failed(&mut self, _: &crate::SagaContext, _: &str) {
+            self.terminal_hooks += 1;
+        }
+    }
+
+    impl crate::AsyncSagaParticipant for WorkflowTestActor {
+        fn step_name(&self) -> &str {
+            "alpha_step"
+        }
+        fn saga_types(&self) -> &[&'static str] {
+            <Self as crate::SagaParticipant>::saga_types(self)
+        }
+        fn depends_on(&self) -> DependencySpec {
+            self.dependencies.clone()
+        }
+        fn execute_step<'a>(
+            &'a mut self,
+            context: &'a crate::SagaContext,
+            input: &'a [u8],
+        ) -> crate::SagaBoxFuture<'a, Result<StepOutput, crate::StepError>> {
+            Box::pin(async move { ALPHA_WORKFLOW.execute_step(self, context, input) })
+        }
+        fn compensate_step<'a>(
+            &'a mut self,
+            context: &'a crate::SagaContext,
+            data: &'a [u8],
+        ) -> crate::SagaBoxFuture<'a, Result<crate::CompensationOutput, crate::CompensationError>>
+        {
+            Box::pin(async move { ALPHA_WORKFLOW.compensate_step(self, context, data) })
+        }
+        fn dispatch_effect<'a>(
+            &'a mut self,
+            request: &'a crate::EffectDispatchRequest<'a>,
+        ) -> crate::SagaBoxFuture<
+            'a,
+            Result<crate::EffectDispatchOutcome, crate::EffectDispatchError>,
+        > {
+            Box::pin(async move { ALPHA_WORKFLOW.dispatch_effect(self, request) })
+        }
+        fn on_saga_completed(&mut self, _: &crate::SagaContext) {
+            self.terminal_hooks += 1;
+        }
+        fn on_saga_failed(&mut self, _: &crate::SagaContext, _: &str) {
+            self.terminal_hooks += 1;
+        }
+    }
+
+    async fn drive_mode(
+        actor: &mut WorkflowTestActor,
+        mode: u8,
+        event: crate::SagaChoreographyEvent,
+    ) -> Vec<crate::SagaChoreographyEvent> {
+        let mut emitted = Vec::new();
+        match mode {
+            0 => super::apply_sync_participant_saga_ingress_with_hooks(
+                actor,
+                event,
+                |_, _| {},
+                |_| panic!("invalid transition"),
+                |_, event| emitted.push(event.clone()),
+            ),
+            1 => {
+                super::apply_async_participant_saga_ingress_with_hooks(
+                    actor,
+                    event,
+                    |_, _| {},
+                    |_| panic!("invalid transition"),
+                    |_, event| emitted.push(event.clone()),
+                )
+                .await
+            }
+            _ => super::apply_sync_workflow_participant_saga_ingress_with_hooks(
+                actor,
+                event,
+                |_, _| {},
+                |_| panic!("invalid transition"),
+                |_, event| emitted.push(event.clone()),
+            ),
+        }
+        emitted
+    }
+
+    #[tokio::test]
+    async fn protocol_modes_preserve_original_input_and_commit_boundaries() {
+        for kind in 0..=3 {
+            for (dependency, saga_type) in [
+                (DependencySpec::OnSagaStart, "alpha_workflow"),
+                (DependencySpec::After("upstream"), "after_workflow"),
+                (
+                    DependencySpec::AnyOf(&["upstream", "other"]),
+                    "any_workflow",
+                ),
+                (
+                    DependencySpec::AllOf(&["upstream", "other"]),
+                    "allof_workflow",
+                ),
+            ] {
+                for reverse in [false, true] {
+                    let mut expected_history = None;
+                    let mut expected_emitted = None;
+                    for mode in 0..3 {
+                        let mut actor = WorkflowTestActor {
+                            kind,
+                            dependencies: dependency.clone(),
+                            ..Default::default()
+                        };
+                        let context = DeterministicContextBuilder::default()
+                            .with_saga_type(saga_type)
+                            .build();
+                        let mut emitted = Vec::new();
+                        if dependency.is_on_saga_start() {
+                            emitted.extend(
+                                drive_mode(
+                                    &mut actor,
+                                    mode,
+                                    crate::SagaChoreographyEvent::SagaStarted {
+                                        context: context.clone(),
+                                        payload: vec![7],
+                                    },
+                                )
+                                .await,
+                            );
+                            assert_eq!(
+                                actor
+                                    .saga
+                                    .store
+                                    .commits
+                                    .load(std::sync::atomic::Ordering::Relaxed),
+                                if kind == 1 { 3 } else { 2 }
+                            );
+                        } else {
+                            for name in if reverse {
+                                ["other", "upstream"]
+                            } else {
+                                ["upstream", "other"]
+                            } {
+                                let mut predecessor = context.clone();
+                                predecessor.step_name = name.into();
+                                emitted.extend(
+                                    drive_mode(
+                                        &mut actor,
+                                        mode,
+                                        crate::SagaChoreographyEvent::StepCompleted {
+                                            context: predecessor,
+                                            output: vec![55],
+                                            saga_input: vec![7],
+                                            compensation_available: false,
+                                        },
+                                    )
+                                    .await,
+                                );
+                            }
+                        }
+                        assert_eq!(actor.alpha_calls, 1);
+                        assert_eq!(
+                            actor.inputs,
+                            vec![if dependency.is_on_saga_start()
+                                || dependency.prefers_original_saga_input()
+                            {
+                                vec![7]
+                            } else {
+                                vec![55]
+                            }]
+                        );
+                        assert_eq!(actor.dispatched, usize::from(kind == 1));
+                        if kind == 2 {
+                            assert_eq!(
+                                actor.saga.accepted_workflow_steps[&context.saga_id].saga_input,
+                                vec![7]
+                            );
+                            // Replaying an accepted trigger must not quarantine or execute twice.
+                            let replay = if dependency.is_on_saga_start() {
+                                crate::SagaChoreographyEvent::SagaStarted {
+                                    context: context.clone(),
+                                    payload: vec![7],
+                                }
+                            } else {
+                                let mut c = context.clone();
+                                c.step_name = "upstream".into();
+                                crate::SagaChoreographyEvent::StepCompleted {
+                                    context: c,
+                                    output: vec![55],
+                                    saga_input: vec![7],
+                                    compensation_available: false,
+                                }
+                            };
+                            assert!(drive_mode(&mut actor, mode, replay).await.is_empty());
+                            assert_eq!(actor.alpha_calls, 1);
+                            let completed = super::complete_accepted_workflow_step(
+                                &mut actor,
+                                context.saga_id,
+                                crate::StepExecutionId::new("work"),
+                                crate::AcceptedStepCompletion {
+                                    completed_at_millis: crate::SagaContext::now_millis(),
+                                    output: vec![42],
+                                    compensation_data: vec![9],
+                                },
+                            )
+                            .unwrap();
+                            emitted.push(completed);
+                        }
+                        for event in &emitted {
+                            if let crate::SagaChoreographyEvent::StepCompleted {
+                                saga_input, ..
+                            } = event
+                            {
+                                assert_eq!(saga_input, &[7]);
+                            }
+                        }
+                        let history: Vec<_> = actor
+                            .saga
+                            .store
+                            .read(context.saga_id)
+                            .unwrap()
+                            .iter()
+                            .map(|row| std::mem::discriminant(&row.event))
+                            .collect();
+                        if let Some(expected) = &expected_history {
+                            assert_eq!(&history, expected);
+                        } else {
+                            expected_history = Some(history);
+                        }
+                        let types: Vec<_> =
+                            emitted.iter().map(|event| event.event_type()).collect();
+                        if let Some(expected) = &expected_emitted {
+                            assert_eq!(&types, expected);
+                        } else {
+                            expected_emitted = Some(types);
+                        }
+                        if kind <= 2 {
+                            let recovered = super::collect_startup_recovery_events_for_saga_type(
+                                &actor.saga.store,
+                                "alpha_step",
+                                saga_type,
+                            )
+                            .unwrap();
+                            assert!(recovered.iter().any(|event| matches!(event, crate::SagaChoreographyEvent::StepCompleted { saga_input, output, .. } if saga_input == &[7] && output == &[42])));
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -5348,7 +4703,7 @@ mod tests {
         );
         let entries = actor
             .saga
-            .journal
+            .store
             .read(crate::SagaId::new(77))
             .expect("journal read should succeed");
         assert!(matches!(
@@ -5358,6 +4713,7 @@ mod tests {
                     event: crate::ParticipantEvent::ParticipantRunRecorded { .. },
                     ..
                 },
+                _,
                 _,
                 // A plain completion is one strict proof append carrying the full
                 // result; no raw result row precedes it.
@@ -5590,17 +4946,16 @@ mod property_tests {
     /// Build a `JournalEntry` wrapping the `ParticipantEvent` variant at `idx`.
     ///
     /// Variant index map (mirrors declaration order in `ParticipantEvent`):
-    /// 0=SagaRegistered, 1=StepTriggered, 2=StepExecutionStarted,
+    /// 0=StepTriggered, 1=StepTriggered, 2=StepExecutionStarted,
     /// 3=StepExecutionCompleted, 4=StepExecutionFailed, 5=CompensationStarted,
     /// 6=CompensationCompleted, 7=CompensationFailed, 8=Quarantined,
     /// 9=AcceptedStepRecorded.
     fn participant_event_for(idx: u8) -> ParticipantEvent {
         let now = 1_234u64;
         match idx {
-            0 => ParticipantEvent::SagaRegistered {
-                saga_type: "pt".into(),
-                step_name: "pt_step".into(),
-                registered_at_millis: now,
+            0 => ParticipantEvent::StepTriggered {
+                triggering_event: "registration_removed".into(),
+                triggered_at_millis: 0,
             },
             1 => ParticipantEvent::StepTriggered {
                 triggering_event: "e".into(),
@@ -5731,10 +5086,10 @@ mod property_tests {
 /// Loom (exhaustive concurrency model-checking) scaffold for the dedupe
 /// `check_and_mark` atomicity contract.
 ///
-/// Every `ParticipantDedupeStore` backend MUST make check-and-mark atomic:
+/// Every participant store backend MUST make check-and-mark atomic:
 /// across all thread interleavings, exactly one concurrent first-mark for a
 /// given (saga_id, key) wins, and every duplicate observes a miss. The in-tree
-/// `InMemoryDedupe` uses the same canonical mutex-protected check-and-mark
+/// `InMemoryParticipantStore` uses the same canonical mutex-protected check-and-mark
 /// operation modeled below. Real backends (LMDB/heed, SQL, KV stores) use
 /// shared mutable state and SHOULD be exercised here.
 ///

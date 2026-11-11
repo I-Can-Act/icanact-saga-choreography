@@ -94,7 +94,7 @@ mod wave1c_tests {
     fn v3_schema_has_eight_tables_and_indexed_terminal_maintenance() {
         use crate::journal::{ParticipantStore, lmdb::LmdbParticipantStore};
         use crate::{
-            DeterministicContextBuilder, ParticipantEvent, ParticipantJournal,
+            DeterministicContextBuilder, ParticipantEvent,
             ParticipantTerminalKind,
         };
         let dir = tempfile::tempdir().unwrap();

@@ -52,7 +52,6 @@ mod state_ext;
 mod traits;
 
 // === Storage ===
-mod dedupe;
 mod journal;
 #[cfg(feature = "lmdb")]
 mod lmdb_owner;
@@ -83,7 +82,7 @@ pub use binding::{
 pub use bus::{
     SagaBusPublishError, SagaBusReleaseWaiter, SagaChoreographyBus, global_saga_choreography_bus,
 };
-pub use context::{PeerId, SagaContext, SagaId, StepId};
+pub use context::{PeerId, SagaContext, SagaId};
 pub use durability::*;
 
 // State (typestate)
@@ -98,7 +97,7 @@ pub use support::{
 
 // Events
 pub use events::{
-    AckStatus, ParticipantEvent, ParticipantForwardOutcome, ParticipantTerminalKind,
+    ParticipantEvent, ParticipantForwardOutcome, ParticipantTerminalKind,
     SagaChoreographyEvent, SagaFailureDetails, SagaReplyTo, SagaReplyToHandle, SagaReplyToResult,
     SagaTerminalOutcome,
 };
@@ -121,8 +120,11 @@ pub use traits::{
 };
 
 // Storage
-pub use dedupe::{DedupeError, InMemoryDedupe, ParticipantDedupeStore};
-pub use journal::{InMemoryJournal, JournalEntry, JournalError, ParticipantJournal};
+pub use journal::{
+    InMemoryParticipantStore, JournalEntry, JournalError, ParticipantStore, StoreAdmission,
+};
+#[cfg(feature = "lmdb")]
+pub use journal::lmdb::LmdbParticipantStore;
 
 // Helpers
 pub use helpers::{handle_async_saga_event_with_emit, handle_saga_event_with_emit};

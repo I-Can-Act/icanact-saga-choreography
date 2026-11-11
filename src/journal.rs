@@ -37,10 +37,10 @@ use std::sync::Mutex;
 ///
 /// ```
 /// use icanact_saga_choreography::{
-///     InMemoryJournal, ParticipantEvent, ParticipantJournal, SagaId,
+///     InMemoryParticipantStore, ParticipantEvent, ParticipantStore, SagaId,
 /// };
 ///
-/// let journal = InMemoryJournal::new();
+/// let journal = InMemoryParticipantStore::new();
 /// let saga_id = SagaId::new(1);
 /// journal.append(
 ///     saga_id,
@@ -53,68 +53,6 @@ use std::sync::Mutex;
 /// assert_eq!(entries.len(), 1);
 /// # Ok::<(), icanact_saga_choreography::JournalError>(())
 /// ```
-pub trait ParticipantJournal: Send + Sync + 'static {
-    /// Appends a new event to the journal for the specified SAGA.
-    ///
-    /// Events are assigned monotonically increasing sequence numbers
-    /// and timestamped with the current system time.
-    ///
-    /// # Arguments
-    ///
-    /// * `saga_id` - The unique identifier of the SAGA this event belongs to
-    /// * `event` - The participant event to record
-    ///
-    /// # Returns
-    ///
-    /// The sequence number assigned to this event on success, or a
-    /// [`JournalError`] on failure.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`JournalError::Storage`] if the underlying storage fails
-    /// to persist the event.
-    fn append(&self, saga_id: SagaId, event: ParticipantEvent) -> Result<u64, JournalError>;
-
-    /// Reads all journal entries for a specific SAGA.
-    ///
-    /// Entries are returned in the order they were recorded (by sequence number).
-    ///
-    /// # Arguments
-    ///
-    /// * `saga_id` - The unique identifier of the SAGA to read events for
-    ///
-    /// # Returns
-    ///
-    /// A vector of [`JournalEntry`] instances representing all recorded events,
-    /// or an empty vector if no events exist for this SAGA.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`JournalError::Storage`] if the underlying storage fails
-    /// to read the events.
-    fn read(&self, saga_id: SagaId) -> Result<Vec<JournalEntry>, JournalError>;
-
-    /// Lists all SAGA IDs that have at least one journal entry.
-    ///
-    /// This is useful for recovery scenarios where you need to identify
-    /// all SAGAs that may need to be resumed.
-    ///
-    /// # Returns
-    ///
-    /// A vector of [`SagaId`] instances for all SAGAs with recorded events.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`JournalError::Storage`] if the underlying storage fails.
-    fn list_sagas(&self) -> Result<Vec<SagaId>, JournalError>;
-
-    /// Deletes all journal entries for a specific SAGA.
-    ///
-    /// Destructive administrative primitive: deletion removes replay protection
-    /// and unresolved evidence. Never use it for automatic terminal cleanup;
-    /// preserve an audited replacement fence before deliberate archival/deletion.
-    fn prune(&self, saga_id: SagaId) -> Result<(), JournalError>;
-}
 
 /// A single entry in the participant's journal.
 ///
@@ -157,27 +95,6 @@ pub enum JournalError {
     /// The requested SAGA was not found in the journal.
     #[error("Not found: {0}")]
     NotFound(SagaId),
-}
-
-impl<T> ParticipantJournal for std::sync::Arc<T>
-where
-    T: ParticipantJournal + ?Sized,
-{
-    fn append(&self, saga_id: SagaId, event: ParticipantEvent) -> Result<u64, JournalError> {
-        (**self).append(saga_id, event)
-    }
-
-    fn read(&self, saga_id: SagaId) -> Result<Vec<JournalEntry>, JournalError> {
-        (**self).read(saga_id)
-    }
-
-    fn list_sagas(&self) -> Result<Vec<SagaId>, JournalError> {
-        (**self).list_sagas()
-    }
-
-    fn prune(&self, saga_id: SagaId) -> Result<(), JournalError> {
-        (**self).prune(saga_id)
-    }
 }
 
 #[cfg(test)]
@@ -468,7 +385,6 @@ mod wave1c_tests {
 use crate::{ParticipantAdmission, ParticipantTerminalKind, SagaContext};
 
 /// Admission and execution intent are committed together, or not at all.
-#[allow(dead_code)] // Exported by the companion API lane, not this storage lane.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoreAdmission {
     Admitted,
@@ -476,8 +392,74 @@ pub enum StoreAdmission {
     Rejected(ParticipantAdmission),
 }
 
-#[allow(dead_code)]
-pub trait ParticipantStore: ParticipantJournal {
+pub trait ParticipantStore: Send + Sync + 'static {
+    /// Appends a new event to the journal for the specified SAGA.
+    ///
+    /// Events are assigned monotonically increasing sequence numbers
+    /// and timestamped with the current system time.
+    ///
+    /// # Arguments
+    ///
+    /// * `saga_id` - The unique identifier of the SAGA this event belongs to
+    /// * `event` - The participant event to record
+    ///
+    /// # Returns
+    ///
+    /// The sequence number assigned to this event on success, or a
+    /// [`JournalError`] on failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::Storage`] if the underlying storage fails
+    /// to persist the event.
+    fn append(&self, saga_id: SagaId, event: ParticipantEvent) -> Result<u64, JournalError>;
+
+    /// Reads all journal entries for a specific SAGA.
+    ///
+    /// Entries are returned in the order they were recorded (by sequence number).
+    ///
+    /// # Arguments
+    ///
+    /// * `saga_id` - The unique identifier of the SAGA to read events for
+    ///
+    /// # Returns
+    ///
+    /// A vector of [`JournalEntry`] instances representing all recorded events,
+    /// or an empty vector if no events exist for this SAGA.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::Storage`] if the underlying storage fails
+    /// to read the events.
+    fn read(&self, saga_id: SagaId) -> Result<Vec<JournalEntry>, JournalError>;
+
+    /// Lists all SAGA IDs that have at least one journal entry.
+    ///
+    /// This is useful for recovery scenarios where you need to identify
+    /// all SAGAs that may need to be resumed.
+    ///
+    /// # Returns
+    ///
+    /// A vector of [`SagaId`] instances for all SAGAs with recorded events.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::Storage`] if the underlying storage fails.
+    fn list_sagas(&self) -> Result<Vec<SagaId>, JournalError>;
+
+    /// Deletes all journal entries for a specific SAGA.
+    ///
+    /// Destructive administrative primitive: deletion removes replay protection
+    /// and unresolved evidence. Never use it for automatic terminal cleanup;
+    /// preserve an audited replacement fence before deliberate archival/deletion.
+    fn prune(&self, saga_id: SagaId) -> Result<(), JournalError>;
+
+    fn check_and_mark(&self, saga_id: SagaId, key: &str) -> Result<bool, JournalError>;
+    fn remove_processed(&self, saga_id: SagaId, key: &str) -> Result<(), JournalError>;
+    fn mark_processed(&self, saga_id: SagaId, key: &str) -> Result<(), JournalError> {
+        self.check_and_mark(saga_id, key).map(|_| ())
+    }
+
     fn append_batch(
         &self,
         saga_id: SagaId,
@@ -498,6 +480,51 @@ pub trait ParticipantStore: ParticipantJournal {
         cutoff_millis: u64,
         batch_limit: usize,
     ) -> Result<usize, JournalError>;
+}
+
+impl<T: ParticipantStore + ?Sized> ParticipantStore for std::sync::Arc<T> {
+    fn append(&self, id: SagaId, event: ParticipantEvent) -> Result<u64, JournalError> {
+        (**self).append(id, event)
+    }
+    fn read(&self, id: SagaId) -> Result<Vec<JournalEntry>, JournalError> {
+        (**self).read(id)
+    }
+    fn list_sagas(&self) -> Result<Vec<SagaId>, JournalError> {
+        (**self).list_sagas()
+    }
+    fn prune(&self, id: SagaId) -> Result<(), JournalError> {
+        (**self).prune(id)
+    }
+    fn append_batch(
+        &self,
+        id: SagaId,
+        events: Vec<ParticipantEvent>,
+    ) -> Result<Vec<u64>, JournalError> {
+        (**self).append_batch(id, events)
+    }
+    fn admit_and_record_intent(
+        &self,
+        c: &SagaContext,
+        key: &str,
+        trigger: &str,
+    ) -> Result<StoreAdmission, JournalError> {
+        (**self).admit_and_record_intent(c, key, trigger)
+    }
+    fn unresolved_saga_ids(&self) -> Result<Vec<SagaId>, JournalError> {
+        (**self).unresolved_saga_ids()
+    }
+    fn compact_terminal_detail(&self, limit: usize) -> Result<usize, JournalError> {
+        (**self).compact_terminal_detail(limit)
+    }
+    fn prune_resolved_before(&self, cutoff: u64, limit: usize) -> Result<usize, JournalError> {
+        (**self).prune_resolved_before(cutoff, limit)
+    }
+    fn check_and_mark(&self, id: SagaId, key: &str) -> Result<bool, JournalError> {
+        (**self).check_and_mark(id, key)
+    }
+    fn remove_processed(&self, id: SagaId, key: &str) -> Result<(), JournalError> {
+        (**self).remove_processed(id, key)
+    }
 }
 
 pub(crate) type RunKey = (u64, Box<str>, u64);
@@ -684,7 +711,8 @@ fn event_key(saga_id: SagaId, event: &ParticipantEvent) -> Option<RunKey> {
             saga_started_at_millis,
             ..
         } => Some((saga_id.get(), saga_type.clone(), *saga_started_at_millis)),
-        ParticipantEvent::AcceptedStepRecorded { context, .. }
+        ParticipantEvent::AcceptedDeadlineRenewed { context, .. }
+        | ParticipantEvent::AcceptedStepRecorded { context, .. }
         | ParticipantEvent::AcceptedCompensationRecorded { context, .. }
         | ParticipantEvent::CompensationRequestRecorded { context, .. }
         | ParticipantEvent::ParticipantReconciliationEvidence { context, .. }
@@ -786,7 +814,6 @@ fn intent(context: &SagaContext, triggering_event: &str, new_run: bool) -> Vec<P
 }
 
 /// Compatibility journal name and the unified store have identical backing state.
-pub type InMemoryJournal = InMemoryParticipantStore;
 pub struct InMemoryParticipantStore {
     state: Mutex<MemoryRuns<JournalEntry>>,
 }
@@ -865,7 +892,7 @@ impl InMemoryParticipantStore {
         Ok(sequences)
     }
 }
-impl ParticipantJournal for InMemoryParticipantStore {
+impl ParticipantStore for InMemoryParticipantStore {
     fn append(&self, saga_id: SagaId, event: ParticipantEvent) -> Result<u64, JournalError> {
         Ok(self.append_batch(saga_id, vec![event])?[0])
     }
@@ -902,8 +929,34 @@ impl ParticipantJournal for InMemoryParticipantStore {
         }
         Ok(())
     }
-}
-impl ParticipantStore for InMemoryParticipantStore {
+
+    fn check_and_mark(&self, saga_id: SagaId, marker: &str) -> Result<bool, JournalError> {
+        let mut state = self.state()?;
+        let key = state
+            .by_saga
+            .get(&saga_id.get())
+            .and_then(|keys| keys.iter().max_by_key(|k| k.2))
+            .cloned()
+            .ok_or_else(|| storage("marker requires durable run evidence"))?;
+        Ok(state
+            .runs
+            .get_mut(&key)
+            .unwrap()
+            .dedupe
+            .insert(marker.into()))
+    }
+    fn remove_processed(&self, saga_id: SagaId, marker: &str) -> Result<(), JournalError> {
+        let mut state = self.state()?;
+        let keys = state
+            .by_saga
+            .get(&saga_id.get())
+            .cloned()
+            .unwrap_or_default();
+        for key in keys {
+            state.runs.get_mut(&key).unwrap().dedupe.remove(marker);
+        }
+        Ok(())
+    }
     fn append_batch(
         &self,
         saga_id: SagaId,
@@ -977,7 +1030,6 @@ impl ParticipantStore for InMemoryParticipantStore {
 }
 
 #[cfg(feature = "lmdb")]
-#[allow(dead_code)] // Companion lane exposes these public APIs from lib.rs.
 pub mod lmdb {
     use super::*;
     use crate::lmdb_owner::{IndexedStore, LmdbEnvOwner, decode_summary, hex, parse_run, run_key};
@@ -1097,7 +1149,7 @@ pub mod lmdb {
             txn.commit().unwrap();
         }
     }
-    impl ParticipantJournal for LmdbParticipantStore {
+    impl ParticipantStore for LmdbParticipantStore {
         fn append(&self, saga_id: SagaId, event: ParticipantEvent) -> Result<u64, JournalError> {
             Ok(self.append_batch(saga_id, vec![event])?[0])
         }
@@ -1157,8 +1209,51 @@ pub mod lmdb {
             }
             txn.commit().map_err(storage)
         }
-    }
-    impl ParticipantStore for LmdbParticipantStore {
+
+        fn check_and_mark(&self, saga_id: SagaId, marker: &str) -> Result<bool, JournalError> {
+            let mut txn = self.db.env.write_txn().map_err(storage)?;
+            let mut latest = None;
+            for row in self
+                .db
+                .runs
+                .prefix_iter(&txn, &self.saga_prefix(saga_id))
+                .map_err(storage)?
+            {
+                let (key, _) = row.map_err(storage)?;
+                let run = parse_run(&self.db.namespace, key).map_err(storage)?;
+                if latest.as_ref().is_none_or(|(at, _)| run.2 > *at) {
+                    latest = Some((run.2, key.to_owned()));
+                }
+            }
+            let (_, run) = latest.ok_or_else(|| storage("marker requires durable run evidence"))?;
+            let key = format!("{run}{}", hex(marker));
+            if key.len() > 511 {
+                return Err(storage("dedupe key exceeds LMDB key capacity"));
+            }
+            if self.dedupe.get(&txn, &key).map_err(storage)?.is_some() {
+                return Ok(false);
+            }
+            self.dedupe.put(&mut txn, &key, &[]).map_err(storage)?;
+            txn.commit().map_err(storage)?;
+            Ok(true)
+        }
+        fn remove_processed(&self, saga_id: SagaId, marker: &str) -> Result<(), JournalError> {
+            let mut txn = self.db.env.write_txn().map_err(storage)?;
+            let runs = self
+                .db
+                .runs
+                .prefix_iter(&txn, &self.saga_prefix(saga_id))
+                .map_err(storage)?
+                .map(|row| row.map(|(key, _)| key.to_owned()))
+                .collect::<heed::Result<Vec<_>>>()
+                .map_err(storage)?;
+            for run in runs {
+                self.dedupe
+                    .delete(&mut txn, &format!("{run}{}", hex(marker)))
+                    .map_err(storage)?;
+            }
+            txn.commit().map_err(storage)
+        }
         fn append_batch(
             &self,
             saga_id: SagaId,

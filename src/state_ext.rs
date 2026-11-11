@@ -8,22 +8,20 @@
 //! provide `SagaStateExt` automatically.
 
 use crate::{
-    DedupeError, HasSagaParticipantSupport, JournalError, ParticipantDedupeStore, ParticipantEvent,
-    ParticipantForwardOutcome, ParticipantJournal, ParticipantTerminalKind, SagaChoreographyEvent,
-    SagaContext, SagaId, SagaStateEntry,
+    HasSagaParticipantSupport, JournalError, ParticipantEvent, ParticipantForwardOutcome,
+    ParticipantStore, ParticipantTerminalKind, SagaChoreographyEvent, SagaContext, SagaId,
+    SagaStateEntry,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Debug)]
 pub enum SagaStateStoreError {
-    Dedupe(DedupeError),
     Journal(JournalError),
 }
 
 impl std::fmt::Display for SagaStateStoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Dedupe(err) => write!(f, "dedupe store: {err}"),
             Self::Journal(err) => write!(f, "journal store: {err}"),
         }
     }
@@ -134,18 +132,17 @@ impl ParticipantRunEvidence {
 ///
 /// ```ignore
 /// struct MyActor {
-///     saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
+///     saga: SagaParticipantSupport<InMemoryParticipantStore>,
 /// }
 ///
 /// impl HasSagaParticipantSupport for MyActor {
-///     type Journal = InMemoryJournal;
-///     type Dedupe = InMemoryDedupe;
+///     type Store = InMemoryParticipantStore;
 ///
-///     fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+///     fn saga_support(&self) -> &SagaParticipantSupport<Self::Store> {
 ///         &self.saga
 ///     }
 ///
-///     fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+///     fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Store> {
 ///         &mut self.saga
 ///     }
 /// }
@@ -190,7 +187,7 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
             .remove(&saga_id);
         self.saga_support_mut()
             .resolved_workflow_steps
-            .retain(|(resolved_saga_id, _)| *resolved_saga_id != saga_id);
+            .remove(&saga_id);
     }
 
     /// Returns mutable access to terminal saga latches.
@@ -248,6 +245,7 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
                 break;
             };
             self.terminal_sagas().remove(&evicted);
+            self.clear_in_memory_saga_run_tracking(evicted);
             self.saga_support_mut().saga_run_started_at.remove(&evicted);
         }
     }
@@ -261,16 +259,8 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
     ///
     /// The journal is used to durably record saga events for recovery
     /// and audit purposes.
-    fn saga_journal(&self) -> &<Self as HasSagaParticipantSupport>::Journal {
-        &self.saga_support().journal
-    }
-
-    /// Returns the deduplication store for idempotency tracking.
-    ///
-    /// The dedupe store tracks which operations have already been processed
-    /// to prevent duplicate execution of side effects.
-    fn saga_dedupe(&self) -> &<Self as HasSagaParticipantSupport>::Dedupe {
-        &self.saga_support().dedupe
+    fn saga_store(&self) -> &Self::Store {
+        &self.saga_support().store
     }
 
     /// Returns the current timestamp in milliseconds.
@@ -308,13 +298,13 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
     /// `true` if the operation is new and should proceed, `false` if it
     /// has already been processed.
     fn check_dedupe_strict(&self, saga_id: SagaId, key: &str) -> Result<bool, SagaStateStoreError> {
-        self.saga_dedupe()
+        self.saga_store()
             .check_and_mark(saga_id, key)
-            .map_err(SagaStateStoreError::Dedupe)
+            .map_err(SagaStateStoreError::Journal)
     }
 
     fn check_dedupe(&self, saga_id: SagaId, key: &str) -> bool {
-        match self.saga_dedupe().check_and_mark(saga_id, key) {
+        match self.saga_store().check_and_mark(saga_id, key) {
             Ok(value) => value,
             Err(err) => {
                 tracing::error!(
@@ -343,7 +333,7 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
         saga_id: SagaId,
         event: ParticipantEvent,
     ) -> Result<(), SagaStateStoreError> {
-        self.saga_journal()
+        self.saga_store()
             .append(saga_id, event)
             .map(|_| ())
             .map_err(SagaStateStoreError::Journal)
@@ -372,12 +362,11 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
     /// * `saga_id` - The unique identifier of the saga to prune
     fn prune_saga_strict(&mut self, saga_id: SagaId) -> Result<(), SagaStateStoreError> {
         self.clear_in_memory_saga_run_tracking(saga_id);
-        self.saga_journal()
+        self.unlatch_terminal_saga(saga_id);
+        self.saga_support_mut().saga_run_started_at.remove(&saga_id);
+        self.saga_store()
             .prune(saga_id)
-            .map_err(SagaStateStoreError::Journal)?;
-        self.saga_dedupe()
-            .prune(saga_id)
-            .map_err(SagaStateStoreError::Dedupe)
+            .map_err(SagaStateStoreError::Journal)
     }
 
     fn prune_saga(&mut self, saga_id: SagaId) {
@@ -422,7 +411,7 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
         context: &SagaContext,
     ) -> Result<Option<ParticipantTerminalKind>, SagaStateStoreError> {
         let entries = self
-            .saga_journal()
+            .saga_store()
             .read(context.saga_id)
             .map_err(SagaStateStoreError::Journal)?;
         Ok(scan_runs(&entries)
@@ -441,8 +430,32 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
         &self,
         context: &SagaContext,
     ) -> Result<ParticipantAdmission, SagaStateStoreError> {
+        let admission = self.inspect_participant_event_strict(context)?;
+        if admission.is_admitted() {
+            let entries = self
+                .saga_store()
+                .read(context.saga_id)
+                .map_err(SagaStateStoreError::Journal)?;
+            if !scan_runs(&entries).contains(context) {
+                self.record_event_strict(
+                    context.saga_id,
+                    ParticipantEvent::ParticipantRunRecorded {
+                        saga_type: context.saga_type.clone(),
+                        saga_started_at_millis: context.saga_started_at_millis,
+                        recorded_at_millis: self.now_millis(),
+                    },
+                )?;
+            }
+        }
+        Ok(admission)
+    }
+
+    fn inspect_participant_event_strict(
+        &self,
+        context: &SagaContext,
+    ) -> Result<ParticipantAdmission, SagaStateStoreError> {
         let entries = self
-            .saga_journal()
+            .saga_store()
             .read(context.saga_id)
             .map_err(SagaStateStoreError::Journal)?;
         let runs = scan_runs(&entries);
@@ -450,8 +463,7 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
             && entries.iter().any(|entry| {
                 !matches!(
                     entry.event,
-                    ParticipantEvent::SagaRegistered { .. }
-                        | ParticipantEvent::ParticipantDependencyCompletedRecorded { .. }
+                    ParticipantEvent::ParticipantDependencyCompletedRecorded { .. }
                 )
             })
         {
@@ -482,14 +494,6 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
                     active_started_at_millis: active.started_at,
                 });
             }
-            self.record_event_strict(
-                context.saga_id,
-                ParticipantEvent::ParticipantRunRecorded {
-                    saga_type: context.saga_type.clone(),
-                    saga_started_at_millis: context.saga_started_at_millis,
-                    recorded_at_millis: self.now_millis(),
-                },
-            )?;
         }
         Ok(ParticipantAdmission::Admitted)
     }
@@ -501,14 +505,25 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
         context: &SagaContext,
     ) -> Result<bool, SagaStateStoreError> {
         let entries = self
-            .saga_journal()
+            .saga_store()
             .read(context.saga_id)
             .map_err(SagaStateStoreError::Journal)?;
         let start = entries.iter().rposition(|entry| matches!(&entry.event,
             ParticipantEvent::ParticipantRunRecorded { saga_type, saga_started_at_millis, .. }
                 if saga_type == &context.saga_type && *saga_started_at_millis == context.saga_started_at_millis
-        )).unwrap_or(0);
-        Ok(entries[start..].iter().any(|entry| {
+        ));
+        if start.is_none()
+            && entries.iter().any(|entry| {
+                matches!(
+                    entry.event,
+                    ParticipantEvent::ParticipantRunRecorded { .. }
+                        | ParticipantEvent::ParticipantTerminalRecorded { .. }
+                )
+            })
+        {
+            return Ok(false);
+        }
+        Ok(entries[start.unwrap_or(0)..].iter().any(|entry| {
             matches!(
                 entry.event,
                 ParticipantEvent::StepExecutionStarted { .. }
@@ -527,7 +542,7 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
         context: &SagaContext,
     ) -> Result<ParticipantRunEvidence, SagaStateStoreError> {
         let entries = self
-            .saga_journal()
+            .saga_store()
             .read(context.saga_id)
             .map_err(SagaStateStoreError::Journal)?;
         Ok(run_evidence(&entries, context))
@@ -570,7 +585,7 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
         context: &SagaContext,
     ) -> Result<HashSet<Box<str>>, SagaStateStoreError> {
         let entries = self
-            .saga_journal()
+            .saga_store()
             .read(context.saga_id)
             .map_err(SagaStateStoreError::Journal)?;
         Ok(entries
@@ -621,7 +636,7 @@ pub trait SagaStateExt: HasSagaParticipantSupport {
         reason: &str,
     ) -> Result<(), SagaStateStoreError> {
         let entries = self
-            .saga_journal()
+            .saga_store()
             .read(context.saga_id)
             .map_err(SagaStateStoreError::Journal)?;
         let previous = scan_runs(&entries)
@@ -755,7 +770,8 @@ fn run_evidence(entries: &[crate::JournalEntry], context: &SagaContext) -> Parti
                 && ctx.saga_started_at_millis == context.saga_started_at_millis
         };
         let belongs = match &entry.event {
-            ParticipantEvent::AcceptedStepRecorded { context, .. }
+            ParticipantEvent::AcceptedDeadlineRenewed { context, .. }
+            | ParticipantEvent::AcceptedStepRecorded { context, .. }
             | ParticipantEvent::AcceptedCompensationRecorded { context, .. }
             | ParticipantEvent::CompensationRequestRecorded { context, .. }
             | ParticipantEvent::ParticipantReconciliationEvidence { context, .. }
@@ -1001,37 +1017,95 @@ impl<T> SagaStateExt for T where T: HasSagaParticipantSupport {}
 #[cfg(test)]
 mod tests {
     use crate::{
-        HasSagaParticipantSupport, InMemoryDedupe, InMemoryJournal, ParticipantEvent,
-        ParticipantJournal, SagaId, SagaParticipantSupport,
+        HasSagaParticipantSupport, InMemoryParticipantStore, ParticipantEvent, ParticipantStore,
+        SagaId, SagaParticipantSupport,
     };
 
     use super::SagaStateExt;
 
     struct DummyParticipant {
-        saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
+        saga: SagaParticipantSupport<InMemoryParticipantStore>,
     }
 
     impl DummyParticipant {
         fn new() -> Self {
             Self {
-                saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+                saga: SagaParticipantSupport::new(InMemoryParticipantStore::new()),
             }
         }
     }
 
     impl HasSagaParticipantSupport for DummyParticipant {
-        type Journal = InMemoryJournal;
-        type Dedupe = InMemoryDedupe;
+        type Store = InMemoryParticipantStore;
 
-        fn saga_support(&self) -> &crate::SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+        fn saga_support(&self) -> &crate::SagaParticipantSupport<Self::Store> {
             &self.saga
         }
 
-        fn saga_support_mut(
-            &mut self,
-        ) -> &mut crate::SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+        fn saga_support_mut(&mut self) -> &mut crate::SagaParticipantSupport<Self::Store> {
             &mut self.saga
         }
+    }
+
+    #[test]
+    fn prune_removes_all_volatile_metadata_and_preserves_other_sagas() {
+        let mut actor = DummyParticipant::new();
+        for id in [SagaId::new(1), SagaId::new(2)] {
+            actor.record_saga_run_start(id, 100);
+            actor.latch_terminal_saga(id);
+            actor
+                .saga
+                .resolved_workflow_steps
+                .entry(id)
+                .or_default()
+                .insert(crate::StepExecutionId::new("one"));
+            actor
+                .saga
+                .resolved_workflow_steps
+                .entry(id)
+                .or_default()
+                .insert(crate::StepExecutionId::new("two"));
+            actor.saga.dependency_fired.insert(id);
+            actor
+                .saga
+                .dependency_completions
+                .entry(id)
+                .or_default()
+                .insert("upstream".into());
+        }
+        assert_eq!(actor.saga.resolved_workflow_step_count(), 4);
+        actor.prune_saga_strict(SagaId::new(1)).unwrap();
+        assert_eq!(actor.saga.resolved_workflow_step_count(), 2);
+        assert!(
+            !actor
+                .saga
+                .resolved_workflow_steps
+                .contains_key(&SagaId::new(1))
+        );
+        assert!(!actor.saga.saga_run_started_at.contains_key(&SagaId::new(1)));
+        assert!(!actor.saga.terminal_sagas.contains(&SagaId::new(1)));
+        assert_eq!(
+            actor
+                .saga
+                .terminal_saga_order
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![SagaId::new(2)]
+        );
+        assert!(!actor.saga.dependency_fired.contains(&SagaId::new(1)));
+        assert!(
+            !actor
+                .saga
+                .dependency_completions
+                .contains_key(&SagaId::new(1))
+        );
+        actor.clear_in_memory_saga_run_tracking(SagaId::new(2));
+        assert!(actor.saga.resolved_workflow_steps.is_empty());
+        assert!(
+            actor.saga.terminal_sagas.contains(&SagaId::new(2)),
+            "ordinary settlement must preserve durable replay latch cache"
+        );
     }
 
     #[test]
@@ -1048,7 +1122,7 @@ mod tests {
         );
         assert_eq!(
             participant
-                .saga_journal()
+                .saga_store()
                 .read(saga_id)
                 .expect("journal should read")
                 .len(),

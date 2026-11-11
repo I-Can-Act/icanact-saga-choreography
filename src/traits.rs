@@ -20,7 +20,6 @@ use icanact_core::{ActorId, ActorIdError};
 ///
 /// ```rust,ignore
 /// impl SagaParticipant for OrderManagerActor {
-///     type Error = OrderError;
 ///     
 ///     fn step_name(&self) -> &str { "create_order" }
 ///     fn saga_types(&self) -> &[&'static str] { &["order_workflow"] }
@@ -39,9 +38,6 @@ use icanact_core::{ActorId, ActorIdError};
 /// }
 /// ```
 pub trait SagaParticipant {
-    /// Error type for this participant
-    type Error: std::fmt::Debug + Send;
-
     /// The step name this participant handles
     fn step_name(&self) -> &str;
 
@@ -224,8 +220,6 @@ pub type SagaBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// Use this when a participant step needs to await actor asks or other async IO.
 /// This keeps sync and async choreography execution models distinct at the type level.
 pub trait AsyncSagaParticipant {
-    type Error: std::fmt::Debug + Send;
-
     fn step_name(&self) -> &str;
 
     fn participant_id(&self) -> &str {

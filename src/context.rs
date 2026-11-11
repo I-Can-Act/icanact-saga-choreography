@@ -57,15 +57,6 @@ impl std::fmt::Display for SagaId {
     }
 }
 
-/// Unique identifier for a step within a saga
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct StepId {
-    /// The saga this step belongs to
-    pub saga_id: SagaId,
-    /// Index of the step in the workflow
-    pub step_index: usize,
-}
-
 /// Peer ID type (matches icanact-core)
 pub type PeerId = [u8; 32];
 
