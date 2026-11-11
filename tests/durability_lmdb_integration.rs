@@ -1456,23 +1456,34 @@ fn open_lmdb_participant_support_for_saga_type(
     open_lmdb_participant_support_for_saga_types(base, participant_key, &[saga_type])
 }
 
+fn lmdb_v3_ctx(saga_id: u64, saga_type: &str, step_name: &str) -> SagaContext {
+    let ts = SagaContext::next_run_start_millis();
+    SagaContext {
+        saga_id: SagaId::new(saga_id),
+        saga_type: saga_type.into(),
+        step_name: step_name.into(),
+        correlation_id: saga_id,
+        causation_id: saga_id,
+        trace_id: saga_id,
+        step_index: 0,
+        attempt: 1,
+        initiator_peer_id: [0; 32],
+        saga_started_at_millis: ts,
+        event_timestamp_millis: ts,
+    }
+}
+
 #[test]
 fn v3_shared_base_isolates_participants_and_resolver_through_maintenance_and_reopen() {
     use icanact_saga_choreography::{
-        DeterministicContextBuilder, LmdbTerminalResolverJournal, ParticipantTerminalKind,
-        StoreAdmission, TerminalResolverJournal,
+        LmdbTerminalResolverJournal, ParticipantTerminalKind, StoreAdmission,
+        TerminalResolverJournal,
     };
     let temp = tempfile::tempdir().unwrap();
     let base = temp.path();
-    let run = DeterministicContextBuilder::default()
-        .with_saga_id(801)
-        .build();
-    let active = DeterministicContextBuilder::default()
-        .with_saga_id(802)
-        .build();
-    let quarantined = DeterministicContextBuilder::default()
-        .with_saga_id(803)
-        .build();
+    let run = lmdb_v3_ctx(801, "order_lifecycle", "step");
+    let active = lmdb_v3_ctx(802, "order_lifecycle", "step");
+    let quarantined = lmdb_v3_ctx(803, "order_lifecycle", "step");
     {
         let a = LmdbParticipantStore::open(base, "a").unwrap();
         let b = LmdbParticipantStore::open(&base.join("."), "b").unwrap();
@@ -1590,21 +1601,12 @@ fn accepted_step_and_compensation_renewals_survive_v3_reopen_without_payload_dup
         recover_accepted_workflow_steps_for_saga_type,
     };
     use icanact_saga_choreography::{
-        AcceptedStepPolicy, AcceptedStepTimeoutOutcome, DeterministicContextBuilder,
-        StepExecutionId, accept_workflow_step,
+        AcceptedStepPolicy, AcceptedStepTimeoutOutcome, StepExecutionId, accept_workflow_step,
     };
     let temp = tempfile::tempdir().unwrap();
     let now = SagaContext::now_millis();
-    let step = DeterministicContextBuilder::default()
-        .with_saga_id(901)
-        .with_saga_type("renewals")
-        .with_step_name("work")
-        .build();
-    let undo = DeterministicContextBuilder::default()
-        .with_saga_id(902)
-        .with_saga_type("renewals")
-        .with_step_name("work")
-        .build();
+    let step = lmdb_v3_ctx(901, "renewals", "work");
+    let undo = lmdb_v3_ctx(902, "renewals", "work");
     let forward_id = StepExecutionId::new("forward");
     let undo_id = StepExecutionId::new("undo");
     let payload = vec![7; 4096];
