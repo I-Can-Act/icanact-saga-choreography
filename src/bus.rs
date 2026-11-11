@@ -2574,12 +2574,32 @@ impl SagaChoreographyBus {
         let responder: Arc<str> = Arc::from(responder);
         let (resolver, recovery_events, admission, recovery_history) = match &journal {
             Some(journal) => {
-                let entries = journal.read_all().map_err(|error| {
-                    format!(
-                        "terminal resolver recovery read failed saga_type={}: {error}",
-                        policy.saga_type
-                    )
-                })?;
+                let mut entries = Vec::new();
+                match journal.visit_unresolved_runs(&mut |entry| {
+                    entries.push(entry.clone());
+                    Ok(())
+                }) {
+                    Ok(()) => {}
+                    Err(crate::TerminalResolverJournalError::Unsupported(_)) => {
+                        // Compatibility for append/read_all-only custom journals.
+                        // Discard any partial visit before taking the legacy path.
+                        entries = journal.read_all().map_err(|error| {
+                            format!(
+                                "terminal resolver recovery read failed saga_type={}: {error}",
+                                policy.saga_type
+                            )
+                        })?;
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "terminal resolver recovery stream failed saga_type={}: {error}",
+                            policy.saga_type
+                        ));
+                    }
+                }
+                // Stores may stream in run-index order; cross-run quarantine
+                // reconstruction requires the original durable sequence order.
+                entries.sort_by_key(|entry| entry.sequence);
                 let mut events = Vec::with_capacity(entries.len());
                 for entry in entries {
                     if entry.event.context().saga_type.as_ref() != policy.saga_type.as_ref() {
@@ -2592,8 +2612,8 @@ impl SagaChoreographyBus {
                     }
                     events.push(entry.event);
                 }
-                // The only full history read. Later starts and cache misses use
-                // bounded per-saga lookups when the journal supports them.
+                // Only unresolved/quarantined evidence is resident for streaming
+                // stores. Closed fences are loaded by bounded per-saga lookup.
                 let admission = AdmissionIndex::from_events(
                     limits,
                     journal.supports_saga_lookup(),
@@ -6513,5 +6533,258 @@ mod wave1b_tests {
         join.join().unwrap();
         handle.shutdown();
         waiter_handle.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod streaming_attach_tests {
+    use super::*;
+    use crate::{
+        InMemoryTerminalResolverJournal, TerminalResolverJournalEntry, TerminalResolverJournalError,
+    };
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Instant;
+
+    struct StreamingOnly<J> {
+        inner: J,
+        visits: AtomicUsize,
+    }
+
+    impl<J: TerminalResolverJournal> TerminalResolverJournal for StreamingOnly<J> {
+        fn append(
+            &self,
+            event: SagaChoreographyEvent,
+        ) -> Result<u64, TerminalResolverJournalError> {
+            self.inner.append(event)
+        }
+        fn read_all(
+            &self,
+        ) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError> {
+            panic!("resolver attach must stream, never read_all")
+        }
+        fn supports_saga_lookup(&self) -> bool {
+            self.inner.supports_saga_lookup()
+        }
+        fn read_saga_bounded(
+            &self,
+            id: SagaId,
+            max: usize,
+        ) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError> {
+            self.inner.read_saga_bounded(id, max)
+        }
+        fn visit_unresolved_runs(
+            &self,
+            visitor: &mut dyn FnMut(
+                &TerminalResolverJournalEntry,
+            ) -> Result<(), TerminalResolverJournalError>,
+        ) -> Result<(), TerminalResolverJournalError> {
+            self.inner.visit_unresolved_runs(&mut |entry| {
+                self.visits.fetch_add(1, Ordering::SeqCst);
+                visitor(entry)
+            })
+        }
+    }
+
+    fn context(id: u64) -> SagaContext {
+        let now = SagaContext::now_millis();
+        SagaContext {
+            saga_id: SagaId::new(id),
+            saga_type: "order_lifecycle".into(),
+            step_name: "create_order".into(),
+            correlation_id: id,
+            causation_id: id,
+            trace_id: id,
+            step_index: 0,
+            attempt: 0,
+            initiator_peer_id: [0; 32],
+            saga_started_at_millis: now,
+            event_timestamp_millis: now,
+        }
+    }
+
+    fn exercise<J: TerminalResolverJournal>(inner: J, ordinary: u64) {
+        for id in 1..=ordinary {
+            let context = context(id);
+            inner
+                .append(SagaChoreographyEvent::SagaStarted {
+                    context: context.clone(),
+                    payload: vec![],
+                })
+                .unwrap();
+            inner
+                .append(SagaChoreographyEvent::SagaCompleted { context })
+                .unwrap();
+        }
+        let active = context(ordinary + 1);
+        let quarantined = context(ordinary + 2);
+        for context in [&active, &quarantined] {
+            inner
+                .append(SagaChoreographyEvent::SagaStarted {
+                    context: context.clone(),
+                    payload: vec![],
+                })
+                .unwrap();
+        }
+        inner
+            .append(SagaChoreographyEvent::SagaQuarantined {
+                context: quarantined.clone(),
+                reason: "uncertain".into(),
+                step: quarantined.step_name.clone(),
+                participant_id: "test".into(),
+            })
+            .unwrap();
+        let journal = Arc::new(StreamingOnly {
+            inner,
+            visits: AtomicUsize::new(0),
+        });
+        let bus = SagaChoreographyBus::new();
+        bus.attach_durable_terminal_resolver(
+            TerminalPolicy::order_lifecycle_default(),
+            "stream-test",
+            journal.clone(),
+        )
+        .unwrap();
+        assert_eq!(journal.visits.load(Ordering::SeqCst), 3);
+        let gate = bus.read_state().runtimes["order_lifecycle"].gate.clone();
+        assert_eq!(gate.index().resident_ids(), 2);
+        assert_eq!(gate.phase(&active), Some(RunPhase::Active));
+        assert_eq!(gate.phase(&quarantined), Some(RunPhase::Quarantined));
+        bus.activate_terminal_resolver_recovery("order_lifecycle")
+            .unwrap();
+        let mut successor = quarantined;
+        successor.saga_started_at_millis += 1;
+        assert!(
+            bus.publish_strict(SagaChoreographyEvent::SagaStarted {
+                context: successor,
+                payload: vec![]
+            })
+            .is_err()
+        );
+        bus.publish_strict(SagaChoreographyEvent::StepCompleted {
+            context: active.clone(),
+            output: vec![],
+            saga_input: vec![],
+            compensation_available: false,
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(outcome) = bus.take_terminal_outcome(active.saga_id) {
+                assert!(matches!(outcome, SagaTerminalOutcome::Completed { .. }));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "restored active run did not complete"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn resolver_attach_never_calls_read_all() {
+        exercise(InMemoryTerminalResolverJournal::default(), 0);
+    }
+
+    #[test]
+    fn memory_resolver_attach_skips_5000_resolved_runs() {
+        exercise(InMemoryTerminalResolverJournal::default(), 5_000);
+    }
+
+    #[cfg(feature = "lmdb")]
+    #[test]
+    fn lmdb_resolver_attach_skips_5000_resolved_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        exercise(
+            crate::LmdbTerminalResolverJournal::open(dir.path()).unwrap(),
+            5_000,
+        );
+    }
+    #[test]
+    fn streaming_storage_error_does_not_fall_back_to_read_all() {
+        struct Broken;
+        impl TerminalResolverJournal for Broken {
+            fn append(
+                &self,
+                _: SagaChoreographyEvent,
+            ) -> Result<u64, TerminalResolverJournalError> {
+                unreachable!()
+            }
+            fn read_all(
+                &self,
+            ) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError>
+            {
+                panic!("must not mask streaming storage errors")
+            }
+            fn visit_unresolved_runs(
+                &self,
+                _: &mut dyn FnMut(
+                    &TerminalResolverJournalEntry,
+                ) -> Result<(), TerminalResolverJournalError>,
+            ) -> Result<(), TerminalResolverJournalError> {
+                Err(TerminalResolverJournalError::Storage(
+                    "injected streaming failure".into(),
+                ))
+            }
+        }
+        let bus = SagaChoreographyBus::new();
+        let err = bus
+            .attach_durable_terminal_resolver(
+                TerminalPolicy::order_lifecycle_default(),
+                "error-test",
+                Arc::new(Broken),
+            )
+            .unwrap_err();
+        assert!(err.contains("injected streaming failure"), "{err}");
+        assert!(bus.read_state().runtimes.is_empty());
+    }
+
+    #[test]
+    fn unsupported_streaming_discards_partial_visit_before_legacy_fallback() {
+        struct Legacy;
+        impl TerminalResolverJournal for Legacy {
+            fn append(
+                &self,
+                _: SagaChoreographyEvent,
+            ) -> Result<u64, TerminalResolverJournalError> {
+                unreachable!()
+            }
+            fn read_all(
+                &self,
+            ) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError>
+            {
+                Ok(vec![])
+            }
+            fn visit_unresolved_runs(
+                &self,
+                visitor: &mut dyn FnMut(
+                    &TerminalResolverJournalEntry,
+                )
+                    -> Result<(), TerminalResolverJournalError>,
+            ) -> Result<(), TerminalResolverJournalError> {
+                visitor(&TerminalResolverJournalEntry {
+                    sequence: 1,
+                    event: SagaChoreographyEvent::SagaStarted {
+                        context: context(1),
+                        payload: vec![],
+                    },
+                })?;
+                Err(TerminalResolverJournalError::Unsupported("legacy".into()))
+            }
+        }
+        let bus = SagaChoreographyBus::new();
+        bus.attach_durable_terminal_resolver(
+            TerminalPolicy::order_lifecycle_default(),
+            "legacy-test",
+            Arc::new(Legacy),
+        )
+        .unwrap();
+        assert_eq!(
+            bus.read_state().runtimes["order_lifecycle"]
+                .gate
+                .index()
+                .resident_ids(),
+            0
+        );
     }
 }
