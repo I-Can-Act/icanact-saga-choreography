@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use icanact_core::local::PublishStats;
 
 use crate::{
-    AcceptedStepPolicy, ParticipantDedupeStore, ParticipantJournal, ParticipantStats,
+    AcceptedStepPolicy, ParticipantDedupeStore, ParticipantJournal,
     SagaChoreographyBus, SagaChoreographyEvent, SagaContext, SagaId, SagaStateEntry,
     StepExecutionId,
 };
@@ -59,7 +59,6 @@ where
     pub resolved_workflow_steps: HashSet<(SagaId, StepExecutionId)>,
     pub journal: J,
     pub dedupe: D,
-    pub stats: ParticipantStats,
     pub startup_recovery_events: Vec<SagaChoreographyEvent>,
     pub bus: Option<SagaChoreographyBus>,
 }
@@ -82,7 +81,6 @@ where
             resolved_workflow_steps: HashSet::new(),
             journal,
             dedupe,
-            stats: ParticipantStats::new(),
             startup_recovery_events: Vec::new(),
             bus: None,
         }
@@ -169,7 +167,6 @@ where
                 &self.startup_recovery_events.len(),
             )
             .field("bus_attached", &self.bus.is_some())
-            .field("stats", &self.stats.snapshot())
             .finish()
     }
 }

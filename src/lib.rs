@@ -57,13 +57,8 @@ mod journal;
 #[cfg(feature = "lmdb")]
 mod lmdb_owner;
 
-// === Observability ===
-mod observer;
-mod stats;
-
 // === Helpers ===
 mod helpers;
-mod reply_registry;
 mod resolver;
 mod resolver_journal;
 #[cfg(any(test, feature = "test-harness"))]
@@ -104,7 +99,8 @@ pub use support::{
 // Events
 pub use events::{
     AckStatus, ParticipantEvent, ParticipantForwardOutcome, ParticipantTerminalKind,
-    SagaChoreographyEvent, SagaFailureDetails, SagaReplyTo, SagaTerminalOutcome,
+    SagaChoreographyEvent, SagaFailureDetails, SagaReplyTo, SagaReplyToHandle, SagaReplyToResult,
+    SagaTerminalOutcome,
 };
 
 // Errors
@@ -128,13 +124,8 @@ pub use traits::{
 pub use dedupe::{DedupeError, InMemoryDedupe, ParticipantDedupeStore};
 pub use journal::{InMemoryJournal, JournalEntry, JournalError, ParticipantJournal};
 
-// Observability
-pub use observer::{NoOpObserver, SagaObserver, TracingObserver};
-pub use stats::{ParticipantStats, ParticipantStatsSnapshot};
-
 // Helpers
 pub use helpers::{handle_async_saga_event_with_emit, handle_saga_event_with_emit};
-pub use reply_registry::{SagaReplyToHandle, SagaReplyToResult};
 pub use resolver::{
     FailureAuthority, SuccessCriteria, TERMINAL_RESOLVER_STEP, TerminalPolicy, TerminalResolver,
 };

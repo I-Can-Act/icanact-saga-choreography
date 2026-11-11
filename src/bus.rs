@@ -8,7 +8,7 @@ use icanact_core::CorrelationRegistry;
 use icanact_core::local::{FirehosePubSub, FirehoseSubscription, PublishStats};
 use icanact_core::local_sync::{self, SyncActor};
 
-use crate::reply_registry::{SagaReplyToHandle, SagaReplyToResult};
+use crate::events::{SagaReplyToHandle, SagaReplyToResult};
 use crate::workflow_contract::required_path_steps_from_success_criteria;
 use crate::{
     HasSagaWorkflowParticipants, SagaChoreographyEvent, SagaContext, SagaId, SagaReplyTo,

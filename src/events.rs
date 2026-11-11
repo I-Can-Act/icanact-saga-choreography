@@ -3,6 +3,9 @@
 use super::{AcceptedStepTimeoutOutcome, SagaContext, StepExecutionId};
 use icanact_core::ActorId;
 
+pub type SagaReplyToResult = Result<SagaReplyTo, String>;
+pub type SagaReplyToHandle = icanact_core::local_sync::ReplyTo<SagaReplyToResult>;
+
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct SagaFailureDetails {
     pub step_name: Box<str>,
