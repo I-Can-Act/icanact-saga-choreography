@@ -169,6 +169,8 @@ pub mod lmdb {
     use heed::types::{Bytes, Str};
     use heed::{Database, Env, EnvOpenOptions};
 
+    use crate::lmdb_owner::LmdbEnvOwner;
+
     use super::{
         SagaChoreographyEvent, SagaId, TerminalResolverJournal, TerminalResolverJournalEntry,
         TerminalResolverJournalError,
@@ -189,6 +191,8 @@ pub mod lmdb {
         /// transaction as every row insert or delete.
         saga_index: Database<Str, Bytes>,
         meta: Database<Str, Str>,
+        // Drop last: release ownership only after all other env handles are gone.
+        _owner: LmdbEnvOwner,
     }
 
     impl LmdbTerminalResolverJournal {
@@ -201,13 +205,12 @@ pub mod lmdb {
             map_size_bytes: usize,
         ) -> Result<Self, TerminalResolverJournalError> {
             std::fs::create_dir_all(path).map_err(storage_error)?;
-            let env = unsafe {
-                EnvOpenOptions::new()
-                    .max_dbs(4)
-                    .map_size(map_size_bytes)
-                    .open(path)
-            }
+            let owner = LmdbEnvOwner::open(
+                path,
+                EnvOpenOptions::new().max_dbs(4).map_size(map_size_bytes),
+            )
             .map_err(storage_error)?;
+            let env = owner.env();
             let mut wtxn = env.write_txn().map_err(storage_error)?;
             let rows = env
                 .create_database::<Str, Bytes>(&mut wtxn, Some("resolver_events"))
@@ -253,10 +256,11 @@ pub mod lmdb {
             }
             wtxn.commit().map_err(storage_error)?;
             Ok(Self {
-                env,
+                env: env.clone(),
                 rows,
                 saga_index,
                 meta,
+                _owner: owner,
             })
         }
 
@@ -521,6 +525,129 @@ mod tests {
                 .build(),
             Vec::new(),
         )
+    }
+
+    #[test]
+    fn resolver_journal_envs_close_on_drop() {
+        let dir = tempfile::tempdir().expect("tempdir should open");
+        for iteration in 0..600 {
+            let journal = LmdbTerminalResolverJournal::open(
+                &dir.path().join(format!("resolver-{iteration}")),
+            )
+            .unwrap_or_else(|err| panic!("resolver open failed at iteration {iteration}: {err}"));
+            drop(journal);
+        }
+    }
+
+    #[test]
+    fn resolver_journal_preserves_rows_after_drop_and_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir should open");
+        let journal = LmdbTerminalResolverJournal::open(dir.path()).unwrap();
+        let sequence = journal.append(event(100)).unwrap();
+        drop(journal);
+
+        let journal = LmdbTerminalResolverJournal::open(dir.path()).unwrap();
+        let rows = journal.read_all().expect("rows should read back");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sequence, sequence);
+        assert!(matches!(
+            &rows[0].event,
+            crate::SagaChoreographyEvent::SagaStarted { context, .. }
+                if context.saga_id == crate::SagaId::new(100)
+        ));
+        let saga_rows = journal.read_saga(crate::SagaId::new(100)).unwrap();
+        assert_eq!(saga_rows.len(), 1);
+        assert_eq!(saga_rows[0].sequence, sequence);
+        assert_eq!(journal.append(event(101)).unwrap(), sequence + 1);
+    }
+
+    #[test]
+    fn resolver_journal_double_open_drop_and_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir should open");
+        let journal = LmdbTerminalResolverJournal::open(dir.path()).unwrap();
+        let second_journal = LmdbTerminalResolverJournal::open(dir.path()).unwrap();
+        drop(journal);
+        drop(second_journal);
+
+        let journal = LmdbTerminalResolverJournal::open(dir.path()).unwrap();
+        assert!(journal.read_all().unwrap().is_empty());
+        assert_eq!(journal.append(event(100)).unwrap(), 1);
+    }
+
+    #[test]
+    fn resolver_journal_drop_preserves_other_same_path_owners() {
+        let dir = tempfile::tempdir().expect("tempdir should open");
+        let first = LmdbTerminalResolverJournal::open(dir.path()).unwrap();
+        let second = LmdbTerminalResolverJournal::open(dir.path()).unwrap();
+        drop(first);
+
+        assert_eq!(second.append(event(100)).unwrap(), 1);
+        assert_eq!(second.read_all().unwrap().len(), 1);
+        let third = LmdbTerminalResolverJournal::open(dir.path())
+            .expect("third open should succeed while the second owner is alive");
+        assert_eq!(third.read_all().unwrap().len(), 1);
+        drop(second);
+        assert_eq!(third.append(event(101)).unwrap(), 2);
+        drop(third);
+
+        let reopened = LmdbTerminalResolverJournal::open(dir.path()).unwrap();
+        assert_eq!(reopened.read_all().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn resolver_journal_concurrent_open_and_drop() {
+        let dir = tempfile::tempdir().expect("tempdir should open");
+        std::thread::scope(|scope| {
+            for worker in 0..4 {
+                let path = dir.path();
+                scope.spawn(move || {
+                    for iteration in 0..100 {
+                        let journal = LmdbTerminalResolverJournal::open(path).unwrap();
+                        let saga_id = worker * 100 + iteration;
+                        journal.append(event(saga_id)).unwrap();
+                        assert_eq!(
+                            journal
+                                .read_saga(crate::SagaId::new(saga_id))
+                                .unwrap()
+                                .len(),
+                            1
+                        );
+                    }
+                });
+            }
+        });
+        let journal = LmdbTerminalResolverJournal::open(dir.path()).unwrap();
+        assert_eq!(journal.read_all().unwrap().len(), 400);
+    }
+
+    #[test]
+    fn resolver_journal_failed_open_releases_env_ownership() {
+        let dir = tempfile::tempdir().expect("tempdir should open");
+        let env = unsafe {
+            heed::EnvOpenOptions::new()
+                .max_dbs(4)
+                .map_size(256 * 1024 * 1024)
+                .open(dir.path())
+        }
+        .unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let meta = env
+            .create_database::<heed::types::Str, heed::types::Str>(&mut wtxn, Some("resolver_meta"))
+            .unwrap();
+        meta.put(&mut wtxn, "schema_version", "unsupported")
+            .unwrap();
+        wtxn.commit().unwrap();
+        let _ = env.prepare_for_closing();
+
+        for _ in 0..2 {
+            let err = LmdbTerminalResolverJournal::open(dir.path())
+                .expect_err("incompatible schema must fail");
+            assert!(
+                err.to_string()
+                    .contains("incompatible terminal resolver journal schema")
+            );
+            assert!(heed::env_closing_event(dir.path().canonicalize().unwrap()).is_none());
+        }
     }
 
     #[test]

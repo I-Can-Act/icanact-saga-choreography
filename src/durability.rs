@@ -4589,6 +4589,8 @@ pub mod lmdb {
     use heed::types::{Bytes, Str};
     use heed::{Database, Env, EnvOpenOptions};
 
+    use crate::lmdb_owner::LmdbEnvOwner;
+
     use super::{
         DEFAULT_RECOVERY_SAGA_TYPE, collect_startup_recovery_events_for_saga_type_inner,
         recover_accepted_workflow_steps_for_saga_type,
@@ -4640,6 +4642,8 @@ pub mod lmdb {
         rows: Database<Str, Bytes>,
         saga_index: Database<Str, Str>,
         meta: Database<Str, Str>,
+        // Drop last: release ownership only after all other env handles are gone.
+        _owner: LmdbEnvOwner,
     }
 
     impl LmdbJournal {
@@ -4647,13 +4651,10 @@ pub mod lmdb {
             std::fs::create_dir_all(path)
                 .map_err(|err| JournalError::Storage(err.to_string().into()))?;
             let map_size = lmdb_map_size_bytes().map_err(JournalError::Storage)?;
-            let env = unsafe {
-                EnvOpenOptions::new()
-                    .max_dbs(16)
-                    .map_size(map_size)
-                    .open(path)
-            }
-            .map_err(|err| JournalError::Storage(err.to_string().into()))?;
+            let owner =
+                LmdbEnvOwner::open(path, EnvOpenOptions::new().max_dbs(16).map_size(map_size))
+                    .map_err(|err| JournalError::Storage(err.to_string().into()))?;
+            let env = owner.env();
             let mut wtxn = env
                 .write_txn()
                 .map_err(|err| JournalError::Storage(err.to_string().into()))?;
@@ -4707,10 +4708,11 @@ pub mod lmdb {
             wtxn.commit()
                 .map_err(|err| JournalError::Storage(err.to_string().into()))?;
             Ok(Self {
-                env,
+                env: env.clone(),
                 rows,
                 saga_index,
                 meta,
+                _owner: owner,
             })
         }
 
@@ -4857,6 +4859,8 @@ pub mod lmdb {
     pub struct LmdbDedupe {
         env: Env,
         entries: Database<Str, Str>,
+        // Drop last: release ownership only after all other env handles are gone.
+        _owner: LmdbEnvOwner,
     }
 
     impl LmdbDedupe {
@@ -4864,13 +4868,10 @@ pub mod lmdb {
             std::fs::create_dir_all(path)
                 .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
             let map_size = lmdb_map_size_bytes().map_err(DedupeError::Storage)?;
-            let env = unsafe {
-                EnvOpenOptions::new()
-                    .max_dbs(8)
-                    .map_size(map_size)
-                    .open(path)
-            }
-            .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
+            let owner =
+                LmdbEnvOwner::open(path, EnvOpenOptions::new().max_dbs(8).map_size(map_size))
+                    .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
+            let env = owner.env();
             let mut wtxn = env
                 .write_txn()
                 .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
@@ -4879,7 +4880,11 @@ pub mod lmdb {
                 .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
             wtxn.commit()
                 .map_err(|err| DedupeError::Storage(err.to_string().into()))?;
-            Ok(Self { env, entries })
+            Ok(Self {
+                env: env.clone(),
+                entries,
+                _owner: owner,
+            })
         }
 
         fn key(saga_id: SagaId, key: &str) -> String {
@@ -5028,13 +5033,9 @@ pub mod lmdb {
             let path = temp.path().join("lmdb-dedupe-readers");
             std::fs::create_dir_all(&path).expect("lmdb path should be created");
 
-            let env = unsafe {
-                EnvOpenOptions::new()
-                    .max_dbs(8)
-                    .max_readers(1)
-                    .open(&path)
-                    .expect("env should open")
-            };
+            let owner = LmdbEnvOwner::open(&path, EnvOpenOptions::new().max_dbs(8).max_readers(1))
+                .expect("env should open");
+            let env = owner.env();
             let mut wtxn = env.write_txn().expect("write txn should open");
             let entries = env
                 .create_database::<Str, Str>(&mut wtxn, Some("dedupe_entries"))
@@ -5044,13 +5045,14 @@ pub mod lmdb {
             let dedupe = LmdbDedupe {
                 env: env.clone(),
                 entries,
+                _owner: owner,
             };
             let saga_id = SagaId::new(404);
             dedupe
                 .mark_processed(saga_id, "probe")
                 .expect("mark_processed should succeed");
 
-            let held_reader = env.read_txn().expect("held reader should open");
+            let held_reader = dedupe.env.read_txn().expect("held reader should open");
             assert!(
                 dedupe.contains(saga_id, "probe").is_err(),
                 "contains should surface read_txn reader slot failure"

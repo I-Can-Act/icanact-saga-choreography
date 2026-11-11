@@ -1334,7 +1334,40 @@ struct TerminalResolverRuntime {
     subscription: FirehoseSubscription,
     shutdown: Arc<AtomicBool>,
     resolver_ref: local_sync::SyncActorRef<TerminalResolverActor>,
-    handle: local_sync::ActorHandle,
+    handle: Arc<Mutex<Option<local_sync::ActorHandle>>>,
+}
+
+// ActorHandle is consuming and has no Drop cleanup. Retain access until the
+// registry confirms ownership, including when an ask fails after enqueueing.
+struct TerminalResolverAttachGuard {
+    bus: FirehosePubSub<SagaChoreographyEvent>,
+    shutdown: Option<Arc<AtomicBool>>,
+    subscription: Option<FirehoseSubscription>,
+    handle: Option<Arc<Mutex<Option<local_sync::ActorHandle>>>>,
+}
+
+fn shutdown_resolver_handle(handle: &Mutex<Option<local_sync::ActorHandle>>) {
+    let handle = handle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(handle) = handle {
+        handle.shutdown();
+    }
+}
+
+impl Drop for TerminalResolverAttachGuard {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            shutdown.store(true, Ordering::Release);
+        }
+        if let Some(subscription) = self.subscription.take() {
+            self.bus.unsubscribe(subscription);
+        }
+        if let Some(handle) = self.handle.take() {
+            shutdown_resolver_handle(&handle);
+        }
+    }
 }
 
 enum TerminalResolverRegistryAsk {
@@ -1345,21 +1378,33 @@ enum TerminalResolverRegistryAsk {
     },
     ActivateRecovery(Box<str>),
     Gate(Box<str>),
+    Remove(Box<str>),
     ShutdownAll,
+}
+
+enum TerminalResolverGate {
+    Attached(Arc<ResolverGate>),
+    NeverAttached,
+    Detached,
 }
 
 enum TerminalResolverRegistryReply {
     Existing(Option<FirehoseSubscription>),
-    Registered(FirehoseSubscription),
+    Registered {
+        subscription: FirehoseSubscription,
+        loser_subscription: Option<FirehoseSubscription>,
+    },
     RecoveryActivated(bool),
-    Gate(Option<Arc<ResolverGate>>),
-    ShutdownComplete,
+    Gate(TerminalResolverGate),
+    Removed(Option<FirehoseSubscription>),
+    ShutdownComplete(Vec<FirehoseSubscription>),
 }
 
 #[derive(Default)]
 struct TerminalResolverRegistryActor {
     /// Declared after the runtimes so their gates are released first.
     runtimes: HashMap<Box<str>, TerminalResolverRuntime>,
+    detached: HashSet<Box<str>>,
     _release: Option<ReleaseGuard>,
 }
 
@@ -1385,13 +1430,20 @@ impl SyncActor for TerminalResolverRegistryActor {
                 match self.runtimes.entry(saga_type) {
                     std::collections::hash_map::Entry::Vacant(entry) => {
                         let subscription = runtime.subscription.clone();
+                        self.detached.remove(entry.key());
                         entry.insert(runtime);
-                        TerminalResolverRegistryReply::Registered(subscription)
+                        TerminalResolverRegistryReply::Registered {
+                            subscription,
+                            loser_subscription: None,
+                        }
                     }
                     std::collections::hash_map::Entry::Occupied(entry) => {
                         runtime.shutdown.store(true, Ordering::Release);
-                        runtime.handle.shutdown();
-                        TerminalResolverRegistryReply::Registered(entry.get().subscription.clone())
+                        shutdown_resolver_handle(&runtime.handle);
+                        TerminalResolverRegistryReply::Registered {
+                            subscription: entry.get().subscription.clone(),
+                            loser_subscription: Some(runtime.subscription),
+                        }
                     }
                 }
             }
@@ -1412,17 +1464,36 @@ impl SyncActor for TerminalResolverRegistryActor {
                     });
                 TerminalResolverRegistryReply::RecoveryActivated(activated)
             }
-            TerminalResolverRegistryAsk::Gate(saga_type) => TerminalResolverRegistryReply::Gate(
-                self.runtimes
-                    .get(saga_type.as_ref())
-                    .map(|runtime| Arc::clone(&runtime.gate)),
-            ),
+            TerminalResolverRegistryAsk::Gate(saga_type) => {
+                let gate = if let Some(runtime) = self.runtimes.get(saga_type.as_ref()) {
+                    TerminalResolverGate::Attached(Arc::clone(&runtime.gate))
+                } else if self.detached.contains(saga_type.as_ref()) {
+                    TerminalResolverGate::Detached
+                } else {
+                    TerminalResolverGate::NeverAttached
+                };
+                TerminalResolverRegistryReply::Gate(gate)
+            }
+            TerminalResolverRegistryAsk::Remove(saga_type) => {
+                let subscription = self.runtimes.remove(saga_type.as_ref()).map(|runtime| {
+                    runtime.shutdown.store(true, Ordering::Release);
+                    shutdown_resolver_handle(&runtime.handle);
+                    runtime.subscription
+                });
+                if subscription.is_some() {
+                    self.detached.insert(saga_type);
+                }
+                TerminalResolverRegistryReply::Removed(subscription)
+            }
             TerminalResolverRegistryAsk::ShutdownAll => {
+                let mut subscriptions = Vec::with_capacity(self.runtimes.len());
                 for (_, runtime) in self.runtimes.drain() {
                     runtime.shutdown.store(true, Ordering::Release);
-                    runtime.handle.shutdown();
+                    shutdown_resolver_handle(&runtime.handle);
+                    subscriptions.push(runtime.subscription);
                 }
-                TerminalResolverRegistryReply::ShutdownComplete
+                self.detached.clear();
+                TerminalResolverRegistryReply::ShutdownComplete(subscriptions)
             }
         }
     }
@@ -1890,6 +1961,8 @@ pub struct SagaChoreographyBus {
 }
 
 struct BusActorLifecycle {
+    bus: FirehosePubSub<SagaChoreographyEvent>,
+    release: Arc<ReleaseLatch>,
     pending_replies: CorrelationRegistry<SagaId, SagaReplyToResult>,
     pending_run_replies: CorrelationRegistry<RunKey, SagaReplyToResult>,
     state_handle: Option<local_sync::ActorHandle>,
@@ -1901,27 +1974,67 @@ struct BusActorLifecycle {
 
 impl Drop for BusActorLifecycle {
     fn drop(&mut self) {
-        let _ = self
-            .terminal_resolver_registry_ref
-            .ask(TerminalResolverRegistryAsk::ShutdownAll);
-        if let Some(handle) = self.terminal_resolver_registry_handle.take() {
-            handle.shutdown();
-        }
-        if let Some(handle) = self.state_handle.take() {
-            handle.shutdown();
-        }
+        let terminal_resolver_registry_handle = self.terminal_resolver_registry_handle.take();
+        let state_handle = self.state_handle.take();
+        let terminal_resolver_registry_ref = self.terminal_resolver_registry_ref.clone();
+        let pending_replies = self.pending_replies.clone();
+        let pending_run_replies = self.pending_run_replies.clone();
+        let bus = self.bus.clone();
+        let cleanup_release = self.release.guard();
+        let cleanup = move || {
+            // Locals drop in reverse order, including on unwind: subscriber
+            // destruction must finish before cleanup can signal release.
+            let _release = cleanup_release;
+            let cleanup_bus = bus;
+            if let Ok(TerminalResolverRegistryReply::ShutdownComplete(subscriptions)) =
+                terminal_resolver_registry_ref.ask(TerminalResolverRegistryAsk::ShutdownAll)
+            {
+                for subscription in subscriptions {
+                    cleanup_bus.unsubscribe(subscription);
+                }
+            }
+            if let Some(handle) = terminal_resolver_registry_handle {
+                handle.shutdown();
+            }
+            if let Some(handle) = state_handle {
+                handle.shutdown();
+            }
 
-        for (_, reply) in self.pending_replies.drain() {
-            let _ = reply.reply(Err("saga bus dropped".to_string()));
-        }
-        for (_, reply) in self.pending_run_replies.drain() {
-            let _ = reply.reply(Err("saga bus dropped".to_string()));
+            for (_, reply) in pending_replies.drain() {
+                let _ = reply.reply(Err("saga bus dropped".to_string()));
+            }
+            for (_, reply) in pending_run_replies.drain() {
+                let _ = reply.reply(Err("saga bus dropped".to_string()));
+            }
+        };
+        // Retain the cleanup if spawning fails: spawn otherwise consumes its closure.
+        let cleanup = Arc::new(Mutex::new(Some(cleanup)));
+        let run_cleanup = move || {
+            let cleanup = cleanup
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(cleanup) = cleanup {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(cleanup));
+            }
+        };
+        if let Err(err) = thread::Builder::new()
+            .name("saga-bus-cleanup".into())
+            .spawn(run_cleanup.clone())
+        {
+            tracing::error!(
+                target: "core::saga",
+                event = "saga_bus_cleanup_thread_spawn_failed",
+                error = %err
+            );
+            run_cleanup();
         }
     }
 }
 
 const DEFAULT_TERMINAL_RETENTION_LIMIT: usize = 1024;
 const DEFAULT_TERMINAL_WATCHDOG_TICK_MS: u64 = 100;
+const RESOLVER_MAILBOX_CAPACITY: usize = 1024;
 
 pub(crate) fn ensure_saga_sync_pool_capacity() {
     static CONFIGURED: OnceLock<()> = OnceLock::new();
@@ -2002,7 +2115,10 @@ impl SagaChoreographyBus {
             });
         let pending_replies = CorrelationRegistry::new();
         let pending_run_replies = CorrelationRegistry::new();
+        let bus = FirehosePubSub::new();
         let lifecycle = Arc::new(BusActorLifecycle {
+            bus: bus.clone(),
+            release: Arc::clone(&release),
             _release: release.guard(),
             pending_replies: pending_replies.clone(),
             pending_run_replies: pending_run_replies.clone(),
@@ -2011,7 +2127,7 @@ impl SagaChoreographyBus {
             terminal_resolver_registry_handle: Some(terminal_resolver_registry_handle),
         });
         Self {
-            bus: FirehosePubSub::new(),
+            bus,
             pending_replies,
             pending_run_replies,
             legacy_waiter_floors: Arc::default(),
@@ -2549,12 +2665,34 @@ impl SagaChoreographyBus {
         run || id
     }
 
+    /// Use `detach_terminal_resolver` as the supported removal path.
     pub fn attach_terminal_resolver(
         &self,
         policy: TerminalPolicy,
         responder: &'static str,
     ) -> Result<FirehoseSubscription, String> {
         self.attach_terminal_resolver_inner(policy, responder, None, AdmissionLimits::from_env())
+    }
+
+    /// Detaches the terminal resolver for `saga_type`: unsubscribes it and stops
+    /// its actor and watchdog. Returns `false` if none was attached. In-flight
+    /// sagas of this type lose terminal resolution; their waiters are not
+    /// resolved by detach. A later attach for the same type starts fresh.
+    /// New saga starts for this type fail closed until a replacement resolver
+    /// is attached and, for durable resolvers, recovery is activated.
+    pub fn detach_terminal_resolver(&self, saga_type: &str) -> bool {
+        if let Ok(TerminalResolverRegistryReply::Removed(Some(subscription))) = self
+            .terminal_resolver_registry_ref
+            .ask(TerminalResolverRegistryAsk::Remove(saga_type.into()))
+        {
+            self.unsubscribe(subscription);
+            if let Ok(mut gates) = self.gates.lock() {
+                gates.remove(saga_type);
+            }
+            true
+        } else {
+            false
+        }
     }
 
     pub fn attach_durable_terminal_resolver<J: TerminalResolverJournal>(
@@ -2586,20 +2724,21 @@ impl SagaChoreographyBus {
                     saga_type_topic.clone(),
                 )) {
                 Ok(TerminalResolverRegistryReply::Existing(existing)) => existing,
-                Ok(TerminalResolverRegistryReply::Registered(_)) => {
+                Ok(TerminalResolverRegistryReply::Registered { .. }) => {
                     return Err(format!(
                         "terminal resolver registry returned register reply saga_type={}",
                         saga_type_topic
                     ));
                 }
-                Ok(TerminalResolverRegistryReply::ShutdownComplete) => {
+                Ok(TerminalResolverRegistryReply::ShutdownComplete(_)) => {
                     return Err(format!(
                         "terminal resolver registry returned shutdown reply saga_type={}",
                         saga_type_topic
                     ));
                 }
                 Ok(TerminalResolverRegistryReply::RecoveryActivated(_))
-                | Ok(TerminalResolverRegistryReply::Gate(_)) => {
+                | Ok(TerminalResolverRegistryReply::Gate(_))
+                | Ok(TerminalResolverRegistryReply::Removed(_)) => {
                     return Err(format!(
                         "terminal resolver registry returned activation reply saga_type={}",
                         saga_type_topic
@@ -2700,22 +2839,36 @@ impl SagaChoreographyBus {
             pending_fence_keys: HashSet::new(),
         };
         resolver_actor.recover_successor_fences(&recovery_history);
-        let (resolver_ref, resolver_handle) = local_sync::spawn(resolver_actor);
+        let (resolver_ref, resolver_handle) = local_sync::spawn_with_opts(
+            resolver_actor,
+            local_sync::SpawnOpts {
+                mailbox_capacity: RESOLVER_MAILBOX_CAPACITY,
+                ..Default::default()
+            },
+        );
+        let resolver_handle = Arc::new(Mutex::new(Some(resolver_handle)));
+        let mut attach_guard = TerminalResolverAttachGuard {
+            bus: self.bus.clone(),
+            shutdown: Some(Arc::clone(&shutdown)),
+            subscription: None,
+            handle: Some(Arc::clone(&resolver_handle)),
+        };
         spawn_terminal_watchdog_if_needed(&policy, resolver_ref.clone(), Arc::clone(&shutdown))?;
         let subscription_saga_type = policy.saga_type.clone();
         let subscription_resolver_ref = resolver_ref.clone();
         let subscription = self.subscribe_fn(saga_type_topic.as_ref(), move |event| {
-            if !subscription_resolver_ref
-                .tell(TerminalResolverTell::Ingest(Box::new(event.clone())))
-            {
+            let delivered = subscription_resolver_ref
+                .tell(TerminalResolverTell::Ingest(Box::new(event.clone())));
+            if !delivered {
                 tracing::error!(
                     target: "core::saga",
                     event = "terminal_resolver_ingest_failed",
                     saga_type = subscription_saga_type.as_ref()
                 );
             }
-            true
+            delivered
         });
+        attach_guard.subscription = Some(subscription.clone());
         let registered =
             match self
                 .terminal_resolver_registry_ref
@@ -2729,17 +2882,29 @@ impl SagaChoreographyBus {
                         handle: resolver_handle,
                     },
                 }) {
-                Ok(TerminalResolverRegistryReply::Registered(subscription)) => subscription,
+                Ok(TerminalResolverRegistryReply::Registered {
+                    subscription,
+                    loser_subscription,
+                }) => {
+                    if let Some(loser_subscription) = loser_subscription {
+                        self.unsubscribe(loser_subscription);
+                    }
+                    attach_guard.shutdown.take();
+                    attach_guard.subscription.take();
+                    attach_guard.handle.take();
+                    subscription
+                }
                 Ok(TerminalResolverRegistryReply::Existing(_)) => {
                     return Err(
                         "terminal resolver registry returned unexpected existing reply".to_string(),
                     );
                 }
-                Ok(TerminalResolverRegistryReply::ShutdownComplete) => {
+                Ok(TerminalResolverRegistryReply::ShutdownComplete(_)) => {
                     return Err("terminal resolver registry returned shutdown reply".to_string());
                 }
                 Ok(TerminalResolverRegistryReply::RecoveryActivated(_))
-                | Ok(TerminalResolverRegistryReply::Gate(_)) => {
+                | Ok(TerminalResolverRegistryReply::Gate(_))
+                | Ok(TerminalResolverRegistryReply::Removed(_)) => {
                     return Err(
                         "terminal resolver registry returned unexpected activation reply"
                             .to_string(),
@@ -2750,7 +2915,7 @@ impl SagaChoreographyBus {
                 }
             };
         // Mirror the winning gate so id-scoped lookups need no actor ask.
-        if let Ok(TerminalResolverRegistryReply::Gate(Some(gate))) = self
+        if let Ok(TerminalResolverRegistryReply::Gate(TerminalResolverGate::Attached(gate))) = self
             .terminal_resolver_registry_ref
             .ask(TerminalResolverRegistryAsk::Gate(policy.saga_type.clone()))
             && let Ok(mut gates) = self.gates.lock()
@@ -2917,8 +3082,21 @@ impl SagaChoreographyBus {
             .terminal_resolver_registry_ref
             .ask(TerminalResolverRegistryAsk::Gate(context.saga_type.clone()))
         {
-            Ok(TerminalResolverRegistryReply::Gate(Some(gate))) => gate,
-            Ok(TerminalResolverRegistryReply::Gate(None)) => return Ok(()),
+            Ok(TerminalResolverRegistryReply::Gate(TerminalResolverGate::Attached(gate))) => gate,
+            Ok(TerminalResolverRegistryReply::Gate(TerminalResolverGate::NeverAttached)) => {
+                return Ok(());
+            }
+            Ok(TerminalResolverRegistryReply::Gate(TerminalResolverGate::Detached)) => {
+                return Err(Refusal {
+                    reason: format!(
+                        "terminal resolver is detached; saga_type={}",
+                        context.saga_type
+                    )
+                    .into(),
+                    reject_run_waiter: true,
+                    reject_id_waiter: false,
+                });
+            }
             _ => {
                 return Err(Refusal {
                     reason: "terminal resolver registry unavailable during start admission".into(),
@@ -3133,7 +3311,6 @@ fn spawn_terminal_watchdog_if_needed(
                     event = "terminal_watchdog_poll_failed",
                     saga_type = saga_type.as_ref()
                 );
-                break;
             }
         }
     });
@@ -3257,6 +3434,173 @@ mod tests {
             })
             .expect("pending reply should be registered");
         (pending, probe_handle)
+    }
+
+    #[derive(Default)]
+    struct SlowTerminalResolverJournal(InMemoryTerminalResolverJournal);
+
+    impl TerminalResolverJournal for SlowTerminalResolverJournal {
+        fn append(
+            &self,
+            event: SagaChoreographyEvent,
+        ) -> Result<u64, TerminalResolverJournalError> {
+            thread::sleep(Duration::from_millis(2));
+            self.0.append(event)
+        }
+
+        fn read_all(
+            &self,
+        ) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError> {
+            self.0.read_all()
+        }
+    }
+
+    #[test]
+    fn ingest_burst_never_counts_dropped_events_as_delivered() {
+        let bus = SagaChoreographyBus::new();
+        bus.attach_durable_terminal_resolver(
+            TerminalPolicy::order_lifecycle_default(),
+            "burst-test",
+            Arc::new(SlowTerminalResolverJournal::default()),
+        )
+        .unwrap();
+        bus.activate_terminal_resolver_recovery("order_lifecycle")
+            .unwrap();
+        let mut publishes = Vec::new();
+        for id in 10000..10300 {
+            let stats = bus.publish(SagaChoreographyEvent::StepCompleted {
+                context: context("create_order", id),
+                output: Vec::new(),
+                saga_input: Vec::new(),
+                compensation_available: false,
+            });
+            publishes.push((SagaId::new(id), stats));
+        }
+        let mut fully_delivered: HashSet<_> = publishes
+            .into_iter()
+            .filter_map(|(id, stats)| (stats.delivered == stats.attempted).then_some(id))
+            .collect();
+        assert!(!fully_delivered.is_empty());
+        let expected = fully_delivered.len();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !fully_delivered.is_empty() && Instant::now() < deadline {
+            fully_delivered.retain(|id| {
+                !matches!(
+                    bus.take_terminal_outcome(*id),
+                    Some(SagaTerminalOutcome::Completed { .. })
+                )
+            });
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            fully_delivered.is_empty(),
+            "{} of {expected} fully delivered sagas never completed",
+            fully_delivered.len()
+        );
+    }
+
+    #[test]
+    fn detach_then_reattach_restores_resolver_processing() {
+        let bus = SagaChoreographyBus::new();
+        bus.attach_terminal_resolver(TerminalPolicy::order_lifecycle_default(), "detach-test")
+            .unwrap();
+        assert!(bus.detach_terminal_resolver("order_lifecycle"));
+        assert!(!bus.detach_terminal_resolver("order_lifecycle"));
+        let publish_step = |id| {
+            bus.publish(SagaChoreographyEvent::StepCompleted {
+                context: context("create_order", id),
+                output: Vec::new(),
+                saga_input: Vec::new(),
+                compensation_available: false,
+            })
+        };
+        publish_step(9001);
+        thread::sleep(Duration::from_millis(100));
+        assert!(bus.take_terminal_outcome(SagaId::new(9001)).is_none());
+        bus.attach_terminal_resolver(TerminalPolicy::order_lifecycle_default(), "reattach-test")
+            .unwrap();
+        publish_step(9002);
+        wait_until(Instant::now() + Duration::from_secs(3), || {
+            matches!(
+                bus.take_terminal_outcome(SagaId::new(9002)),
+                Some(SagaTerminalOutcome::Completed { .. })
+            )
+        });
+    }
+
+    #[test]
+    fn detached_durable_resolver_rejects_starts_until_recovery_is_reactivated() {
+        let bus = SagaChoreographyBus::new();
+        bus.register_workflow_contract_provider::<OrderLifecycleContract>()
+            .unwrap();
+        bus.register_bound_workflow_step("order_lifecycle", "create_order")
+            .unwrap();
+        let effects = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&effects);
+        let _participant = bus.subscribe_saga_type_fn("order_lifecycle", move |event| {
+            if matches!(event, SagaChoreographyEvent::SagaStarted { .. }) {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+            true
+        });
+        // Keep enough live routes that delivery checks cannot mask admission.
+        let _other_route = bus.subscribe_saga_type_fn("order_lifecycle", |_| true);
+        let journal = Arc::new(InMemoryTerminalResolverJournal::default());
+        let attach = || {
+            bus.attach_durable_terminal_resolver_for_contract::<OrderLifecycleContract, _>(
+                "detach-test",
+                Arc::clone(&journal),
+            )
+            .unwrap();
+        };
+        let start = |id| {
+            bus.publish_strict(SagaChoreographyEvent::SagaStarted {
+                context: context("create_order", id),
+                payload: Vec::new(),
+            })
+        };
+        attach();
+        bus.activate_terminal_resolver_recovery("order_lifecycle")
+            .unwrap();
+        assert!(bus.detach_terminal_resolver("order_lifecycle"));
+        assert!(!bus.detach_terminal_resolver("order_lifecycle"));
+
+        let result = start(9011);
+        assert!(
+            matches!(
+                &result,
+                Err(super::SagaBusPublishError::AdmissionRejected { reason, .. })
+                    if reason.contains("terminal resolver is detached")
+                        && reason.contains("order_lifecycle")
+            ),
+            "detached resolver must reject before fanout: {result:?}, effects={}",
+            effects.load(Ordering::SeqCst)
+        );
+        assert_eq!(effects.load(Ordering::SeqCst), 0);
+        assert!(journal.read_all().unwrap().is_empty());
+
+        attach();
+        let result = start(9012);
+        assert!(
+            matches!(
+                &result,
+                Err(super::SagaBusPublishError::AdmissionRejected { reason, .. })
+                    if reason.contains("recovery is not activated")
+            ),
+            "replacement must remain closed before recovery activation: {result:?}"
+        );
+        assert_eq!(effects.load(Ordering::SeqCst), 0);
+        assert!(journal.read_all().unwrap().is_empty());
+
+        bus.activate_terminal_resolver_recovery("order_lifecycle")
+            .unwrap();
+        start(9013).expect("replacement must admit starts after recovery activation");
+        assert_eq!(effects.load(Ordering::SeqCst), 1);
+        assert!(journal.read_all().unwrap().iter().any(|entry| matches!(
+            &entry.event,
+            SagaChoreographyEvent::SagaStarted { context, .. }
+                if context.saga_id == SagaId::new(9013)
+        )));
     }
 
     struct RejectingTerminalResolverJournal;

@@ -13,6 +13,161 @@ use icanact_saga_choreography::{
 };
 
 #[test]
+fn lmdb_envs_close_on_drop_allowing_many_sequential_participants() {
+    let temp = tempfile::tempdir().expect("tempdir should open");
+    for iteration in 0..300 {
+        let journal = LmdbJournal::open(&temp.path().join(format!("journal-{iteration}")))
+            .unwrap_or_else(|err| panic!("journal open failed at iteration {iteration}: {err}"));
+        let dedupe = LmdbDedupe::open(&temp.path().join(format!("dedupe-{iteration}")))
+            .unwrap_or_else(|err| panic!("dedupe open failed at iteration {iteration}: {err}"));
+        assert!(
+            dedupe
+                .check_and_mark(SagaId::new(iteration), "probe")
+                .unwrap_or_else(|err| panic!(
+                    "check_and_mark failed at iteration {iteration}: {err}"
+                ))
+        );
+        drop(journal);
+        drop(dedupe);
+    }
+}
+
+#[test]
+fn lmdb_journal_and_dedupe_preserve_rows_after_drop_and_reopen() {
+    let temp = tempfile::tempdir().expect("tempdir should open");
+    let journal_path = temp.path().join("journal");
+    let dedupe_path = temp.path().join("dedupe");
+    let saga_id = SagaId::new(100);
+    let journal = LmdbJournal::open(&journal_path).expect("journal should open");
+    let dedupe = LmdbDedupe::open(&dedupe_path).expect("dedupe should open");
+    let sequence = journal
+        .append(
+            saga_id,
+            ParticipantEvent::StepExecutionStarted {
+                attempt: 1,
+                started_at_millis: 1000,
+            },
+        )
+        .expect("append should succeed");
+    assert!(dedupe.check_and_mark(saga_id, "probe").unwrap());
+    drop(journal);
+    drop(dedupe);
+
+    let journal = LmdbJournal::open(&journal_path).expect("journal should reopen");
+    let dedupe = LmdbDedupe::open(&dedupe_path).expect("dedupe should reopen");
+    let rows = journal.read(saga_id).expect("rows should read back");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].sequence, sequence);
+    assert!(matches!(
+        rows[0].event,
+        ParticipantEvent::StepExecutionStarted {
+            attempt: 1,
+            started_at_millis: 1000,
+        }
+    ));
+    assert_eq!(journal.list_sagas().unwrap(), vec![saga_id]);
+    assert!(dedupe.contains(saga_id, "probe").unwrap());
+    assert!(!dedupe.check_and_mark(saga_id, "probe").unwrap());
+}
+
+#[test]
+fn lmdb_journal_and_dedupe_double_open_drop_and_reopen() {
+    let temp = tempfile::tempdir().expect("tempdir should open");
+    let journal_path = temp.path().join("journal");
+    let dedupe_path = temp.path().join("dedupe");
+    let journal = LmdbJournal::open(&journal_path).expect("first journal should open");
+    let second_journal = LmdbJournal::open(&journal_path).expect("second journal should open");
+    let dedupe = LmdbDedupe::open(&dedupe_path).expect("first dedupe should open");
+    let second_dedupe = LmdbDedupe::open(&dedupe_path).expect("second dedupe should open");
+    drop(journal);
+    drop(second_journal);
+    drop(dedupe);
+    drop(second_dedupe);
+
+    let journal = LmdbJournal::open(&journal_path).expect("journal should reopen");
+    let dedupe = LmdbDedupe::open(&dedupe_path).expect("dedupe should reopen");
+    assert!(journal.list_sagas().unwrap().is_empty());
+    assert!(dedupe.check_and_mark(SagaId::new(100), "probe").unwrap());
+}
+
+#[test]
+fn lmdb_journal_and_dedupe_drop_preserves_other_same_path_owners() {
+    let temp = tempfile::tempdir().expect("tempdir should open");
+    let journal_path = temp.path().join("journal");
+    let dedupe_path = temp.path().join("dedupe");
+    let first_journal = LmdbJournal::open(&journal_path).unwrap();
+    let first_dedupe = LmdbDedupe::open(&dedupe_path).unwrap();
+    let second_journal = LmdbJournal::open(&journal_path.join(".")).unwrap();
+    let second_dedupe = LmdbDedupe::open(&dedupe_path.join(".")).unwrap();
+    drop(first_journal);
+    drop(first_dedupe);
+
+    let saga_id = SagaId::new(100);
+    second_journal
+        .append(
+            saga_id,
+            ParticipantEvent::StepExecutionStarted {
+                attempt: 1,
+                started_at_millis: 1000,
+            },
+        )
+        .unwrap();
+    assert_eq!(second_journal.read(saga_id).unwrap().len(), 1);
+    assert!(second_dedupe.check_and_mark(saga_id, "probe").unwrap());
+    assert!(second_dedupe.contains(saga_id, "probe").unwrap());
+
+    let third_journal = LmdbJournal::open(&journal_path)
+        .expect("third journal should open while the second owner is alive");
+    let third_dedupe = LmdbDedupe::open(&dedupe_path)
+        .expect("third dedupe should open while the second owner is alive");
+    drop(second_journal);
+    drop(second_dedupe);
+    assert_eq!(third_journal.read(saga_id).unwrap().len(), 1);
+    assert!(third_dedupe.contains(saga_id, "probe").unwrap());
+    drop(third_journal);
+    drop(third_dedupe);
+
+    let reopened_journal = LmdbJournal::open(&journal_path).unwrap();
+    let reopened_dedupe = LmdbDedupe::open(&dedupe_path).unwrap();
+    assert_eq!(reopened_journal.read(saga_id).unwrap().len(), 1);
+    assert!(reopened_dedupe.contains(saga_id, "probe").unwrap());
+}
+
+#[test]
+fn lmdb_failed_opens_release_env_ownership() {
+    let temp = tempfile::tempdir().expect("tempdir should open");
+    for (name, max_dbs) in [("journal", 16), ("dedupe", 8)] {
+        let path = temp.path().join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        let env = unsafe {
+            EnvOpenOptions::new()
+                .max_dbs(max_dbs)
+                .map_size(1024 * 1024 * 1024)
+                .open(&path)
+        }
+        .unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        for index in 0..max_dbs {
+            env.create_database::<Str, Str>(&mut wtxn, Some(&format!("occupied-{index}")))
+                .unwrap();
+        }
+        wtxn.commit().unwrap();
+
+        // Keep the seeded env live so all database slots remain occupied.
+        if name == "journal" {
+            LmdbJournal::open(&path).expect_err("database creation must fail");
+        } else {
+            LmdbDedupe::open(&path).expect_err("database creation must fail");
+        }
+        drop(env);
+        assert!(
+            heed::env_closing_event(path.canonicalize().unwrap()).is_none(),
+            "failed {name} open must release and close its env"
+        );
+    }
+}
+
+#[test]
 fn lmdb_journal_and_dedupe_roundtrip() {
     let temp = tempfile::tempdir().expect("tempdir should open");
     let journal_path = temp.path().join("journal");
@@ -562,6 +717,8 @@ mod workflow_reopen {
             "{events:?}"
         );
         assert_eq!(reopened.pay_calls, 0);
+        // Drop this owner to exercise a cold reopen; overlapping owners keep the env open.
+        drop(reopened);
 
         // Partial failure: the result landed but the confirming proof did not.
         let other = SagaContext {
