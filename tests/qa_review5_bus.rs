@@ -187,6 +187,10 @@ impl FaultJournal {
 }
 
 impl TerminalResolverJournal for FaultJournal {
+    fn max_run_start_millis(&self) -> Result<u64, TerminalResolverJournalError> {
+        self.inner.max_run_start_millis()
+    }
+
     fn append(&self, event: SagaChoreographyEvent) -> Result<u64, TerminalResolverJournalError> {
         let parked = match &event {
             SagaChoreographyEvent::SagaQuarantined { reason, .. } => {

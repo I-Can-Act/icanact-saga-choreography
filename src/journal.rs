@@ -354,6 +354,12 @@ pub enum StoreAdmission {
 }
 
 pub trait ParticipantStore: Send + Sync + 'static {
+    /// Largest retained or previously recorded run token. Legacy stores may
+    /// return zero; durable stores must retain this across history maintenance.
+    fn max_run_start_millis(&self) -> Result<u64, JournalError> {
+        Ok(0)
+    }
+
     /// Appends a new event to the journal for the specified SAGA.
     ///
     /// Events are assigned monotonically increasing sequence numbers
@@ -444,6 +450,10 @@ pub trait ParticipantStore: Send + Sync + 'static {
 }
 
 impl<T: ParticipantStore + ?Sized> ParticipantStore for std::sync::Arc<T> {
+    fn max_run_start_millis(&self) -> Result<u64, JournalError> {
+        (**self).max_run_start_millis()
+    }
+
     fn append(&self, id: SagaId, event: ParticipantEvent) -> Result<u64, JournalError> {
         (**self).append(id, event)
     }
@@ -534,6 +544,7 @@ pub(crate) struct MemoryRuns<E> {
     pub unresolved: BTreeSet<RunKey>,
     fifo: VecDeque<RunKey>,
     pub next: u64,
+    pub max_run_start_millis: u64,
     terminal_capacity: usize,
     protected_capacity: usize,
 }
@@ -545,6 +556,7 @@ impl<E> MemoryRuns<E> {
             unresolved: BTreeSet::new(),
             fifo: VecDeque::new(),
             next: 1,
+            max_run_start_millis: 0,
             terminal_capacity,
             protected_capacity,
         }
@@ -556,6 +568,7 @@ impl<E> MemoryRuns<E> {
         Ok(())
     }
     pub fn insert(&mut self, key: RunKey, sequence: u64, entry: E, phase: u8, at: u64) {
+        self.max_run_start_millis = self.max_run_start_millis.max(key.2);
         self.by_saga.entry(key.0).or_default().insert(key.clone());
         let run = self.runs.entry(key.clone()).or_default();
         let ordinary_before = run.summary.ordinary();
@@ -854,6 +867,10 @@ impl InMemoryParticipantStore {
     }
 }
 impl ParticipantStore for InMemoryParticipantStore {
+    fn max_run_start_millis(&self) -> Result<u64, JournalError> {
+        Ok(self.state()?.max_run_start_millis)
+    }
+
     fn append(&self, saga_id: SagaId, event: ParticipantEvent) -> Result<u64, JournalError> {
         Ok(self.append_batch(saga_id, vec![event])?[0])
     }
@@ -1111,6 +1128,10 @@ pub mod lmdb {
         }
     }
     impl ParticipantStore for LmdbParticipantStore {
+        fn max_run_start_millis(&self) -> Result<u64, JournalError> {
+            self.db.max_run_start_millis().map_err(storage)
+        }
+
         fn append(&self, saga_id: SagaId, event: ParticipantEvent) -> Result<u64, JournalError> {
             Ok(self.append_batch(saga_id, vec![event])?[0])
         }

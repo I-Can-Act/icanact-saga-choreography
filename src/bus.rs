@@ -248,6 +248,7 @@ struct AdmissionLimits {
 }
 
 const DEFAULT_ADMISSION_CAPACITY: usize = 1 << 18;
+const DEFAULT_SAGA_LOOKUP_ROW_LIMIT: usize = 1 << 16;
 
 impl Default for AdmissionLimits {
     fn default() -> Self {
@@ -261,6 +262,11 @@ impl AdmissionLimits {
             max_ids,
             max_fingerprints: max_ids.saturating_mul(4),
         }
+    }
+
+    /// Raw journal rows include repeated heartbeats that add no fingerprints.
+    fn max_saga_lookup_rows(&self) -> usize {
+        DEFAULT_SAGA_LOOKUP_ROW_LIMIT.max(self.max_ids.saturating_add(self.max_fingerprints))
     }
 
     /// Fingerprint room kept free when admitting a run, so a healthy run can
@@ -922,10 +928,7 @@ impl ResolverGate {
             }
             return Self::complete_resident(journal.as_ref(), index, saga_id);
         }
-        let row_budget = index
-            .limits
-            .max_ids
-            .saturating_add(index.limits.max_fingerprints);
+        let row_budget = index.limits.max_saga_lookup_rows();
         let entries = journal
             .read_saga_bounded(saga_id, row_budget)
             .map_err(|error| {
@@ -965,10 +968,7 @@ impl ResolverGate {
         index: &mut AdmissionIndex,
         saga_id: SagaId,
     ) -> Result<(), Box<str>> {
-        let row_budget = index
-            .limits
-            .max_ids
-            .saturating_add(index.limits.max_fingerprints);
+        let row_budget = index.limits.max_saga_lookup_rows();
         let entries = journal
             .read_saga_bounded(saga_id, row_budget)
             .map_err(|error| {
@@ -2607,6 +2607,13 @@ impl SagaChoreographyBus {
         let responder: Arc<str> = Arc::from(responder);
         let (resolver, recovery_events, admission, recovery_history) = match &journal {
             Some(journal) => {
+                match journal.max_run_start_millis() {
+                    Ok(high_water) => SagaContext::observe_run_start_millis(high_water),
+                    Err(crate::TerminalResolverJournalError::Unsupported(_)) => {}
+                    Err(error) => {
+                        return Err(format!("terminal resolver high-water read failed: {error}"));
+                    }
+                }
                 let mut entries = Vec::new();
                 match journal.visit_unresolved_runs(&mut |entry| {
                     entries.push(entry.clone());
@@ -2621,7 +2628,7 @@ impl SagaChoreographyBus {
                                 .iter()
                                 .map(|entry| entry.event.context().saga_id)
                                 .collect();
-                            let row_budget = limits.max_ids.saturating_add(limits.max_fingerprints);
+                            let row_budget = limits.max_saga_lookup_rows();
                             for saga_id in ids {
                                 entries.extend(journal.read_saga_bounded(saga_id, row_budget).map_err(
                                     |error| format!("terminal resolver recovery lookup failed saga_id={saga_id}: {error}"),
@@ -2652,6 +2659,9 @@ impl SagaChoreographyBus {
                 entries.dedup_by_key(|entry| entry.sequence);
                 let mut events = Vec::with_capacity(entries.len());
                 for entry in entries {
+                    SagaContext::observe_run_start_millis(
+                        entry.event.context().saga_started_at_millis,
+                    );
                     if entry.event.context().saga_type.as_ref() != policy.saga_type.as_ref() {
                         return Err(format!(
                             "terminal resolver journal saga_type mismatch: expected={} actual={} sequence={}",
@@ -4841,6 +4851,10 @@ mod admission_tests {
     }
 
     impl TerminalResolverJournal for LookupJournal {
+        fn max_run_start_millis(&self) -> Result<u64, TerminalResolverJournalError> {
+            self.inner.max_run_start_millis()
+        }
+
         fn append(
             &self,
             event: SagaChoreographyEvent,
@@ -5037,6 +5051,56 @@ mod admission_tests {
             Err(SagaBusPublishError::AdmissionRejected { reason, .. }) => reason.to_string(),
             other => panic!("expected admission rejection, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn progress_heavy_recovery_uses_row_budget_not_index_capacity() {
+        let journal = Arc::new(InMemoryTerminalResolverJournal::default());
+        let old = ctx("adm_chain", 77, "a", SagaContext::now_millis());
+        let mut active = old.clone();
+        active.saga_started_at_millis += 1;
+        journal.append(started(&old)).unwrap();
+        journal.append(saga_failed(&old)).unwrap();
+        journal.append(started(&active)).unwrap();
+        for _ in 0..14 {
+            journal
+                .append(accepted(&active, "a", "one-execution"))
+                .unwrap();
+        }
+        let (bus, _) = bus_with::<Chain>(Some(journal), AdmissionLimits::with_capacity(2));
+        assert_eq!(resident(&bus, "adm_chain"), (1, 1));
+        let gate = bus.read_state().runtimes["adm_chain"].gate.clone();
+        assert_eq!(gate.index().phase(&active), Some(RunPhase::Active));
+    }
+
+    #[test]
+    fn progress_heavy_failed_run_reloads_after_eviction_and_completes_resident() {
+        let journal = Arc::new(InMemoryTerminalResolverJournal::default());
+        let failed = ctx("adm_chain", 78, "a", SagaContext::now_millis());
+        journal.append(started(&failed)).unwrap();
+        for _ in 0..15 {
+            journal
+                .append(accepted(&failed, "a", "one-execution"))
+                .unwrap();
+        }
+        journal.append(saga_failed(&failed)).unwrap();
+        let (bus, _) = bus_with::<Chain>(Some(journal.clone()), AdmissionLimits::with_capacity(2));
+        let gate = bus.read_state().runtimes["adm_chain"].gate.clone();
+        let mut index = gate.index();
+        gate.ensure_resident(&mut index, failed.saga_id).unwrap();
+        // Force FIFO eviction by admitting two other ordinary closed runs.
+        for id in [79, 80] {
+            let other = ctx("adm_chain", id, "a", failed.saga_started_at_millis);
+            assert!(index.observe_row(&started(&other)));
+            assert!(index.observe_row(&saga_failed(&other)));
+            index.make_room_for(None);
+        }
+        assert!(!index.contains(failed.saga_id));
+        gate.ensure_resident(&mut index, failed.saga_id).unwrap();
+        assert_eq!(index.phase(&failed), Some(RunPhase::Failed));
+        ResolverGate::complete_resident(journal.as_ref(), &mut index, failed.saga_id).unwrap();
+        assert_eq!(index.fingerprint_count(), 1);
+        assert!(!index.exceeds_capacity());
     }
 
     // ------------------------------------------------ successful siblings
@@ -6603,6 +6667,10 @@ mod streaming_attach_tests {
     }
 
     impl<J: TerminalResolverJournal> TerminalResolverJournal for StreamingOnly<J> {
+        fn max_run_start_millis(&self) -> Result<u64, TerminalResolverJournalError> {
+            self.inner.max_run_start_millis()
+        }
+
         fn append(
             &self,
             event: SagaChoreographyEvent,

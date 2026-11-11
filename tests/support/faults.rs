@@ -203,6 +203,10 @@ impl<S: ParticipantStore> FaultStore<S> {
 }
 
 impl<S: ParticipantStore> ParticipantStore for FaultStore<S> {
+    fn max_run_start_millis(&self) -> Result<u64, JournalError> {
+        self.inner.max_run_start_millis()
+    }
+
     fn append(&self, saga_id: SagaId, event: ParticipantEvent) -> Result<u64, JournalError> {
         self.check(JournalOp::Append, &[event_kind(&event)])?;
         self.inner.append(saga_id, event)

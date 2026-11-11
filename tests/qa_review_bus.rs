@@ -125,6 +125,10 @@ struct ProbeJournal {
 }
 
 impl TerminalResolverJournal for ProbeJournal {
+    fn max_run_start_millis(&self) -> Result<u64, TerminalResolverJournalError> {
+        self.inner.max_run_start_millis()
+    }
+
     fn append(&self, event: SagaChoreographyEvent) -> Result<u64, TerminalResolverJournalError> {
         if self.fail_appends.load(Ordering::SeqCst) {
             return Err(TerminalResolverJournalError::Storage("append down".into()));
@@ -929,4 +933,254 @@ fn ephemeral_bus_fifo_evicts_ordinary_runs_but_pins_active_and_quarantined() {
             && event.context().saga_id == failed.saga_id),
         1
     );
+}
+
+/// Compatibility journal deliberately implementing only append/read_all.
+#[derive(Default)]
+struct LegacyJournal(InMemoryTerminalResolverJournal);
+impl TerminalResolverJournal for LegacyJournal {
+    fn append(&self, event: SagaChoreographyEvent) -> Result<u64, TerminalResolverJournalError> {
+        self.0.append(event)
+    }
+    fn read_all(&self) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError> {
+        self.0.read_all()
+    }
+}
+
+fn record_closed_journal(journal: &impl TerminalResolverJournal, ctx: &SagaContext) {
+    journal.append(started(ctx)).unwrap();
+    journal
+        .append(SagaChoreographyEvent::SagaCompleted {
+            context: ctx.clone(),
+        })
+        .unwrap();
+}
+
+fn record_closed_store(store: &impl ParticipantStore, ctx: &SagaContext) {
+    assert_eq!(
+        store
+            .admit_and_record_intent(ctx, "start", "SagaStarted")
+            .unwrap(),
+        StoreAdmission::Admitted
+    );
+    store
+        .append(
+            ctx.saga_id,
+            ParticipantEvent::ParticipantTerminalRecorded {
+                saga_type: ctx.saga_type.clone(),
+                saga_started_at_millis: ctx.saga_started_at_millis,
+                outcome: ParticipantTerminalKind::Completed,
+                reason: "done".into(),
+                recorded_at_millis: SagaContext::now_millis(),
+            },
+        )
+        .unwrap();
+}
+
+fn assert_fresh_journal_run(journal: impl TerminalResolverJournal, old: u64) {
+    let (bus, _) = durable_bus(Arc::new(journal));
+    let token = SagaContext::next_run_start_millis();
+    assert!(
+        token > old,
+        "new token {token} must exceed retained token {old}"
+    );
+    bus.publish_strict(started(&context_at(77, "a", token)))
+        .unwrap();
+}
+
+fn assert_fresh_store_run(store: impl ParticipantStore, old: u64) {
+    let support = SagaParticipantSupport::new(store);
+    let token = SagaContext::next_run_start_millis();
+    assert!(
+        token > old,
+        "new token {token} must exceed retained token {old}"
+    );
+    assert_eq!(
+        support
+            .store
+            .admit_and_record_intent(&context_at(77, "a", token), "start", "SagaStarted")
+            .unwrap(),
+        StoreAdmission::Admitted
+    );
+}
+
+#[test]
+fn closed_memory_and_legacy_history_seed_run_allocator() {
+    const CHILD: &str = "PR57_MEMORY_HIGH_WATER";
+    if let Ok(kind) = std::env::var(CHILD) {
+        // Simulate retained logical tokens ahead of this process's allocator.
+        let old = SagaContext::now_millis() + 60_000;
+        let ctx = context_at(77, "a", old);
+        match kind.as_str() {
+            "memory" => {
+                let journal = InMemoryTerminalResolverJournal::default();
+                record_closed_journal(&journal, &ctx);
+                assert_fresh_journal_run(journal, old);
+            }
+            "legacy" => {
+                let journal = LegacyJournal::default();
+                record_closed_journal(&journal, &ctx);
+                assert_fresh_journal_run(journal, old);
+            }
+            "participant" => {
+                let store = InMemoryParticipantStore::new();
+                record_closed_store(&store, &ctx);
+                assert_fresh_store_run(store, old);
+            }
+            "memory-evicted" => {
+                let journal = InMemoryTerminalResolverJournal::with_capacity(0, 2);
+                record_closed_journal(&journal, &ctx);
+                assert!(journal.read_all().unwrap().is_empty());
+                assert_fresh_journal_run(journal, old);
+            }
+            "participant-evicted" => {
+                let store = InMemoryParticipantStore::with_capacity(0, 2);
+                record_closed_store(&store, &ctx);
+                assert!(store.read(ctx.saga_id).unwrap().is_empty());
+                assert_fresh_store_run(store, old);
+            }
+            "participant-deleted" => {
+                let store = InMemoryParticipantStore::new();
+                record_closed_store(&store, &ctx);
+                store.prune(ctx.saga_id).unwrap();
+                assert_fresh_store_run(store, old);
+            }
+            "memory-pruned" => {
+                let journal = InMemoryTerminalResolverJournal::default();
+                record_closed_journal(&journal, &ctx);
+                journal.compact_terminal_detail().unwrap();
+                journal.prune_resolved_before(u64::MAX, 256).unwrap();
+                assert!(journal.read_all().unwrap().is_empty());
+                assert_fresh_journal_run(journal, old);
+            }
+            "participant-pruned" => {
+                let store = InMemoryParticipantStore::new();
+                record_closed_store(&store, &ctx);
+                store.compact_terminal_detail(256).unwrap();
+                store.prune_resolved_before(u64::MAX, 256).unwrap();
+                assert!(store.read(ctx.saga_id).unwrap().is_empty());
+                assert_fresh_store_run(store, old);
+            }
+            _ => unreachable!(),
+        }
+        return;
+    }
+    let mut failures = Vec::new();
+    for kind in [
+        "memory",
+        "legacy",
+        "participant",
+        "memory-pruned",
+        "participant-pruned",
+        "memory-evicted",
+        "participant-evicted",
+        "participant-deleted",
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "closed_memory_and_legacy_history_seed_run_allocator",
+                "--nocapture",
+            ])
+            .env(CHILD, kind)
+            .output()
+            .unwrap();
+        if !output.status.success() {
+            failures.push(format!(
+                "{kind}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[cfg(feature = "lmdb")]
+#[test]
+fn lmdb_restart_seeds_allocator_from_closed_and_pruned_history() {
+    const CHILD: &str = "PR57_LMDB_HIGH_WATER";
+    if let Ok(phase) = std::env::var(CHILD) {
+        let root = std::path::PathBuf::from(std::env::var_os("PR57_LMDB_DIR").unwrap());
+        let kind = std::env::var("PR57_LMDB_KIND").unwrap();
+        let participant = kind.starts_with("participant");
+        let compact = kind.ends_with("compact");
+        let prune = kind.ends_with("prune");
+        if phase == "write" {
+            for _ in 0..5_000 {
+                SagaContext::next_run_start_millis();
+            }
+            let old = SagaContext::next_run_start_millis();
+            assert!(SagaContext::now_millis() < old);
+            let ctx = context_at(77, "a", old);
+            if participant {
+                let store = LmdbParticipantStore::open(&root, "a").unwrap();
+                record_closed_store(&store, &ctx);
+                if compact || prune {
+                    store.compact_terminal_detail(256).unwrap();
+                }
+                if prune {
+                    store.prune_resolved_before(u64::MAX, 256).unwrap();
+                }
+            } else {
+                let journal = LmdbTerminalResolverJournal::open(&root).unwrap();
+                record_closed_journal(&journal, &ctx);
+                if compact || prune {
+                    journal.compact_terminal_detail().unwrap();
+                }
+                if prune {
+                    journal.prune_resolved_before(u64::MAX, 256).unwrap();
+                }
+            }
+            std::fs::write(root.join("token"), old.to_string()).unwrap();
+        } else {
+            let old = std::fs::read_to_string(root.join("token"))
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+            assert!(
+                SagaContext::now_millis() < old,
+                "restart must precede wall-clock catchup"
+            );
+            if participant {
+                assert_fresh_store_run(LmdbParticipantStore::open(&root, "a").unwrap(), old);
+            } else {
+                assert_fresh_journal_run(LmdbTerminalResolverJournal::open(&root).unwrap(), old);
+            }
+        }
+        return;
+    }
+    let mut failures = Vec::new();
+    for kind in [
+        "resolver",
+        "resolver-compact",
+        "resolver-prune",
+        "participant",
+        "participant-compact",
+        "participant-prune",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        for phase in ["write", "read"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "lmdb_restart_seeds_allocator_from_closed_and_pruned_history",
+                    "--nocapture",
+                ])
+                .env(CHILD, phase)
+                .env("PR57_LMDB_DIR", dir.path())
+                .env("PR57_LMDB_KIND", kind)
+                .output()
+                .unwrap();
+            if !output.status.success() {
+                failures.push(format!(
+                    "{kind}/{phase}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+                break;
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

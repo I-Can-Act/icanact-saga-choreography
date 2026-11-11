@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use heed::{Env, EnvOpenOptions};
@@ -244,6 +245,14 @@ pub(crate) fn decode_summary(bytes: &[u8]) -> Result<RunSummary, String> {
     rkyv::from_bytes::<RunSummary, rkyv::rancor::Error>(&aligned).map_err(|e| e.to_string())
 }
 
+fn run_start_millis(key: &str) -> Result<u64, String> {
+    key.rsplit(':')
+        .nth(2)
+        .ok_or("missing run start")?
+        .parse::<u64>()
+        .map_err(|e| e.to_string())
+}
+
 /// Indexed raw operations shared by participant and resolver stores. No history
 /// decoding on open, and maintenance stages at most 256 keys/rows per txn.
 pub(crate) struct IndexedStore {
@@ -254,6 +263,7 @@ pub(crate) struct IndexedStore {
     pub meta: Database<Str, Str>,
     pub namespace: String,
     pub counter: String,
+    max_run_start_millis: AtomicU64,
     _owner: LmdbEnvOwner,
 }
 impl std::fmt::Debug for IndexedStore {
@@ -304,7 +314,35 @@ impl IndexedStore {
             meta.put(&mut txn, &format!("{counter}:last_allocated"), "0")
                 .map_err(|e| e.to_string())?;
         }
+        let high_water = match meta
+            .get(&txn, "max_run_start_millis")
+            .map_err(|e| e.to_string())?
+        {
+            Some(raw) => raw.parse::<u64>().map_err(|e| e.to_string())?,
+            None => {
+                // Upgrade existing indexed journals once, without decoding history.
+                // The high water is environment-wide, including all namespaces.
+                let mut high_water = 0;
+                for name in ["participant_runs", "resolver_runs"] {
+                    if let Some(db) = env
+                        .open_database::<Str, Bytes>(&txn, Some(name))
+                        .map_err(|e| e.to_string())?
+                    {
+                        for row in db.iter(&txn).map_err(|e| e.to_string())? {
+                            let (key, _) = row.map_err(|e| e.to_string())?;
+                            if !key.starts_with('~') {
+                                high_water = high_water.max(run_start_millis(key)?);
+                            }
+                        }
+                    }
+                }
+                meta.put(&mut txn, "max_run_start_millis", &high_water.to_string())
+                    .map_err(|e| e.to_string())?;
+                high_water
+            }
+        };
         txn.commit().map_err(|e| e.to_string())?;
+        crate::SagaContext::observe_run_start_millis(high_water);
         Ok(Self {
             env: env.clone(),
             rows,
@@ -313,9 +351,25 @@ impl IndexedStore {
             meta,
             namespace,
             counter,
+            max_run_start_millis: AtomicU64::new(high_water),
             _owner: owner,
         })
     }
+    /// A point lookup keeps independent handles coherent; no history scan.
+    pub fn max_run_start_millis(&self) -> Result<u64, String> {
+        let txn = self.env.read_txn().map_err(|e| e.to_string())?;
+        let value = self
+            .meta
+            .get(&txn, "max_run_start_millis")
+            .map_err(|e| e.to_string())?
+            .ok_or("run token high water is missing")?
+            .parse::<u64>()
+            .map_err(|e| e.to_string())?;
+        self.max_run_start_millis
+            .fetch_max(value, Ordering::Relaxed);
+        Ok(self.max_run_start_millis.load(Ordering::Relaxed))
+    }
+
     pub fn next(&self, txn: &mut heed::RwTxn<'_>, count: usize) -> Result<u64, String> {
         let raw = self
             .meta
@@ -391,6 +445,22 @@ impl IndexedStore {
         key: &str,
         summary: &RunSummary,
     ) -> Result<(), String> {
+        let token = run_start_millis(key)?;
+        let previous = self
+            .meta
+            .get(txn, "max_run_start_millis")
+            .map_err(|e| e.to_string())?
+            .ok_or("run token high water is missing")?
+            .parse::<u64>()
+            .map_err(|e| e.to_string())?;
+        if token > previous {
+            self.meta
+                .put(txn, "max_run_start_millis", &token.to_string())
+                .map_err(|e| e.to_string())?;
+        }
+        // A transaction abort can only over-seed the cache, never reuse a token.
+        self.max_run_start_millis
+            .fetch_max(token.max(previous), Ordering::Relaxed);
         self.remove_indexes(txn, key, &self.summary(txn, key)?)?;
         let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(summary).map_err(|e| e.to_string())?;
         self.runs
@@ -707,6 +777,50 @@ mod wave1c_tests {
         std::fs::write(dir.path().join("journal/data.mdb"), []).unwrap();
         assert!(LmdbEnvOwner::acquire(dir.path()).is_err());
         assert!(!dir.path().join("data.mdb").exists());
+    }
+
+    #[test]
+    fn high_water_upgrade_scans_all_namespaces_and_handles_remain_coherent() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = |kind: &str, namespace: &str| {
+            IndexedStore::open(
+                LmdbEnvOwner::acquire(dir.path()).unwrap(),
+                dir.path(),
+                kind,
+                namespace.into(),
+            )
+            .unwrap()
+        };
+        let participant = open("participant", "61:");
+        let resolver = open("resolver", "r:");
+        for (db, token) in [(&participant, 900), (&resolver, 800)] {
+            let key = run_key(&db.namespace, &(77, "qa_review".into(), token)).unwrap();
+            let mut txn = db.env.write_txn().unwrap();
+            db.put_summary(&mut txn, &key, &RunSummary::default())
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        assert_eq!(resolver.max_run_start_millis().unwrap(), 900);
+        let mut txn = participant.env.write_txn().unwrap();
+        participant
+            .meta
+            .delete(&mut txn, "max_run_start_millis")
+            .unwrap();
+        txn.commit().unwrap();
+        drop(participant);
+        drop(resolver);
+        // Opening an unrelated namespace must seed from both existing stores.
+        let unrelated = open("participant", "62:");
+        assert_eq!(unrelated.max_run_start_millis().unwrap(), 900);
+        let resolver = open("resolver", "r:");
+        let key = run_key(&resolver.namespace, &(77, "qa_review".into(), 1000)).unwrap();
+        let mut txn = resolver.env.write_txn().unwrap();
+        resolver
+            .put_summary(&mut txn, &key, &RunSummary::default())
+            .unwrap();
+        resolver.remove_summary(&mut txn, &key).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(unrelated.max_run_start_millis().unwrap(), 1000);
     }
 
     #[test]

@@ -20,6 +20,13 @@ pub enum TerminalResolverJournalError {
 }
 
 pub trait TerminalResolverJournal: Send + Sync + 'static {
+    /// Monotonic run-token high water, independent of replay retention.
+    fn max_run_start_millis(&self) -> Result<u64, TerminalResolverJournalError> {
+        Err(TerminalResolverJournalError::Unsupported(
+            "run token high water".into(),
+        ))
+    }
+
     fn append(&self, event: SagaChoreographyEvent) -> Result<u64, TerminalResolverJournalError>;
     fn read_all(&self) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError>;
     fn supports_saga_lookup(&self) -> bool {
@@ -133,6 +140,10 @@ impl InMemoryTerminalResolverJournal {
     }
 }
 impl TerminalResolverJournal for InMemoryTerminalResolverJournal {
+    fn max_run_start_millis(&self) -> Result<u64, TerminalResolverJournalError> {
+        Ok(self.state()?.max_run_start_millis)
+    }
+
     fn append(&self, event: SagaChoreographyEvent) -> Result<u64, TerminalResolverJournalError> {
         let mut state = self.state()?;
         let key = context_key(event.context());
@@ -297,6 +308,10 @@ pub mod lmdb {
         }
     }
     impl TerminalResolverJournal for LmdbTerminalResolverJournal {
+        fn max_run_start_millis(&self) -> Result<u64, TerminalResolverJournalError> {
+            self.db.max_run_start_millis().map_err(storage)
+        }
+
         fn append(
             &self,
             event: SagaChoreographyEvent,

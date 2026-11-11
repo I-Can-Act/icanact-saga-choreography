@@ -65,6 +65,12 @@ where
     S: ParticipantStore,
 {
     pub fn new(store: S) -> Self {
+        match store.max_run_start_millis() {
+            Ok(high_water) => SagaContext::observe_run_start_millis(high_water),
+            Err(error) => {
+                tracing::error!(target: "core::saga", event = "participant_high_water_read_failed", %error)
+            }
+        }
         Self {
             saga_states: HashMap::new(),
             dependency_completions: HashMap::new(),
