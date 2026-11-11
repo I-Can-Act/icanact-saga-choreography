@@ -86,162 +86,6 @@ impl Drop for LmdbEnvOwner {
     }
 }
 
-#[cfg(test)]
-mod wave1c_tests {
-    use super::*;
-
-    #[test]
-    fn v3_schema_has_eight_tables_and_indexed_terminal_maintenance() {
-        use crate::journal::{ParticipantStore, lmdb::LmdbParticipantStore};
-        use crate::{
-            DeterministicContextBuilder, ParticipantEvent,
-            ParticipantTerminalKind,
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let store = LmdbParticipantStore::open(dir.path(), "a").unwrap();
-        let c = DeterministicContextBuilder::default()
-            .with_saga_id(1)
-            .build();
-        store.admit_and_record_intent(&c, "x", "start").unwrap();
-        store
-            .append(
-                c.saga_id,
-                ParticipantEvent::ParticipantTerminalRecorded {
-                    saga_type: c.saga_type,
-                    saga_started_at_millis: c.saga_started_at_millis,
-                    outcome: ParticipantTerminalKind::Completed,
-                    reason: "done".into(),
-                    recorded_at_millis: 10,
-                },
-            )
-            .unwrap();
-        let owner = LmdbEnvOwner::acquire(dir.path()).unwrap();
-        let index_count = |prefix: &str| {
-            let txn = owner.env().read_txn().unwrap();
-            let runs = owner
-                .env()
-                .open_database::<Str, Bytes>(&txn, Some("participant_runs"))
-                .unwrap()
-                .unwrap();
-            runs.prefix_iter(&txn, prefix).unwrap().count()
-        };
-        let txn = owner.env().read_txn().unwrap();
-        let root = owner
-            .env()
-            .open_database::<Str, Bytes>(&txn, None)
-            .unwrap()
-            .unwrap();
-        let names: Vec<_> = root
-            .iter(&txn)
-            .unwrap()
-            .map(|r| r.unwrap().0.to_owned())
-            .collect();
-        assert_eq!(
-            names,
-            [
-                "meta",
-                "participant_dedupe",
-                "participant_events",
-                "participant_runs",
-                "participant_unresolved",
-                "resolver_events",
-                "resolver_runs",
-                "resolver_unresolved"
-            ]
-        );
-        drop(txn);
-        assert_eq!(index_count("~age:61:"), 1);
-        assert_eq!(index_count("~detail:61:"), 1);
-        assert_eq!(store.compact_terminal_detail(1).unwrap(), 1);
-        assert_eq!(index_count("~detail:61:"), 0);
-        assert_eq!(index_count("~age:61:"), 1);
-        assert_eq!(store.prune_resolved_before(11, 1).unwrap(), 1);
-        assert_eq!(index_count("~age:61:"), 0);
-    }
-
-    #[test]
-    fn acquire_configures_sixteen_named_databases() {
-        let dir = tempfile::tempdir().unwrap();
-        let owner = LmdbEnvOwner::acquire(dir.path()).unwrap();
-        let mut txn = owner.env().write_txn().unwrap();
-        for i in 0..16 {
-            owner
-                .env()
-                .create_database::<Str, Bytes>(&mut txn, Some(&format!("test-{i}")))
-                .unwrap();
-        }
-        assert!(
-            owner
-                .env()
-                .create_database::<Str, Bytes>(&mut txn, Some("seventeenth"))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn old_and_unversioned_schemas_fail_closed_without_migration() {
-        use crate::LmdbTerminalResolverJournal;
-        use crate::journal::lmdb::LmdbParticipantStore;
-        for version in [None, Some("1"), Some("2"), Some("3")] {
-            let dir = tempfile::tempdir().unwrap();
-            let owner = LmdbEnvOwner::acquire(dir.path()).unwrap();
-            let mut txn = owner.env().write_txn().unwrap();
-            let meta = owner
-                .env()
-                .create_database::<Str, Str>(&mut txn, Some("meta"))
-                .unwrap();
-            if let Some(version) = version {
-                meta.put(&mut txn, "schema_version", version).unwrap();
-            }
-            meta.put(&mut txn, "evidence", "must survive").unwrap();
-            txn.commit().unwrap();
-            drop(owner);
-            assert!(LmdbParticipantStore::open(dir.path(), "a").is_err());
-            assert!(LmdbTerminalResolverJournal::open(dir.path()).is_err());
-            let owner = LmdbEnvOwner::acquire(dir.path()).unwrap();
-            let txn = owner.env().read_txn().unwrap();
-            let meta = owner
-                .env()
-                .open_database::<Str, Str>(&txn, Some("meta"))
-                .unwrap()
-                .unwrap();
-            assert_eq!(meta.get(&txn, "evidence").unwrap(), Some("must survive"));
-            assert_eq!(meta.get(&txn, "schema_version").unwrap(), version);
-        }
-    }
-
-    #[test]
-    fn map_size_parser_refuses_invalid_overrides() {
-        assert_eq!(parse_map_size(None).unwrap(), 1024 * 1024 * 1024);
-        assert_eq!(parse_map_size(Some("10485760")).unwrap(), 10485760);
-        for invalid in ["0", "-1", "bad", "184467440737095516160"] {
-            assert!(parse_map_size(Some(invalid)).is_err());
-        }
-    }
-
-    #[test]
-    fn split_layout_refused_before_creating_replacement_env() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("journal")).unwrap();
-        std::fs::write(dir.path().join("journal/data.mdb"), []).unwrap();
-        assert!(LmdbEnvOwner::acquire(dir.path()).is_err());
-        assert!(!dir.path().join("data.mdb").exists());
-    }
-
-    #[test]
-    fn acquire_creates_canonical_shared_environment() {
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().join("missing");
-        let first = LmdbEnvOwner::acquire(&base).unwrap();
-        let second = LmdbEnvOwner::acquire(&base.join(".")).unwrap();
-        assert_eq!(first.key, base.canonicalize().unwrap());
-        assert_eq!(first.env().info().map_size, 1024 * 1024 * 1024);
-        drop(first);
-        second.env().write_txn().unwrap().commit().unwrap();
-        assert!(base.join("data.mdb").exists());
-    }
-}
-
 /// Every production opener uses the same options; malformed overrides fail closed.
 fn parse_map_size(raw: Option<&str>) -> std::io::Result<usize> {
     match raw {
@@ -723,5 +567,158 @@ impl IndexedStore {
         }
         txn.commit().map_err(|e| e.to_string())?;
         Ok(changed)
+    }
+}
+
+#[cfg(test)]
+mod wave1c_tests {
+    use super::*;
+
+    #[test]
+    fn v3_schema_has_eight_tables_and_indexed_terminal_maintenance() {
+        use crate::journal::{ParticipantStore, lmdb::LmdbParticipantStore};
+        use crate::{DeterministicContextBuilder, ParticipantEvent, ParticipantTerminalKind};
+        let dir = tempfile::tempdir().unwrap();
+        let store = LmdbParticipantStore::open(dir.path(), "a").unwrap();
+        let c = DeterministicContextBuilder::default()
+            .with_saga_id(1)
+            .build();
+        store.admit_and_record_intent(&c, "x", "start").unwrap();
+        store
+            .append(
+                c.saga_id,
+                ParticipantEvent::ParticipantTerminalRecorded {
+                    saga_type: c.saga_type,
+                    saga_started_at_millis: c.saga_started_at_millis,
+                    outcome: ParticipantTerminalKind::Completed,
+                    reason: "done".into(),
+                    recorded_at_millis: 10,
+                },
+            )
+            .unwrap();
+        let owner = LmdbEnvOwner::acquire(dir.path()).unwrap();
+        let index_count = |prefix: &str| {
+            let txn = owner.env().read_txn().unwrap();
+            let runs = owner
+                .env()
+                .open_database::<Str, Bytes>(&txn, Some("participant_runs"))
+                .unwrap()
+                .unwrap();
+            runs.prefix_iter(&txn, prefix).unwrap().count()
+        };
+        let txn = owner.env().read_txn().unwrap();
+        let root = owner
+            .env()
+            .open_database::<Str, Bytes>(&txn, None)
+            .unwrap()
+            .unwrap();
+        let names: Vec<_> = root
+            .iter(&txn)
+            .unwrap()
+            .map(|r| r.unwrap().0.to_owned())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "meta",
+                "participant_dedupe",
+                "participant_events",
+                "participant_runs",
+                "participant_unresolved",
+                "resolver_events",
+                "resolver_runs",
+                "resolver_unresolved"
+            ]
+        );
+        drop(txn);
+        assert_eq!(index_count("~age:61:"), 1);
+        assert_eq!(index_count("~detail:61:"), 1);
+        assert_eq!(store.compact_terminal_detail(1).unwrap(), 1);
+        assert_eq!(index_count("~detail:61:"), 0);
+        assert_eq!(index_count("~age:61:"), 1);
+        assert_eq!(store.prune_resolved_before(11, 1).unwrap(), 1);
+        assert_eq!(index_count("~age:61:"), 0);
+    }
+
+    #[test]
+    fn acquire_configures_sixteen_named_databases() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = LmdbEnvOwner::acquire(dir.path()).unwrap();
+        let mut txn = owner.env().write_txn().unwrap();
+        for i in 0..16 {
+            owner
+                .env()
+                .create_database::<Str, Bytes>(&mut txn, Some(&format!("test-{i}")))
+                .unwrap();
+        }
+        assert!(
+            owner
+                .env()
+                .create_database::<Str, Bytes>(&mut txn, Some("seventeenth"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn old_and_unversioned_schemas_fail_closed_without_migration() {
+        use crate::LmdbTerminalResolverJournal;
+        use crate::journal::lmdb::LmdbParticipantStore;
+        for version in [None, Some("1"), Some("2"), Some("3")] {
+            let dir = tempfile::tempdir().unwrap();
+            let owner = LmdbEnvOwner::acquire(dir.path()).unwrap();
+            let mut txn = owner.env().write_txn().unwrap();
+            let meta = owner
+                .env()
+                .create_database::<Str, Str>(&mut txn, Some("meta"))
+                .unwrap();
+            if let Some(version) = version {
+                meta.put(&mut txn, "schema_version", version).unwrap();
+            }
+            meta.put(&mut txn, "evidence", "must survive").unwrap();
+            txn.commit().unwrap();
+            drop(owner);
+            assert!(LmdbParticipantStore::open(dir.path(), "a").is_err());
+            assert!(LmdbTerminalResolverJournal::open(dir.path()).is_err());
+            let owner = LmdbEnvOwner::acquire(dir.path()).unwrap();
+            let txn = owner.env().read_txn().unwrap();
+            let meta = owner
+                .env()
+                .open_database::<Str, Str>(&txn, Some("meta"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(meta.get(&txn, "evidence").unwrap(), Some("must survive"));
+            assert_eq!(meta.get(&txn, "schema_version").unwrap(), version);
+        }
+    }
+
+    #[test]
+    fn map_size_parser_refuses_invalid_overrides() {
+        assert_eq!(parse_map_size(None).unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_map_size(Some("10485760")).unwrap(), 10485760);
+        for invalid in ["0", "-1", "bad", "184467440737095516160"] {
+            assert!(parse_map_size(Some(invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn split_layout_refused_before_creating_replacement_env() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("journal")).unwrap();
+        std::fs::write(dir.path().join("journal/data.mdb"), []).unwrap();
+        assert!(LmdbEnvOwner::acquire(dir.path()).is_err());
+        assert!(!dir.path().join("data.mdb").exists());
+    }
+
+    #[test]
+    fn acquire_creates_canonical_shared_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("missing");
+        let first = LmdbEnvOwner::acquire(&base).unwrap();
+        let second = LmdbEnvOwner::acquire(&base.join(".")).unwrap();
+        assert_eq!(first.key, base.canonicalize().unwrap());
+        assert_eq!(first.env().info().map_size, 1024 * 1024 * 1024);
+        drop(first);
+        second.env().write_txn().unwrap().commit().unwrap();
+        assert!(base.join("data.mdb").exists());
     }
 }

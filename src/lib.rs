@@ -69,9 +69,9 @@ mod workflow_contract;
 // Types
 pub use binding::{
     SagaParticipantChannel, bind_async_participant_channel, bind_async_participant_channel_lazy,
-    bind_async_participant_tell, bind_sync_participant_channel,
-    bind_sync_participant_channel_lazy, bind_sync_participant_tell,
-    bind_sync_workflow_participant_channel, bind_sync_workflow_participant_channel_lazy,
+    bind_async_participant_tell, bind_sync_participant_channel, bind_sync_participant_channel_lazy,
+    bind_sync_participant_tell, bind_sync_workflow_participant_channel,
+    bind_sync_workflow_participant_channel_lazy,
     bind_sync_workflow_participant_channel_lazy_strict,
     bind_sync_workflow_participant_channel_strict, bind_sync_workflow_participant_tell,
     bind_sync_workflow_participant_tell_strict, checked_workflow_saga_types, workflow_saga_types,
@@ -94,9 +94,8 @@ pub use support::{
 
 // Events
 pub use events::{
-    ParticipantEvent, ParticipantForwardOutcome, ParticipantTerminalKind,
-    SagaChoreographyEvent, SagaFailureDetails, SagaReplyTo, SagaReplyToHandle, SagaReplyToResult,
-    SagaTerminalOutcome,
+    ParticipantEvent, ParticipantForwardOutcome, ParticipantTerminalKind, SagaChoreographyEvent,
+    SagaFailureDetails, SagaReplyTo, SagaReplyToHandle, SagaReplyToResult, SagaTerminalOutcome,
 };
 
 // Errors
@@ -117,11 +116,11 @@ pub use traits::{
 };
 
 // Storage
+#[cfg(feature = "lmdb")]
+pub use journal::lmdb::LmdbParticipantStore;
 pub use journal::{
     InMemoryParticipantStore, JournalEntry, JournalError, ParticipantStore, StoreAdmission,
 };
-#[cfg(feature = "lmdb")]
-pub use journal::lmdb::LmdbParticipantStore;
 
 // Helpers
 pub use helpers::{handle_async_saga_event_with_emit, handle_saga_event_with_emit};
