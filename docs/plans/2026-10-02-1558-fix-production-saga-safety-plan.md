@@ -10,6 +10,20 @@ execution: code
 
 # Production Saga Safety - Plan
 
+## Current status (document alignment update)
+
+This plan has been executed. The remediation it specifies is merged on `main` as
+`394a5e2` (PR #54), followed by the actor-resource-lifecycle fix `5af675f` (PR #55).
+The audited baseline `583cd83...` below is therefore no longer `origin/main`, and the
+task-scoped boundaries in the Goal Capsule (no push/PR/merge authorization, isolated
+writer worktrees, no execution progress in this plan) describe how that task was run,
+not the current state of the repository. Requirement-to-test mapping lives in
+[../safety-regressions.md](../safety-regressions.md); breaking changes are in
+[../migration.md](../migration.md). Divergences between this plan and the delivered
+tree that matter for navigation are corrected inline below (U7/U8 file lists);
+otherwise the plan text is the original record of intent. Nothing here certifies a
+release: the crate version remains `0.1.0`.
+
 ## Goal Capsule
 
 - **Objective:** Applications do not repeat terminal business effects after restart, report success without durable evidence, or lose unresolved rollback obligations.
@@ -244,7 +258,7 @@ flowchart TB
 - **Goal:** Make startup, retention, effect dispatch, and external idempotency obligations actionable.
 - **Requirements:** R3, R4, R9-R13.
 - **Dependencies:** None; reconcile exact API names after U1-U6.
-- **Files:** `README.md`, `docs/architecture.md`, `docs/integration_guide.md`, `docs/operations.md`.
+- **Files:** `README.md`, `docs/architecture.md`, `docs/integration_guide.md`, `docs/operations.md` (as delivered, also `docs/migration.md`, `docs/safety-regressions.md` and this plan).
 - **Approach:** Update the startup sequence, retention/compaction guidance, single-owner rollback semantics, effect-dispatch migration, and administrative quarantine resolution. State limits without an exactly-once promise.
 - **Test expectation:** No independent behavior change; validate examples and API links against the integrated library.
 - **Verification:** Documentation describes actual APIs, no automatic quarantine pruning, and no unsupported deployment guarantee.
@@ -254,7 +268,7 @@ flowchart TB
 - **Goal:** Demonstrate the shared safety contract on the integrated tree.
 - **Requirements:** R1-R14.
 - **Dependencies:** U1-U7.
-- **Files:** All owned implementation/test paths for reconciliation; `tests/qa_production_safety.rs`; documentation examples if needed.
+- **Files:** All owned implementation/test paths for reconciliation; the delivered coverage lives in the `tests/qa_remediation_*.rs`, `tests/qa_review*.rs` and `tests/qa_rechallenge_*.rs` suites mapped in `docs/safety-regressions.md` (no `tests/qa_production_safety.rs` file was created); documentation examples if needed.
 - **Approach:** Inspect actual lane diffs and ownership. Integrate in dependency order and convert all thirteen original QA observations into safety expectations or explicitly linked equivalent regressions. Remove obsolete unsafe expectations and temporary approaches, not valid coverage.
 - **Execution note:** Retain the original QA worktree unchanged. Capture pre-remediation evidence separately from green final results.
 - **Test scenarios:** Full actor/bus/participant restart chain, late rollback ordering, strict delivery failure, pre-activation watchdog, faulty persistence, and aligned real LMDB recovery.
@@ -296,5 +310,7 @@ Every U1-U7 handoff names actual changed files, inspected tests, pre-change evid
 U8 passes the Verification Contract and maps all original QA scenarios to safe behavior.
 U9 records a completed independent review and fixes all valid findings.
 No abandoned implementation, observation-only bug assertion, or temporary experiment remains in the delivered diff.
-No execution progress is written into this plan.
-Canonical and QA checkouts remain untouched, and no push or PR is performed.
+Execution progress was not written into this plan during the task; the status header
+at the top of this file was added afterwards, during a later documentation-alignment
+pass, to record that the plan was executed and merged (PR #54, follow-up PR #55).
+Canonical and QA checkouts remained untouched during the task.

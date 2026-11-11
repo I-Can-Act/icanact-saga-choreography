@@ -1,9 +1,12 @@
 # Migration: production saga safety remediation
 
-Baseline: `583cd830fda8b4518a7aa7a6a6d7e8f654079a1f`. This change set is **not released**.
-The crate remains `0.1.0`: manifests/lockfiles were excluded from this task. Before any
-publication, choose a semver-appropriate version bump and complete release validation.
-Nothing in these notes authorizes publication or certifies production operation.
+Baseline: `583cd830fda8b4518a7aa7a6a6d7e8f654079a1f`. This change set is merged on
+`main` as `394a5e2` (PR #54), with the actor-resource-lifecycle follow-up `5af675f`
+(PR #55) covered in item 15 below. It is **not released**: the crate version in
+`Cargo.toml` remains `0.1.0` and the repository contains no publication step. Before
+any publication, choose a semver-appropriate version bump and complete release
+validation. Nothing in these notes authorizes publication or certifies production
+operation.
 
 ## Breaking changes
 
@@ -90,6 +93,19 @@ Nothing in these notes authorizes publication or certifies production operation.
     Obtain it before dropping public owners and wait only off-actor/off-callback. True
     observes actual bus-owned resource destruction; it does not shut down work, resolve
     sagas, close application-held journal clones or physically cancel external work.
+15. **Resource lifecycle follow-up (`5af675f`, additive).**
+    `SagaChoreographyBus::detach_terminal_resolver(saga_type) -> bool` is the supported
+    resolver removal path: it unsubscribes the resolver and stops its actor and
+    watchdog, does not resolve in-flight waiters, and new starts for the type fail
+    closed while detached until a replacement is attached (and, for durable
+    resolvers, recovery is activated). Simply releasing the attachment subscription
+    is not a full detach. Dropping the last public bus now runs lifecycle shutdown on
+    a dedicated cleanup thread instead of on scheduler workers. Crate LMDB handles
+    close their (path-keyed, process-shared) environment only when the last same-path
+    handle drops; dropping one of several openers leaves the others usable. In
+    `SagaTestWorld`, participant-handle `shutdown()` now unsubscribes the participant
+    from the bus before stopping its actor, where subscriptions previously leaked for
+    the life of the bus.
 
 ## Drain before upgrading from baseline
 

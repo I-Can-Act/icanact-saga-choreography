@@ -9,8 +9,11 @@
 //! - Retry logic may cause duplicate attempts
 //!
 //! In the choreography-based SAGA pattern, each participant must be able to
-//! determine if it has already processed a given request to maintain exactly-once
-//! semantics despite the possibility of duplicate message delivery.
+//! determine if it has already processed a given request, so duplicate delivery
+//! under at-least-once transport does not repeat work. Deduplication fences
+//! re-processing inside this crate; it does not provide exactly-once semantics
+//! for external effects, which still need stable idempotency keys and
+//! reconciliation.
 
 use super::SagaId;
 use std::collections::HashSet;
@@ -26,11 +29,12 @@ type DedupeSet = HashSet<DedupeKey>;
 ///
 /// - Preventing duplicate transaction execution
 /// - Ensuring compensation actions aren't applied multiple times
-/// - Maintaining exactly-once processing semantics
+/// - Fencing replayed events for an already-processed run after restart
 ///
-/// Implementations should provide persistent storage with appropriate TTLs
-/// for production use. The store should survive process restarts to handle
-/// redelivered messages after crashes.
+/// Implementations must provide durable storage for production use and must
+/// survive process restarts to handle redelivered messages after crashes.
+/// Dedupe markers are replay fences, not a TTL cache: they must be retained
+/// for as long as replay of the run has to stay fenced.
 ///
 /// # Thread Safety
 ///
@@ -115,11 +119,13 @@ pub trait ParticipantDedupeStore: Send + Sync + 'static {
     /// the corresponding operation was recorded but never started.
     fn remove_processed(&self, saga_id: SagaId, key: &str) -> Result<(), DedupeError>;
 
-    /// Removes all deduplication records for a completed SAGA.
+    /// Removes all deduplication records for a SAGA.
     ///
-    /// Call this when a SAGA has completed (successfully or with compensation)
-    /// to free up storage. This is particularly important for long-running
-    /// systems to prevent unbounded memory/disk growth.
+    /// Destructive administrative primitive: deletion removes replay
+    /// protection and unresolved evidence. Never use it for automatic
+    /// terminal cleanup — ordinary completion does not make pruning safe;
+    /// preserve an audited replacement fence before deliberate
+    /// archival/deletion.
     ///
     /// # Arguments
     ///

@@ -12,8 +12,10 @@ diagnostics = []
 test-harness = ["icanact-core/test-support", "dep:tracing-subscriber"]
 test-support = ["test-harness"]
 lmdb = ["dep:heed"]
-# Opt-in exhaustive concurrency model checking for the dedupe/journal atomicity
-# contracts. Run with: cargo test --features loom (slower; explores all interleavings).
+# Opt-in exhaustive concurrency model checking of a reference dedupe
+# check-and-mark model (the algorithm the in-memory store also uses; shipped
+# LMDB stores are not themselves loom-modeled). Run with:
+# cargo test --features loom (slower; explores all interleavings).
 loom = []
 
 [[test]]

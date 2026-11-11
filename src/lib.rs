@@ -1,11 +1,11 @@
 //! Choreography-Based SAGA for icanact-core Actors
 //!
 //! A choreography-based SAGA pattern that integrates natively with `icanact-core` actors.
-//! Actors implement saga business behavior via `SagaParticipant`, and can either:
-//!
-//! - implement `SagaStateExt` directly, or
-//! - embed `SagaParticipantSupport` and implement `HasSagaParticipantSupport`
-//!   to get `SagaStateExt` automatically.
+//! Actors implement saga business behavior via `SagaParticipant` (or
+//! `AsyncSagaParticipant` / `SagaWorkflowParticipant`) and embed
+//! `SagaParticipantSupport`, implementing `HasSagaParticipantSupport` to expose it.
+//! `SagaStateExt` is then blanket-implemented for the actor; it is not implemented
+//! directly.
 //!
 //! # Quick Start
 //!
@@ -31,8 +31,15 @@
 //! // 3. Implement SagaParticipant (business logic)
 //! impl SagaParticipant for MyActor { /* ... */ }
 //!
-//! // 4. Handle saga events in Actor::handle
-//! MyActorCommand::SagaEvent { event } => handle_saga_event_with_emit(self, event, |_| {}),
+//! // 4. Attach the bus so ingress can republish emitted events
+//! //    (SagaTestWorld::spawn_* does this in tests):
+//! actor.saga.attach_bus(bus.clone());
+//!
+//! // 5. Route saga events through the ingress helper, which validates emitted
+//! //    transitions and republishes them through the attached bus:
+//! MyActorCommand::SagaEvent { event } => {
+//!     apply_sync_participant_saga_ingress(self, event, |_actor, _incoming| {}, |_invalid| {})
+//! }
 //! ```
 
 #![allow(missing_docs)]

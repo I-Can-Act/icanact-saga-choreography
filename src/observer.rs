@@ -8,6 +8,11 @@ use super::SagaContext;
 /// Observers must be `Send + Sync + 'static` to support concurrent access
 /// from multiple saga participants.
 ///
+/// Note: no framework path currently invokes a `SagaObserver`. The trait is
+/// a callback vocabulary for application code to call from its own
+/// participant/terminal hooks; framework telemetry itself is emitted as
+/// `tracing` events.
+///
 /// # Example
 ///
 /// ```ignore
@@ -81,8 +86,8 @@ pub trait SagaObserver: Send + Sync + 'static {
 
 /// A no-operation observer that ignores all saga events.
 ///
-/// Use this when you need an observer but don't want any observability overhead.
-/// All callback methods are empty implementations.
+/// All callback methods are empty implementations. Like every
+/// `SagaObserver`, it is only invoked if application code calls it.
 pub struct NoOpObserver;
 
 impl SagaObserver for NoOpObserver {
@@ -105,7 +110,8 @@ impl SagaObserver for NoOpObserver {
 /// - `ERROR`: Saga failures and quarantines
 ///
 /// Each log event includes structured fields for `saga_id`, and where applicable,
-/// `step`, `duration_ms`, `error`, or `reason`.
+/// `step`, `duration_ms`, `error`, or `reason`. It only runs when application
+/// code invokes it (see the `SagaObserver` note).
 pub struct TracingObserver;
 
 impl SagaObserver for TracingObserver {

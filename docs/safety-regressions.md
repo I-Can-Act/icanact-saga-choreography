@@ -2,9 +2,13 @@
 
 Audit baseline: `583cd830fda8b4518a7aa7a6a6d7e8f654079a1f`.
 Plan: [Production Saga Safety](plans/2026-10-02-1558-fix-production-saga-safety-plan.md).
-The original thirteen QA probes asserted defects. They remain preserved in the separate
-QA worktree and are **not** green acceptance tests for this branch. The tests below
-assert safe behavior instead.
+Status: this remediation is merged on `main` as `394a5e2` (PR #54), with the
+actor-resource-lifecycle follow-up `5af675f` (PR #55) mapped at the end of this
+ledger. This file is the coverage record for those changes; it is not a release or
+production certification.
+The original thirteen QA probes asserted defects. They were preserved in a separate
+QA worktree (not in this repository) and are **not** green acceptance tests here. The
+tests below, which are in this repository, assert safe behavior instead.
 
 ## All thirteen observations mapped to safety assertions
 
@@ -25,7 +29,8 @@ assert safe behavior instead.
    `failed_run_fence_survives_cache_eviction`; workflows
    `completed_run_does_not_repeat_effect_after_restart_and_later_run_is_admitted`.
 5. `qa_confirms_lmdb_restart_reexecutes_completed_and_quarantined_sagas`:
-   the two reopened-LMDB terminal/quarantine tests in `tests/durability_lmdb_integration.rs`.
+   `tests/durability_lmdb_integration.rs::workflow_reopen::completed_run_does_not_repeat_effect_after_lmdb_reopen`
+   and `workflow_reopen::quarantined_run_keeps_evidence_and_blocks_reuse_after_lmdb_reopen`.
 6. `qa_confirms_retained_resolver_history_does_not_prevent_lmdb_participant_replay_effect`:
    `workflow_reopen::resolver_and_participant_lmdb_reopen_fence_replay_before_fanout`
    reopens both real LMDB stores, tests bus admission before fanout and independently
@@ -91,7 +96,8 @@ assert safe behavior instead.
 
 The first independent review of `ece1cb4` returned **BLOCK** (two P1, nine P2).
 The following assertions address its concrete findings; a passing suite is not a review
-verdict. The same reviewer is re-challenged only after parent verification/commit.
+verdict. (At the time, the same reviewer was re-challenged only after parent
+verification/commit; the subsequent re-challenge rounds are recorded below.)
 
 - **P1-1, unresolved forward effects:** `tests/qa_review_resolver.rs` exercises long-running
   and accepted work, known undo plus unknown obligations, and late effects after ordinary
@@ -223,7 +229,8 @@ SHA-bound parent final gates establish implementation verification, not release 
 The same reviewer's **OK with notes** was a local recommendation, not all-findings or
 production acceptance. Two isolated native writers supplied disjoint helper and coupled
 bus/resolver handoffs. The parent preserved their actual diffs, native receipts and logs,
-then integrated and strengthened them; the next independent verdict remains separate.
+then integrated and strengthened them. That round's follow-up verdict is recorded in
+the next section; none of these local verdicts is production acceptance.
 
 - **N1, non-resolver quarantine waiters:** `tests/qa_review5_bus.rs` requires owned-run
   participant and delivery-shortfall quarantines to resolve exact-run and correctly bound
@@ -275,9 +282,10 @@ along with native transcript/events and the disclosed overwritten attempt log.
 Pending retry does not certify a crash-safe fence before its append succeeds, nor flush
 on release. Unrepresented/sticky uncertainty remains conservative and may not fit retry
 tracking. Application-held evidence, audited reconciliation, external idempotency and
-irreducible retention/capacity costs remain explicit operational limits. Fresh SHA-bound
-parent gates and the same retained reviewer's committed-tree recommendation—not writer
-self-checks or this ledger—determine local remediation acceptance.
+irreducible retention/capacity costs remain explicit operational limits. At the time,
+fresh SHA-bound parent gates and the retained reviewer's committed-tree
+recommendation—not writer self-checks or this ledger—determined local remediation
+acceptance.
 
 ## Re-challenge of `5bd6816`: final observations
 
@@ -312,7 +320,28 @@ quarantine draft also reached the existing capacity-generated reply path; that d
 failure is preserved but is not accepted O1 RED. Native `checked` authoring evidence,
 parent verification, the new committed-tree recommendation and production certification
 remain separate boundaries. No failed aggregate or historical count substitutes for
-fresh SHA-bound gates or the retained reviewer's next challenge.
+fresh SHA-bound gates or a further independent challenge.
+
+## Follow-up `5af675f` (PR #55): resource lifecycle coverage
+
+A later merged fix remediated actor resource leaks in bus drop, LMDB environments,
+subscriptions and resolver lifecycle. It is outside the thirteen-observation audit;
+its regressions are:
+
+- Bus drop from inside an actor releases bus resources without deadlock:
+  `tests/bus_drop_deadlock.rs::dropping_last_bus_clone_from_actor_releases_bus_resources`.
+- Resolver detach/reattach and fail-closed starts while detached:
+  `bus::tests::detach_then_reattach_restores_resolver_processing` and
+  `bus::tests::detached_durable_resolver_rejects_starts_until_recovery_is_reactivated`
+  (unit tests in `src/bus.rs`).
+- Resolver ingest saturation is not miscounted as delivery:
+  `bus::tests::ingest_burst_never_counts_dropped_events_as_delivered`.
+- LMDB environments close only on last same-path drop, with rows preserved across
+  reopen: the `lmdb_envs_close_on_drop_*` / `lmdb_journal_and_dedupe_*drop*` tests in
+  `tests/durability_lmdb_integration.rs` and the `resolver_journal_*` unit tests in
+  `src/resolver_journal.rs`.
+- Testkit participant shutdown unsubscribes from the bus:
+  `tests/saga_testkit_smoke.rs::participant_shutdown_unsubscribes_from_bus`.
 
 ## Evidence and limits
 
@@ -321,14 +350,17 @@ added separate RED logs for compaction quarantine retention, partial starts, lat
 boundaries, typed result evidence, storage-error visibility, active bus ownership,
 ingress-driven activation, workflow legacy ordering and lifecycle release.
 
-The parent runs authoritative default/all-feature debug, all-feature release, both Clippy
-configurations with `-D warnings`, formatting, rustdoc with `-D warnings` and diff hygiene.
-Local artifacts/logs are under `/tmp/saga-remediation-20261002/`; the parent checkpoint
-binds their results to the integrated commit. Exactly one fresh serial native independent
-reviewer owns the review; subsequent challenges resume that same reviewer against verified
-commits, not worker assertions. No push, PR, deployment or
-main-branch merge is part of this task. The plan's unavailable document-review mechanism
-did not run and is not represented as an independent code review.
+For the integrated change set, the parent ran authoritative default/all-feature debug,
+all-feature release, both Clippy configurations with `-D warnings`, formatting, rustdoc
+with `-D warnings` and diff hygiene. Those runs happened outside this repository:
+the artifacts/logs were kept under `/tmp/saga-remediation-20261002/` and the log names
+cited above are not files in this repository, so they cannot be re-verified from the
+repo alone; the tests cited by path are the in-repository evidence. One serial native
+independent reviewer owned the review rounds recorded above against verified commits,
+not worker assertions. The change set has since been pushed and merged to `main` via
+PR #54 (with PR #55 as a follow-up), which supersedes the original task's no-push/
+no-merge boundary. The plan's unavailable document-review mechanism did not run and
+is not represented as an independent code review.
 
 Breaking changes and the release prerequisite (no version bump here) are in
 [migration.md](migration.md). Review follow-ups are not claimed fixed by documentation;

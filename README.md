@@ -26,12 +26,14 @@ shortfall quarantines because some owners may already have received the start.
 
 ## Minimal Startup Example
 
+This example uses `LmdbTerminalResolverJournal`, which requires the crate's
+`lmdb` Cargo feature (`features = ["lmdb"]` on the dependency).
+
 ```rust,no_run
 use std::path::Path;
 use std::sync::Arc;
 use icanact_saga_choreography::{
-    define_saga_workflow_contract, LmdbTerminalResolverJournal, SagaChoreographyBus,
-    SagaWorkflowContract,
+    LmdbTerminalResolverJournal, SagaChoreographyBus, define_saga_workflow_contract,
 };
 
 fn main() -> Result<(), String> {
@@ -72,8 +74,13 @@ Ok(())
 The non-durable `attach_terminal_resolver*` methods are for isolated tests only. A
 process-restart-capable deployment must use a durable resolver journal so recovery can
 reconstruct compensation ownership across all participants.
-Activation is deliberately separate from attachment: call it only after every participant
-binding is live, so recovered compensation requests cannot be lost during startup.
+Activation is deliberately separate from attachment for durable resolvers: call it only
+after every participant binding is live, so recovered compensation requests cannot be
+lost during startup. Non-durable attachment starts out activated (there is no durable
+history to hold). Use `detach_terminal_resolver` as the supported resolver removal
+path: it stops the resolver and its watchdog, does not resolve waiters, and new starts
+for the saga type fail closed until a replacement is attached (and, for durable
+resolvers, recovery is activated).
 
 Startup order is: attach resolver -> bind/hydrate participants -> activate recovery -> accept
 new starts. Terminal and quarantine state is durably fenced so restarts do not repeat
@@ -99,7 +106,7 @@ use stable external idempotency keys and reconciliation. See
 - Obtain `bus.release_waiter()` before dropping public bus owners. Its
   `wait_timeout(Duration)` observes actual bus-owned resource destruction; wait only
   off-actor/off-callback. It neither cancels work nor closes application-owned journal clones.
-- Drain all in-flight sagas before upgrading from baseline; see
+- Drain all in-flight sagas before upgrading from the pre-remediation baseline; see
   [docs/migration.md](docs/migration.md). No repair/safe-clear API exists.
 
 ## Timeout Semantics
@@ -113,6 +120,11 @@ use stable external idempotency keys and reconciliation. See
 
 - Unit/integration: `cargo test`
 - Harness-enabled e2e: `cargo test --features test-harness`
+- LMDB durability integration: `cargo test --features lmdb`
+- Everything: `cargo test --features lmdb,test-harness`
+
+Markdown examples (including the one above) are not compiled by `cargo test`;
+only the rustdoc examples in `src/` run as doctests.
 
 ## Docs
 
