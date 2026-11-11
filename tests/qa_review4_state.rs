@@ -3,24 +3,18 @@
 //! `forward_definitively_rejected` marker.
 use icanact_saga_choreography::*;
 
-type Journal = InMemoryJournal;
-
-struct Actor(SagaParticipantSupport<Journal, InMemoryDedupe>);
+struct Actor(SagaParticipantSupport<InMemoryParticipantStore>);
 impl HasSagaParticipantSupport for Actor {
-    type Journal = Journal;
-    type Dedupe = InMemoryDedupe;
-    fn saga_support(&self) -> &SagaParticipantSupport<Journal, InMemoryDedupe> {
+    type Store = InMemoryParticipantStore;
+    fn saga_support(&self) -> &SagaParticipantSupport<InMemoryParticipantStore> {
         &self.0
     }
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Journal, InMemoryDedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<InMemoryParticipantStore> {
         &mut self.0
     }
 }
 fn actor() -> Actor {
-    Actor(SagaParticipantSupport::new(
-        InMemoryJournal::new(),
-        InMemoryDedupe::new(),
-    ))
+    Actor(SagaParticipantSupport::new(InMemoryParticipantStore::new()))
 }
 fn ctx_of(id: u64, ty: &str, start: u64) -> SagaContext {
     SagaContext {

@@ -1356,13 +1356,13 @@ impl TerminalResolverActor {
             .recovery_events
             .iter()
             .filter(|event| matches!(event, SagaChoreographyEvent::SagaQuarantined { .. }))
-            .map(|event| event.context().clone())
+            .cloned()
             .collect();
-        for context in derived {
-            self.fence_live(&context);
+        for event in &derived {
+            self.fence_live(event.context());
         }
         let mut oldest: HashMap<SagaId, &SagaChoreographyEvent> = HashMap::new();
-        for event in history {
+        for event in history.iter().chain(&derived) {
             if !matches!(event, SagaChoreographyEvent::SagaQuarantined { .. })
                 || self.gate.phase(event.context()) != Some(RunPhase::Quarantined)
             {
@@ -1497,6 +1497,11 @@ impl SyncActor for TerminalResolverActor {
                     matches!(*event, SagaChoreographyEvent::SagaQuarantined { .. })
                         && self.gate.known_run(event.context());
                 self.ingest_event(&event);
+                // Ingress may create pending durable work after publication's
+                // earlier wake, including an activation output append failure.
+                if let Some(inner) = self.bus.upgrade() {
+                    SagaChoreographyBus { inner }.notify_watchdog();
+                }
                 if known_quarantine {
                     if self.activated {
                         if let Some(inner) = self.bus.upgrade() {
@@ -1519,6 +1524,29 @@ impl SyncActor for TerminalResolverActor {
                 self.activated = true;
                 let mut pending = std::mem::take(&mut self.recovery_events);
                 pending.append(&mut self.held_events);
+                // Exact quarantine outputs now own persistence through ingress.
+                // An already-queued watchdog poll must not append a generic
+                // fence before their loopback. Failed delivery or append will
+                // re-enqueue the retry without weakening the live run fence.
+                let handed_off: HashSet<_> = pending
+                    .iter()
+                    .filter(|event| matches!(event, SagaChoreographyEvent::SagaQuarantined { .. }))
+                    .map(|event| {
+                        (
+                            event.context().saga_id,
+                            event.context().saga_started_at_millis,
+                        )
+                    })
+                    .collect();
+                {
+                    let mut index = self.gate.index();
+                    index.pending_durable_quarantine.retain(|context| {
+                        !handed_off.contains(&(context.saga_id, context.saga_started_at_millis))
+                    });
+                    index
+                        .pending_fence_keys
+                        .retain(|key| !handed_off.contains(key));
+                }
                 self.publish_terminal_events(pending);
                 for event in std::mem::take(&mut self.held_quarantine_replies).into_values() {
                     if let Some(inner) = self.bus.upgrade() {
@@ -1529,7 +1557,9 @@ impl SyncActor for TerminalResolverActor {
                 return;
             }
             TerminalResolverTell::PollTimeouts => {
-                self.retry_pending_fences();
+                if self.activated && self.gate.activated.load(Ordering::Acquire) {
+                    self.retry_pending_fences();
+                }
                 self.resolver.poll_timeouts()
             }
         };
@@ -1885,7 +1915,10 @@ impl SagaChoreographyBus {
                             .values()
                             .filter(|r| {
                                 let index = r.gate.index();
-                                !index.pending_durable_quarantine.is_empty()
+                                // The queue may be transiently empty while its
+                                // last fence append is in flight. Retry identity
+                                // remains live until that append succeeds.
+                                !index.pending_fence_keys.is_empty()
                                     || index.ids.values().any(|id| {
                                         id.runs.iter().any(|run| run.phase == RunPhase::Active)
                                     })
@@ -2579,7 +2612,23 @@ impl SagaChoreographyBus {
                     entries.push(entry.clone());
                     Ok(())
                 }) {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        if journal.supports_saga_lookup() {
+                            // Load closed siblings only for IDs with unresolved
+                            // evidence, so old quarantines can fence successors
+                            // without scanning cleanly resolved IDs at attach.
+                            let ids: std::collections::BTreeSet<_> = entries
+                                .iter()
+                                .map(|entry| entry.event.context().saga_id)
+                                .collect();
+                            let row_budget = limits.max_ids.saturating_add(limits.max_fingerprints);
+                            for saga_id in ids {
+                                entries.extend(journal.read_saga_bounded(saga_id, row_budget).map_err(
+                                    |error| format!("terminal resolver recovery lookup failed saga_id={saga_id}: {error}"),
+                                )?);
+                            }
+                        }
+                    }
                     Err(crate::TerminalResolverJournalError::Unsupported(_)) => {
                         // Compatibility for append/read_all-only custom journals.
                         // Discard any partial visit before taking the legacy path.
@@ -2600,6 +2649,7 @@ impl SagaChoreographyBus {
                 // Stores may stream in run-index order; cross-run quarantine
                 // reconstruction requires the original durable sequence order.
                 entries.sort_by_key(|entry| entry.sequence);
+                entries.dedup_by_key(|entry| entry.sequence);
                 let mut events = Vec::with_capacity(entries.len());
                 for entry in entries {
                     if entry.event.context().saga_type.as_ref() != policy.saga_type.as_ref() {
@@ -2612,8 +2662,8 @@ impl SagaChoreographyBus {
                     }
                     events.push(entry.event);
                 }
-                // Only unresolved/quarantined evidence is resident for streaming
-                // stores. Closed fences are loaded by bounded per-saga lookup.
+                // Streaming stores retain unresolved/quarantined IDs and their
+                // bounded sibling history. Unrelated closed IDs stay unloaded.
                 let admission = AdmissionIndex::from_events(
                     limits,
                     journal.supports_saga_lookup(),
@@ -2714,6 +2764,7 @@ impl SagaChoreographyBus {
                     .insert(saga_type_topic.clone(), policy.policy_id.clone());
                 state.detached.remove(saga_type_topic.as_ref());
                 state.runtimes.insert(saga_type_topic.clone(), runtime);
+                self.notify_watchdog();
                 None
             }
         };
@@ -2769,6 +2820,7 @@ impl SagaChoreographyBus {
             .tell(TerminalResolverTell::ActivateRecovery)
         {
             runtime.gate.activated.store(true, Ordering::Release);
+            self.notify_watchdog();
             Ok(())
         } else {
             Err(format!(

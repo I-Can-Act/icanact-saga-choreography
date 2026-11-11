@@ -61,7 +61,7 @@ fn tamper_rows(
 ) {
     let env = unsafe {
         EnvOpenOptions::new()
-            .max_dbs(4)
+            .max_dbs(16)
             .map_size(map_size)
             .open(path)
     }
@@ -111,9 +111,15 @@ fn corrupted_rows_remain_errors() {
         let journal = LmdbTerminalResolverJournal::open(dir.path()).unwrap();
         journal.append(started(1, "a", 1, 3)).unwrap();
         journal.append(started(2, "a", 1, 4)).unwrap();
+        journal.append(completed(2, "a", 1)).unwrap();
         drop(journal);
-        tamper_rows(dir.path(), 256 * 1024 * 1024, |rows, wtxn| {
-            let key = format!("{:020}", 2);
+        tamper_rows(dir.path(), 1024 * 1024 * 1024, |rows, wtxn| {
+            let key = rows
+                .iter(wtxn)
+                .unwrap()
+                .map(|row| row.unwrap().0.to_owned())
+                .find(|key| key.ends_with(&format!(":{:020}", 2)))
+                .unwrap();
             let original = rows.get(wtxn, &key).unwrap().unwrap().to_vec();
             rows.put(wtxn, &key, &corrupt(&original)).unwrap();
         });
@@ -145,7 +151,7 @@ fn compaction_keeps_unresolved_runs_and_terminal_fences() {
 
     let removed = journal.compact_terminal_detail().unwrap();
     assert_eq!(
-        removed, 2,
+        removed, 1,
         "quarantined runs are unresolved: all their evidence must remain"
     );
 
@@ -174,14 +180,24 @@ fn compaction_keeps_unresolved_runs_and_terminal_fences() {
 
 #[test]
 fn custom_journals_report_unsupported_maintenance() {
-    let journal = InMemoryTerminalResolverJournal::default();
-    journal.append(completed(1, "a", 1)).unwrap();
+    struct Custom;
+    impl TerminalResolverJournal for Custom {
+        fn append(&self, _: SagaChoreographyEvent) -> Result<u64, TerminalResolverJournalError> {
+            Ok(1)
+        }
+        fn read_all(
+            &self,
+        ) -> Result<Vec<TerminalResolverJournalEntry>, TerminalResolverJournalError> {
+            Ok(Vec::new())
+        }
+    }
+    let journal = Custom;
     let result = journal.compact_terminal_detail();
     assert!(
         matches!(result, Err(TerminalResolverJournalError::Unsupported(_))),
         "{result:?}"
     );
-    assert_eq!(journal.read_all().unwrap().len(), 1);
+    assert!(journal.read_all().unwrap().is_empty());
 }
 
 #[test]
@@ -241,11 +257,11 @@ fn in_memory_journal_reads_one_saga_in_sequence_order() {
     journal.append(completed(1, "a", 1)).unwrap(); // 3
     assert_eq!(
         sequences(&journal.read_saga(SagaId::new(1)).unwrap()),
-        vec![0, 2, 3]
+        vec![1, 3, 4]
     );
     assert_eq!(
         sequences(&journal.read_saga(SagaId::new(2)).unwrap()),
-        vec![1]
+        vec![2]
     );
     assert!(journal.read_saga(SagaId::new(3)).unwrap().is_empty());
 }
@@ -301,59 +317,60 @@ fn lmdb_per_saga_lookup_is_bounded_ordered_and_survives_reopen() {
 }
 
 #[test]
-fn lmdb_schema_one_journal_is_backfilled_transactionally_on_open() {
-    let dir = tempfile::tempdir().unwrap();
-    {
-        let journal = LmdbTerminalResolverJournal::open(dir.path()).unwrap();
-        journal.append(started(7, "a", 1, 1)).unwrap();
-        journal.append(started(8, "a", 1, 1)).unwrap();
-        journal.append(completed(7, "a", 1)).unwrap();
-    }
-    // Rewind to the pre-index schema: version 1 and no index rows.
-    let env = unsafe {
-        EnvOpenOptions::new()
-            .max_dbs(4)
-            .map_size(256 * 1024 * 1024)
-            .open(dir.path())
-    }
-    .unwrap();
-    let mut wtxn = env.write_txn().unwrap();
-    let meta = env
-        .open_database::<Str, Str>(&wtxn, Some("resolver_meta"))
-        .unwrap()
+fn lmdb_old_or_unversioned_schema_is_rejected_without_relabeling_rows() {
+    for version in [Some("1"), Some("2"), None] {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let journal = LmdbTerminalResolverJournal::open(dir.path()).unwrap();
+            journal.append(started(7, "a", 1, 1)).unwrap();
+        }
+        let env = unsafe {
+            EnvOpenOptions::new()
+                .max_dbs(16)
+                .map_size(1024 * 1024 * 1024)
+                .open(dir.path())
+        }
         .unwrap();
-    meta.put(&mut wtxn, "schema_version", "1").unwrap();
-    if let Some(index) = env
-        .open_database::<Str, Bytes>(&wtxn, Some("resolver_saga_index"))
-        .unwrap()
-    {
-        index.clear(&mut wtxn).unwrap();
+        let mut txn = env.write_txn().unwrap();
+        let meta = env
+            .open_database::<Str, Str>(&txn, Some("meta"))
+            .unwrap()
+            .unwrap();
+        let rows = env
+            .open_database::<Str, Bytes>(&txn, Some("resolver_events"))
+            .unwrap()
+            .unwrap();
+        let before: Vec<_> = rows
+            .iter(&txn)
+            .unwrap()
+            .map(|row| {
+                let (key, value) = row.unwrap();
+                (key.to_owned(), value.to_vec())
+            })
+            .collect();
+        match version {
+            Some(version) => meta.put(&mut txn, "schema_version", version).unwrap(),
+            None => {
+                meta.delete(&mut txn, "schema_version").unwrap();
+            }
+        }
+        txn.commit().unwrap();
+        assert!(LmdbTerminalResolverJournal::open(dir.path()).is_err());
+        let txn = env.read_txn().unwrap();
+        assert_eq!(meta.get(&txn, "schema_version").unwrap(), version);
+        let after: Vec<_> = rows
+            .iter(&txn)
+            .unwrap()
+            .map(|row| {
+                let (key, value) = row.unwrap();
+                (key.to_owned(), value.to_vec())
+            })
+            .collect();
+        assert_eq!(
+            before, after,
+            "failed open must not rewrite old recovery evidence"
+        );
     }
-    wtxn.commit().unwrap();
-    drop(env);
-
-    let journal = LmdbTerminalResolverJournal::open(dir.path()).unwrap();
-    assert_eq!(
-        sequences(&journal.read_saga(SagaId::new(7)).unwrap()),
-        vec![1, 3]
-    );
-    assert_eq!(
-        sequences(&journal.read_saga(SagaId::new(8)).unwrap()),
-        vec![2]
-    );
-    // Appends after the migration stay indexed.
-    journal.append(step(8, "a", 1)).unwrap();
-    assert_eq!(
-        sequences(&journal.read_saga(SagaId::new(8)).unwrap()),
-        vec![2, 4]
-    );
-    drop(journal);
-    // The migrated store is now a current-schema store that reopens unchanged.
-    let reopened = LmdbTerminalResolverJournal::open(dir.path()).unwrap();
-    assert_eq!(
-        sequences(&reopened.read_saga(SagaId::new(8)).unwrap()),
-        vec![2, 4]
-    );
 }
 
 #[test]
@@ -369,7 +386,7 @@ fn lmdb_compaction_keeps_lookup_consistent_and_retains_failed_run_effect_fingerp
     journal.append(effect(2, "a", 10, 6)).unwrap(); // 6
     journal.append(failed(2, "a", 10)).unwrap(); // 7
 
-    assert_eq!(journal.compact_terminal_detail().unwrap(), 4);
+    assert_eq!(journal.compact_terminal_detail().unwrap(), 2);
     let kept = |id| sequences(&journal.read_saga(SagaId::new(id)).unwrap());
     assert_eq!(kept(1), vec![3], "only the completion fence remains");
     assert_eq!(
@@ -440,4 +457,93 @@ fn lmdb_failed_append_leaves_rows_and_lookup_index_consistent() {
             "index and rows must commit or fail together (id {id})"
         );
     }
+}
+
+#[test]
+fn indexed_streaming_compaction_and_explicit_pruning_preserve_protected_runs() {
+    let memory = InMemoryTerminalResolverJournal::default();
+    let dir = tempfile::tempdir().unwrap();
+    let lmdb = LmdbTerminalResolverJournal::open(dir.path()).unwrap();
+    for journal in [&memory as &dyn TerminalResolverJournal, &lmdb] {
+        journal.append(started(1, "a", 10, 1)).unwrap();
+        journal.append(completed(1, "a", 10)).unwrap();
+        journal.append(started(2, "a", 10, 1)).unwrap();
+        journal.append(effect(2, "a", 10, 2)).unwrap();
+        journal.append(failed(2, "a", 10)).unwrap();
+        journal.append(started(3, "a", 10, 1)).unwrap();
+        journal.append(started(4, "a", 10, 1)).unwrap();
+        journal.append(quarantined(4, "a", 10)).unwrap();
+        let protected = || {
+            let mut rows = Vec::new();
+            journal
+                .visit_unresolved_runs(&mut |entry| {
+                    rows.push(entry.sequence);
+                    Ok(())
+                })
+                .unwrap();
+            rows.sort_unstable();
+            rows
+        };
+        assert_eq!(protected(), vec![6, 7, 8]);
+        assert_eq!(journal.compact_terminal_detail_batched(0).unwrap(), 0);
+        assert_eq!(journal.compact_terminal_detail_batched(1).unwrap(), 1);
+        assert_eq!(journal.compact_terminal_detail_batched(1).unwrap(), 1);
+        assert_eq!(journal.compact_terminal_detail_batched(1).unwrap(), 0);
+        assert_eq!(
+            sequences(&journal.read_saga(SagaId::new(1)).unwrap()),
+            vec![2]
+        );
+        assert_eq!(
+            sequences(&journal.read_saga(SagaId::new(2)).unwrap()),
+            vec![4, 5]
+        );
+        assert_eq!(protected(), vec![6, 7, 8]);
+        // The strict cutoff excludes equal timestamps; zero batches do nothing.
+        assert_eq!(journal.prune_resolved_before(10, 1).unwrap(), 0);
+        assert_eq!(journal.prune_resolved_before(11, 0).unwrap(), 0);
+        assert_eq!(journal.prune_resolved_before(11, 1).unwrap(), 1);
+        assert_eq!(journal.prune_resolved_before(11, 1).unwrap(), 1);
+        assert_eq!(journal.prune_resolved_before(u64::MAX, 256).unwrap(), 0);
+        assert_eq!(sequences(&journal.read_all().unwrap()), vec![6, 7, 8]);
+        assert_eq!(
+            protected(),
+            vec![6, 7, 8],
+            "active and quarantine never pruned"
+        );
+        assert_eq!(journal.append(started(5, "a", 20, 1)).unwrap(), 9);
+    }
+    drop(lmdb);
+    let reopened = LmdbTerminalResolverJournal::open(dir.path()).unwrap();
+    assert_eq!(sequences(&reopened.read_all().unwrap()), vec![6, 7, 8, 9]);
+}
+
+#[test]
+fn resolver_and_participant_namespaces_share_one_schema_three_environment() {
+    use icanact_saga_choreography::{LmdbParticipantStore, ParticipantEvent, ParticipantStore};
+    let dir = tempfile::tempdir().unwrap();
+    let participant = LmdbParticipantStore::open(dir.path(), "worker").unwrap();
+    let other = LmdbParticipantStore::open(dir.path(), "other").unwrap();
+    let resolver = LmdbTerminalResolverJournal::open(dir.path()).unwrap();
+    let event = ParticipantEvent::StepExecutionStarted {
+        attempt: 1,
+        started_at_millis: 10,
+    };
+    assert_eq!(
+        participant.append(SagaId::new(1), event.clone()).unwrap(),
+        1
+    );
+    assert_eq!(other.append(SagaId::new(1), event).unwrap(), 1);
+    assert_eq!(resolver.append(started(1, "a", 10, 1)).unwrap(), 1);
+    // Closing one owner must not poison the other live owners of this base.
+    drop(participant);
+    assert_eq!(resolver.append(step(1, "a", 10)).unwrap(), 2);
+    assert_eq!(other.read(SagaId::new(1)).unwrap().len(), 1);
+    drop(other);
+    drop(resolver);
+    let resolver = LmdbTerminalResolverJournal::open(dir.path()).unwrap();
+    let participant = LmdbParticipantStore::open(dir.path(), "worker").unwrap();
+    assert_eq!(participant.read(SagaId::new(1)).unwrap().len(), 1);
+    assert_eq!(sequences(&resolver.read_all().unwrap()), vec![1, 2]);
+    assert!(!dir.path().join("journal").exists());
+    assert!(!dir.path().join("dedupe").exists());
 }

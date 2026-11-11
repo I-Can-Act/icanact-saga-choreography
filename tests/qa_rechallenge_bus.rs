@@ -161,7 +161,7 @@ fn bus_for<C: SagaWorkflowContract>(
     let bus = SagaChoreographyBus::new();
     bus.register_workflow_contract_provider::<C>().unwrap();
     for step in C::steps() {
-        bus.register_bound_workflow_step(C::saga_type(), step.step_name)
+        bus.subscribe_workflow_step_fn(C::saga_type(), step.step_name, |_| true)
             .unwrap();
     }
     let seen: Seen = Arc::default();
@@ -170,7 +170,7 @@ fn bus_for<C: SagaWorkflowContract>(
         sink.lock().unwrap().push(event.clone());
         true
     });
-    // Required-path delivery needs more subscribers than the capture sink.
+    // Additional untagged observers supply diagnostics, not role coverage.
     for _ in 0..3 {
         bus.subscribe_saga_type_fn(C::saga_type(), |_| true);
     }
@@ -377,7 +377,7 @@ fn legacy_waiter_does_not_choose_between_multiple_active_runs_or_stale_history()
         .unwrap();
     for ty in ["qa_rc_owner_one", "qa_rc_owner_two"] {
         for step in ["a", "b"] {
-            bus.register_bound_workflow_step(ty, step).unwrap();
+            bus.subscribe_workflow_step_fn(ty, step, |_| true).unwrap();
         }
         for _ in 0..3 {
             bus.subscribe_saga_type_fn(ty, |_| true);
@@ -529,5 +529,120 @@ mod lmdb {
                 .iter()
                 .any(|entry| is_quarantined(&entry.event))
         );
+    }
+}
+
+contract!(
+    BooleanBranchContract,
+    "qa_rc_boolean",
+    SuccessCriteria::AllOf(set(&["finish"])),
+    [
+        ("a", WorkflowDependencySpec::OnSagaStart),
+        ("b", WorkflowDependencySpec::OnSagaStart),
+        ("finish", WorkflowDependencySpec::AnyOf(&["a", "b"]))
+    ]
+);
+
+#[test]
+fn anyof_dependency_completes_with_one_live_branch_and_a_dead_observer() {
+    for live in ["a", "b"] {
+        let bus = SagaChoreographyBus::new();
+        bus.register_workflow_contract_provider::<BooleanBranchContract>()
+            .unwrap();
+        bus.attach_terminal_resolver_for_contract::<BooleanBranchContract>("qa")
+            .unwrap();
+        for step in [live, "finish"] {
+            bus.subscribe_workflow_step_fn(BooleanBranchContract::saga_type(), step, |_| true)
+                .unwrap();
+        }
+        // Untagged observer failures are diagnostics, never workflow obligations.
+        bus.subscribe_saga_type_fn(BooleanBranchContract::saga_type(), |_| false);
+        let ctx = context_for(
+            BooleanBranchContract::saga_type(),
+            9_001,
+            "a",
+            SagaContext::now_millis(),
+        );
+        bus.publish_strict(started(&ctx)).unwrap();
+        bus.publish_strict(step_completed(&ctx, live, false))
+            .unwrap();
+        bus.publish_strict(step_completed(&ctx, "finish", false))
+            .unwrap();
+        assert!(wait_until(Duration::from_secs(2), || matches!(
+            bus.take_terminal_outcome_for_run(&ctx),
+            Some(SagaTerminalOutcome::Completed { .. })
+        )));
+    }
+}
+
+#[test]
+fn anyof_dependency_without_a_live_branch_cannot_be_masked_by_observers() {
+    let bus = SagaChoreographyBus::new();
+    bus.register_workflow_contract_provider::<BooleanBranchContract>()
+        .unwrap();
+    bus.attach_terminal_resolver_for_contract::<BooleanBranchContract>("qa")
+        .unwrap();
+    bus.subscribe_workflow_step_fn(BooleanBranchContract::saga_type(), "finish", |_| true)
+        .unwrap();
+    for _ in 0..8 {
+        bus.subscribe_saga_type_fn(BooleanBranchContract::saga_type(), |_| true);
+    }
+    let ctx = context_for(
+        BooleanBranchContract::saga_type(),
+        9_002,
+        "a",
+        SagaContext::now_millis(),
+    );
+    assert!(matches!(
+        bus.publish_strict(started(&ctx)),
+        Err(SagaBusPublishError::AdmissionRejected { .. })
+    ));
+    assert!(matches!(
+        bus.take_terminal_outcome_for_run(&ctx),
+        Some(SagaTerminalOutcome::Failed { .. })
+    ));
+}
+
+#[test]
+fn anyof_delivery_receipts_require_at_least_one_successful_branch() {
+    for live in [true, false] {
+        let bus = SagaChoreographyBus::new();
+        bus.register_workflow_contract_provider::<BooleanBranchContract>()
+            .unwrap();
+        bus.attach_terminal_resolver_for_contract::<BooleanBranchContract>("qa")
+            .unwrap();
+        for (step, delivered) in [("a", live), ("b", false), ("finish", true)] {
+            bus.subscribe_workflow_step_fn(BooleanBranchContract::saga_type(), step, move |_| {
+                delivered
+            })
+            .unwrap();
+        }
+        let ctx = context_for(
+            BooleanBranchContract::saga_type(),
+            9_003,
+            "a",
+            SagaContext::now_millis(),
+        );
+        let result = bus.publish_strict(started(&ctx));
+        if live {
+            result.unwrap();
+            bus.publish_strict(step_completed(&ctx, "a", false))
+                .unwrap();
+            bus.publish_strict(step_completed(&ctx, "finish", false))
+                .unwrap();
+            assert!(wait_until(Duration::from_secs(2), || matches!(
+                bus.take_terminal_outcome_for_run(&ctx),
+                Some(SagaTerminalOutcome::Completed { .. })
+            )));
+        } else {
+            assert!(matches!(
+                result,
+                Err(SagaBusPublishError::RequiredPathDeliveryShortfall { .. })
+            ));
+            assert!(matches!(
+                bus.take_terminal_outcome_for_run(&ctx),
+                Some(SagaTerminalOutcome::Quarantined { .. })
+            ));
+        }
     }
 }

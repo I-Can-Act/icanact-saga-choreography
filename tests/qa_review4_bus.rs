@@ -144,7 +144,7 @@ mod lmdb {
         let bus = SagaChoreographyBus::new();
         bus.register_workflow_contract_provider::<C>().unwrap();
         for step in C::steps() {
-            bus.register_bound_workflow_step(C::saga_type(), step.step_name)
+            bus.subscribe_workflow_step_fn(C::saga_type(), step.step_name, |_| true)
                 .unwrap();
         }
         let seen: Seen = Arc::default();

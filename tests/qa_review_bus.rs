@@ -92,15 +92,15 @@ fn prepared_bus() -> (SagaChoreographyBus, Seen) {
     let bus = SagaChoreographyBus::new();
     bus.register_workflow_contract_provider::<ReviewContract>()
         .unwrap();
-    bus.register_bound_workflow_step(TYPE, "a").unwrap();
-    bus.register_bound_workflow_step(TYPE, "b").unwrap();
+    bus.subscribe_workflow_step_fn(TYPE, "a", |_| true).unwrap();
+    bus.subscribe_workflow_step_fn(TYPE, "b", |_| true).unwrap();
     let seen: Seen = Arc::default();
     let sink = Arc::clone(&seen);
     bus.subscribe_saga_type_fn(TYPE, move |event| {
         sink.lock().unwrap().push(event.clone());
         true
     });
-    // Required-path delivery needs more subscribers than the capture sink.
+    // Additional untagged observers supply diagnostics, not role coverage.
     for _ in 0..2 {
         bus.subscribe_saga_type_fn(TYPE, |_| true);
     }
@@ -162,6 +162,7 @@ enum ProbeMsg {
         context: Option<SagaContext>,
         saga_id: SagaId,
         reply: SagaReplyToHandle,
+        registered: mpsc::Sender<()>,
     },
 }
 
@@ -180,19 +181,23 @@ fn waiter(
             context,
             saga_id,
             reply,
+            registered,
         } => {
             let _ = match context {
                 Some(context) => bus.register_terminal_reply_for_run(&context, reply),
                 None => bus.register_terminal_reply(saga_id, reply),
             };
+            registered.send(()).unwrap();
         }
     });
+    let (registered, ready) = mpsc::channel();
     let pending = probe
         .ask_delegated(|reply| ProbeMsg::Register {
             bus: bus.clone(),
             context: context.cloned(),
             saga_id,
             reply,
+            registered,
         })
         .expect("waiter registered");
     let (tx, rx) = mpsc::channel();
@@ -200,8 +205,9 @@ fn waiter(
         let _keep = _handle;
         let _ = tx.send(pending.wait().map_err(|e| format!("{e:?}")));
     });
-    // Let the probe actor register before the caller proceeds.
-    std::thread::sleep(Duration::from_millis(50));
+    ready
+        .recv_timeout(Duration::from_secs(2))
+        .expect("registration acknowledged");
     rx
 }
 
@@ -751,4 +757,176 @@ fn ephemeral_resolver_also_serializes_concurrent_live_admission() {
         .count();
     assert_eq!(admitted, 1);
     assert_eq!(count(&seen, is_start), 1);
+}
+
+#[test]
+fn invalid_start_settles_both_preregistered_waiters_without_diagnostic_delivery() {
+    for invalid in [
+        "no resolver",
+        "no contract",
+        "wrong first step",
+        "missing role",
+    ] {
+        let bus = SagaChoreographyBus::new();
+        if invalid != "no contract" {
+            bus.register_workflow_contract_provider::<ReviewContract>()
+                .unwrap();
+        }
+        if invalid != "no resolver" {
+            bus.attach_terminal_resolver_for_contract::<ReviewContract>("qa")
+                .unwrap();
+        }
+        if invalid != "missing role" {
+            for step in ["a", "b"] {
+                bus.subscribe_workflow_step_fn(TYPE, step, |_| true)
+                    .unwrap();
+            }
+        }
+        // No diagnostic subscriber is capable of delivering a reply.
+        bus.subscribe_saga_type_fn(TYPE, |_| false);
+        let ctx = context_at(
+            9_100,
+            if invalid == "wrong first step" {
+                "b"
+            } else {
+                "a"
+            },
+            SagaContext::now_millis(),
+        );
+        let run = waiter(&bus, ctx.saga_id, Some(&ctx));
+        let legacy = waiter(&bus, ctx.saga_id, None);
+        assert!(bus.publish_strict(started(&ctx)).is_err(), "{invalid}");
+        for receiver in [&run, &legacy] {
+            assert!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap()
+                    .is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(
+            !bus.cancel_terminal_reply_for_run(&ctx),
+            "settled run waiter removed"
+        );
+        assert!(
+            !bus.cancel_terminal_reply(ctx.saga_id),
+            "settled id waiter removed"
+        );
+    }
+}
+
+#[test]
+fn waiter_ttl_expires_and_cancel_releases_both_registration_kinds() {
+    let bus = SagaChoreographyBus::with_waiter_ttl(Duration::from_millis(100));
+    let ctx = context_at(9_101, "a", SagaContext::now_millis());
+    let run = waiter(&bus, ctx.saga_id, Some(&ctx));
+    let legacy = waiter(&bus, ctx.saga_id, None);
+    // Expiry drops the delegated handle; it does not fabricate a saga failure.
+    assert!(run.recv_timeout(Duration::from_secs(2)).unwrap().is_err());
+    assert!(
+        legacy
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .is_err()
+    );
+    assert!(!bus.cancel_terminal_reply_for_run(&ctx));
+    assert!(!bus.cancel_terminal_reply(ctx.saga_id));
+    assert!(bus.take_terminal_outcome_for_run(&ctx).is_none());
+
+    // Expired registrations leave neither duplicate handles nor legacy floors.
+    let run = waiter(&bus, ctx.saga_id, Some(&ctx));
+    let legacy = waiter(&bus, ctx.saga_id, None);
+    assert!(bus.cancel_terminal_reply_for_run(&ctx));
+    assert!(bus.cancel_terminal_reply(ctx.saga_id));
+    assert!(run.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
+    assert!(
+        legacy
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .is_err()
+    );
+    assert!(!bus.cancel_terminal_reply_for_run(&ctx));
+    assert!(!bus.cancel_terminal_reply(ctx.saga_id));
+}
+
+#[test]
+fn ephemeral_bus_fifo_evicts_ordinary_runs_but_pins_active_and_quarantined() {
+    const CHILD: &str = "W3A_FIFO_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Environment-based admission limits are isolated from parallel tests.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ephemeral_bus_fifo_evicts_ordinary_runs_but_pins_active_and_quarantined",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("SAGA_ADMISSION_CAPACITY", "4")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let (bus, seen) = prepared_bus();
+    bus.attach_terminal_resolver_for_contract::<ReviewContract>("qa")
+        .unwrap();
+    let base = SagaContext::now_millis();
+    let contexts: Vec<_> = (0..5).map(|id| context_at(9_200 + id, "a", base)).collect();
+    let [active, quarantined, completed, failed, fresh] = contexts.as_slice() else {
+        unreachable!()
+    };
+    for ctx in [active, quarantined, completed, failed] {
+        bus.publish_strict(started(ctx)).unwrap();
+    }
+    bus.publish_strict(SagaChoreographyEvent::SagaQuarantined {
+        context: quarantined.clone(),
+        reason: "pinned".into(),
+        step: "a".into(),
+        participant_id: "a".into(),
+    })
+    .unwrap();
+    bus.publish_strict(SagaChoreographyEvent::SagaCompleted {
+        context: completed.clone(),
+    })
+    .unwrap();
+    bus.publish_strict(SagaChoreographyEvent::SagaFailed {
+        context: failed.clone(),
+        reason: "ordinary".into(),
+        failure: None,
+    })
+    .unwrap();
+    assert!(wait_until(Duration::from_secs(2), || bus
+        .publish_strict(started(fresh))
+        .is_ok()));
+    // The newer ordinary failure remains; only the oldest completion was evicted.
+    assert!(bus.publish_strict(started(failed)).is_err());
+    assert!(bus.publish_strict(started(completed)).is_ok());
+    // Re-admitting that evicted run consumes the slot of the ordinary failure.
+    assert!(
+        bus.publish_strict(started(failed)).is_err(),
+        "all slots are now protected"
+    );
+    for ctx in [active, quarantined] {
+        assert!(bus.publish_strict(started(ctx)).is_err());
+        let mut successor = ctx.clone();
+        successor.saga_started_at_millis += 1;
+        assert!(bus.publish_strict(started(&successor)).is_err());
+    }
+    assert_eq!(
+        count(&seen, |event| is_start(event)
+            && event.context().saga_id == completed.saga_id),
+        2
+    );
+    assert_eq!(
+        count(&seen, |event| is_start(event)
+            && event.context().saga_id == failed.saga_id),
+        1
+    );
 }

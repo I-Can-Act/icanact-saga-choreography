@@ -4,8 +4,8 @@ use std::path::Path;
 
 use heed::EnvOpenOptions;
 use heed::types::{Bytes, Str};
-use icanact_saga_choreography::durability::lmdb::LmdbJournal;
-use icanact_saga_choreography::{ParticipantEvent, ParticipantJournal, SagaId};
+use icanact_saga_choreography::LmdbParticipantStore;
+use icanact_saga_choreography::{ParticipantEvent, ParticipantStore, SagaId};
 
 fn event() -> ParticipantEvent {
     ParticipantEvent::StepExecutionStarted {
@@ -28,7 +28,7 @@ fn tamper_meta(
     .expect("raw env should open");
     let mut wtxn = env.write_txn().expect("write txn");
     let meta = env
-        .create_database::<Str, Str>(&mut wtxn, Some("journal_meta"))
+        .create_database::<Str, Str>(&mut wtxn, Some("meta"))
         .expect("meta db");
     edit(&meta, &mut wtxn);
     wtxn.commit().expect("commit");
@@ -38,7 +38,7 @@ fn tamper_meta(
 fn snapshot_rows(env: &heed::Env) -> Vec<(String, Vec<u8>)> {
     let mut wtxn = env.write_txn().expect("write txn");
     let rows = env
-        .create_database::<Str, Bytes>(&mut wtxn, Some("journal_rows"))
+        .create_database::<Str, Bytes>(&mut wtxn, Some("participant_events"))
         .expect("rows db");
     let out = rows
         .iter(&wtxn)
@@ -53,7 +53,7 @@ fn snapshot_rows(env: &heed::Env) -> Vec<(String, Vec<u8>)> {
 }
 
 fn seeded(path: &Path) {
-    let journal = LmdbJournal::open(path).expect("open");
+    let journal = LmdbParticipantStore::open(path, "worker").expect("open");
     let saga = SagaId::new(7);
     assert_eq!(journal.append(saga, event()).expect("append 1"), 1);
     assert_eq!(journal.append(saga, event()).expect("append 2"), 2);
@@ -67,19 +67,21 @@ fn journal_rejects_bad_sequence_metadata_without_overwriting_existing_row() {
         seeded(&path);
         let before = tamper_meta(&path, |meta, wtxn| match corruption {
             "missing" => {
-                meta.delete(wtxn, "next_sequence").expect("delete");
+                meta.delete(wtxn, "participant:776f726b6572:next_sequence")
+                    .expect("delete");
             }
-            _ => meta.put(wtxn, "next_sequence", "garbage").expect("put"),
+            _ => meta
+                .put(wtxn, "participant:776f726b6572:next_sequence", "garbage")
+                .expect("put"),
         });
         assert_eq!(before.len(), 2);
 
-        let journal = LmdbJournal::open(&path).expect("reopen");
-        let result = journal.append(SagaId::new(7), event());
+        let result = LmdbParticipantStore::open(&path, "worker")
+            .and_then(|journal| journal.append(SagaId::new(7), event()));
         assert!(
             result.is_err(),
             "{corruption}: append must fail, got {result:?}"
         );
-        drop(journal);
 
         let after = tamper_meta(&path, |_, _| {});
         assert_eq!(
@@ -95,11 +97,15 @@ fn journal_rejects_exhausted_sequence_space() {
     let path = temp.path().join("journal");
     seeded(&path);
     let before = tamper_meta(&path, |meta, wtxn| {
-        meta.put(wtxn, "next_sequence", &u64::MAX.to_string())
-            .expect("put")
+        meta.put(
+            wtxn,
+            "participant:776f726b6572:next_sequence",
+            &u64::MAX.to_string(),
+        )
+        .expect("put")
     });
 
-    let journal = LmdbJournal::open(&path).expect("reopen");
+    let journal = LmdbParticipantStore::open(&path, "worker").expect("reopen");
     let result = journal.append(SagaId::new(7), event());
     assert!(
         result.is_err(),
@@ -112,6 +118,6 @@ fn journal_rejects_exhausted_sequence_space() {
 #[test]
 fn fresh_empty_journal_starts_at_one() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let journal = LmdbJournal::open(&temp.path().join("journal")).expect("open");
+    let journal = LmdbParticipantStore::open(&temp.path().join("journal"), "worker").expect("open");
     assert_eq!(journal.append(SagaId::new(1), event()).expect("append"), 1);
 }
