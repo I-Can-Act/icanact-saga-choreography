@@ -13,44 +13,42 @@ use icanact_saga_choreography::{
     AcceptedCompensationCompletion, AcceptedCompensationFailure, AcceptedStepCompletion,
     AcceptedStepError, AcceptedStepFailure, AcceptedStepPolicy, AcceptedStepTimeoutOutcome,
     AcceptedWorkflowCompensation, CompensationError, CompensationOutput, DependencySpec,
-    FailureAuthority, HasSagaParticipantSupport, HasSagaWorkflowParticipants, InMemoryDedupe,
-    InMemoryJournal, ParticipantDedupeStore, ParticipantEvent, ParticipantJournal,
-    SagaChoreographyEvent, SagaContext, SagaId, SagaParticipant, SagaParticipantState,
-    SagaParticipantSupport, SagaStateEntry, SagaStateExt, SagaTerminalOutcome, SagaTestWorld,
-    SagaWorkflowParticipant, StepError, StepExecutionId, StepOutput, SuccessCriteria,
-    TerminalPolicy, TerminalResolver, accept_workflow_step as accept_workflow_step_with_state,
-    complete_accepted_workflow_step, fail_accepted_workflow_step, handle_saga_event_with_emit,
-    poll_accepted_workflow_step_timeouts, record_accepted_workflow_step_progress,
-    recover_accepted_workflow_steps_for_saga_type,
+    FailureAuthority, HasSagaParticipantSupport, HasSagaWorkflowParticipants,
+    InMemoryParticipantStore, ParticipantEvent, ParticipantStore, SagaChoreographyEvent,
+    SagaContext, SagaId, SagaParticipant, SagaParticipantState, SagaParticipantSupport,
+    SagaStateEntry, SagaStateExt, SagaTerminalOutcome, SagaTestWorld, SagaWorkflowParticipant,
+    StepError, StepExecutionId, StepOutput, SuccessCriteria, TerminalPolicy, TerminalResolver,
+    accept_workflow_step as accept_workflow_step_with_state, complete_accepted_workflow_step,
+    fail_accepted_workflow_step, handle_saga_event_with_emit, poll_accepted_workflow_step_timeouts,
+    record_accepted_workflow_step_progress, recover_accepted_workflow_steps_for_saga_type,
 };
 
 struct HarnessActor {
-    saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
+    saga: SagaParticipantSupport<InMemoryParticipantStore>,
 }
 
 impl Default for HarnessActor {
     fn default() -> Self {
         Self {
-            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+            saga: SagaParticipantSupport::new(InMemoryParticipantStore::new()),
         }
     }
 }
 
 impl HasSagaParticipantSupport for HarnessActor {
-    type Journal = InMemoryJournal;
-    type Dedupe = InMemoryDedupe;
+    type Store = InMemoryParticipantStore;
 
-    fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support(&self) -> &SagaParticipantSupport<Self::Store> {
         &self.saga
     }
 
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Store> {
         &mut self.saga
     }
 }
 
 struct DeferredWorkflowActor {
-    saga: SagaParticipantSupport<InMemoryJournal, InMemoryDedupe>,
+    saga: SagaParticipantSupport<InMemoryParticipantStore>,
     emitted: Vec<SagaChoreographyEvent>,
     compensation_completed_hooks: usize,
 }
@@ -58,7 +56,7 @@ struct DeferredWorkflowActor {
 impl Default for DeferredWorkflowActor {
     fn default() -> Self {
         Self {
-            saga: SagaParticipantSupport::new(InMemoryJournal::new(), InMemoryDedupe::new()),
+            saga: SagaParticipantSupport::new(InMemoryParticipantStore::new()),
             emitted: Vec::new(),
             compensation_completed_hooks: 0,
         }
@@ -66,14 +64,13 @@ impl Default for DeferredWorkflowActor {
 }
 
 impl HasSagaParticipantSupport for DeferredWorkflowActor {
-    type Journal = InMemoryJournal;
-    type Dedupe = InMemoryDedupe;
+    type Store = InMemoryParticipantStore;
 
-    fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support(&self) -> &SagaParticipantSupport<Self::Store> {
         &self.saga
     }
 
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Store> {
         &mut self.saga
     }
 }
@@ -151,22 +148,83 @@ impl HasSagaWorkflowParticipants for HarnessActor {
 }
 
 struct FailOnAppendJournal {
-    inner: InMemoryJournal,
+    inner: InMemoryParticipantStore,
     fail_on_append: usize,
     appends: AtomicUsize,
 }
 
 impl FailOnAppendJournal {
+    // Reserve a whole operation before mutation: an injected failure must never
+    // leave a partial batch or a dedupe marker without its execution intent.
+    fn check_appends(&self, count: usize) -> Result<(), icanact_saga_choreography::JournalError> {
+        let previous = self.appends.fetch_add(count, Ordering::SeqCst);
+        if previous < self.fail_on_append && self.fail_on_append <= previous + count {
+            return Err(icanact_saga_choreography::JournalError::Storage(
+                format!("forced append failure {}", self.fail_on_append).into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn new(fail_on_append: usize) -> Self {
         Self {
-            inner: InMemoryJournal::new(),
+            inner: InMemoryParticipantStore::new(),
             fail_on_append,
             appends: AtomicUsize::new(0),
         }
     }
 }
 
-impl ParticipantJournal for FailOnAppendJournal {
+impl ParticipantStore for FailOnAppendJournal {
+    fn check_and_mark(
+        &self,
+        id: SagaId,
+        key: &str,
+    ) -> Result<bool, icanact_saga_choreography::JournalError> {
+        self.inner.check_and_mark(id, key)
+    }
+    fn remove_processed(
+        &self,
+        id: SagaId,
+        key: &str,
+    ) -> Result<(), icanact_saga_choreography::JournalError> {
+        self.inner.remove_processed(id, key)
+    }
+    fn append_batch(
+        &self,
+        id: SagaId,
+        events: Vec<ParticipantEvent>,
+    ) -> Result<Vec<u64>, icanact_saga_choreography::JournalError> {
+        self.check_appends(events.len())?;
+        self.inner.append_batch(id, events)
+    }
+    fn admit_and_record_intent(
+        &self,
+        context: &SagaContext,
+        key: &str,
+        trigger: &str,
+    ) -> Result<icanact_saga_choreography::StoreAdmission, icanact_saga_choreography::JournalError>
+    {
+        self.check_appends(3)?;
+        self.inner.admit_and_record_intent(context, key, trigger)
+    }
+    fn unresolved_saga_ids(&self) -> Result<Vec<SagaId>, icanact_saga_choreography::JournalError> {
+        self.inner.unresolved_saga_ids()
+    }
+    fn compact_terminal_detail(
+        &self,
+        limit: usize,
+    ) -> Result<usize, icanact_saga_choreography::JournalError> {
+        self.inner.compact_terminal_detail(limit)
+    }
+    fn prune_resolved_before(
+        &self,
+        cutoff: u64,
+        limit: usize,
+    ) -> Result<usize, icanact_saga_choreography::JournalError> {
+        self.inner.prune_resolved_before(cutoff, limit)
+    }
+
     fn append(
         &self,
         saga_id: SagaId,
@@ -199,29 +257,25 @@ impl ParticipantJournal for FailOnAppendJournal {
 }
 
 struct FailingJournalActor {
-    saga: SagaParticipantSupport<FailOnAppendJournal, InMemoryDedupe>,
+    saga: SagaParticipantSupport<FailOnAppendJournal>,
 }
 
 impl FailingJournalActor {
     fn fail_on_append(fail_on_append: usize) -> Self {
         Self {
-            saga: SagaParticipantSupport::new(
-                FailOnAppendJournal::new(fail_on_append),
-                InMemoryDedupe::new(),
-            ),
+            saga: SagaParticipantSupport::new(FailOnAppendJournal::new(fail_on_append)),
         }
     }
 }
 
 impl HasSagaParticipantSupport for FailingJournalActor {
-    type Journal = FailOnAppendJournal;
-    type Dedupe = InMemoryDedupe;
+    type Store = FailOnAppendJournal;
 
-    fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support(&self) -> &SagaParticipantSupport<Self::Store> {
         &self.saga
     }
 
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Store> {
         &mut self.saga
     }
 }
@@ -233,8 +287,6 @@ impl HasSagaWorkflowParticipants for FailingJournalActor {
 }
 
 impl SagaParticipant for FailingJournalActor {
-    type Error = String;
-
     fn step_name(&self) -> &str {
         "create_order"
     }
@@ -271,7 +323,7 @@ impl SagaParticipant for FailingJournalActor {
 }
 
 struct RestartedHarnessActor {
-    saga: SagaParticipantSupport<Arc<InMemoryJournal>, InMemoryDedupe>,
+    saga: SagaParticipantSupport<Arc<InMemoryParticipantStore>>,
 }
 
 struct RestartedHarnessWorkflow;
@@ -315,22 +367,21 @@ impl HasSagaWorkflowParticipants for RestartedHarnessActor {
 }
 
 impl RestartedHarnessActor {
-    fn new(journal: Arc<InMemoryJournal>) -> Self {
+    fn new(journal: Arc<InMemoryParticipantStore>) -> Self {
         Self {
-            saga: SagaParticipantSupport::new(journal, InMemoryDedupe::new()),
+            saga: SagaParticipantSupport::new(journal),
         }
     }
 }
 
 impl HasSagaParticipantSupport for RestartedHarnessActor {
-    type Journal = Arc<InMemoryJournal>;
-    type Dedupe = InMemoryDedupe;
+    type Store = Arc<InMemoryParticipantStore>;
 
-    fn saga_support(&self) -> &SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support(&self) -> &SagaParticipantSupport<Self::Store> {
         &self.saga
     }
 
-    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Journal, Self::Dedupe> {
+    fn saga_support_mut(&mut self) -> &mut SagaParticipantSupport<Self::Store> {
         &mut self.saga
     }
 }
@@ -444,7 +495,7 @@ fn accepted_step_rejects_idle_timeout_after_hard_timeout() {
     assert!(
         actor
             .saga_support()
-            .journal
+            .store
             .read(ctx.saga_id)
             .expect("journal read should succeed")
             .is_empty()
@@ -728,7 +779,7 @@ fn accept_failure_on_run_identity_append_leaves_no_accepted_metadata() {
     assert!(
         actor
             .saga
-            .journal
+            .store
             .read(ctx.saga_id)
             .expect("journal read should succeed")
             .is_empty()
@@ -756,7 +807,7 @@ fn accept_failure_on_metadata_append_does_not_orphan_accepted_metadata() {
     assert_eq!(actor.saga.accepted_workflow_step_count(), 0);
     let entries = actor
         .saga
-        .journal
+        .store
         .read(ctx.saga_id)
         .expect("journal read should succeed");
     assert!(matches!(
@@ -820,14 +871,14 @@ fn accepted_completion_append_failure_preserves_evidence_without_reopening_succe
     ));
     assert_eq!(actor.saga.accepted_workflow_step_count(), 1);
     assert_eq!(actor.saga.resolved_workflow_step_count(), 0);
-    assert!(actor.saga.journal.read(ctx.saga_id).unwrap().iter().any(|entry|
+    assert!(actor.saga.store.read(ctx.saga_id).unwrap().iter().any(|entry|
         matches!(&entry.event, ParticipantEvent::ParticipantReconciliationEvidence { compensation_data, .. } if compensation_data == b"undo")));
 }
 
 #[test]
 fn accepted_step_metadata_persistence_failure_quarantines_external_effect() {
     // Run identity + execution intent precede accepted metadata.
-    let mut actor = FailingJournalActor::fail_on_append(3);
+    let mut actor = FailingJournalActor::fail_on_append(4);
     let ctx = context("create_order", 42);
     let mut emitted = Vec::new();
 
@@ -857,7 +908,7 @@ fn accepted_step_metadata_persistence_failure_quarantines_external_effect() {
     ));
     let journal = actor
         .saga
-        .journal
+        .store
         .read(ctx.saga_id)
         .expect("quarantine evidence should remain readable");
     assert!(matches!(
@@ -962,7 +1013,7 @@ fn compensating_failure_tombstones_forward_execution_but_keeps_compensation_data
 
 #[test]
 fn live_accepted_step_replays_its_exact_deadline_policy_after_restart() {
-    let journal = Arc::new(InMemoryJournal::new());
+    let journal = Arc::new(InMemoryParticipantStore::new());
     let mut actor = RestartedHarnessActor::new(journal.clone());
     let ctx = context("create_order", 42);
     let accepted = accept_workflow_step_with_state(
@@ -992,7 +1043,6 @@ fn live_accepted_step_replays_its_exact_deadline_policy_after_restart() {
 
     let recovery_events = collect_startup_recovery_events_for_saga_type(
         journal.as_ref(),
-        &InMemoryDedupe::new(),
         "create_order",
         "order_lifecycle",
     )
@@ -1018,7 +1068,7 @@ fn live_accepted_step_replays_its_exact_deadline_policy_after_restart() {
 
 #[test]
 fn compensating_failure_restart_keeps_forward_execution_tombstoned() {
-    let journal = Arc::new(InMemoryJournal::new());
+    let journal = Arc::new(InMemoryParticipantStore::new());
     let mut actor = RestartedHarnessActor::new(journal.clone());
     let ctx = context("create_order", 39);
     let execution_id = StepExecutionId::new("effect-39");
@@ -1042,13 +1092,9 @@ fn compensating_failure_restart_keeps_forward_execution_tombstoned() {
     )
     .expect("compensating failure should be durable");
 
-    let recovery_events = collect_startup_recovery_events_for_saga_type(
-        &journal,
-        &InMemoryDedupe::new(),
-        "create_order",
-        "order_lifecycle",
-    )
-    .expect("durable failure recovery events should be collected");
+    let recovery_events =
+        collect_startup_recovery_events_for_saga_type(&journal, "create_order", "order_lifecycle")
+            .expect("durable failure recovery events should be collected");
     assert!(matches!(
         recovery_events.as_slice(),
         [SagaChoreographyEvent::StepAccepted {
@@ -1235,7 +1281,7 @@ fn volatile_run_tracking_reset_cannot_reaccept_durably_recorded_execution() {
 
 #[test]
 fn accepted_step_can_complete_after_participant_restart() {
-    let journal = Arc::new(InMemoryJournal::new());
+    let journal = Arc::new(InMemoryParticipantStore::new());
     let mut actor = RestartedHarnessActor::new(journal.clone());
     let ctx = context("create_order", 23);
     let execution_id = StepExecutionId::new("effect-23");
@@ -1285,7 +1331,7 @@ fn accepted_step_can_complete_after_participant_restart() {
 
 #[test]
 fn accepted_compensation_can_complete_after_participant_restart() {
-    let journal = Arc::new(InMemoryJournal::new());
+    let journal = Arc::new(InMemoryParticipantStore::new());
     let ctx = context("create_order", 37);
     let execution_id = StepExecutionId::new("cancel-order-request-37");
     let accepted_at_millis = SagaContext::now_millis();
@@ -1326,13 +1372,9 @@ fn accepted_compensation_can_complete_after_participant_restart() {
         )
         .expect("accepted compensation should be durable before restart");
 
-    let recovery_events = collect_startup_recovery_events_for_saga_type(
-        &journal,
-        &InMemoryDedupe::new(),
-        "create_order",
-        "order_lifecycle",
-    )
-    .expect("accepted compensation lifecycle should recover");
+    let recovery_events =
+        collect_startup_recovery_events_for_saga_type(&journal, "create_order", "order_lifecycle")
+            .expect("accepted compensation lifecycle should recover");
     assert!(matches!(
         recovery_events.as_slice(),
         [SagaChoreographyEvent::CompensationRequested { steps_to_compensate, .. }, SagaChoreographyEvent::CompensationAccepted { .. }]
@@ -1393,10 +1435,19 @@ fn accepted_compensation_can_complete_after_participant_restart() {
 }
 
 #[test]
-fn unstarted_compensation_request_replays_and_rearms_its_dedupe_key() {
-    let journal = InMemoryJournal::new();
-    let dedupe = InMemoryDedupe::new();
+fn unstarted_compensation_request_replays_without_erasing_its_ingress_marker() {
+    let journal = InMemoryParticipantStore::new();
     let ctx = context("create_order", 43);
+    journal
+        .append(
+            ctx.saga_id,
+            ParticipantEvent::ParticipantRunRecorded {
+                saga_type: ctx.saga_type.clone(),
+                saga_started_at_millis: ctx.saga_started_at_millis,
+                recorded_at_millis: ctx.saga_started_at_millis,
+            },
+        )
+        .unwrap();
     journal
         .append(
             ctx.saga_id,
@@ -1442,30 +1493,73 @@ fn unstarted_compensation_request_replays_and_rearms_its_dedupe_key() {
         resolver_context.step_name,
         "create_order"
     );
-    dedupe
+    journal
         .mark_processed(ctx.saga_id, &dedupe_key)
         .expect("original ingress should be marked");
 
-    let recovery_events = collect_startup_recovery_events_for_saga_type(
-        &journal,
-        &dedupe,
-        "create_order",
-        "order_lifecycle",
-    )
-    .expect("unstarted compensation request should recover");
+    let recovery_events =
+        collect_startup_recovery_events_for_saga_type(&journal, "create_order", "order_lifecycle")
+            .expect("unstarted compensation request should recover");
     assert!(matches!(
         recovery_events.as_slice(),
         [SagaChoreographyEvent::CompensationRequested { context, .. }]
             if context.saga_id == ctx.saga_id
     ));
     assert!(
-        !dedupe
-            .contains(ctx.saga_id, &dedupe_key)
-            .expect("rearmed dedupe key should be readable"),
-        "startup replay must be allowed through normal participant ingress exactly once"
+        !journal
+            .check_and_mark(ctx.saga_id, &dedupe_key)
+            .expect("ingress marker should remain readable"),
+        "recovery uses durable compensation intent, not deletion of an ingress marker"
     );
 
-    let mut support = SagaParticipantSupport::new(journal, dedupe);
+    let mut replay_actor = FailingJournalActor::fail_on_append(usize::MAX);
+    replay_actor
+        .saga
+        .store
+        .inner
+        .append_batch(
+            ctx.saga_id,
+            journal
+                .read(ctx.saga_id)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.event)
+                .collect(),
+        )
+        .unwrap();
+    replay_actor
+        .saga
+        .store
+        .mark_processed(ctx.saga_id, &dedupe_key)
+        .unwrap();
+    recover_accepted_workflow_steps_for_saga_type(
+        &mut replay_actor.saga,
+        "create_order",
+        "order_lifecycle",
+    )
+    .unwrap();
+    let mut replayed = Vec::new();
+    for _ in 0..2 {
+        handle_saga_event_with_emit(&mut replay_actor, recovery_events[0].clone(), |event| {
+            replayed.push(event)
+        });
+    }
+    assert!(
+        replayed
+            .iter()
+            .any(|event| matches!(event, SagaChoreographyEvent::CompensationCompleted { .. })),
+        "{replayed:?}"
+    );
+    let rows = replay_actor.saga.store.read(ctx.saga_id).unwrap();
+    assert_eq!(
+        rows.iter()
+            .filter(|row| matches!(row.event, ParticipantEvent::CompensationStarted { .. }))
+            .count(),
+        1,
+        "normal replay performs the physical undo only once despite the old marker"
+    );
+
+    let mut support = SagaParticipantSupport::new(journal);
     recover_accepted_workflow_steps_for_saga_type(&mut support, "create_order", "order_lifecycle")
         .expect("compensable state should rehydrate before request replay");
     assert!(matches!(
@@ -1476,7 +1570,7 @@ fn unstarted_compensation_request_replays_and_rearms_its_dedupe_key() {
     ));
 
     support
-        .journal
+        .store
         .append(
             ctx.saga_id,
             ParticipantEvent::CompensationStarted {
@@ -1486,12 +1580,11 @@ fn unstarted_compensation_request_replays_and_rearms_its_dedupe_key() {
         )
         .expect("compensation start should persist");
     support
-        .dedupe
+        .store
         .mark_processed(ctx.saga_id, &dedupe_key)
         .expect("started request should remain deduped");
     let after_start = collect_startup_recovery_events_for_saga_type(
-        &support.journal,
-        &support.dedupe,
+        &support.store,
         "create_order",
         "order_lifecycle",
     )
@@ -1503,15 +1596,16 @@ fn unstarted_compensation_request_replays_and_rearms_its_dedupe_key() {
     );
     assert!(
         support
-            .dedupe
-            .contains(ctx.saga_id, &dedupe_key)
+            .store
+            .check_and_mark(ctx.saga_id, &dedupe_key)
+            .map(|fresh| !fresh)
             .expect("started dedupe key should remain readable")
     );
 }
 
 #[test]
 fn completed_accepted_compensation_replays_terminal_resolution_after_restart() {
-    let journal = InMemoryJournal::new();
+    let journal = InMemoryParticipantStore::new();
     let ctx = context("create_order", 44);
     let accepted_at_millis = 1_700_000_000_200;
     journal
@@ -1559,13 +1653,9 @@ fn completed_accepted_compensation_replays_terminal_resolution_after_restart() {
         )
         .expect("authoritative compensation completion should persist");
 
-    let recovery_events = collect_startup_recovery_events_for_saga_type(
-        &journal,
-        &InMemoryDedupe::new(),
-        "create_order",
-        "order_lifecycle",
-    )
-    .expect("completed accepted compensation should recover");
+    let recovery_events =
+        collect_startup_recovery_events_for_saga_type(&journal, "create_order", "order_lifecycle")
+            .expect("completed accepted compensation should recover");
     assert!(matches!(
         recovery_events.as_slice(),
         [SagaChoreographyEvent::CompensationRequested { .. }, SagaChoreographyEvent::CompensationCompleted { context }]
@@ -1593,7 +1683,7 @@ fn accepted_compensation_failure_leaves_no_compensating_state() {
         let accepted_at_millis = 1_700_000_000_000;
         actor
             .saga
-            .journal
+            .store
             .append(
                 ctx.saga_id,
                 ParticipantEvent::CompensationRequestRecorded {
@@ -1614,7 +1704,7 @@ fn accepted_compensation_failure_leaves_no_compensating_state() {
             .expect("compensation request should persist");
         actor
             .saga
-            .journal
+            .store
             .append(
                 ctx.saga_id,
                 ParticipantEvent::AcceptedCompensationRecorded {
@@ -1694,7 +1784,7 @@ fn accepted_compensation_failure_leaves_no_compensating_state() {
         }
         let journal = actor
             .saga
-            .journal
+            .store
             .read(ctx.saga_id)
             .expect("compensation failure should be durable");
         if is_ambiguous {
@@ -1716,8 +1806,7 @@ fn accepted_compensation_failure_leaves_no_compensating_state() {
         assert_eq!(actor.saga.accepted_workflow_compensation_count(), 0);
 
         let recovery_events = collect_startup_recovery_events_for_saga_type(
-            &actor.saga.journal,
-            &InMemoryDedupe::new(),
+            &actor.saga.store,
             "create_order",
             "order_lifecycle",
         )
@@ -1746,7 +1835,7 @@ fn accepted_compensation_failure_leaves_no_compensating_state() {
 
 #[test]
 fn accepted_step_restart_recovers_refreshed_progress_deadline() {
-    let journal = Arc::new(InMemoryJournal::new());
+    let journal = Arc::new(InMemoryParticipantStore::new());
     let mut actor = RestartedHarnessActor::new(journal.clone());
     let ctx = context("create_order", 24);
     let execution_id = StepExecutionId::new("effect-24");
@@ -1868,7 +1957,7 @@ fn accepted_step_completion_records_actual_completion_time() {
 
     let entries = actor
         .saga
-        .journal
+        .store
         .read(ctx.saga_id)
         .expect("journal read should succeed");
     // The single strict proof append carries the actual completion time; no raw
@@ -1951,7 +2040,7 @@ fn duplicate_accept_for_same_saga_is_rejected_without_losing_original_step() {
                 requires_compensation: false,
             }),
         ),
-        Err(AcceptedStepError::AlreadyAccepted { .. })
+        Err(AcceptedStepError::Durability { error, .. }) if error.contains("durable intent/evidence")
     ));
 
     fail_accepted_workflow_step(
@@ -2131,7 +2220,7 @@ fn accepted_step_progress_extends_idle_deadline_but_not_hard_deadline() {
 
 #[test]
 fn resolver_timeout_step_failure_blocks_late_accepted_completion() {
-    let mut actor = HarnessActor::default();
+    let mut actor = DeferredWorkflowActor::default();
     let ctx = context("create_order", 7);
     let execution_id = StepExecutionId::new("effect-7");
 
@@ -2322,4 +2411,37 @@ fn saga_test_world_progress_helper_publishes_resolver_heartbeat() {
         world.wait_for_terminal(ctx.saga_id, Duration::from_secs(1)),
         SagaTerminalOutcome::Completed { .. }
     ));
+}
+
+#[test]
+fn failed_progress_append_preserves_deadline_and_returns_no_heartbeat() {
+    let mut actor = FailingJournalActor::fail_on_append(usize::MAX);
+    let ctx = context("create_order", 909);
+    let execution_id = StepExecutionId::new("renewal-failure");
+    accept_workflow_step(
+        &mut actor,
+        ctx.clone(),
+        "worker".into(),
+        execution_id.clone(),
+        policy(AcceptedStepTimeoutOutcome::QuarantineSaga),
+    )
+    .unwrap();
+    let before = actor.saga.accepted_workflow_steps[&ctx.saga_id].clone();
+    let row_count = actor.saga.store.read(ctx.saga_id).unwrap().len();
+    actor.saga.store.fail_on_append = actor.saga.store.appends.load(Ordering::SeqCst) + 1;
+    let result = record_accepted_workflow_step_progress(
+        &mut actor,
+        ctx.saga_id,
+        execution_id,
+        before.deadline_at_millis - 50,
+    );
+    assert!(matches!(result, Err(AcceptedStepError::Durability { .. })));
+    let after = &actor.saga.accepted_workflow_steps[&ctx.saga_id];
+    assert_eq!(after.deadline_at_millis, before.deadline_at_millis);
+    assert_eq!(
+        after.hard_deadline_at_millis,
+        before.hard_deadline_at_millis
+    );
+    assert_eq!(after.context, before.context);
+    assert_eq!(actor.saga.store.read(ctx.saga_id).unwrap().len(), row_count);
 }
